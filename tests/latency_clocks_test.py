@@ -241,6 +241,62 @@ def test_a_single_stray_vote_is_not_a_slip():
     assert pairing.slip is None and not pairing.ambiguous, pairing.reason
 
 
+def test_a_short_delivery_backlog_is_not_a_slip_for_arrival():
+    # A brief host stall holds three frames a period late and then the votes return to the
+    # majority; a lost NI transition never returns. 3 of 9000 is a run that long by the rule,
+    # recorded as a diagnostic, and it must not cost a correct session its pairing.
+    ids, exposure, transition_perf = _exposures(9000)
+    arrival = exposure + 0.002
+    arrival[4000:4003] += PERIOD_150
+
+    pairing = clocks.choose_pairing(ids, arrival, transition_perf, PERIOD_150,
+                                    ni_residual_rms=0.00002)
+
+    assert not pairing.ambiguous, pairing.reason
+    assert pairing.reason == ""
+    assert pairing.slip["reverts"] is True
+    assert pairing.slip["frames"] == 3
+    assert pairing.slip["frameId"] == ids[4000]
+
+
+def test_a_lost_transition_near_the_end_is_found_beside_a_longer_backlog():
+    # The interior run is longer (30 against 10) and would have been the one reported; the
+    # run that reaches the end of the session is tested first, so the real slip is not hidden.
+    ids, exposure, transition_perf = _exposures(9000)
+    arrival = exposure + 0.002
+    arrival[4000:4030] += PERIOD_150
+    lost = 9000 - 10
+
+    pairing = clocks.choose_pairing(ids, arrival, np.delete(transition_perf, 5 + lost),
+                                    PERIOD_150, ni_residual_rms=0.00002)
+
+    assert pairing.ambiguous, pairing.reason
+    assert pairing.slip["reverts"] is False
+    assert pairing.slip["frameId"] == ids[lost]
+    assert pairing.slip["frames"] == 10
+    assert f"slip at frame {ids[lost]}" in pairing.reason
+
+
+def test_a_lost_transition_early_is_a_slip_that_does_not_revert():
+    # The run opens the session, so it never returns to the majority either.
+    ids, exposure, transition_perf = _exposures(9000)
+    lost = 40
+
+    pairing = clocks.choose_pairing(ids, exposure + 0.002, np.delete(transition_perf, 5 + lost),
+                                    PERIOD_150, ni_residual_rms=0.00002)
+
+    assert pairing.ambiguous, pairing.reason
+    assert pairing.slip["reverts"] is False
+    assert pairing.slip["frameId"] == ids[lost]
+    assert pairing.slip["frames"] == lost
+
+
+def test_the_statistical_constants_are_pinned():
+    assert clocks.coverage_factor() == pytest.approx(4.8916, abs=1e-3)
+    samples = np.random.default_rng(11).normal(0, 0.002, 100_000)
+    assert clocks.robust_spread(samples) == pytest.approx(0.002, rel=0.02)
+
+
 def test_the_arrival_margin_is_measured():
     ids, exposure, transition_perf = _exposures(9000)
     lags = 0.002 + np.random.default_rng(5).normal(0, 0.0003, 9000)
@@ -482,7 +538,27 @@ def test_a_lost_transition_is_a_slip_for_the_camera_clock_too(drop):
     assert pairing.ambiguous
     # The lost edge's own frame sits midway between its neighbours; either may take it.
     assert abs(pairing.slip["frameId"] - ids[drop]) <= 1
+    assert pairing.slip["reverts"] is False
     assert "slip" in pairing.reason
+
+
+def test_the_camera_clock_flags_a_run_that_reverts():
+    # Delivery cannot move a hardware timestamp, so a run of frames the camera clock puts a
+    # period late is the latch map's or the stamps' fault, not a backlog: ambiguous even
+    # though the votes return to the majority.
+    ids, exposure, transition_perf = _exposures(9000)
+    camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
+    camera_ts_ns[4000:4030] += int(round(PERIOD_150 * 1e9))
+    latches = _latches([exposure[0] + 0.001, exposure[-1] + 0.001])
+
+    pairing = clocks.choose_pairing_by_camera_clock(
+        ids, camera_ts_ns, latches, transition_perf, PERIOD_150, ni_residual_rms=0.00002,
+        clock="perf")
+
+    assert pairing.ambiguous
+    assert pairing.slip["reverts"] is True
+    assert pairing.slip["frames"] == 30
+    assert "slip at frame" in pairing.reason
 
 
 @pytest.mark.parametrize("frame_period, tolerance", [

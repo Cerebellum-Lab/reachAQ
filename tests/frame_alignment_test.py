@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from autotrainer.core import ProjectInfo
+from autotrainer.core.latency.schema import CAMERA_FRAME_DTYPE
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 from tools.latency import clocks
 from tools.latency.finalize import finalize_session_latency, read_raw_stream
@@ -201,13 +202,36 @@ def test_without_usable_latches_the_arrival_match_anchors_at_lower_confidence(tm
 
 def test_latency_frames_beyond_the_ni_spool_do_not_cost_the_arrival_match(tmp_path):
     # The camera runs on after the spool ends: those frames arrive past the last transition
-    # and have none of their own, so they must not count against either pairing (9 % of
-    # these frames is already under the 0.95 agreement the camera-clock pairing needs).
+    # and have none of their own, so they must not count against either pairing: counted,
+    # each would vote a shift of its own and the agreement would fall below 1.
     rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001, stream_tail_seconds=2.0)
 
     camera = result["cameraNidaqAlignment"]
-    assert camera["arrival"]["status"] == "paired" and camera["arrival"]["agreement"] >= 0.95
+    assert camera["arrival"]["status"] == "paired" and camera["arrival"]["agreement"] == 1.0
+    # 20 s of the 150 fps stream lies inside the spool; the 2 s after it is left out of both.
+    assert camera["arrival"]["frames"] == camera["latch"]["frames"] == int(20.0 * FPS)
     assert camera["confidence"] == "hardware_edge"
+
+
+def test_a_delivery_backlog_leaves_the_arrival_anchor_paired():
+    # Three of 9000 frames held a period late in delivery (a host stall): a run by the slip
+    # rule, but one that returns to the majority, as a lost NI transition never does. The
+    # anchor stays paired, names the first frame's own transition, and records the run.
+    period, early = 1 / FPS, 5
+    transition_host = 100.0 + np.arange(9000 + 2 * early) * period
+    frames = np.zeros(9000, dtype=CAMERA_FRAME_DTYPE)
+    frames["frame_id"] = 5000 + np.arange(9000)
+    frames["arrival_perf"] = transition_host[early:early + 9000] + 0.002
+    frames["arrival_perf"][4000:4003] += period
+    boundary = SimpleNamespace(primary_frame_id=5000)
+
+    evidence, number = SessionDataRecorder._arrival_anchor(
+        boundary, {"frames": frames}, "", transition_host, period, ni_residual_rms=0.00002)
+
+    assert evidence["status"] == "paired", evidence["reason"]
+    assert evidence["ambiguous"] is False and evidence["reason"] == ""
+    assert evidence["slip"]["reverts"] is True and evidence["slip"]["frames"] == 3
+    assert number == early
 
 
 def test_the_first_frame_stamp_anchor_is_the_latest_transition_at_or_before_it():

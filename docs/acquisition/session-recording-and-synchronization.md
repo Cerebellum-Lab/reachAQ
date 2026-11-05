@@ -503,13 +503,20 @@ the primary camera's latency stream:
     MAD_lag the robust spread of the per-frame lags and n the frames counted:
     a `medianLagSeconds` within it of 0 or of P is `ambiguous`.
   - `slip` is null, or where the votes change shift: `frameId`, `frames` (the
-    run's length), `fromShift` and `toShift`. In frame-ID order the stray
-    rate is p̂ = (votes off the majority + 1) / (n + 2), and the longest run L
-    of one other shift is a slip when n·p̂^L is under
-    `FALSE_ALARM_PROBABILITY`. `frameId` is the run's first frame, or, for a
-    run that opens the session, the frame after it. A lost or spurious NI
-    transition puts every later frame on the next shift, a slip in both
-    matches, which are then `ambiguous`. `agreement` stays as a diagnostic.
+    run's length), `fromShift`, `toShift` and `reverts`. In frame-ID order the
+    stray rate is p̂ = (votes off the majority + 1) / (n + 2), and a run of L
+    frames voting one other shift is a slip when n·p̂^L is under
+    `FALSE_ALARM_PROBABILITY`. Runs that reach an end of the session are
+    tested first and the longest that passes is reported; only if none does,
+    the longest interior run that passes, so a long backlog cannot hide a real
+    slip. `frameId` is the run's first frame, or, for a run that opens the
+    session, the frame after it. `reverts` is true for an interior run, one
+    that returns to the majority: frames held late in delivery by a host
+    stall. A lost or spurious NI transition puts every later frame on the next
+    shift, so its run reaches an end of the session and never reverts. A run
+    that returns to the majority does not make the arrival pairing ambiguous;
+    the camera-clock pairing flags any slip. `agreement` stays as a
+    diagnostic.
   - These replace the fixed 0.95 agreement, 0.1 ms arrival margin and 2 ms
     latch bracket cap.
 - `anchorMethod` is the first that yields a transition: `camera_latch` when the
@@ -566,6 +573,14 @@ Three things to know when reading `cameraNidaqAlignment`:
   separate fits of the same stamps: the first from the published, boundary-trimmed
   `nidaq.h5`, the second from the whole spool. Their `knotCount` and `x_min`
   differ, and neither is derived from the other.
+
+The latency finalizer's own `cameraToNi` record (`latency.h5`
+`clock/camera_to_ni`, and `clocks.cameraToNi` in its status) carries the
+pairing it used under `pairing`, and, when latches paired the frames, the
+host-arrival cross-check under `arrivalPairing`; each holds the `slip` above,
+`reverts` included. `latchDropped` lists the latch row numbers the latch map
+left out (an empty list when none), and those latches are named in `reason`,
+which on a valid record is a note and not a failure: read `valid`.
 
 Final session JSON/YAML uses `metadataSchemaVersion: 2`. It records the animal
 snapshot, `counts`, recording completion, stop policy/result, compact hardware

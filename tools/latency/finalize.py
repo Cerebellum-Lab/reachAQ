@@ -265,7 +265,10 @@ def _confirmed_by_arrival(latch: clocks.Pairing, arrival: clocks.Pairing) -> clo
     a residual as small as the right pairing's, and nothing on the latch side
     can see it. Host arrival reads no latch, so it can. An ambiguous arrival
     pairing confirms nothing: choose_pairing reports shift 0 when it cannot
-    pair at all, so its shift is compared only when it is unambiguous.
+    pair at all, so its shift is compared only when it is unambiguous. A
+    delivery backlog, a run of late frames that returns to the majority, leaves
+    it unambiguous (Pairing.slip records it); only a run that does not return,
+    as a lost NI transition's does not, makes it ambiguous.
     """
     if not arrival.ambiguous and arrival.shift == latch.shift:
         return latch
@@ -414,6 +417,8 @@ class _Context:
             return
         # Older sessions, and cameras with no clock to latch, have no latches.
         latches = self.cameras.get(self.primary_name, {}).get("clock_latches")
+        latch_dropped: list = []
+        latch_note = ""
         try:
             ni_seconds = transition_index / ni["rate"]
             transition_perf = self.ni_to_host.map(ni_seconds)
@@ -433,6 +438,9 @@ class _Context:
             # Otherwise on perf, where that line ignores the slews; Pairing.clock says which.
             clock = clocks.latch_clock(latches, self.ni_to_host)
             latch_fit = clocks.fit_latches(latches, clock=clock)
+            # A latch the map left out is otherwise invisible in the record.
+            latch_dropped = list(latch_fit.dropped)
+            latch_note = latch_fit.reason if latch_dropped else ""
             fallback = ""
             if latch_fit.valid and clocks.latch_gate_ok(latch_fit, residual, self.frame_period):
                 transition_times = (self.ni_to_host.to_raw(ni_seconds) if clock == "raw"
@@ -460,7 +468,8 @@ class _Context:
             frames["frame_id"], frames["camera_ts_ns"], transition_index, ni["rate"],
             pairing, self.frame_period))
         record["cameraToNi"] = {**self.camera_to_ni.as_record(),
-                                "pairing": dataclasses.asdict(self.pairing)}
+                                "pairing": dataclasses.asdict(self.pairing),
+                                "latchDropped": latch_dropped}
         if self.arrival_pairing is not None:
             record["cameraToNi"]["arrivalPairing"] = dataclasses.asdict(self.arrival_pairing)
         if pairing.method == clocks.HOST_ARRIVAL:
@@ -508,6 +517,9 @@ class _Context:
         if self.pairing.ambiguous:
             record["cameraToNi"]["valid"] = False
             record["cameraToNi"]["reason"] = self.pairing.reason
+        if latch_note:
+            record["cameraToNi"]["reason"] = "; ".join(
+                part for part in (record["cameraToNi"].get("reason", ""), latch_note) if part)
 
     def exposure_of(self):
         usable = (self.camera_to_ni.valid and self.ni_to_host.valid
