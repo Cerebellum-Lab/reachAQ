@@ -448,6 +448,9 @@ CAN warnings and errors remain in both logs.
 - `enabledSources`, including source role/binding, runtime state, actual paths,
   sample/frame count, first/last offsets, gap and overrun counts, failure, and
   `persistenceStatus`;
+- `boardSequenceGaps`: for each board boot seen during the session, the messages
+  the host's sequence tracker found missing (see the end of Board clock chain,
+  below);
 - `deviceEventOverruns`, `sessionComplete`, and `incompleteReasons`.
 
 Three things to know when reading `cameraNidaqAlignment`:
@@ -884,6 +887,22 @@ the `board_sequence_status_json` column. A row whose `gap` there is above zero i
 a warning (*row N: K board message(s) missing*) that names the row of the frame
 that revealed the loss. A file without the column, or a cell that cannot be read,
 counts no loss.
+
+A row can only show a loss that surfaced on a frame the recorder wrote as a row.
+A loss is shown by whichever frame follows it, which is often a pressure reading
+(about 166 a second) or a no-op frame, and neither is a row. So the recorder also
+keeps, for each board boot, the tracker's running total of missing messages
+(`gap_total` in the same JSON) from the first frame it saw after the session
+began to the last, over every frame whether or not it was recorded, and writes it
+as `alignment.json` `boardSequenceGaps`, `[{"bootId": N, "missing": K}, ...]`,
+one entry per boot seen. `schemaVersion` stays 3; the field is additive, and
+older sessions do not have it. `events.board_time` warns for each boot whose
+`missing` is above zero (*board boot N: the live tracker counted K missing
+message(s) this session*), ahead of the per-row warnings. That is the same loss
+counted over the whole session, not an addition to the per-row ones. A loss shown
+on the first frame the recorder saw of a boot is not counted, because it may have
+come before the session; and a loss on the last frames before the recorder stops
+may be missed.
 
 ## Storage, discovery, and safe hardware boundaries
 

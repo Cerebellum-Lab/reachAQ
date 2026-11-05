@@ -1155,3 +1155,27 @@ def test_clock_check_covers_only_queue_stamps(tmp_path):
         _host_row(10.002, 7, 3, 6000, "tx_queue"),
     )
     assert _board_time_result(tmp_path, rows).status.value == "pass"
+
+
+def test_tracker_gaps_on_frames_outside_device_csv_are_a_warning(tmp_path):
+    # Lost messages the tracker saw on a pressure or no-op frame leave no
+    # gap on any row; the session total is where they show.
+    rows = (_status_row(10.0, 7, 1, 1000, "tx_queue"), _status_row(10.1, 7, 2, 2000, "tx_queue"))
+    alignment = {"boardSequenceGaps": [{"bootId": 7, "missing": 3}, {"bootId": 9, "missing": 0}]}
+    result = _board_time_result(tmp_path, rows, columns=_STATUS_COLUMNS, alignment=alignment)
+    assert result.status.value == "warning"
+    assert "board boot 7: the live tracker counted 3 missing message(s)" in result.message
+    assert "board boot 9" not in result.message
+    assert result.observed["session_missing_messages"] == 3
+
+
+@pytest.mark.parametrize("gaps", (
+    [], [{"bootId": 7, "missing": 0}], None, "none", [None], [{"bootId": 7}], [{"missing": 2}],
+    [{"bootId": 7, "missing": "x"}], [{"bootId": 7, "missing": -1}],
+), ids=("empty", "zero", "null", "string", "null-item", "no-missing", "no-boot", "bad-missing", "negative"))
+def test_no_or_unreadable_session_gap_total_adds_no_warning(tmp_path, gaps):
+    rows = (_status_row(10.0, 7, 1, 1000, "tx_queue"), _status_row(10.1, 7, 2, 2000, "tx_queue"))
+    result = _board_time_result(
+        tmp_path, rows, columns=_STATUS_COLUMNS, alignment={"boardSequenceGaps": gaps},
+    )
+    assert result.status.value == "pass", result.message

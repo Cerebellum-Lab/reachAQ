@@ -267,6 +267,9 @@ class SessionDataRecorder:
         self._device_event_capacity = int(device_event_capacity)
         self._device_event_overruns = 0
         self._device_events_since_start = 0
+        # Per board boot: [first, latest] gap_total the live sequence tracker
+        # reported since the session started (see _note_board_gap_total).
+        self._board_gap_marks = {}
         self._pressure = _PressureRing(pressure_sample_capacity)
         self._pressure_samples_since_start = 0
         self._laser_rows = []
@@ -444,6 +447,7 @@ class SessionDataRecorder:
             # count from here rather than from the ring's own total.
             self._pressure_samples_since_start = 0
             self._pressure.clear()
+            self._board_gap_marks = {}
 
     @contextmanager
     def _locked_then_log(self):
@@ -505,6 +509,7 @@ class SessionDataRecorder:
                 0,
                 self._device_events_since_start - self._device_event_capacity,
             )
+            board_sequence_gaps = self._board_sequence_gap_records()
             pressure_columns = self._pressure.snapshot()
             pressure_overruns = max(
                 0,
@@ -547,6 +552,7 @@ class SessionDataRecorder:
                 "nidaq_chunks": nidaq_chunks,
                 "timing_plan": timing_plan,
                 "device_event_overruns": device_event_overruns,
+                "board_sequence_gaps": board_sequence_gaps,
                 "source_manifest": source_manifest,
                 "source_results": source_results,
                 "boundary": boundary,
@@ -1039,6 +1045,7 @@ class SessionDataRecorder:
         self._start_wall = None
         self._boundary = None
         self._device_events_since_start = 0
+        self._board_gap_marks = {}
         self._pressure_samples_since_start = 0
         self._laser_rows = []
         self._log_rows = []
@@ -1258,6 +1265,9 @@ class SessionDataRecorder:
         if not math.isfinite(event_perf):
             event_perf = float(perf_time)
         sequence_status = getattr(data, "board_sequence_status", None)
+        self._note_board_gap_total(
+            getattr(data, "board_boot_id", None), sequence_status,
+        )
         if kind_name == "PRESSURE_READING":
             # Pressure is ~166 Hz across the two sensors and made up 98% of
             # every device row a session wrote, which overran the shared
@@ -1300,6 +1310,41 @@ class SessionDataRecorder:
                 getattr(data, "timestamp_method", "host_receive_perf_time"),
                 getattr(data, "timing_confidence", "host_timestamp"),
             ))
+
+    def _note_board_gap_total(self, boot_id, status) -> None:
+        """Remember how many messages the live tracker found a board boot missing.
+
+        The tracker sees every frame a board sends with a timing trailer. A loss
+        shows up on whichever frame arrives next, and not every frame is a
+        device.csv row: pressure readings go to their own stream and the
+        no-op frames are never recorded, so the rows alone cannot total the
+        loss. Each frame's status carries the tracker's running total for the
+        boot (gap_total), so this keeps the first and the latest total seen
+        since the session started; their difference is the loss counted during
+        the session, and it does not depend on which frames were recorded. A
+        loss shown on the first frame of a boot is not counted, since it may
+        have happened before the session.
+        """
+        if boot_id is None or not isinstance(status, dict):
+            return
+        total = status.get("gap_total")
+        if not isinstance(total, int) or isinstance(total, bool):
+            return
+        with self._lock:
+            marks = self._board_gap_marks.get(boot_id)
+            if marks is None:
+                self._board_gap_marks[boot_id] = [total, total]
+            elif total > marks[1]:
+                marks[1] = total
+
+    def _board_sequence_gap_records(self) -> list:
+        """alignment.json's boardSequenceGaps: [{bootId, missing}], one per boot seen.
+
+        The caller holds self._lock."""
+        return [
+            {"bootId": int(boot_id), "missing": int(latest - first)}
+            for boot_id, (first, latest) in sorted(self._board_gap_marks.items())
+        ]
 
     @classmethod
     def _payload_json(cls, value) -> str:
@@ -1702,6 +1747,7 @@ class SessionDataRecorder:
         pressure_overruns=0,
         structured_event_overruns=0,
         device_event_overruns=0,
+        board_sequence_gaps=(),
         source_manifest=(),
         source_results=None,
         boundary: Optional[SessionBoundary] = None,
@@ -2372,6 +2418,7 @@ class SessionDataRecorder:
             "deviceEventOverruns": int(device_event_overruns),
             "structuredEventOverruns": int(structured_event_overruns),
             "retentionLimited": retention,
+            "boardSequenceGaps": [dict(item) for item in board_sequence_gaps],
             "sessionComplete": not incomplete_reasons,
             "incompleteReasons": incomplete_reasons,
             "enabledSources": finalized_sources,

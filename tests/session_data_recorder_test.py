@@ -2332,3 +2332,87 @@ def test_board_clock_chain_without_a_fit_or_a_finite_stamp_is_unavailable(monkey
 
     assert record["status"] == "unavailable" and "without host time" in record["reason"]
     assert record["pairing"] is None
+
+
+def _gap_frame(boot, sequence, gap, gap_total):
+    return SimpleNamespace(
+        index=10_200_000_000, timestamp_ns=100_200_000_000, event_perf_time=10.2,
+        board_boot_id=boot, board_sequence=sequence, board_time_us=sequence * 1000,
+        board_timestamp_kind="tx_queue", instance=0, pressure=1,
+        board_sequence_status={"gap": gap, "gap_total": gap_total, "reboot": False},
+    )
+
+
+def test_board_gap_totals_come_from_every_frame_the_tracker_saw(tmp_path, monkeypatch):
+    # A lost message surfaces on whichever frame arrives next. When that is a
+    # pressure reading it is never a device.csv row, so no row shows the loss.
+    captured = {}
+    monkeypatch.setattr(SessionDataRecorder, "_write_session",
+                        staticmethod(lambda **snapshot: captured.update(snapshot) or {}))
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=14)
+    ring = SimpleNamespace(channel_names=(), capacity=1, sample_rate_hz=1000.0,
+                           copy_since=lambda last, destination: None)
+    laser = _EventSource("trace_received")
+    laser.configuration = SimpleNamespace(backend="disabled")
+    recorder = SessionDataRecorder(SimpleNamespace(sample_ring=ring, timing_plan=None), laser)
+    tone, pressure = SystemStatusMessageKind.TONE_STATUS, SystemStatusMessageKind.PRESSURE_READING
+    try:
+        recorder.arm(project)
+        recorder._on_device_message(tone, _gap_frame(7, 1, 0, 5), 9.0, 99.0)  # before the session: 5 lost already
+        recorder.commit_start(10.0, 100.0)
+        recorder._on_device_message(tone, _gap_frame(7, 20, 0, 5), 10.1, 100.1)
+        recorder._on_device_message(pressure, _gap_frame(7, 24, 3, 8), 10.2, 100.2)  # 3 lost, shown on a pressure frame
+        recorder._on_device_message(tone, _gap_frame(7, 25, 0, 8), 10.3, 100.3)
+        recorder._on_device_message(tone, _gap_frame(9, 3, 0, 0), 10.4, 100.4)
+        recorder._on_device_message(tone, _gap_frame(9, 5, 1, 1), 10.5, 100.5)
+        recorder._on_device_message(tone, SimpleNamespace(index=1, timestamp_ns=1), 10.6, 100.6)  # no timing trailer
+        recorder.stop(11.0)
+    finally:
+        recorder.close()
+
+    assert captured["board_sequence_gaps"] == [
+        {"bootId": 7, "missing": 3}, {"bootId": 9, "missing": 1},
+    ]
+
+
+def test_alignment_records_the_board_sequence_gap_totals(tmp_path):
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=6)
+
+    SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 11.0, (), (), (), (),
+        board_sequence_gaps=[{"bootId": 7, "missing": 4}],
+    )
+
+    session_dir = next(Path(tmp_path).rglob("alignment.json")).parent
+    alignment = json.loads((session_dir / "alignment.json").read_text(encoding="utf-8"))
+    assert alignment["boardSequenceGaps"] == [{"bootId": 7, "missing": 4}]
+    assert alignment["schemaVersion"] == 3
+
+
+def test_alignment_gap_totals_are_empty_when_none_were_given(tmp_path):
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=7)
+
+    SessionDataRecorder._write_session(project, 10.0, 100.0, 11.0, (), (), (), ())
+
+    session_dir = next(Path(tmp_path).rglob("alignment.json")).parent
+    alignment = json.loads((session_dir / "alignment.json").read_text(encoding="utf-8"))
+    assert alignment["boardSequenceGaps"] == []
+
+
+def test_the_validator_reads_the_gap_totals_the_recorder_wrote(tmp_path):
+    from board_clock_chain_synthetic import device_row
+
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=8)
+    rows = (device_row(10.5, "TONE_STATUS", {}, 7, 1, 1_000_000, "tx_queue"),)
+
+    SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 11.0, rows, (), (), (),
+        board_sequence_gaps=[{"bootId": 7, "missing": 4}],
+    )
+
+    session_dir = next(Path(tmp_path).rglob("alignment.json")).parent.parent
+    report = validate_session(session_dir, profile=ValidationProfile.FAST)
+    result = next(item for item in report.results if item.rule_id == "events.board_time")
+    assert result.status.value == "warning", result.message
+    assert "board boot 7: the live tracker counted 4 missing message(s)" in result.message

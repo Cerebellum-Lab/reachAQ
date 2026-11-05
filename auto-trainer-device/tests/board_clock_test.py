@@ -92,3 +92,14 @@ def test_implausible_slope_falls_back_to_an_offset_instead_of_raising():
 
     assert estimate.slope == 1.0
     assert not estimate.slope_fitted
+
+
+def test_board_sequence_totals_the_missing_messages_since_the_boot_began():
+    tracker = BoardSequenceTracker()
+    assert tracker.observe(1, 10)["gap_total"] == 0
+    assert tracker.observe(1, 12)["gap_total"] == 1
+    assert tracker.observe(1, 16)["gap_total"] == 4
+    assert tracker.observe(1, 16)["gap_total"] == 4  # a duplicate loses nothing
+    assert tracker.observe(1, 15)["gap_total"] == 4  # nor does a step backward
+    assert tracker.observe(2, 7)["gap_total"] == 0  # a new boot starts again from none
+    assert tracker.observe(2, 9)["gap_total"] == 1

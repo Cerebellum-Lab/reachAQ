@@ -165,11 +165,17 @@ class BoardClockModel:
 
 
 class BoardSequenceTracker:
-    """Detect reboot, duplicate, backward, and missing board message sequences."""
+    """Detect reboot, duplicate, backward, and missing board message sequences.
+
+    ``gap`` is what this frame found missing; ``gap_total`` is what every frame of
+    the board's current boot has found, so a total read off any later frame also
+    counts a gap seen on a frame that was not recorded.
+    """
 
     def __init__(self):
         self._boot_id = None
         self._sequence = None
+        self._missing = 0
 
     def observe(self, boot_id: int, sequence: int) -> dict:
         boot_id, sequence = int(boot_id), int(sequence)
@@ -183,9 +189,11 @@ class BoardSequenceTracker:
         )
         self._boot_id = boot_id
         self._sequence = sequence
+        self._missing = 0 if reboot else self._missing + gap
         return {
             "reboot": reboot,
             "duplicate": duplicate,
             "backward": backward,
             "gap": gap,
+            "gap_total": self._missing,
         }

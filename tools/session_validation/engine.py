@@ -1137,6 +1137,33 @@ def _tracker_gap(row):
     return 0
 
 
+def _session_gap_totals(context):
+    """(boot id, missing) for each board boot the live tracker counted loss on.
+
+    alignment.json's boardSequenceGaps totals the tracker's gaps over every frame
+    of the session, including the ones that are not device.csv rows (pressure
+    readings, no-op frames), where no row can show the loss. Sessions written
+    before the field existed have none; whatever cannot be read is skipped.
+    """
+    try:
+        records = context.json("streams/alignment.json").get("boardSequenceGaps")
+    except (OSError, ValueError, AttributeError):
+        return []
+    if not isinstance(records, list):
+        return []
+    totals = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        boot, missing = item.get("bootId"), item.get("missing")
+        if (
+            all(isinstance(value, int) and not isinstance(value, bool) for value in (boot, missing))
+            and missing > 0
+        ):
+            totals.append((boot, missing))
+    return totals
+
+
 def _board_time_rule(context):
     path = context.path("streams/device.csv")
     if not path.is_file():
@@ -1231,6 +1258,12 @@ def _board_time_rule(context):
             "events.board_time", "not_applicable",
             "No board timing envelopes were present; host receive timing remains in use",
         )
+    session_gaps = _session_gap_totals(context)
+    # First, so the 20 details shown always include the session's own account.
+    warnings[:0] = [
+        f"board boot {boot}: the live tracker counted {missing} missing message(s) this session"
+        for boot, missing in session_gaps
+    ]
     status = "fail" if errors else ("warning" if warnings else "pass")
     details = errors or warnings
     return _result(
@@ -1239,6 +1272,7 @@ def _board_time_rule(context):
         observed={
             "timestamped_rows": timestamped,
             "boot_epochs": len(envelopes),
+            "session_missing_messages": sum(missing for _, missing in session_gaps),
             "clock_models": sorted(model_ids),
             "warnings": len(warnings),
             "errors": len(errors),
