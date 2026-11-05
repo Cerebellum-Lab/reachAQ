@@ -279,9 +279,10 @@ def test_camera_clock_latches_pair_frames_and_arrival_must_confirm_them(tmp_path
 
 
 def test_a_delivery_backlog_does_not_invalidate_a_confirmed_pairing(tmp_path):
-    # Three of 9000 frames are held a period late in delivery: a run by the slip rule, but one
-    # that returns to the majority, as a lost NI transition never does. The arrival pairing
-    # records it and still names shift 0, so the camera-clock pairing stays confirmed.
+    # Three of 9000 frames are held a period late in delivery: a run by the slip rule, but an
+    # interior one with the majority on both sides, voting below it, which is what a backlog
+    # looks like. The arrival pairing records it and still names shift 0, so the camera-clock
+    # pairing stays confirmed.
     session = _session(tmp_path, seconds=61.0, frame_count=9000, backlog=slice(4000, 4003))
 
     status = finalize_session_latency(session, primary_camera="left")
