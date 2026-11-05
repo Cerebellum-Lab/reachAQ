@@ -80,10 +80,11 @@ def pytest_collection_modifyitems(config, items):
 def pytest_unconfigure(config):
     """CI only: report what is alive as pytest hands over to interpreter exit.
 
-    The job once hung after the summary. A hang there is an exit blocked on a
+    The job once hung at exit with every test passed. That is an exit blocked on a
     child that never died, so name the children and the process tree. The dump
     below fires only if this process is still alive 5 minutes from now; a healthy
-    exit takes about 10 s and cancels it. Nothing here may fail a healthy run.
+    exit takes about 22 s on CI, measured from here to the end of the step, and cancels it.
+    Nothing here may fail a healthy run.
     """
     if not os.environ.get("GITHUB_ACTIONS"):
         return
