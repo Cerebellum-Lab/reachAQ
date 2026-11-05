@@ -1037,15 +1037,20 @@ _BOARD_COLUMNS = (
 )
 
 
-def _board_time_result(tmp_path, rows):
+_STATUS_COLUMNS = (*_BOARD_COLUMNS, "board_sequence_status_json")
+
+
+def _board_time_result(tmp_path, rows, *, columns=_BOARD_COLUMNS, alignment=None):
     import csv
     root = _session(tmp_path)
     path = root / "streams/device.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.writer(stream)
-        writer.writerow(_BOARD_COLUMNS)
+        writer.writerow(columns)
         writer.writerows(rows)
+    if alignment is not None:
+        _write(root / "streams/alignment.json", json.dumps({"schemaVersion": 3, **alignment}))
     report = validate_session(root, profile=ValidationProfile.FAST)
     return next(item for item in report.results if item.rule_id == "events.board_time")
 
@@ -1075,8 +1080,78 @@ def test_queue_clock_moving_backward_in_sequence_order_fails(tmp_path):
     assert _board_time_result(tmp_path, rows).status.value == "fail"
 
 
-def test_board_sequence_gap_is_a_warning(tmp_path):
+def _status_row(perf, boot, sequence, board_us, kind, gap=0):
+    """A row as the recorder writes it, with the live tracker's verdict on the frame."""
+    status = {"backward": False, "duplicate": False, "gap": gap, "reboot": False}
+    return (*_host_row(perf, boot, sequence, board_us, kind), json.dumps(status))
+
+
+def test_board_sequence_gap_the_tracker_saw_is_a_warning(tmp_path):
+    rows = (
+        _status_row(10.0, 7, 1, 1000, "tx_queue"),
+        _status_row(10.1, 7, 4, 2000, "tx_queue", gap=2),
+    )
+    result = _board_time_result(tmp_path, rows, columns=_STATUS_COLUMNS)
+    assert result.status.value == "warning"
+    assert "row 3: 2 board message(s) missing" in result.message
+
+
+def test_sequence_numbers_of_frames_that_are_never_rows_are_not_loss(tmp_path):
+    # A timekeeper's tick: its own SYNC_CLAP is a no-op frame, so it uses a
+    # sequence number and is never a device.csv row. The tracker saw every frame.
+    rows, sequence = [], 0
+    for tick in range(60):
+        sequence += 1
+        for kind, offset in (("observed", 0.0), ("physical_start", 0.5)):
+            sequence += 1
+            perf = 100.0 + tick + offset
+            rows.append(_status_row(perf, 0xB007, sequence, int(perf * 1e6), kind))
+    result = _board_time_result(tmp_path, rows, columns=_STATUS_COLUMNS)
+    assert result.status.value == "pass", result.message
+
+
+def test_pressure_frames_between_queue_rows_are_not_loss(tmp_path):
+    # The pellet board's FSR readings (about 166 Hz) go to pressure.csv, so
+    # its device rows skip dozens of sequence numbers.
+    rows = tuple(
+        _status_row(10.0 + 0.1 * index, 7, 1 + 30 * index, 1000 * index, "tx_queue")
+        for index in range(20)
+    )
+    result = _board_time_result(tmp_path, rows, columns=_STATUS_COLUMNS)
+    assert result.status.value == "pass", result.message
+
+
+@pytest.mark.parametrize("status", ("", "not json", "[]", '{"gap": "x"}', '{"gap": -3}', '{"gap": true}', "{}"))
+def test_an_unreadable_tracker_status_counts_nothing(tmp_path, status):
+    rows = (
+        (*_host_row(10.0, 7, 1, 1000, "tx_queue"), status),
+        (*_host_row(10.1, 7, 4, 2000, "tx_queue"), status),
+    )
+    result = _board_time_result(tmp_path, rows, columns=_STATUS_COLUMNS)
+    assert result.status.value == "pass", result.message
+
+
+def test_a_device_file_without_the_status_column_still_validates(tmp_path):
+    # No tracker evidence: the sequence skips are not read as loss.
     rows = (_host_row(10.0, 7, 1, 1000, "tx_queue"), _host_row(10.1, 7, 4, 2000, "tx_queue"))
     result = _board_time_result(tmp_path, rows)
-    assert result.status.value == "warning"
-    assert "2 board message(s) missing" in result.message
+    assert result.status.value == "pass", result.message
+
+
+def test_a_duplicate_sequence_is_still_an_error_beside_status_columns(tmp_path):
+    rows = (_status_row(10.0, 7, 5, 1000, "tx_queue"), _status_row(10.1, 7, 5, 2000, "tx_queue"))
+    result = _board_time_result(tmp_path, rows, columns=_STATUS_COLUMNS)
+    assert result.status.value == "fail"
+    assert "duplicate board sequence 5" in result.message
+
+
+def test_clock_check_covers_only_queue_stamps(tmp_path):
+    # An observed event is stamped before the queued frame that reports it, so
+    # its board time sits below the queue stamp that came before in sequence.
+    # The rows are 4 ms apart, so an "all kinds" check would fail on the second.
+    rows = (
+        _host_row(10.000, 7, 1, 5000, "tx_queue"),
+        _host_row(10.001, 7, 2, 1000, "observed"),
+        _host_row(10.002, 7, 3, 6000, "tx_queue"),
+    )
+    assert _board_time_result(tmp_path, rows).status.value == "pass"

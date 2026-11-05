@@ -1114,6 +1114,29 @@ def _optional_int(row, name):
 _QUEUE_CLOCK_TOLERANCE_US = 1000
 
 
+def _tracker_gap(row):
+    """Messages the live tracker found missing just before this row's frame.
+
+    The host's sequence tracker saw every trailer-bearing frame a board sent,
+    including the ones device.csv does not hold, so its count is the evidence
+    of loss. A row that has no readable count (a file written before the column
+    existed, a blank or damaged cell) contributes none: nothing says it lost
+    anything, and the rows alone cannot tell, because most of a board's frames
+    are never rows.
+    """
+    text = row.get("board_sequence_status_json")
+    if not isinstance(text, str) or not text:
+        return 0
+    try:
+        status = json.loads(text)
+    except ValueError:
+        return 0
+    gap = status.get("gap") if isinstance(status, dict) else None
+    if isinstance(gap, int) and not isinstance(gap, bool) and gap > 0:
+        return gap
+    return 0
+
+
 def _board_time_rule(context):
     path = context.path("streams/device.csv")
     if not path.is_file():
@@ -1149,9 +1172,10 @@ def _board_time_rule(context):
                 if None in (boot, sequence, board_us):
                     errors.append(f"row {line_number}: partial board timing envelope")
                     continue
-                envelopes.setdefault(boot, []).append(
-                    (line_number, sequence, board_us, row.get("board_timestamp_kind") or "")
-                )
+                envelopes.setdefault(boot, []).append((
+                    line_number, sequence, board_us,
+                    row.get("board_timestamp_kind") or "", _tracker_gap(row),
+                ))
 
                 aligned = _optional_float(row, "board_aligned_perf_time")
                 model_id = row.get("board_clock_model_id") or None
@@ -1184,19 +1208,19 @@ def _board_time_rule(context):
                 errors.append(f"row {line_number}: {error}")
     # device.csv is ordered by event time, and a board stamps observed and
     # physical events before the frame that reports them is queued, so a
-    # board's rows are judged in the order the board numbered them.
+    # board's rows are judged in the order the board numbered them. Loss is
+    # not read off the sequence numbers of the rows: most of a board's frames
+    # are not rows (its pressure stream, its no-op frames), so they skip
+    # numbers on a healthy board. It is the tracker's own count (_tracker_gap).
     for entries in envelopes.values():
         entries.sort(key=lambda entry: entry[1])
         previous_sequence = None
         latest_queue_us = None
-        for line_number, sequence, board_us, kind in entries:
-            if previous_sequence is not None:
-                if sequence == previous_sequence:
-                    errors.append(f"row {line_number}: duplicate board sequence {sequence}")
-                elif sequence - previous_sequence > 1:
-                    warnings.append(
-                        f"row {line_number}: {sequence - previous_sequence - 1} board message(s) missing"
-                    )
+        for line_number, sequence, board_us, kind, missing in entries:
+            if previous_sequence is not None and sequence == previous_sequence:
+                errors.append(f"row {line_number}: duplicate board sequence {sequence}")
+            if missing:
+                warnings.append(f"row {line_number}: {missing} board message(s) missing")
             previous_sequence = sequence
             if kind == "tx_queue":
                 if latest_queue_us is not None and board_us < latest_queue_us - _QUEUE_CLOCK_TOLERANCE_US:

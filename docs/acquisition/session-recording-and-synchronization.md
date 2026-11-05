@@ -867,10 +867,23 @@ event precedes the frame that reports it, so a healthy board's rows are not in
 its sequence order. The rule used to read them in file order and could report a
 sequence or clock moving backward that never did. It now groups rows by
 `board_boot_id` and sorts each group by `board_sequence`. A repeated sequence is
-an error and a gap is a warning (*N board message(s) missing*). *Board clock moved
-backward* is an error only among `tx_queue` rows, with 1 ms of tolerance, because
-only queue stamps are taken in queue order. A sequence can no longer be seen to
-move backward, so that error is no longer reported.
+an error. *Board clock moved backward* is an error only among `tx_queue` rows,
+with 1 ms of tolerance, because only queue stamps are taken in queue order. A
+sequence can no longer be seen to move backward, so that error is no longer
+reported.
+
+Loss is not read from the sequence numbers of the rows, because `device.csv`
+holds only some of the frames a board numbers. The pellet board's pressure
+readings go to `pressure.csv`, and a no-op frame (the timekeeper's own
+`SYNC_CLAP`, a door sensor or a temperature and humidity reading) is never a
+row, yet each used a sequence number, so the rows of a healthy board skip
+numbers. The rule once counted those skips as lost messages: 59 warnings over 60
+healthy timekeeper ticks. The host's sequence tracker, one per board, sees every
+frame that carries a timing trailer, and its verdict on each recorded frame is
+the `board_sequence_status_json` column. A row whose `gap` there is above zero is
+a warning (*row N: K board message(s) missing*) that names the row of the frame
+that revealed the loss. A file without the column, or a cell that cannot be read,
+counts no loss.
 
 ## Storage, discovery, and safe hardware boundaries
 
