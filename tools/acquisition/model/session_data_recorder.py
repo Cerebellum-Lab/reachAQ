@@ -2984,13 +2984,12 @@ class SessionDataRecorder:
         that clock and the majority shift wins. Transition number = frame id -
         shift. Only the frames _frames_in_spool admits take part.
 
-        The clock is chosen as the finalizer chooses it: CLOCK_MONOTONIC_RAW
-        when both sides carry it, the transitions (transition_raw, from the NI
-        fit's RAW view; None without one) and the latches (a valid RAW latch
-        map). RAW is never slewed, so one latch line holds all session.
-        Otherwise perf_counter (transition_host), where that line ignores the
-        slews. The evidence names the clock, the map's uncertainty, the latches
-        it left out, the residual tolerance and any slip.
+        The caller chooses the clock with clocks.latch_clock, the finalizer's
+        rule, and says which by transition_raw: the transitions on
+        CLOCK_MONOTONIC_RAW, where no slew is, so one latch line holds all
+        session; or None for perf_counter (transition_host), where that line
+        ignores the slews. The evidence names the clock, the map's uncertainty,
+        the latches it left out, the residual tolerance and any slip.
         """
         if stream is None:
             return {"status": "unavailable", "reason": stream_reason}, None
@@ -2998,12 +2997,9 @@ class SessionDataRecorder:
             frames = stream.get("frames")
             latches = stream.get("clock_latches")
             rows = 0 if latches is None else int(len(latches))
-            raw_fit = None if transition_raw is None else clocks.fit_latches(latches, clock="raw")
-            if raw_fit is not None and raw_fit.valid:
-                clock, fit, transitions = "raw", raw_fit, transition_raw
-            else:
-                clock, fit = "perf", clocks.fit_latches(latches, clock="perf")
-                transitions = transition_host
+            clock, transitions = (("perf", transition_host) if transition_raw is None
+                                  else ("raw", transition_raw))
+            fit = clocks.fit_latches(latches, clock=clock)
             usable = int(clocks.usable_latches(latches, clock=clock)[0].size)
             if frames is None or len(frames) == 0:
                 return {"status": "unavailable", "reason": "no frames in the latency stream",
@@ -3046,9 +3042,10 @@ class SessionDataRecorder:
             number = int(boundary.primary_frame_id) - int(pairing.shift)
             if not 0 <= number < transition_host.size:
                 evidence["status"] = "outside"
-                evidence["reason"] = (
-                    f"the first recorded frame's transition ({number}) is outside the spool"
-                )
+                evidence["reason"] = "; ".join(part for part in (
+                    f"the first recorded frame's transition ({number}) is outside the spool",
+                    dropped_reason,
+                ) if part)
                 return evidence, None
             return evidence, number
         except Exception as error:
@@ -3250,10 +3247,6 @@ class SessionDataRecorder:
                                         read_latency_stream) -> dict:
         ni_seconds = indices[edge_positions] / float(rate)
         transition_host = ni_fit.map(ni_seconds)
-        # The same transitions on CLOCK_MONOTONIC_RAW, for the latch match, when the fit
-        # was bridged through it (the RAW view the latency finalizer pairs on too).
-        transition_raw = (ni_fit.to_raw(ni_seconds) if getattr(ni_fit, "has_raw", False)
-                          else None)
         # The median interval, as the epoch method and the latency finalizer
         # take it (it reads 6.7 ms at 150 fps on 0.1 ms samples; close enough
         # for the arrival window and a quarter-period latch tolerance).
@@ -3267,6 +3260,11 @@ class SessionDataRecorder:
             (None, "no latency stream reader") if read_latency_stream is None
             else read_latency_stream()
         )
+        # The latch match's clock, by the rule the latency finalizer uses: the transitions on
+        # CLOCK_MONOTONIC_RAW when the fit and the latches both carry it, else on perf.
+        latches = None if latency_stream is None else latency_stream.get("clock_latches")
+        transition_raw = (ni_fit.to_raw(ni_seconds)
+                          if clocks.latch_clock(latches, ni_fit) == "raw" else None)
         latch, latched = SessionDataRecorder._latch_anchor(
             boundary, latency_stream, stream_reason, transition_host, period,
             ni_residual_rms=ni_fit.residual_rms, transition_raw=transition_raw,

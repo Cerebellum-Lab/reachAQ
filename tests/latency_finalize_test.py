@@ -458,6 +458,24 @@ def test_raw_on_only_one_side_pairs_on_perf_and_says_so(tmp_path, side, ni_metho
     assert status["status"] == "complete", status
 
 
+def test_raw_on_one_latch_burst_only_pairs_on_perf(tmp_path):
+    # Every latch usable on perf must be usable on RAW too (clocks.latch_clock), though the
+    # one burst left would make a valid RAW fit. The recorder's anchor reads the same rule.
+    session = _session(tmp_path, raw=True)
+    with h5py.File(session / "streams" / "latency" / "camera_left.h5", "r+") as store:
+        latches = store["clock_latches"][()]
+        latches["raw_before"][3:] = np.nan
+        latches["raw_after"][3:] = np.nan
+        store["clock_latches"][...] = latches
+
+    status = finalize_session_latency(session, primary_camera="left")
+
+    camera = status["clocks"]["cameraToNi"]
+    assert status["clocks"]["niToHost"]["method"] == "raw_bridged"
+    assert camera["valid"] is True, camera
+    assert camera["pairing"]["method"] == "camera_latch" and camera["pairing"]["clock"] == "perf"
+
+
 def test_latches_one_period_off_disagree_with_arrival_and_are_invalid(tmp_path):
     # Latches that read the camera clock a period early place every frame on the next
     # frame's edge, with a residual as small as the right pairing's. Host arrival reads no

@@ -1128,6 +1128,28 @@ def latch_window(fit: ClockFit, camera_seconds) -> numpy.ndarray:
             & (camera_seconds <= fit.x_max + LATCH_WINDOW_SECONDS))
 
 
+def latch_clock(latches, ni_fit) -> str:
+    """The host clock a camera-clock pairing runs on, "raw" or "perf": one rule for every caller.
+
+    "raw" needs CLOCK_MONOTONIC_RAW on both sides: the NI fit has a RAW view
+    (has_raw), every latch usable on perf is usable on RAW too, and the RAW
+    latches make a valid fit. RAW on only some of the latches, one burst say,
+    is "perf": a RAW map through those alone would give up latches perf keeps,
+    and with a whole burst gone, the drift. Anything else is "perf", and this
+    never raises: latches that cannot be read here say so when the pairing
+    reads them.
+    """
+    try:
+        if not getattr(ni_fit, "has_raw", False):
+            return "perf"
+        on_raw = usable_latches(latches, clock="raw")[0].size
+        if on_raw != usable_latches(latches, clock="perf")[0].size:
+            return "perf"
+        return "raw" if fit_latches(latches, clock="raw").valid else "perf"
+    except Exception:
+        return "perf"
+
+
 def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_times,
                                    frame_period: float, *, ni_residual_rms: float,
                                    clock: str) -> Pairing:

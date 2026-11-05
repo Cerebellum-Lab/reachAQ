@@ -444,6 +444,72 @@ def test_a_latch_left_out_of_the_map_is_listed_in_the_anchor_evidence(tmp_path):
     assert evidence["dropped"] == [4]
     assert "latch 4 left out" in evidence["reason"]
     assert evidence["clock"] == "perf" and evidence["usableLatches"] == 6
+    # A first frame whose transition is outside the spool still says which latch was left out.
+    evidence, number = SessionDataRecorder._latch_anchor(
+        SimpleNamespace(primary_frame_id=rig.frame_id(n0) - 20), stream, "", transitions, 1 / FPS,
+        ni_residual_rms=4e-5, transition_raw=None)
+    assert evidence["status"] == "outside" and number is None
+    assert "(-10) is outside the spool" in evidence["reason"]
+    assert "latch 4 left out" in evidence["reason"]
+    assert evidence["dropped"] == [4]
+
+
+def test_a_3_ms_slew_needs_the_raw_map_to_pair(tmp_path):
+    # perf_counter takes a 3 ms bump mid-session, gone again at both ends where the latches are:
+    # the perf latch line cannot follow it, and RAW, which no slew touches, is not in it. The
+    # `clock` label alone cannot tell the two apart; this outcome rests on the numbers. By
+    # hand: half the frames sit under 3 ms x sin(pi/4) = 2.12 ms of bump, and less the 0.175 ms
+    # exposure the perf residual's median is about 1.95 ms, over the 1.67 ms quarter period.
+    rig = SyntheticRig()
+    n0 = rig.first_edge_at_or_after(5.0)
+    stream = read_raw_stream(rig.write_latency_stream(_project(tmp_path), "left", n0, 3000, 0.001,
+                                                      raw_latches=True))
+    t = rig.edge_time(np.arange(n0 - 10, n0 + 3010))
+    perf = rig.host(t) + 0.003 * np.sin(np.pi * (t - t[0]) / (t[-1] - t[0]))
+    boundary = SimpleNamespace(primary_frame_id=rig.frame_id(n0))
+
+    def anchor(transition_raw):
+        return SessionDataRecorder._latch_anchor(
+            boundary, stream, "", perf, 1 / FPS, ni_residual_rms=4e-5,
+            transition_raw=transition_raw)
+
+    on_perf, perf_number = anchor(None)
+    on_raw, raw_number = anchor(rig.raw(t))
+
+    assert on_perf["status"] == "ambiguous" and perf_number is None
+    assert on_perf["clock"] == "perf" and "over the latch tolerance" in on_perf["reason"]
+    assert on_perf["medianResidualSeconds"] == pytest.approx(0.00195, abs=5e-5)
+    assert on_raw["status"] == "paired" and raw_number == 10
+    assert on_raw["clock"] == "raw" and on_raw["slip"] is None
+    assert on_raw["medianResidualSeconds"] == pytest.approx(-EXPOSURE, abs=1e-6)
+
+
+def test_raw_on_one_latch_burst_only_anchors_on_perf(tmp_path):
+    # clocks.latch_clock through the recorder's own wiring, on a real RAW-bridged NI fit.
+    rig = SyntheticRig()
+    project = _project(tmp_path)
+    n0 = rig.first_edge_at_or_after(5.0)
+    spool = rig.write_spool(tmp_path / "spool.h5", t_from=0.0, t_to=25.0, raw=True)
+    fit = SessionDataRecorder._fit_nidaq_to_host(spool)
+    assert fit.has_raw, fit.reason
+    start_perf, _, boundary = rig.start(project, n0, 0.001)
+    stream = read_raw_stream(rig.write_latency_stream(project, "left", n0, 2000, 0.001,
+                                                      raw_latches=True))
+
+    def anchored():
+        return SessionDataRecorder._match_camera_nidaq_edge(
+            boundary, start_perf, spool, ni_fit=fit, exposure_seconds=EXPOSURE,
+            read_latency_stream=lambda: (stream, ""))
+
+    assert anchored()["latch"]["clock"] == "raw"
+    stream["clock_latches"]["raw_before"][3:] = np.nan
+    stream["clock_latches"]["raw_after"][3:] = np.nan
+
+    camera = anchored()
+
+    assert camera["latch"]["clock"] == "perf" and camera["latch"]["usableLatches"] == 6
+    assert camera["confidence"] == "hardware_edge"
+    assert camera["matchedSampleIndex"] == rig.edge_sample(n0)
 
 
 def test_alignment_schema_four_keeps_the_old_fields_and_records_both_matches(tmp_path):
