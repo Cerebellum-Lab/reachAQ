@@ -140,3 +140,18 @@ jobs:
         with:
           name: htmlcov
           path: htmlcov/
+      - name: Hang diagnostics
+        # A hung exit ends here: the job limit cancels the pytest step. The runner kills the
+        # step's shell but not its children, so the wedged processes are still alive to dump.
+        if: ${{ cancelled() && steps.pytest.outcome == 'cancelled' }}
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          ps --ppid 2 -p 2 --deselect --forest -o pid,ppid,pgid,etimes,stat,wchan:24,comm,args || true
+          pip install --quiet py-spy==0.4.1 || true
+          for pid in $(pgrep -x coverage; pgrep -x python); do
+            echo "::group::pid $pid $(tr '\0' ' ' < /proc/$pid/cmdline | cut -c1-120)"
+            grep -E '^(SigCgt|SigPnd|ShdPnd|Threads):' /proc/$pid/status || true
+            sudo "$(command -v py-spy)" dump --pid "$pid" || true
+            echo "::endgroup::"
+          done
