@@ -1,4 +1,4 @@
-import hashlib, importlib.util, io, json, queue, signal, sys, threading, time
+import hashlib, importlib.util, io, json, os, queue, signal, sys, threading, time
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -602,6 +602,10 @@ def _config_file(tmp_path):
 def _plan(tmp_path, *flags):
     path = _config_file(tmp_path)
     args = tool.parse_args(["--dry-run", f"--config={path}", f"--record-dir={tmp_path / 'rec'}", *flags])
+    # execute() refuses a namespace that has not attested the laser is unable to
+    # emit. These tests hand it fakes only, so the attestation is set on the
+    # namespace here; the parser's --laser-disconnected is never passed.
+    args.laser_disconnected = True
     configuration = _system(fake.rig_lasers())
     return args, configuration, tool.make_plan(args, configuration)
 
@@ -642,10 +646,15 @@ def _execute(daq, tmp_path, make, *flags, samples=None, reader=None, clock=None,
         return process
     reader = reader or _FakeReader(_samples(_held_until_the_reopen) if samples is None else samples)
     seams.setdefault("kill", lambda pid, sig: by_pid[pid].kill_by(pid, sig))
-    status = tool.execute(
-        args, configuration, plan, _STARTED, load_nidaqmx=lambda: daq,
-        spawn_factory=_factory(tracked), reader_factory=reader,
-        now=clock.now, sleep=clock.sleep, **seams)
+    reader.by_pid = by_pid
+    try:
+        status = tool.execute(
+            args, configuration, plan, _STARTED, load_nidaqmx=lambda: daq,
+            spawn_factory=_factory(tracked), reader_factory=reader,
+            now=clock.now, sleep=clock.sleep, **seams)
+    except KeyboardInterrupt as error:
+        # Left to propagate it would abort the whole pytest session.
+        pytest.fail(f"execute let {error!r} escape")
     return status, args, reader
 
 def _killable(case, level):
@@ -656,11 +665,9 @@ def _killable(case, level):
 
 # C1: a slow before prompt cannot make a dead train read safe.
 
-def test_the_before_prompt_is_asked_first_and_before_is_read_at_the_kill():
+def _run_with_a_before_prompt(prompt_seconds, level_at, hold_start=101.0):
     clock = _Clock()
-    # 2 V until 129.5: the operator's before prompt takes 40 s, and the train
-    # (30 s) is over by the time the kill lands.
-    log = _log([(100 + i / 100, 2.0 if 100 + i / 100 < 129.5 else 0.0) for i in range(0, 5500)])
+    log = _log([(100 + i / 100, level_at(100 + i / 100)) for i in range(0, 6000)])
     process = _Process()
     events = []
     def kill(pid, sig):
@@ -669,17 +676,44 @@ def test_the_before_prompt_is_asked_first_and_before_is_read_at_the_kill():
     def dmm(instant):
         events.append((instant, clock.t))
         if instant == "before":
-            clock.sleep(40.0)
+            clock.sleep(prompt_seconds)
         return None
     observation = tool.run_case(
         KillCase("sigkill", "software", "dc"), spawn=lambda c: process, log=log, now=clock.now,
         sleep=clock.sleep, kill=kill, reopen=lambda: None, reset=lambda: None,
         hold_seconds=5.0, instrument="ai3", dmm=dmm)
+    return observation, events
+
+def test_the_before_prompt_is_asked_first_and_before_is_read_at_the_kill():
+    # The output drops while the operator reads the meter (15 s, under the limit):
+    # before, read after the prompt, shows it, and the row is not safe.
+    observation, events = _run_with_a_before_prompt(
+        15.0, lambda t: 2.0 if t < 109.5 else 0.0)
     assert [name for name, _ in events][:2] == ["before", "kill"]
-    assert events[1][1] >= 141.0                       # the kill came after the prompt
+    assert events[1][1] >= 116.0                       # the kill came after the prompt
     assert observation.before.maximum == 0.0           # read after it, at the kill
     verdict = judge(observation, minimum_volts=0.0, level_volts=2.0)
     assert verdict != SAFE_ON_DEATH and verdict == UNKNOWN
+
+def test_a_forty_second_before_prompt_leaves_the_row_unknown_with_a_note():
+    # The requested case: 2 V until 129.5 and a 40 s prompt.
+    observation, _ = _run_with_a_before_prompt(40.0, lambda t: 2.0 if t < 129.5 else 0.0)
+    assert observation.before is None
+    assert "before prompt took 40 s" in observation.notes[0]
+    assert judge(observation, minimum_volts=0.0, level_volts=2.0) == UNKNOWN
+
+def test_a_before_prompt_over_twenty_seconds_cannot_read_safe_when_the_output_drops_just_after_it():
+    # The output holds until the prompt ends and drops a moment later: before
+    # reads 2 V, the kill lands on a dead output, and everything after reads 0 V.
+    observation, _ = _run_with_a_before_prompt(25.0, lambda t: 2.0 if t < 126.02 else 0.0)
+    assert observation.after_kill.mean == 0.0 and observation.hold.maximum == 0.0
+    assert observation.before is None and "over 20 s" in observation.notes[0]
+    assert "it read 2.000 V" in observation.notes[0]
+    assert judge(observation, minimum_volts=0.0, level_volts=2.0) == UNKNOWN
+
+def test_a_before_prompt_within_the_limit_keeps_its_reading_and_has_no_note():
+    observation, _ = _run_with_a_before_prompt(19.0, lambda t: 2.0 if t < 125.0 else 0.0)
+    assert observation.before.maximum == 2.0 and observation.notes == ()
 
 def test_a_victim_that_closed_itself_during_the_prompt_is_not_a_safe_row():
     # The 60 s cue timeout: the victim closed, the signal lands on a zombie.
@@ -698,12 +732,45 @@ def test_a_victim_that_closed_itself_during_the_prompt_is_not_a_safe_row():
 
 # C2: the orchestrator's own death.
 
-def test_the_first_interrupt_raises_and_later_ones_are_ignored():
-    handler = tool.InterruptOnce()
+def test_the_first_interrupt_raises_and_later_ones_are_only_recorded():
+    gate = tool.InterruptGate(raising=True)
     with pytest.raises(KeyboardInterrupt, match="15"):
-        handler(signal.SIGTERM, None)
-    handler(signal.SIGINT, None)        # a second one cannot cut the recovery short
-    handler(signal.SIGTERM, None)
+        gate(signal.SIGTERM, None)
+    gate(signal.SIGINT, None)        # a second one cannot cut the recovery short
+    gate(signal.SIGTERM, None)
+    assert gate.raised == [signal.SIGTERM] and gate.pending == [signal.SIGINT, signal.SIGTERM]
+
+def test_a_gate_that_is_not_raising_only_records():
+    gate = tool.InterruptGate()
+    gate(signal.SIGTERM, None)
+    assert gate.pending == [signal.SIGTERM] and gate.raised == []
+
+def test_the_run_region_raises_once_and_leaves_the_gate_not_raising():
+    gate = tool.InterruptGate()
+    with pytest.raises(KeyboardInterrupt):
+        with gate.interruptible():
+            gate(signal.SIGINT, None)
+    assert gate.raising is False
+    gate(signal.SIGINT, None)                    # after the run: held
+    assert gate.pending == [signal.SIGINT]
+
+def test_a_signal_during_a_deferred_stretch_is_raised_when_the_stretch_ends_inside_the_run():
+    gate = tool.InterruptGate()
+    with gate.interruptible():
+        with gate.deferred():
+            gate(signal.SIGTERM, None)           # held while a victim is started
+            assert gate.pending == [signal.SIGTERM]
+        assert gate.raising is True              # back to what it interrupted
+        with pytest.raises(KeyboardInterrupt, match="15"):
+            gate.raise_if_pending()
+    assert gate.pending == [] and gate.raised == [signal.SIGTERM]
+
+def test_a_signal_held_before_the_run_raises_on_entering_it():
+    gate = tool.InterruptGate()
+    gate(signal.SIGHUP, None)
+    with pytest.raises(KeyboardInterrupt, match="1"):
+        with gate.interruptible():
+            raise AssertionError("the run must not begin")
 
 def test_sigint_sigterm_and_sighup_all_become_the_one_interrupt():
     installed = {}
@@ -711,14 +778,21 @@ def test_sigint_sigterm_and_sighup_all_become_the_one_interrupt():
     assert set(installed) == {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
     assert all(h is handler for h in installed.values())
 
-def _matrix(daq, tmp_path, process, log, clock, *flags, cases=(KillCase("sigkill", "software", "dc"),)):
+def _matrix(daq, tmp_path, process, log, clock, *flags, cases=(KillCase("sigkill", "software", "dc"),),
+            stops=None):
+    """run_matrix over `cases`; with `stops`, expects it to stop with RunStopped matching that."""
     observations = []
-    tool.run_matrix(
+    run = lambda: tool.run_matrix(
         list(cases), observations,
         args=tool.parse_args(["--dry-run", f"--record-dir={tmp_path}", *flags]),
         configuration=_system(fake.rig_lasers()), nidaqmx=daq,
         spawn=lambda case, level=None: process, log=log, instrument="PXI1Slot5/ai3",
         level_volts=2.0, minimum_volts=0.0, now=clock.now, sleep=clock.sleep, kill=process.kill_by)
+    if stops is None:
+        run()
+    else:
+        with pytest.raises(tool.RunStopped, match=stops):
+            run()
     return observations
 
 def test_each_row_line_names_the_victims_pid_and_its_notes(daq, tmp_path, capsys):
@@ -848,8 +922,9 @@ def test_a_reset_that_never_returns_does_not_hold_the_row(daq, tmp_path, monkeyp
     daq.system = SimpleNamespace(Device=_Wedged)
     monkeypatch.setattr(tool, "RECOVERY_TIMEOUT_S", 0.05)
     log = _log([(100 + i / 100, 2.0 if 100 + i / 100 < 106.2 else 0.0) for i in range(0, 900)])
-    observations = _matrix(daq, tmp_path, _Process(), log, _Clock())
+    observations = _matrix(daq, tmp_path, _Process(), log, _Clock(), stops="reset timed out")
     release.set()
+    # The row is kept, and is the last: the run stops with the reset outstanding.
     assert observations[0].reset_error.startswith("timed out")
     assert observations[0].victim_exit == "signal 9"
 
@@ -858,7 +933,7 @@ def test_a_reopen_that_never_returns_does_not_hold_the_row(daq, tmp_path, monkey
     monkeypatch.setattr(tool, "reopen", lambda configuration, laser: release.wait(5.0) and None)
     monkeypatch.setattr(tool, "RECOVERY_TIMEOUT_S", 0.05)
     log = _log([(100 + i / 100, 2.0 if 100 + i / 100 < 106.2 else 0.0) for i in range(0, 900)])
-    observations = _matrix(daq, tmp_path, _Process(), log, _Clock())
+    observations = _matrix(daq, tmp_path, _Process(), log, _Clock(), stops="reopen timed out")
     release.set()
     assert observations[0].reopen_error.startswith("timed out")
     assert observations[0].reset_error is None and observations[0].victim_exit == "signal 9"
@@ -1032,7 +1107,263 @@ def test_a_restart_that_fails_is_recorded_and_the_reader_goes_on(daq):
     assert any("failed" in text and "refused to start" in text for text in log.restarts)
     assert len(log.samples()) >= 2
 
-def test_the_victim_command_passes_the_disconnected_attestation():
+def test_the_victim_command_passes_the_disconnected_attestation_and_this_pid():
     args = tool.parse_args(["--dry-run"])
     command = tool.victim_command("python", Path("/w/v.py"), args, KillCase("clean", "software", "dc"))
     assert "--laser-disconnected" in command
+    assert f"--orchestrator-pid={os.getpid()}" in command
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2 (re-review of Task 3). The scenarios of the reviewers' probe, as
+# tests: real signals, sent by the test to its own process, with the handlers
+# that main installs; fakes for the driver and the victims.
+
+@pytest.fixture
+def gate():
+    """The real handlers on SIGINT, SIGTERM and SIGHUP, as main installs them."""
+    numbers = [getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP")]
+    saved = {number: signal.getsignal(number) for number in numbers}
+    handler = tool.install_interrupt_handlers()
+    yield handler
+    for number, previous in saved.items():
+        signal.signal(number, previous)
+
+def _signal_me(gate, number=signal.SIGTERM):
+    # Never signal this process unless the handler under test is the one in place.
+    assert signal.getsignal(number) is gate
+    os.kill(os.getpid(), number)
+
+def _read_jsonl(args):
+    path = args.record_dir / f"laser-kill-{_STAMP}.rows.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+_FULL_BANNER = ("DID NOT COMPLETE", "NOT CONFIRMED SAFE", "reopen: ", "command output on",
+                "NOT READABLE", "DO NOT RECONNECT")
+
+def _clock_that_signals(gate, at, number=signal.SIGTERM):
+    """A clock whose sleep sends a real signal the first time it reaches `at`."""
+    class _SignallingClock(_Clock):
+        sent = False
+        def sleep(self, seconds):
+            super().sleep(seconds)
+            if not self.sent and self.t >= at:
+                self.sent = True
+                _signal_me(gate, number)
+    return _SignallingClock()
+
+class _SignalOnWait(_Process):
+    """wait() sends a real signal the first time it is called: main is then inside end_victim."""
+    def __init__(self, gate, **kwargs):
+        super().__init__(**kwargs)
+        self.gate, self.signalled = gate, False
+    def wait(self, timeout=None):
+        if not self.signalled:
+            self.signalled = True
+            _signal_me(self.gate, signal.SIGTERM)
+        return super().wait(timeout)
+
+# C3a: the first signal can arrive during the recovery.
+
+def test_a_signal_during_the_recovery_is_held_and_the_banner_and_record_finish(daq, tmp_path, capsys, monkeypatch, gate):
+    def reopen_that_is_interrupted(configuration, laser):
+        _signal_me(gate, signal.SIGINT)      # lands on the main thread, which waits in bounded()
+        time.sleep(0.2)
+    monkeypatch.setattr(tool, "reopen", reopen_that_is_interrupted)
+    def make(case, level):
+        raise OSError("fork failed")
+    status, args, _ = _execute(daq, tmp_path, make, "--cases=sigkill-software-dc", interrupts=gate)
+    text = capsys.readouterr().out
+    assert status == 1
+    for needle in _FULL_BANNER:
+        assert needle in text, needle
+    assert "arrived after the run had stopped or finished" in text
+    assert gate.raised == [] and gate.pending == [signal.SIGINT]
+    recovery = _read_jsonl(args)[-1]["recovery"]
+    assert recovery["reopen"] == "ok" and recovery["signals_held"] == [signal.SIGINT]
+
+def test_a_signal_during_the_report_after_a_finished_run_cannot_cut_the_record(daq, tmp_path, capsys, monkeypatch, gate):
+    real = tool.write_record
+    def write_record_while_signalled(*args, **kwargs):
+        _signal_me(gate, signal.SIGTERM)
+        return real(*args, **kwargs)
+    monkeypatch.setattr(tool, "write_record", write_record_while_signalled)
+    status, args, _ = _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc", interrupts=gate)
+    text = capsys.readouterr().out
+    assert status == 0 and "record: " in text and "held until everything above was complete" in text
+    assert (args.record_dir / f"laser-kill-{_STAMP}.json").exists()
+
+def test_a_signal_in_the_hold_window_stops_the_row_and_the_recovery_still_finishes(daq, tmp_path, capsys, gate):
+    # The control: the first signal lands in the run itself, while main sleeps.
+    clock = _clock_that_signals(gate, at=101.1)
+    def make(case, level):
+        return _Process(pid=4242, ready="READY pid=4242 timing=software waveform=dc mode=hang level=2.0000",
+                        ignores_sigterm=True)
+    status, args, reader = _execute(daq, tmp_path, make, "--cases=hang-software-dc", interrupts=gate, clock=clock)
+    text = capsys.readouterr().out
+    assert status == 1 and "stopped: KeyboardInterrupt: signal 15" in text
+    for needle in _FULL_BANNER:
+        assert needle in text, needle
+    assert reader.by_pid[4242].signals == [signal.SIGUSR1, signal.SIGKILL]   # cued, then killed at once
+    assert "victim pid 4242" in text and gate.raised == [signal.SIGTERM]
+
+# C3b: no instant at which a victim exists and nothing owns it.
+
+def test_a_signal_just_after_the_victim_exists_still_ends_it_and_prints_its_pid(daq, tmp_path, capsys, gate):
+    def make(case, level):
+        process = _killable(case, level)
+        _signal_me(gate, signal.SIGTERM)     # lands before run_case's own work has begun
+        return process
+    status, args, reader = _execute(daq, tmp_path, make, "--cases=sigkill-software-dc", interrupts=gate)
+    text = capsys.readouterr().out
+    victim = reader.by_pid[4242]
+    assert status == 1 and victim.signals == [signal.SIGKILL] and not victim.alive
+    assert "(victim pid 4242)" in text and "ended by sigkill after the failure" in text
+    for needle in _FULL_BANNER:
+        assert needle in text, needle
+
+def test_a_signal_while_the_tracking_check_waits_for_a_cued_victim_still_kills_it(daq, tmp_path, capsys, gate):
+    def make(case, level):
+        pid = 5000 + int(level)
+        return _SignalOnWait(gate, pid=pid, ready=f"READY pid={pid} timing=software waveform=dc mode=clean level={level:.4f}")
+    status, args, reader = _execute(daq, tmp_path, make, "--tracking-check", interrupts=gate,
+                                    samples=_samples(lambda t: 0.0))
+    text = capsys.readouterr().out
+    victim = reader.by_pid[5000]
+    assert status == 1
+    assert victim.signals == [signal.SIGUSR1, signal.SIGKILL] and not victim.alive
+    assert "tracking 0 V (victim pid 5000)" in text
+    for needle in _FULL_BANNER:
+        assert needle in text, needle
+
+def test_a_signal_just_after_a_tracking_victim_exists_still_ends_it(daq, tmp_path, capsys, gate):
+    def make(case, level):
+        pid = 5000 + int(level)
+        process = _CuedProcess(pid=pid, ready=f"READY pid={pid} timing=software waveform=dc mode=clean level={level:.4f}")
+        _signal_me(gate, signal.SIGTERM)
+        return process
+    status, _, reader = _execute(daq, tmp_path, make, "--tracking-check", interrupts=gate)
+    assert status == 1 and reader.by_pid[5000].signals == [signal.SIGKILL]
+
+def test_a_signal_before_the_run_starts_starts_nothing(daq, tmp_path, capsys, gate):
+    gate(signal.SIGHUP, None)          # held: it arrived where it may not raise
+    def make(case, level):
+        raise AssertionError("no victim may start")
+    status, args, _ = _execute(daq, tmp_path, make, "--cases=sigkill-software-dc", interrupts=gate)
+    assert status == 1 and "before any victim was started" in capsys.readouterr().out
+    assert daq.writes_to("PXI1Slot4/ao0") == [] and daq.resets == []
+
+# N1: nothing runs while a stale driver call is outstanding.
+
+def test_a_timed_out_reopen_stops_the_run_before_the_next_row(daq, tmp_path, capsys, monkeypatch):
+    release, calls, spawned = threading.Event(), [], []
+    def reopen(configuration, laser):
+        calls.append(1)
+        if len(calls) == 1:
+            release.wait(5.0)                   # the row's own reopen: stale, still running
+    monkeypatch.setattr(tool, "reopen", reopen)
+    monkeypatch.setattr(tool, "RECOVERY_TIMEOUT_S", 0.05)
+    def make(case, level):
+        spawned.append(case.case_id)
+        return _killable(case, level)
+    status, args, _ = _execute(daq, tmp_path, make, "--cases=sigkill-software-dc,sigkill-hardware-dc")
+    release.set()
+    text = capsys.readouterr().out
+    assert status == 1 and spawned == ["sigkill-software-dc"]        # the second row never started
+    assert "RunStopped" in text and "the reopen timed out" in text and "outstanding" in text
+    for needle in _FULL_BANNER:
+        assert needle in text, needle
+    assert [list(r)[0] for r in _read_jsonl(args)] == ["header", "observation", "recovery"]
+
+def test_a_timed_out_reset_stops_the_run_too(daq, tmp_path, capsys, monkeypatch):
+    release, spawned = threading.Event(), []
+    monkeypatch.setattr(tool, "reset_device", lambda nidaqmx, device: release.wait(5.0) and None)
+    monkeypatch.setattr(tool, "RECOVERY_TIMEOUT_S", 0.05)
+    def make(case, level):
+        spawned.append(case.case_id)
+        return _killable(case, level)
+    status, _, _ = _execute(daq, tmp_path, make, "--cases=sigkill-software-dc,sigkill-hardware-dc")
+    release.set()
+    assert status == 1 and spawned == ["sigkill-software-dc"]
+    assert "the reset timed out" in capsys.readouterr().out
+
+def test_a_victim_still_alive_after_sigkill_stops_the_run_before_the_next_row(daq, tmp_path, capsys):
+    spawned = []
+    def make(case, level):
+        spawned.append(case.case_id)
+        return _Immortal()
+    status, _, _ = _execute(daq, tmp_path, make, "--cases=sigkill-software-dc,sigkill-hardware-dc")
+    text = capsys.readouterr().out
+    assert status == 1 and spawned == ["sigkill-software-dc"]
+    assert "still alive after sigkill by pid 4242" in text
+
+def test_a_refused_recovery_is_still_a_measurement_not_a_reason_to_stop(daq, tmp_path, monkeypatch):
+    # -50103 from the reopen is the table's evidence, not a wedge: both rows run.
+    monkeypatch.setattr(tool, "reopen", lambda configuration, laser: "DaqError: -50103 reserved")
+    spawned = []
+    def make(case, level):
+        spawned.append(case.case_id)
+        return _killable(case, level)
+    status, _, _ = _execute(daq, tmp_path, make, "--cases=sigkill-software-dc,sigkill-hardware-dc")
+    assert status == 0 and len(spawned) == 2
+
+# N2: a run that ends with its last recovery failed is not a success.
+
+def test_a_run_whose_last_row_leaves_everything_wedged_exits_1_with_the_banner(daq, tmp_path, capsys, monkeypatch):
+    release = threading.Event()
+    monkeypatch.setattr(tool, "reopen", lambda configuration, laser: release.wait(5.0) and None)
+    monkeypatch.setattr(tool, "reset_device", lambda nidaqmx, device: release.wait(5.0) and None)
+    monkeypatch.setattr(tool, "RECOVERY_TIMEOUT_S", 0.05)
+    status, args, _ = _execute(daq, tmp_path, lambda case, level: _Immortal(), "--cases=sigkill-hardware-dc")
+    release.set()
+    text = capsys.readouterr().out
+    assert status == 1
+    for needle in _FULL_BANNER:
+        assert needle in text, needle
+    assert "reopen: timed out" in text and "still alive after sigkill by pid 4242" in text
+    record = json.loads((args.record_dir / f"laser-kill-{_STAMP}.json").read_text())
+    assert record["recovery"]["reopen"].startswith("timed out")
+
+def test_a_tracking_victim_that_survives_sigkill_stops_the_check(daq, tmp_path, capsys):
+    def make(case, level):
+        pid = 5000 + int(level)
+        return _Immortal(pid=pid, ready=f"READY pid={pid} timing=software waveform=dc mode=clean level={level:.4f}")
+    status, _, _ = _execute(daq, tmp_path, make, "--tracking-check")
+    text = capsys.readouterr().out
+    assert status == 1 and "still alive after sigkill" in text and "NOT CONFIRMED SAFE" in text
+
+# M3, M5, and the reader's message.
+
+def test_skip_reopen_says_the_recovery_closed_the_shutter_line_when_it_did(daq, tmp_path, capsys):
+    def make(case, level):
+        raise OSError("fork failed")
+    _execute(daq, tmp_path, make, "--cases=sigkill-software-dc", "--skip-reopen")
+    text = capsys.readouterr().out
+    assert "the recovery's reopen above did, and said ok" in text
+    assert "nothing in it closed the shutter line" not in text
+
+def test_skip_reopen_says_so_when_the_recovery_could_not_close_it_either(daq, tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(tool, "reopen", lambda configuration, laser: "DaqError: -50103 reserved")
+    def make(case, level):
+        raise OSError("fork failed")
+    _execute(daq, tmp_path, make, "--cases=sigkill-software-dc", "--skip-reopen")
+    text = capsys.readouterr().out
+    assert "nothing in it closed the shutter line" in text and "did not succeed either" in text
+
+def test_execute_refuses_a_namespace_that_has_not_attested_the_laser_is_disconnected(tmp_path):
+    args, configuration, plan = _plan(tmp_path)
+    args.laser_disconnected = False
+    # No seams given: past the check, the autouse guard would raise instead.
+    with pytest.raises(ValueError, match="laser_disconnected"):
+        tool.execute(args, configuration, plan, _STARTED)
+    with pytest.raises(ValueError, match="laser_disconnected"):
+        tool.execute(SimpleNamespace(), configuration, plan, _STARTED)
+
+def test_a_reader_that_fails_for_another_reason_is_not_blamed_on_reachaq(daq, tmp_path, capsys):
+    def reader(*args):
+        raise ValueError("unknown analog terminal configuration 'sideways'")
+    status, _, _ = _execute(daq, tmp_path, lambda case, level: _killable(case, level),
+                            "--cases=sigkill-software-dc", reader=reader)
+    text = capsys.readouterr().out
+    assert status == 1 and "unknown analog terminal configuration 'sideways'" in text
+    assert "reachAQ" not in text and "nothing was started" in text
