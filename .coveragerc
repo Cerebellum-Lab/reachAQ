@@ -35,7 +35,13 @@ omit =
 parallel = true
 # still needed
 
-sigterm = true
+# Off on purpose. With sigterm = true coverage saves its data from a Python SIGTERM
+# handler. In a child process that handler can deadlock on coverage's own data lock when
+# the signal lands during a traced call (coveragepy issue 2310, fix PR 2317 open on
+# 2026-11-05), and multiprocessing's exit then joins that child forever: the job hangs
+# after pytest's summary. Cost: a worker killed by SIGTERM, such as the plot workers at
+# exit, does not save its coverage.
+sigterm = false
 
 [report]
 show_missing = true
