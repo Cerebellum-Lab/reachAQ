@@ -95,3 +95,31 @@ def test_a_reboot_invalidates_only_that_boards_clock():
 
     assert tone.board_aligned_perf_time is None
     assert tone.timestamp_method == "host_receive_perf_time"
+
+
+def test_another_boards_trailer_does_not_disturb_the_pellets_sequence_status():
+    # One tracker serving every board would read the IO module's trailer as a
+    # reboot of the pellet board, and the pellet's next one as another.
+    interface = _interface()
+    interface._translate(_timed(JerryCANCmdType.TONE, PELLET, boot_id=7, sequence=1, board_time_us=10))
+    clap = _timed(
+        JerryCANCmdType.SYNC_CLAP_OBSERVED, IO_MODULE, boot_id=99, sequence=40, board_time_us=5_000,
+        kind=JerryCANTimestampKind.OBSERVED,
+    )
+    clap.sync_clap_observed = SyncClapObserved(tick=3, clapper_node=IO_MODULE)
+    interface._translate(clap)
+    next_clap = _timed(
+        JerryCANCmdType.SYNC_CLAP_OBSERVED, IO_MODULE, boot_id=99, sequence=41, board_time_us=6_000,
+        kind=JerryCANTimestampKind.OBSERVED,
+    )
+    next_clap.sync_clap_observed = SyncClapObserved(tick=4, clapper_node=IO_MODULE)
+    io_status = interface._translate(next_clap).board_sequence_status
+
+    pellet_status = interface._translate(
+        _timed(JerryCANCmdType.TONE, PELLET, boot_id=7, sequence=2, board_time_us=20)
+    ).board_sequence_status
+
+    assert pellet_status["reboot"] is False
+    assert pellet_status["gap"] == 0
+    assert io_status["reboot"] is False
+    assert io_status["gap"] == 0
