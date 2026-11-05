@@ -12,7 +12,11 @@ mode exists to leave it open, as an uncaught error in the application would.
 Only the `clean` mode, and a victim that was never cued, close it.
 
 This drives the real command output. Run it only with the laser unable to
-emit (tools/hardware/laser_kill_test.py states the preconditions).
+emit (tools/hardware/qualify_laser_kill.py states the preconditions, and runs
+this script itself); --laser-disconnected says that is so, and is required.
+
+If the process that started it goes away, this one closes the output and exits
+rather than wait for a cue that can no longer come (see orphaned).
 """
 
 from __future__ import annotations
@@ -60,6 +64,20 @@ _CUE_POLL_S = 0.01
 #: Set by the SIGUSR1 handler; wait_for_cue polls it.
 _cued = threading.Event()
 
+#: The pid of whoever started this process, taken at start. When it changes the
+#: parent is gone (the process was reparented) and no cue or kill can come.
+_PARENT_PID = os.getppid()
+
+_REFUSAL = (
+    "refusing to drive the laser output: pass --laser-disconnected once the key "
+    "is off, the command BNC and shutter cable are unplugged and the output is "
+    "on the dummy load"
+)
+
+
+def orphaned() -> bool:
+    return os.getppid() != _PARENT_PID
+
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -74,7 +92,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--pulse-seconds", type=float, default=30.0)
     parser.add_argument("--ready-settle", type=float, default=0.5)
     parser.add_argument("--cue-timeout", type=float, default=60.0)
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--laser-disconnected", action="store_true",
+        help="the laser is unable to emit (key off, command BNC and shutter cable "
+             "unplugged, output on the dummy load); required")
+    args = parser.parse_args(argv)
+    if not args.laser_disconnected:
+        parser.error(_REFUSAL)
+    return args
 
 
 def laser_configuration_for(
@@ -180,11 +205,14 @@ def act(
     abort: Callable[[], None] = os.abort,
     pause: Callable[[float], None] = time.sleep,
     ignore_sigterm: Callable[[], None] = _ignore_sigterm,
+    is_orphaned: Callable[[], bool] = orphaned,
 ) -> int:
     """Die, or wait to be killed, as `mode` says. Returns an exit status if it lives.
 
     Only `clean` touches the model or the operation: the other modes leave the
-    output exactly as the process held it.
+    output exactly as the process held it, with one exception: a `hang` whose
+    parent has gone away closes the output and exits, because nothing is left to
+    end it and it would hold the output for good.
     """
     if mode == "clean":
         _shut_down(model, operation)
@@ -203,6 +231,9 @@ def act(
         ignore_sigterm()
         while True:
             pause(1)
+            if is_orphaned():
+                _shut_down(model, operation)
+                return 3
     raise ValueError(f"unknown mode {mode!r}")
 
 
@@ -211,10 +242,12 @@ def _on_cue(_signum, _frame) -> None:
 
 
 def wait_for_cue(timeout: float) -> bool:
-    """True once SIGUSR1 has arrived, False if `timeout` seconds pass first."""
+    """True once SIGUSR1 has arrived; False if `timeout` seconds pass first, or at
+    once if the parent process has gone away."""
     deadline = time.monotonic() + timeout
     while not _cued.is_set():
-        if time.monotonic() >= deadline:
+        # Gone: nothing can cue this process now, so do not wait out the timeout.
+        if orphaned() or time.monotonic() >= deadline:
             return False
         time.sleep(_CUE_POLL_S)
     return True
@@ -222,8 +255,13 @@ def wait_for_cue(timeout: float) -> bool:
 
 def _announce(line: str) -> None:
     # Flushed: the orchestrator reads this through a pipe, where print is
-    # block-buffered, and READY must reach it while the process lives.
-    print(line, flush=True)
+    # block-buffered, and READY must reach it while the process lives. A pipe
+    # whose reader has gone is not an error to die of: the orphan check closes
+    # the output.
+    try:
+        print(line, flush=True)
+    except OSError:
+        pass
 
 
 def run(
@@ -253,8 +291,9 @@ def run(
     time.sleep(args.ready_settle)
     announce(ready_line(os.getpid(), args, applied))
     if not wait_for_cue(args.cue_timeout):
+        abandoned = orphaned()
         _shut_down(model, operation)
-        announce("NOT CUED")
+        announce("ORPHANED" if abandoned else "NOT CUED")
         return 3
     return act(args.mode, model=model, operation=operation)
 
