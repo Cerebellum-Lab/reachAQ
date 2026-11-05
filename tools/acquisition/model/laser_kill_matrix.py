@@ -44,6 +44,10 @@ EXPECTED_VICTIM_EXIT = {
 
 SCHEMA = 1
 
+#: A reading within this of a voltage is at it. The judge, the table and the tool's
+#: own check of the end state all use this one value.
+LEVEL_TOLERANCE_V = 0.05
+
 
 @dataclass(frozen=True)
 class KillCase:
@@ -166,7 +170,7 @@ def judge(
     *,
     minimum_volts: float,
     level_volts: float,
-    tolerance_volts: float = 0.05,
+    tolerance_volts: float = LEVEL_TOLERANCE_V,
 ) -> str:
     """The verdict on one row.
 
@@ -302,7 +306,7 @@ def format_table(
     *,
     minimum_volts: float,
     level_volts: float,
-    tolerance_volts: float = 0.05,
+    tolerance_volts: float = LEVEL_TOLERANCE_V,
 ) -> str:
     """A Markdown table, one row per observation, one line per row."""
     lines = [
