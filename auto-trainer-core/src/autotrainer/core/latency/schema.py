@@ -133,7 +133,7 @@ CAN_EVENT_DTYPE = numpy.dtype([
     ("perf_end", "<f8"),
     ("kernel_wall", "<f8"),
 ])
-CAN_STAGES = ("trial_send", "token", "enqueue", "dequeue", "send", "ack")
+CAN_STAGES = ("trial_send", "token", "enqueue", "dequeue", "send", "ack", "ack_lost")
 
 EVENT_TABLES = {
     "live_poses": LIVE_POSE_DTYPE,
