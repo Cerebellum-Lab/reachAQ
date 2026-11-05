@@ -1356,6 +1356,45 @@ def test_a_stim_step_arms_the_short_no_retry_timeout(step, timeout, skips):
     assert device._prev_command_skips_retry is skips
 
 
+def test_a_move_sent_after_a_stim_with_a_lost_ack_still_retries_on_its_own_lost_ack(
+    expected_tok, expected_tok_event, tokens_acked, device, device_conn,
+):
+    """The no-retry policy belongs to the stimulus command alone. The release
+    sent after a stim whose ack was lost must still be re-sent, after its own
+    timeout, when its own ack is lost: it is what reveals the pellet."""
+    interface = device.device_interface
+    real_release = interface.release_pellet
+    pulses, releases = [], []
+
+    def pulse_without_ack(output, duration_us):
+        pulses.append(output)
+        interface.next_uuid()  # the frame went out; the board's ack is lost
+        return True
+
+    def release_without_ack_once(*args, **kwargs):
+        releases.append(time.perf_counter())
+        if len(releases) == 1:
+            interface.next_uuid()  # the first release loses its ack as well
+            return True
+        return real_release(*args, **kwargs)
+
+    interface.pulse_digital_output = pulse_without_ack
+    interface.release_pellet = release_without_ack_once
+    device.default_command_ack_timeout_duration = 0.5
+    ctx = uuid.uuid4()
+    expected_tok.value = ctx
+
+    device.notify_message(
+        SystemCommandKind.SEND_PELLET, {"pre_reveal_stimulus": (200, 1000, 2)}, context=ctx)
+    assert expected_tok_event.wait(5)
+
+    assert ctx in tokens_acked
+    assert len(pulses) == 1, "the stim is still never re-sent"
+    assert len(releases) == 2, "the release must be retried on its own lost ack"
+    # The retry waited the release's own 0.5 s timeout, not the stim's 0.25 s.
+    assert releases[1] - releases[0] >= 0.45
+
+
 def test_pyjerrycan_interface_keeps_the_configured_transport():
     """A non-SocketCAN transport must not be replaced by bare constructor defaults.
 

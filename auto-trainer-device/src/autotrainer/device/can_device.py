@@ -93,11 +93,12 @@ _retry_compound = _Sentinel(role="retry_compound")
 _retry_full = _Sentinel(role="retry_full")
 _shutdown_requested = _Sentinel(role="shutdown_requested")
 
-# A stimulus pulse is never re-sent after a lost ack (the board has already
+# A stimulus pulse is never re-sent after a lost ack (the board has most likely
 # pulsed: a second GPIO_PULSE is a second STIM edge), so there is no reason to
-# wait the default 3 s for an ack that is not coming. The board acks a pulse
-# once its output is back low: a pulse as long as this is reported lost while
-# it is still running.
+# wait the default 3 s for an ack that is not coming. The board acks at assert,
+# not when the line goes low (the pulse handler in the firmware's gpio.c starts
+# the pulse and returns, which is what sends the ack), so this holds for any
+# pulse length.
 _STIM_ACK_TIMEOUT_S: float = 0.25
 
 
@@ -363,8 +364,10 @@ class CanDevice(Device):
             return True
 
         def pulse_output(data):
-            # At most once: the board has pulsed by the time an ack goes missing,
-            # so a lost ack is logged and skipped (_skip_lost_ack), never re-sent.
+            # At most once: when an ack goes missing the board has most likely
+            # pulsed, so a lost ack is logged and skipped (_skip_lost_ack),
+            # never re-sent. If the command frame itself was lost, the trial
+            # goes on unstimulated: no ASSERTED status for that uuid, no NI edge.
             self._prev_command_skips_retry = True
             self._prev_command_timeout = _STIM_ACK_TIMEOUT_S
             return self._interface.pulse_digital_output(DigitalOutputs(data[0]), data[1])
