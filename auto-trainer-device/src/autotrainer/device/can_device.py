@@ -93,6 +93,13 @@ _retry_compound = _Sentinel(role="retry_compound")
 _retry_full = _Sentinel(role="retry_full")
 _shutdown_requested = _Sentinel(role="shutdown_requested")
 
+# A stimulus pulse is never re-sent after a lost ack (the board has already
+# pulsed: a second GPIO_PULSE is a second STIM edge), so there is no reason to
+# wait the default 3 s for an ack that is not coming. The board acks a pulse
+# once its output is back low: a pulse as long as this is reported lost while
+# it is still running.
+_STIM_ACK_TIMEOUT_S: float = 0.25
+
 
 def _no_op():
     return True
@@ -141,6 +148,9 @@ class _BoardPendingContext:
     ack_perf_timeout: float = math.inf  # perf timeout for current uuid ack
     prev_command: Optional[Tuple[str, Any, str]] = None
     prev_command_relative: bool = False
+    prev_command_skips_retry: bool = False  # on ack timeout: log and go on, never re-send
+    last_stim_output: Optional[DigitalOutputs] = None  # line the pending STIM step pulsed (log text)
+    ack_timeout_used: float = math.nan  # the ack timeout armed for the current uuid
     uuid_ack_timeout_engaged: bool = False
     repeated_command_count: int = 0
     compound_steps: Optional[List[Dict[str, Any]]] = None
@@ -245,6 +255,7 @@ class CanDevice(Device):
         self._prev_command_timeout: float = self.default_command_ack_timeout_duration
         self._prev_command: Optional[Tuple[object, Any, type(None)]] = None
         self._prev_command_is_relative = False
+        self._prev_command_skips_retry = False
         # Set by _perform_next_compound_step: the step sent nothing, it only
         # injected steps (or was _no_op). See _perform_compound_until_sent.
         self._compound_step_host_only = False
@@ -351,6 +362,13 @@ class CanDevice(Device):
             logger.verbose("replaced retract proc by %s (prev=%s)", proc, prev)
             return True
 
+        def pulse_output(data):
+            # At most once: the board has pulsed by the time an ack goes missing,
+            # so a lost ack is logged and skipped (_skip_lost_ack), never re-sent.
+            self._prev_command_skips_retry = True
+            self._prev_command_timeout = _STIM_ACK_TIMEOUT_S
+            return self._interface.pulse_digital_output(DigitalOutputs(data[0]), data[1])
+
         def apply_set_or_move(func, motor, *args, **kwargs):
             has_relative = "relative" in kwargs
             is_relative = has_relative and kwargs["relative"]
@@ -435,10 +453,7 @@ class CanDevice(Device):
             SystemCommandKind.SET_DIGITAL_OUTPUT:
                 lambda data: self._interface.set_digital_output(DigitalOutputs(data[0]), data[1]),
 
-            SystemCommandKind.PULSE_DIGITAL_OUTPUT:
-                lambda data: self._interface.pulse_digital_output(
-                    DigitalOutputs(data[0]), data[1],
-                ),
+            SystemCommandKind.PULSE_DIGITAL_OUTPUT: pulse_output,
 
             SystemCommandKind.SET_ANALOG_OUTPUT:
                 lambda data: self._interface.set_analog_output(AnalogOutputs(data[0]), data[1]),
@@ -685,6 +700,7 @@ class CanDevice(Device):
                         board_ctx.uuid = None
                         board_ctx.repeated_command_count = 0
                         board_ctx.prev_command = None
+                        board_ctx.last_stim_output = None
                         logger.debug("uuid_ack_perf_c=%.3f board=%s ctx=%s kind=%s",
                                      msg_perf_c, board_ctx.target, ctx, board_ctx.kind)
                         if board_ctx.skip_uuid_ack_perf_c:
@@ -756,6 +772,9 @@ class CanDevice(Device):
                         context=None if board_ctx.ctx is None else str(board_ctx.ctx),
                     )
                     raise err
+                if board_ctx.prev_command_skips_retry:
+                    self._skip_lost_ack(board_ctx, p_now)
+                    break  # only one board per pass, as for a retry
                 if board_ctx.prev_command_relative:
                     # TODO: should/could simply continue, probably, although surely only for retract command
                     err = RuntimeError(
@@ -827,6 +846,7 @@ class CanDevice(Device):
                            kind, ctx, target_board.ctx)
             #
             self._prev_command_is_relative = False  # always before trying new command, it's used on ack timeout
+            self._prev_command_skips_retry = False  # same: set by the sender of a command that must not be re-sent
             before_uuid = self._interface.uuid()  # to know if some command has used, or not, a new CAN uuid
             #
             if kind is _retry_compound:
@@ -932,6 +952,8 @@ class CanDevice(Device):
             #
             target_board.prev_command_relative = self._prev_command_is_relative
             self._prev_command_is_relative = False
+            target_board.prev_command_skips_retry = self._prev_command_skips_retry
+            self._prev_command_skips_retry = False
             #
             if after_uuid != before_uuid:
                 assert target_board.target is not None, (kind, ctx,)
@@ -955,6 +977,7 @@ class CanDevice(Device):
                 target_board.uuid = after_uuid
                 command_timeout_delay = self._prev_command_timeout or self.default_command_ack_timeout_duration
                 target_board.ack_perf_timeout = t_perf_last_command_with_uuid + command_timeout_delay
+                target_board.ack_timeout_used = command_timeout_delay
                 self._prev_command_timeout = self.default_command_ack_timeout_duration
                 target_board.prev_command = tuple(prev_command)
             else:
@@ -978,6 +1001,50 @@ class CanDevice(Device):
             observer(stage, fields)
         except Exception:
             logger.exception("CAN latency observer failed")
+
+    def _skip_lost_ack(self, board_ctx: _BoardPendingContext, p_now: float) -> None:
+        """
+        Stop waiting for the ack of a command that must not be re-sent.
+
+        Called from the timeout branch of the command loop for a stimulus
+        pulse. The ack travels back after the board has acted, so a missing ack
+        most likely means the pulse went out: re-sending would fire a second
+        STIM edge. The loss is logged and recorded as an "ack_lost" latency
+        stage, and the command goes on as if it had been acknowledged: the next
+        compound step is sent, or the command is acknowledged to its caller.
+        """
+        kind_name = getattr(board_ctx.kind, "name", str(board_ctx.kind))
+        output = board_ctx.last_stim_output
+        what = kind_name if output is None else f"{output.name} pulse in {kind_name}"
+        waited = p_now - (board_ctx.ack_perf_timeout - board_ctx.ack_timeout_used)
+        logger.warning(
+            "ack lost for %s (uuid=%s ctx=%s) after %.3f s; not re-sending: "
+            "a second stimulus would be a second STIM edge; continuing",
+            what, board_ctx.uuid, board_ctx.ctx, waited,
+        )
+        self._latency(
+            "ack_lost",
+            token="" if board_ctx.ctx is None else str(board_ctx.ctx),
+            kind=kind_name, can_uuid=board_ctx.uuid, perf=p_now, waited=waited,
+        )
+        board_ctx.uuid = None
+        board_ctx.prev_command = None
+        board_ctx.repeated_command_count = 0
+        board_ctx.last_stim_output = None
+        if board_ctx.uuid_ack_timeout_engaged:
+            board_ctx.uuid_ack_timeout_engaged = False
+            if not any(b.uuid_ack_timeout_engaged for b in self._boards_pending_ctx.values()):
+                self.property_changed(self.UUID_ACK_TIMEOUT_ENGAGED, False, True)
+        if board_ctx.compound_steps:
+            # Steps remain: leave them attached. The command loop's check for a
+            # next compound step runs later in this same pass (only a retrying
+            # board suppresses it) and sends the next one, as after an ack.
+            return
+        board_ctx.compound_steps = None
+        if board_ctx.ctx is not None:
+            self._acknowledge_command(board_ctx.ctx, perf_c=math.nan)
+        board_ctx.ctx = None
+        board_ctx.kind = None
 
     def _handle_ack(self, msg: Acknowledge):
         cur_can_uuid = self._interface.uuid()
@@ -1057,6 +1124,7 @@ class CanDevice(Device):
         self._compound_movement = None
         self._prev_command = None
         self._prev_command_is_relative = False
+        self._prev_command_skips_retry = False
         self._prev_command_timeout = self.default_command_ack_timeout_duration
         for board in self._boards_pending_ctx.values():
             board.ctx = None
@@ -1065,8 +1133,11 @@ class CanDevice(Device):
             board.uuid_ack_perf_c = -math.inf
             board.skip_uuid_ack_perf_c = False
             board.ack_perf_timeout = math.inf
+            board.ack_timeout_used = math.nan
             board.prev_command = None
             board.prev_command_relative = False
+            board.prev_command_skips_retry = False
+            board.last_stim_output = None
             board.uuid_ack_timeout_engaged = False
             board.repeated_command_count = 0
             board.compound_steps = None
@@ -1671,6 +1742,12 @@ class CanDevice(Device):
                 (int(output.value), duration_us),
                 partial(self._interface.pulse_digital_output, output, duration_us),
             )
+            if success:
+                # At most once, as for a standalone PULSE_DIGITAL_OUTPUT: a lost
+                # ack is skipped (_skip_lost_ack), the step is never re-sent.
+                self._prev_command_skips_retry = True
+                self._prev_command_timeout = _STIM_ACK_TIMEOUT_S
+                board.last_stim_output = output
 
         elif 'predefined' in step:
 
