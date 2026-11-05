@@ -294,6 +294,23 @@ def _ni_derived_lag_p50(frames, latches, camera_to_ni, ni_to_host) -> float:
         return math.nan
 
 
+def _latch_versus_ni_raw(frames, latches, camera_to_ni, ni_to_host) -> float:
+    """Median of the NI-derived exposure minus the latch-derived one, both on
+    CLOCK_MONOTONIC_RAW, over the frames the RAW latch map covers; NaN if not measured."""
+    try:
+        if not (camera_to_ni.valid and ni_to_host.valid):
+            return math.nan
+        fit = clocks.fit_latches(latches, clock="raw")
+        camera = numpy.asarray(frames["camera_ts_ns"], dtype=numpy.float64) / 1e9
+        near = clocks.latch_window(fit, camera) if fit.valid else numpy.zeros(camera.shape, bool)
+        difference = ni_to_host.to_raw(camera_to_ni.map(camera[near])) - fit.map(camera[near])
+        difference = difference[numpy.isfinite(difference)]
+        return float(numpy.median(difference)) if difference.size else math.nan
+    except Exception:
+        logger.exception("Latency RAW exposure comparison failed")
+        return math.nan
+
+
 def _flagged_primary(stream: dict) -> bool:
     try:
         return bool(stream["attrs"].get("is_primary", False))
@@ -458,23 +475,39 @@ class _Context:
             self.status["reasons"].append(fallback)
         else:
             # Exposure to arrival from the latches alone, beside the NI path's
-            # figure over the same frames. Not two measurements: their
-            # difference is the pairing residual again (ni - latch is about
-            # -median_residual), seen through the fitted camera-to-NI line, so
-            # this is a consistency check on fit_camera_to_ni. The residual
-            # gate in choose_pairing_by_camera_clock and the host-arrival
+            # figure over the same frames, both on perf and both kept in the
+            # record as diagnostics. The check is that the two exposure paths
+            # agree, on the clock the frames were paired on. Not two
+            # measurements: the difference is the pairing residual again (NI
+            # minus latch exposure is about median_residual), seen through the
+            # fitted camera-to-NI line, so this is a consistency check on
+            # fit_camera_to_ni. On a perf pairing the perf figures make that
+            # comparison. On a RAW pairing they cannot: the perf latch line
+            # ignores the slews that ni_to_host.map follows, so their difference
+            # would be that line's error, and the paths are compared on RAW. The
+            # residual gate in choose_pairing_by_camera_clock and the host-arrival
             # confirmation are the safeguards against whole-period mispairing
-            # and must not be relaxed on the strength of this check. Both
-            # figures stay in the record as diagnostics.
+            # and must not be relaxed on the strength of this check. A difference
+            # that is not finite was not measured, and fails nothing.
             latch_lag = _latch_direct_lag_p50(frames, latches)
             ni_lag = _ni_derived_lag_p50(frames, latches, self.camera_to_ni, self.ni_to_host)
             record["cameraToNi"]["latchDirectLagP50"] = latch_lag
             record["cameraToNi"]["niDerivedLagP50"] = ni_lag
             tolerance = clocks.latch_tolerance(self.frame_period)
-            if not pairing.ambiguous and abs(ni_lag - latch_lag) > tolerance:
-                self.pairing = dataclasses.replace(pairing, ambiguous=True, reason=(
+            if pairing.clock == "raw":
+                difference = _latch_versus_ni_raw(frames, latches, self.camera_to_ni,
+                                                  self.ni_to_host)
+                record["cameraToNi"]["latchVersusNiRawSeconds"] = difference
+                disagreement = (
+                    f"NI-derived exposure and latch-derived exposure on RAW differ by "
+                    f"{difference * 1e3:.3f} ms, more than {tolerance * 1e3:.3f} ms")
+            else:
+                difference = ni_lag - latch_lag
+                disagreement = (
                     f"NI-derived exposure-to-arrival p50 {ni_lag * 1e3:.3f} ms and latch-direct "
-                    f"p50 {latch_lag * 1e3:.3f} ms differ by more than {tolerance * 1e3:.3f} ms"))
+                    f"p50 {latch_lag * 1e3:.3f} ms differ by more than {tolerance * 1e3:.3f} ms")
+            if not pairing.ambiguous and abs(difference) > tolerance:
+                self.pairing = dataclasses.replace(pairing, ambiguous=True, reason=disagreement)
                 record["cameraToNi"]["pairing"] = dataclasses.asdict(self.pairing)
         if self.pairing.ambiguous:
             record["cameraToNi"]["valid"] = False
