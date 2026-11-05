@@ -1657,3 +1657,23 @@ def test_a_tracking_check_that_finished_writes_no_file(daq, tmp_path, capsys):
     status, args, _ = _execute(daq, tmp_path, make, "--tracking-check",
                                samples=_samples(lambda t: float(int(t - 100.0))))
     assert status == 0 and not list(args.record_dir.glob("*.jsonl"))
+
+def test_a_signal_while_a_row_waits_on_its_reopen_leaves_that_call_named_in_the_banner(daq, tmp_path, capsys, monkeypatch, gate):
+    # The first signal lands while main waits in bounded() on the row's own
+    # reopen, which goes on in the driver. The recovery's calls would collide
+    # with it, so the recovery waits for it first and says so.
+    release, calls = threading.Event(), []
+    def reopen(configuration, laser):
+        calls.append(1)
+        if len(calls) == 1:
+            _signal_me(gate, signal.SIGTERM)       # lands on main, inside bounded()'s join
+            release.wait(5.0)
+    monkeypatch.setattr(tool, "reopen", reopen)
+    status, args, reader = _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc", interrupts=gate)
+    release.set()
+    text = capsys.readouterr().out
+    assert status == 1 and "stopped: KeyboardInterrupt: signal 15" in text
+    assert "the reopen call is STILL RUNNING after" in text and "collide" in text
+    assert reader.by_pid[4242].signals == [signal.SIGKILL] and not reader.by_pid[4242].alive
+    outstanding = _read_jsonl(args)[-1]["recovery"]["outstanding"]
+    assert [(o["call"], o["finished"]) for o in outstanding] == [("the reopen call", False)]

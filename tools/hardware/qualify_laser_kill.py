@@ -348,8 +348,10 @@ def bounded(call: Callable[[], Optional[str]], timeout: float, what: str) -> Opt
 
     Its result (None, or an error as text); an exception becomes its text; and
     a call still running at the timeout gives a WedgedText, "timed out ...", and
-    is left running in the driver, which is all that can be done about it. It is
-    noted as outstanding, for the recovery to wait for first and name.
+    is left running in the driver, which is all that can be done about it. A
+    call still running when the wait is cut short by a signal is left the same
+    way. Either is noted as outstanding, for the recovery to wait for first and
+    name.
     """
     outcome: List[Optional[str]] = []
 
@@ -360,11 +362,25 @@ def bounded(call: Callable[[], Optional[str]], timeout: float, what: str) -> Opt
             outcome.append(f"{type(error).__name__}: {error}")
 
     thread = threading.Thread(target=work, name=f"LaserKill-{what}", daemon=True)
-    thread.start()
-    thread.join(timeout)
+
+    def finished(wait: float) -> bool:
+        thread.join(wait)
+        return not thread.is_alive()
+
+    try:
+        # The start is inside the try: the call can signal as soon as it runs,
+        # and a signal that lands before the join is just as much one that
+        # leaves it going.
+        thread.start()
+        thread.join(timeout)
+    except BaseException:
+        # A signal (KeyboardInterrupt) while waiting: the call goes on in the
+        # driver all the same, and the recovery has to know it is there.
+        if thread.is_alive():
+            _note_outstanding(f"the {what} call", finished)
+        raise
     if thread.is_alive():
-        _note_outstanding(
-            f"the {what} call", lambda wait: (thread.join(wait), not thread.is_alive())[1])
+        _note_outstanding(f"the {what} call", finished)
         return WedgedText(f"timed out after {timeout:g} s (the {what} call is still running)")
     return outcome[0]
 
