@@ -46,6 +46,9 @@ def test_the_software_timed_configuration_keeps_every_channel():
     assert (software.hardware_timed, software.sample_rate_hz) == (False, None)
     assert software.channels == original.channels
     assert dataclasses.replace(software, hardware_timed=True, sample_rate_hz=100_000.0) == original
+    # A hardware row runs the configuration as it is: a changed rate would
+    # stretch every pulse and no other assertion here would notice.
+    assert victim.laser_configuration_for(original, "hardware") is original
 
 def test_a_hardware_row_refuses_a_configuration_without_a_rate():
     untimed = dataclasses.replace(fake.rig_lasers(), hardware_timed=False, sample_rate_hz=None)
@@ -75,6 +78,9 @@ def test_a_hardware_pulse_victim_is_ready_with_its_train_running(daq):
     assert "waveform=pulse" in lines[0]
     assert daq.task("laser_sync_pulse_ao").started or daq.task("laser_sync_pulse_ao").aborted.is_set()
     assert daq.task("laser_1_shutter").writes[-1] is False and code == 0
+    # The row's own path (run -> laser_configuration_for) clocks the train at
+    # the configuration's rate.
+    assert daq.task("laser_sync_pulse_ao").timing_kwargs["rate"] == fake.rig_lasers().sample_rate_hz
 
 # Not in the plan's list: NidaqLaserController.run_pulse_train returns None, so
 # hold() gets the operation from run_synchronized_pulse_train, and the clean
@@ -84,6 +90,7 @@ def test_a_pulse_hold_returns_the_running_operation_with_the_shutter_open_and_cl
     model, controller = victim.open_controller(system, system.laser)
     operation = victim.hold(model, controller, LaserChannelId.LASER_1, "pulse", 2.0, 2.0)
     assert operation is not None and operation.state not in operation.TERMINAL
+    assert daq.task("laser_sync_pulse_ao").timing_kwargs["rate"] == fake.rig_lasers().sample_rate_hz
     assert daq.task("laser_1_shutter").writes[-1] is True
     assert victim.act("clean", model=model, operation=operation) == 0
     assert operation.state is nidaq_laser.LaserOperationState.CANCELLED

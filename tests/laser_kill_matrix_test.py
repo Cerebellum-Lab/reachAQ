@@ -79,3 +79,42 @@ def test_the_record_round_trips_through_json():
     assert record["schema"] == 1 and record["host"] == "christielab10"
     # JSON turns tuples into lists; from_record puts them back.
     assert from_record(json.loads(json.dumps(record))) == observations
+
+# Fix round 1: a stalled reader must read unknown, never safe.
+
+def test_a_pulse_row_at_its_minimum_with_no_hold_reading_is_unknown():
+    # The output was low at +0.10 s, but nothing shows it stayed low: a train
+    # killed on its low phase reads exactly like this.
+    pulse = KillCase("sigkill", "hardware", "pulse", 1)
+    assert judge(_observation(pulse, after_kill=_reading(0.0), hold=None),
+                 minimum_volts=0.0, level_volts=2.0) == UNKNOWN
+
+def test_a_hold_that_left_the_minimum_without_a_full_train_is_not_safe():
+    pulse = KillCase("sigkill", "hardware", "pulse", 1)
+    risen = _observation(pulse, after_kill=_reading(0.0), hold=_reading(0.5, 0.0, 1.0))
+    assert judge(risen, minimum_volts=0.0, level_volts=2.0) == UNKNOWN
+
+def test_a_dc_row_at_its_minimum_with_no_hold_reading_is_unknown():
+    assert judge(_observation(after_kill=_reading(0.0), hold=None),
+                 minimum_volts=0.0, level_volts=2.0) == UNKNOWN
+
+def test_a_dc_row_whose_hold_shows_both_phases_is_unknown_not_a_train():
+    both = _observation(KillCase("sigkill", "software", "dc"),
+                        after_kill=_reading(0.0), hold=_reading(1.0, 0.0, 2.0))
+    assert judge(both, minimum_volts=0.0, level_volts=2.0) == UNKNOWN
+
+def test_a_held_row_with_no_reset_reading_is_unknown():
+    stalled = _observation(after_reopen=None, after_reset=None,
+                           reopen_error="DAQmx -50103", reset_error="reset failed")
+    assert judge(stalled, minimum_volts=0.0, level_volts=2.0) == UNKNOWN
+
+def test_a_refused_reopen_with_a_high_reset_reading_is_still_held_through_reset():
+    held = _observation(after_reopen=None, after_reset=_reading(2.0),
+                        reopen_error="DAQmx -50103")
+    assert judge(held, minimum_volts=0.0, level_volts=2.0) == HELD_THROUGH_RESET
+
+def test_a_dmm_value_that_is_none_is_skipped_by_the_table():
+    text = format_table([_observation(dmm={"before": None, "after_kill": 1.98})],
+                        minimum_volts=0.0, level_volts=2.0)
+    assert text.count("dmm=") == 1 and "dmm=1.98" in text
+    assert "dmm=None" not in text

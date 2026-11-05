@@ -158,9 +158,13 @@ def judge(
 ) -> str:
     """The verdict on one row.
 
+    The table sizes a safety interlock, so a reading that is missing or does
+    not settle the question gives UNKNOWN, never a safe verdict.
+
     The hold window is read before the after-kill instant is trusted: a kill
-    that lands on a pulse's low phase reads safe at +0.10 s while the train
-    goes on generating.
+    that lands on a pulse's low phase reads low at +0.10 s while the train goes
+    on generating. SAFE_ON_DEATH therefore needs a hold window that was
+    observed and stayed at the minimum, not only a low reading at +0.10 s.
     """
     if observation.case.refusal:
         return REFUSED_BY_DESIGN
@@ -172,13 +176,19 @@ def judge(
         and hold.maximum >= level_volts - tolerance_volts
         and hold.minimum <= minimum_volts + tolerance_volts
     ):
-        return TRAIN_RAN_ON
+        # Both phases in the hold window: a train running on if it was one,
+        # an output that moved on its own (nothing here explains it) if not.
+        return TRAIN_RAN_ON if observation.case.waveform == "pulse" else UNKNOWN
     if _within(observation.after_kill, minimum_volts, tolerance_volts):
-        return SAFE_ON_DEATH
+        if hold is not None and hold.maximum <= minimum_volts + tolerance_volts:
+            return SAFE_ON_DEATH
+        return UNKNOWN
     if _within(observation.after_reopen, minimum_volts, tolerance_volts):
         return HELD_UNTIL_REOPEN
     if _within(observation.after_reset, minimum_volts, tolerance_volts):
         return HELD_UNTIL_RESET
+    if observation.after_reset is None:
+        return UNKNOWN
     return HELD_THROUGH_RESET
 
 
@@ -249,6 +259,8 @@ def _row(observation: KillObservation, verdict: str) -> str:
     }
     cells = {column: _escape(text) for column, text in cells.items()}
     for instant, value in observation.dmm.items():
+        if value is None:
+            continue
         column = _DMM_COLUMNS.get(instant)
         if column is None:
             # An instant with no column of its own is still shown, not dropped.
