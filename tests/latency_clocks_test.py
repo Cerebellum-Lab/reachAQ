@@ -291,6 +291,49 @@ def test_a_lost_transition_early_is_a_slip_that_does_not_revert():
     assert pairing.slip["frames"] == lost
 
 
+def test_a_staircase_of_shifts_is_a_slip_that_does_not_revert():
+    # Two lost transitions: 5000 frames on shift 995, 3990 on 996, the last 10 on 997. The
+    # middle run is interior but does not return to the majority, so it is not a backlog.
+    # The 10-run at the end does not pass the rule on its own (n * p^10 is about 2.7).
+    votes = np.repeat([0, 1, 2], [5000, 3990, 10])
+    ids = np.arange(votes.size)
+
+    slip = clocks.find_slip(ids, votes, 0)
+
+    assert slip["frames"] == 3990 and slip["frameId"] == 5000
+    assert slip["reverts"] is False
+
+    ids, exposure, transition_perf = _exposures(9000)
+    pairing = clocks.choose_pairing(ids, exposure + 0.002,
+                                    np.delete(transition_perf, [5 + 5000, 5 + 8990]),
+                                    PERIOD_150, ni_residual_rms=0.00002)
+
+    assert pairing.ambiguous, pairing.reason
+    assert pairing.shift == 995
+    assert pairing.slip["frames"] == 3990 and pairing.slip["frameId"] == ids[5000]
+    assert pairing.slip["reverts"] is False
+    assert f"slip at frame {ids[5000]}" in pairing.reason
+
+
+def test_a_run_voting_above_the_majority_is_not_a_backlog():
+    # Late delivery moves a frame's candidate to a later transition, so a backlog can only
+    # vote below the majority. A lost transition cancelled 30 frames later by a spurious one
+    # is an interior run of +1 votes that returns to the majority, and is still a slip.
+    ids, exposure, transition_perf = _exposures(9000)
+    spurious = exposure[4029] + PERIOD_150 / 2
+    transitions = np.sort(np.append(np.delete(transition_perf, 5 + 4000), spurious))
+
+    pairing = clocks.choose_pairing(ids, exposure + 0.002, transitions, PERIOD_150,
+                                    ni_residual_rms=0.00002)
+
+    assert pairing.shift == 995
+    assert pairing.ambiguous, pairing.reason
+    assert pairing.slip["reverts"] is False
+    assert pairing.slip["frames"] == 30 and pairing.slip["frameId"] == ids[4000]
+    assert pairing.slip["toShift"] == 996  # above the majority
+    assert f"slip at frame {ids[4000]}" in pairing.reason
+
+
 def test_the_statistical_constants_are_pinned():
     assert clocks.coverage_factor() == pytest.approx(4.8916, abs=1e-3)
     samples = np.random.default_rng(11).normal(0, 0.002, 100_000)
