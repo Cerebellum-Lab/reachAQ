@@ -26,19 +26,23 @@ here saves the configuration (it is loaded with save_backup=False and no
 AppModel is built). The only process this signals is the victim it spawned, by
 the pid it was given.
 
-When a run stops early (an error, or SIGINT, SIGTERM or SIGHUP, which all
-become one KeyboardInterrupt), the victim in hand is sent SIGKILL by its pid and
-the run then tries, with a time bound on each, to reopen the controller and
-reset the command device, reads the output once more, and prints a banner
-naming what it could not confirm: the shutter line cannot be read from here,
-and only the reopen closes it. A second interrupt during that is ignored. The
-rows are appended to a .rows.jsonl file as each ends, so a lost terminal or a
-broken `| tee` loses none of them.
+When a run stops early (an error, a row that leaves a reopen or reset
+outstanding in the driver or a victim alive, or SIGINT, SIGTERM or SIGHUP, which
+all become one KeyboardInterrupt) the victim in hand is sent SIGKILL by its pid,
+from the moment it exists, and the run then tries, with a time bound on each, to
+reopen the controller and reset the command device, reads the output once more,
+and prints a banner naming what it could not confirm: the shutter line cannot be
+read from here, and only the reopen closes it. A signal can stop the run only
+inside the run itself (InterruptGate); during the recovery and the report it is
+held, so they always finish. The rows are appended to a .rows.jsonl file as each
+ends, so a lost terminal or a broken `| tee` loses none of them. The exit status
+is 0 only for a run that finished with nothing outstanding.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -92,6 +96,9 @@ RECOVERY_SETTLE_S = 0.5
 #: Ruling T1-I1b: a hold window the reader's chunks cover less than this much
 #: of cannot show the output stayed down.
 HOLD_COVERAGE = 0.9
+#: A before-prompt (--pause-for-dmm) that took longer than this leaves the
+#: output at the kill unknown: it could have dropped just after the reading.
+BEFORE_PROMPT_LIMIT_S = 20.0
 #: The longest one reopen or one device reset is waited for. A kill can leave
 #: nipalk wedged, and a call into it then never returns.
 RECOVERY_TIMEOUT_S = 20.0
@@ -376,6 +383,9 @@ def victim_command(python: str, victim_path: Path, args, case: KillCase) -> List
         # The victim refuses to run without it. This process refused first,
         # unless --dry-run, which never starts a victim.
         "--laser-disconnected",
+        # So that it closes the output and exits if this process goes away,
+        # even one that went while the victim was still starting up.
+        f"--orchestrator-pid={os.getpid()}",
     ]
 
 
@@ -509,6 +519,126 @@ def _row_without_readings(
         victim_exit=victim_exit, notes=notes)
 
 
+class InterruptGate:
+    """Where SIGINT, SIGTERM and SIGHUP may stop the run, and where they only wait.
+
+    The handler raises one KeyboardInterrupt, and only while the gate is
+    `raising`: inside the run itself (`interruptible()`), which is what ends
+    the row in hand and starts the recovery. Everywhere else a signal is
+    recorded in `pending` and does not raise: while a victim is being started
+    and its pid taken (`deferred()`, so it can never exist without an owner),
+    while a failed row's victim is killed, through the whole recovery, and from
+    the end of the run to the last line it prints. A second Ctrl-C, or the
+    hang-up that follows a closed terminal, therefore cannot cut the recovery
+    or the record short; the recovery is time-bounded, and kill -9 is still
+    there. The gate is spent by the first: `raising` is cleared before the
+    exception is raised, so no later signal can raise another.
+    """
+
+    def __init__(self, raising: bool = False) -> None:
+        self.raising = raising
+        #: Signals that became a KeyboardInterrupt.
+        self.raised: List[int] = []
+        #: Signals that arrived where they may not raise.
+        self.pending: List[int] = []
+
+    def __call__(self, signum, frame) -> None:
+        if self.raising:
+            self.raising = False
+            self.raised.append(signum)
+            raise KeyboardInterrupt(f"signal {signum}")
+        self.pending.append(signum)
+
+    def raise_if_pending(self) -> None:
+        """Turn a signal that arrived while deferred into the interrupt, if one may be raised."""
+        if self.raising and self.pending:
+            signum = self.pending[0]
+            self.pending.clear()
+            self.raising = False
+            self.raised.append(signum)
+            raise KeyboardInterrupt(f"signal {signum}")
+
+    def interruptible(self) -> "_GateRegion":
+        return _GateRegion(self, True)
+
+    def deferred(self) -> "_GateRegion":
+        return _GateRegion(self, False)
+
+
+class _GateRegion:
+    def __init__(self, gate: InterruptGate, raising: bool) -> None:
+        self.gate, self.raising, self.previous = gate, raising, False
+
+    def __enter__(self) -> InterruptGate:
+        self.previous = self.gate.raising
+        self.gate.raising = self.raising
+        if self.raising:
+            self.gate.raise_if_pending()
+        return self.gate
+
+    def __exit__(self, *exception) -> None:
+        # Leaving the run leaves the gate not raising for good; leaving a
+        # deferred stretch goes back to what it interrupted.
+        self.gate.raising = False if self.raising else self.previous
+
+
+def install_interrupt_handlers(install=signal.signal) -> InterruptGate:
+    """SIGINT, SIGTERM and SIGHUP all go to one gate, which starts out not raising."""
+    gate = InterruptGate()
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is not None:
+            install(number, gate)
+    return gate
+
+
+class RunStopped(RuntimeError):
+    """A row left something outstanding that no further row could be trusted past."""
+
+
+def _wedged(observation: KillObservation) -> Optional[str]:
+    """What a row left outstanding in the driver, or None.
+
+    A reopen or reset still running (its call timed out) can write the minimum
+    at any moment, as late as just after the next row's kill, and make that row
+    read safe; a victim that survived SIGKILL may still hold the output. Neither
+    is a measurement: the run stops there, with the recovery and its banner.
+    """
+    for label, text in (("reopen", observation.reopen_error),
+                        ("reset", observation.reset_error)):
+        if text and text.startswith("timed out"):
+            return f"the {label} {text}"
+    if observation.victim_exit.startswith("still alive"):
+        return f"the victim {observation.victim_exit}"
+    return None
+
+
+@contextlib.contextmanager
+def _victim_in_hand(spawn_call: Callable, announce: Optional[Callable], kill, gate: InterruptGate):
+    """Start a victim and own it from the moment it exists to the end of the body.
+
+    Signals are held while it is started and its pid announced, so there is no
+    instant at which it exists and nothing is set to end it; one that arrived
+    meanwhile ends the row here, with the victim in hand. A failure anywhere in
+    the body, a signal included, sends it SIGKILL by its pid at once
+    (_abandon_victim, itself undisturbed), and the failure then propagates. The
+    body ends the victim itself when it succeeds.
+    """
+    process = None
+    try:
+        with gate.deferred():
+            process = spawn_call()
+            if announce is not None:
+                announce(process)
+        gate.raise_if_pending()
+        yield process
+    except BaseException:
+        if process is not None:
+            with gate.deferred():
+                _abandon_victim(process, kill)
+        raise
+
+
 def _abandon_victim(process, kill) -> None:
     """A row has failed: SIGKILL its victim by its pid now, and say if it survives.
 
@@ -540,6 +670,8 @@ def run_case(
     hold_seconds: float,
     instrument: str,
     dmm: Optional[Callable[[str], Optional[float]]] = None,
+    announce: Optional[Callable] = None,
+    interrupts: Optional[InterruptGate] = None,
 ) -> KillObservation:
     """One row: start the victim, kill it, read the output at each instant, recover.
 
@@ -549,12 +681,16 @@ def run_case(
     slow over the DMM prompt moves nothing), and the only process signalled is
     the one `spawn` returned, by its pid. The before-prompt is asked first and
     `before` read just ahead of the kill, so what it records is the output at
-    the kill. On any failure the victim is sent SIGKILL by its pid at once, and
+    the kill; if that prompt took over BEFORE_PROMPT_LIMIT_S the output at the
+    kill is not known (it may have dropped just after the reading), so no
+    `before` is recorded and the row reads unknown. `announce(process)` is
+    called as soon as the victim exists. From then on (_victim_in_hand) any
+    failure, a signal included, sends the victim SIGKILL by its pid at once, and
     a victim that survives that is reported, not assumed gone (_abandon_victim);
     the failure then propagates.
     """
-    process = spawn(case)
-    try:
+    gate = interrupts or InterruptGate()
+    with _victim_in_hand(lambda: spawn(case), announce, kill, gate) as process:
         problem = None
         try:
             ready = wait_for_ready(process.lines, READY_TIMEOUT_S)
@@ -586,8 +722,21 @@ def run_case(
         # The prompt first: it can take as long as the operator takes, and a
         # `before` read ahead of it would describe an output that may be gone
         # by the kill (a 30 s train over, a victim closed at its 60 s cue timeout).
+        prompt_started = now()
         ask("before")
+        prompt_seconds = now() - prompt_started
         before = log.at(now(), instrument)
+        notes = []
+        if prompt_seconds > BEFORE_PROMPT_LIMIT_S:
+            # Read at the end of a long prompt, it can still show the level a
+            # moment before the output drops; nothing then says it was up at the
+            # kill. The row cannot be judged (no before reads unknown).
+            shown = "no reading" if before is None else f"{before.mean:.3f} V"
+            notes.append(
+                f"before prompt took {prompt_seconds:.0f} s (over "
+                f"{BEFORE_PROMPT_LIMIT_S:g} s): the output at the kill is not known, "
+                f"so no before reading is recorded (it read {shown})")
+            before = None
 
         t_kill = now()
         apply_kill(case, process.pid, kill=kill)
@@ -602,7 +751,6 @@ def run_case(
         after_hold = log.at(hold_end, instrument)
         ask("after_hold")
 
-        notes = []
         if reopen is None:
             reopen_error, after_reopen = None, None
             notes.append("reopen skipped")
@@ -626,9 +774,6 @@ def run_case(
             reopen_error=reopen_error, reset_error=reset_error,
             victim_exit=end_victim(process, kill=kill, mode=case.mode),
             dmm=dmm_values, notes=tuple(notes))
-    except BaseException:
-        _abandon_victim(process, kill)
-        raise
 
 
 def prompt_dmm(case_id: str, instant: str, *, ask=input) -> Optional[float]:
@@ -656,20 +801,25 @@ def tracking_check(
     now: Callable[[], float] = time.perf_counter,
     sleep: Callable[[float], None] = time.sleep,
     kill=os.kill,
+    interrupts: Optional[InterruptGate] = None,
 ) -> List[Tuple[float, Optional[LevelReading], Optional[float]]]:
     """Does the reader follow the command? One clean software-DC victim per level.
 
     Read at READY plus a second, beside the DMM's reading when there is one.
     The victim is then cued to close and exit, and is ended by its pid if it
-    does not. A failure sends it SIGKILL by its pid at once.
+    does not. From the moment a victim exists, a failure (a signal included)
+    sends it SIGKILL by its pid at once, as in run_case; a victim that survives
+    that, or SIGKILL at the end, stops the run (RunStopped).
     """
+    gate = interrupts or InterruptGate()
     instrument, _ = reader_channel_for(configuration, args.laser, args.reader_channel)
     case = KillCase("clean", "software", "dc")
     rows = []
     for level in TRACKING_LEVELS:
-        process = spawn(case, level)
-        _say(f"tracking {level:g} V (victim pid {process.pid})")
-        try:
+        def announce(process, level=level):
+            _say(f"tracking {level:g} V (victim pid {process.pid})")
+
+        with _victim_in_hand(lambda: spawn(case, level), announce, kill, gate) as process:
             ready = wait_for_ready(process.lines, READY_TIMEOUT_S)
             if ready.get("pid") != process.pid:
                 raise RuntimeError(f"the victim at {level:g} V did not report ready: {ready}")
@@ -677,10 +827,9 @@ def tracking_check(
             reading = log.at(now(), instrument)
             value = dmm(f"{level:g} V") if dmm is not None else None
             apply_kill(case, process.pid, kill=kill)
-        except BaseException:
-            _abandon_victim(process, kill)
-            raise
-        ended = end_victim(process, kill=kill, mode="clean")
+            ended = end_victim(process, kill=kill, mode="clean")
+        if ended.startswith("still alive"):
+            raise RunStopped(f"the victim at {level:g} V {ended}")
         if ended != EXPECTED_VICTIM_EXIT["clean"]:
             _say(f"    the victim at {level:g} V did not end cleanly: {ended}")
         rows.append((level, reading, value))
@@ -709,13 +858,16 @@ def run_matrix(
     kill=os.kill,
     prompt: Callable[[str, str], Optional[float]] = prompt_dmm,
     on_row: Optional[Callable[[KillObservation], None]] = None,
+    interrupts: Optional[InterruptGate] = None,
 ) -> None:
     """Run each case in turn, appending its observation to `observations`.
 
     Appended as each row ends (and handed to `on_row`, which writes it to
     disk), so the rows finished before a failure survive it. Each row's line
     names its victim's pid, so that process can be found by hand if this one
-    dies, then its verdict, notes and refusals.
+    dies, then its verdict, notes and refusals. A row that leaves a reopen or
+    reset outstanding in the driver, or a victim alive after SIGKILL, is kept and
+    then stops the run (RunStopped): no further row starts while that is so.
     """
     channel = configuration.laser.get_channel(args.laser)
     # Both recoveries are bounded: a kill can wedge the driver, and a call into
@@ -728,16 +880,14 @@ def run_matrix(
         functools.partial(reset_device, nidaqmx, device_of(channel.analog_output)),
         RECOVERY_TIMEOUT_S, "reset")
     for index, case in enumerate(cases, 1):
-        def announcing_spawn(row_case, _index=index):
-            process = spawn(row_case)
-            _say(f"[{_index}/{len(cases)}] {row_case.case_id} (victim pid {process.pid})")
-            return process
+        def announce(process, index=index, case=case):
+            _say(f"[{index}/{len(cases)}] {case.case_id} (victim pid {process.pid})")
 
         dmm = functools.partial(prompt, case.case_id) if args.pause_for_dmm else None
         observation = run_case(
-            case, spawn=announcing_spawn, log=log, now=now, sleep=sleep, kill=kill,
+            case, spawn=spawn, log=log, now=now, sleep=sleep, kill=kill,
             reopen=reopen_hook, reset=reset_hook, hold_seconds=args.hold_seconds,
-            instrument=instrument, dmm=dmm)
+            instrument=instrument, dmm=dmm, announce=announce, interrupts=interrupts)
         observations.append(observation)
         if on_row is not None:
             on_row(observation)
@@ -749,6 +899,11 @@ def run_matrix(
             _say(f"    reopen: {observation.reopen_error}")
         if observation.reset_error:
             _say(f"    reset: {observation.reset_error}")
+        wedged = _wedged(observation)
+        if wedged:
+            raise RunStopped(
+                f"{case.case_id}: {wedged}; the run stops here so that no row starts "
+                "while it is outstanding")
 
 
 def repository_revision() -> Optional[str]:
@@ -845,34 +1000,6 @@ def _load_nidaqmx():
     import nidaqmx.constants
     import nidaqmx.system
     return nidaqmx
-
-
-class InterruptOnce:
-    """The handler for SIGINT, SIGTERM and SIGHUP.
-
-    The first becomes a KeyboardInterrupt, which ends the row in hand and starts
-    the recovery; every later one is ignored, so a second Ctrl-C (or the
-    hang-up that follows a closed terminal) cannot cut the recovery short. The
-    recovery is time-bounded, and kill -9 is still there.
-    """
-
-    def __init__(self) -> None:
-        self.signum: Optional[int] = None
-
-    def __call__(self, signum, frame) -> None:
-        if self.signum is not None:
-            return
-        self.signum = signum
-        raise KeyboardInterrupt(f"signal {signum}")
-
-
-def install_interrupt_handlers(install=signal.signal) -> InterruptOnce:
-    handler = InterruptOnce()
-    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
-        number = getattr(signal, name, None)
-        if number is not None:
-            install(number, handler)
-    return handler
 
 
 @dataclasses.dataclass(frozen=True)
@@ -983,12 +1110,26 @@ def recover_after_failure(
     }
 
 
-def warn_reopen_skipped(plan: Plan) -> None:
+def warn_reopen_skipped(plan: Plan, recovery: Optional[dict] = None) -> None:
+    """The --skip-reopen warning, saying what is true of this run's shutter line.
+
+    No row reopened the controller, so no row's end closed the line. If the run
+    then failed and the recovery's own reopen succeeded, that closed it.
+    """
+    line = plan.channel.shutter_output
     _say()
+    if recovery is not None and recovery.get("reopen") == "ok":
+        _say(f"--skip-reopen: no row reopened the controller, so none closed the shutter "
+             f"line {line}; the recovery's reopen above did, and said ok. The output still "
+             "needs confirming at its minimum on the DMM.")
+        return
+    after = ""
+    if recovery is not None:
+        after = " The recovery's reopen did not succeed either (see above)."
     _say("!!! --skip-reopen: this run never reopened the controller after a row, so "
-         f"nothing in it closed the shutter line {plan.channel.shutter_output} (a pulse "
-         "victim opens it and a killed one never closes it), and the output was left as "
-         "the last row left it unless the device reset moved it.")
+         f"nothing in it closed the shutter line {line} (a pulse victim opens it and a "
+         "killed one never closes it), and the output was left as the last row left it "
+         f"unless the device reset moved it.{after}")
     _say(_DO_NOT_RECONNECT)
 
 
@@ -1005,14 +1146,26 @@ def execute(
     sleep: Callable[[float], None] = time.sleep,
     kill=os.kill,
     prompt: Callable[[str, str], Optional[float]] = prompt_dmm,
+    interrupts: Optional[InterruptGate] = None,
 ) -> int:
     """The run itself, after the plan is made and --dry-run is out of the way.
 
     This opens NI tasks and starts victims. The seams (`load_nidaqmx`,
     `spawn_factory`, `reader_factory`, the clock, `kill`, `prompt`) are for the
     tests, which hand it fakes; None takes the real one at the time of the call.
-    Returns the exit status: 0 for a run that finished.
+    `interrupts` is the gate the signal handlers feed (None: one nothing feeds).
+    Returns the exit status: 0 for a run that finished, 1 for any that did not,
+    including one that ended with a reopen or reset still outstanding in the
+    driver or a victim still alive.
+
+    It refuses a namespace that has not attested --laser-disconnected, so that
+    no caller can reach it around the parser.
     """
+    if not getattr(args, "laser_disconnected", False):
+        raise ValueError(
+            "execute refuses to run: args.laser_disconnected is not set (the key off, "
+            "the command BNC and shutter cable unplugged, the output on the dummy load)")
+    gate = interrupts or InterruptGate()
     load_nidaqmx = load_nidaqmx or _load_nidaqmx
     spawn_factory = spawn_factory or make_spawn
     reader_factory = reader_factory or start_reader
@@ -1039,8 +1192,10 @@ def execute(
     except Exception as error:
         _say(f"the reader on {plan.reader_channel} did not start: "
              f"{type(error).__name__}: {error}")
-        _say("the operator's reachAQ may be running: it holds the 6221 inputs (-50103). "
-             "Have its owner stop it; nothing was started or signalled.")
+        if "-50103" in str(error):
+            _say("-50103: something else holds that input. The operator's reachAQ may be "
+                 "running: it holds the 6221 inputs. Have its owner stop it.")
+        _say("nothing was started or signalled.")
         return 1
 
     rows_path = args.record_dir / f"laser-kill-{stamp}.rows.jsonl"
@@ -1064,20 +1219,35 @@ def execute(
             _say(f"    could not append this row to {rows_path}: {error}")
 
     spawn = spawn_factory(args, stamp=stamp)
+    if gate.pending:
+        # A signal during the setup. Nothing has been started, so nothing needs
+        # putting back.
+        _say(f"interrupted (signal {gate.pending[0]}) before any victim was started; "
+             "nothing was started or signalled.")
+        stop.set()
+        reader.join(END_TIMEOUT_S)
+        return 1
     try:
-        if args.tracking_check:
-            dmm = functools.partial(prompt, "tracking") if args.pause_for_dmm else None
-            tracking_check(args, configuration, log, spawn, dmm, now=now, sleep=sleep, kill=kill)
-        else:
-            run_matrix(
-                plan.cases, observations, args=args, configuration=configuration,
-                nidaqmx=nidaqmx, spawn=spawn, log=log, instrument=plan.reader_channel,
-                level_volts=plan.level_volts, minimum_volts=plan.minimum_volts,
-                now=now, sleep=sleep, kill=kill, prompt=prompt, on_row=on_row)
+        # Only inside this `with` may a signal stop the run. Out of it, to the
+        # last line this function prints, signals are held, so the recovery, the
+        # banner, the table and the record always finish.
+        with gate.interruptible():
+            if args.tracking_check:
+                dmm = functools.partial(prompt, "tracking") if args.pause_for_dmm else None
+                tracking_check(args, configuration, log, spawn, dmm, now=now, sleep=sleep,
+                               kill=kill, interrupts=gate)
+            else:
+                run_matrix(
+                    plan.cases, observations, args=args, configuration=configuration,
+                    nidaqmx=nidaqmx, spawn=spawn, log=log, instrument=plan.reader_channel,
+                    level_volts=plan.level_volts, minimum_volts=plan.minimum_volts,
+                    now=now, sleep=sleep, kill=kill, prompt=prompt, on_row=on_row,
+                    interrupts=gate)
     except (Exception, KeyboardInterrupt) as error:
-        # The victim in hand has been sent SIGKILL by its pid (run_case), and a
-        # survivor reported there. What is left is the output and the shutter
-        # line, which the recovery tries to put back and reports on.
+        # The victim in hand has been sent SIGKILL by its pid (run_case, or
+        # tracking_check), and a survivor reported there. What is left is the
+        # output and the shutter line, which the recovery tries to put back and
+        # reports on.
         status = 1
         why = f"{type(error).__name__}: {error}"
         _say(f"stopped: {why}")
@@ -1085,6 +1255,8 @@ def execute(
             recovery = recover_after_failure(
                 why, args=args, configuration=configuration, plan=plan, nidaqmx=nidaqmx,
                 log=log, now=now, sleep=sleep)
+            if gate.pending:
+                recovery["signals_held"] = list(gate.pending)
         except Exception as recovery_error:
             _say("the recovery itself failed: "
                  f"{type(recovery_error).__name__}: {recovery_error}")
@@ -1124,7 +1296,10 @@ def execute(
         else:
             _say(f"record: {path}")
     if args.skip_reopen and not args.tracking_check:
-        warn_reopen_skipped(plan)
+        warn_reopen_skipped(plan, recovery)
+    if gate.pending:
+        _say(f"signal(s) {gate.pending} arrived after the run had stopped or finished and "
+             "were held until everything above was complete.")
     return status
 
 
@@ -1142,8 +1317,7 @@ def main(argv=None) -> int:
     if args.dry_run:
         _say("dry run: no process started, no NI task opened, nothing written")
         return 0
-    install_interrupt_handlers()
-    return execute(args, configuration, plan, started)
+    return execute(args, configuration, plan, started, interrupts=install_interrupt_handlers())
 
 
 if __name__ == "__main__":
