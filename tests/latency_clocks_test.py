@@ -977,6 +977,61 @@ def test_knot_raw_round_trips_through_the_record():
         assert np.allclose(damaged.map(probe), fit.map(probe), atol=1e-9), why
 
 
+def _latches_on_both_clocks():
+    """Two bursts 600 s apart, each latch with a perf and a RAW bracket."""
+    latches = _latches(np.concatenate([_burst(50.0), _burst(650.0)]))
+    latches["raw_before"] = latches["perf_before"] - 7.0  # RAW 7 s behind perf here
+    latches["raw_after"] = latches["perf_after"] - 7.0
+    return latches
+
+
+def test_the_latch_clock_is_raw_only_with_raw_on_the_ni_fit_and_every_latch():
+    ni_fit, _, stamps, _ = _raw_bridged()
+    latches = _latches_on_both_clocks()
+
+    assert clocks.latch_clock(latches, ni_fit) == "raw"
+
+    # RAW on one burst only: the rest of the latches are usable on perf and not on RAW, and a
+    # RAW map through one burst would be an offset where perf has a line through both.
+    one_burst = latches.copy()
+    one_burst["raw_before"][3:] = np.nan
+    one_burst["raw_after"][3:] = np.nan
+    assert clocks.fit_latches(one_burst, clock="raw").valid
+    assert clocks.latch_clock(one_burst, ni_fit) == "perf"
+
+    # An NI fit with no RAW view, however good its latches.
+    perf_only = clocks.fit_piecewise_envelope(stamps.end_index, stamps.perf, 10_000.0)
+    assert perf_only.valid and not perf_only.has_raw
+    assert clocks.latch_clock(latches, perf_only) == "perf"
+    assert clocks.latch_clock(latches, clocks.invalid_piecewise_fit("no read pairs")) == "perf"
+
+    # A stream from before the RAW pair existed.
+    three_fields = np.zeros(latches.size, dtype=[("perf_before", "<f8"), ("camera_ns", "<i8"),
+                                                 ("perf_after", "<f8")])
+    for name in three_fields.dtype.names:
+        three_fields[name] = latches[name]
+    assert clocks.latch_clock(three_fields, ni_fit) == "perf"
+
+
+def test_the_latch_clock_says_perf_rather_than_raise():
+    ni_fit, _, _, _ = _raw_bridged()
+    latches = _latches_on_both_clocks()
+    unusable = latches.copy()
+    for name in ("perf_before", "perf_after", "raw_before", "raw_after"):
+        unusable[name] = np.nan
+    # RAW and perf agree on the count here (none), and there is still no RAW map.
+    assert clocks.latch_clock(unusable, ni_fit) == "perf"
+    assert clocks.latch_clock(None, ni_fit) == "perf"
+    assert clocks.latch_clock(latches[:0], ni_fit) == "perf"
+    assert clocks.latch_clock(latches, None) == "perf"
+    # A table with no camera_ns makes the bracket lookup raise a ValueError on the field.
+    no_camera = np.zeros(6, dtype=[("perf_before", "<f8"), ("perf_after", "<f8"),
+                                   ("raw_before", "<f8"), ("raw_after", "<f8")])
+    with pytest.raises(ValueError):
+        clocks.usable_latches(no_camera, clock="raw")
+    assert clocks.latch_clock(no_camera, ni_fit) == "perf"
+
+
 def test_without_raw_stamps_the_selector_fits_the_piecewise_envelope():
     rng = np.random.default_rng(22)
     host = _slewed_host(-10.0, [])

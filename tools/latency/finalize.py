@@ -431,12 +431,8 @@ class _Context:
             # The latches pair on CLOCK_MONOTONIC_RAW when the NI fit and the latch rows
             # both carry it: no NTP slew is in it, so one latch line holds all session.
             # Otherwise on perf, where that line ignores the slews; Pairing.clock says which.
-            raw_fit = (clocks.fit_latches(latches, clock="raw")
-                       if getattr(self.ni_to_host, "has_raw", False) else None)
-            if raw_fit is not None and raw_fit.valid:
-                clock, latch_fit = "raw", raw_fit
-            else:
-                clock, latch_fit = "perf", clocks.fit_latches(latches, clock="perf")
+            clock = clocks.latch_clock(latches, self.ni_to_host)
+            latch_fit = clocks.fit_latches(latches, clock=clock)
             fallback = ""
             if latch_fit.valid and clocks.latch_gate_ok(latch_fit, residual, self.frame_period):
                 transition_times = (self.ni_to_host.to_raw(ni_seconds) if clock == "raw"

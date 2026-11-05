@@ -471,12 +471,14 @@ the primary camera's latency stream:
   camera runs on before the NI task starts and after it stops, and those frames
   are left out of both pairings.
 - `latch.clock` is `raw` when both sides carry `CLOCK_MONOTONIC_RAW`: the NI fit
-  is `raw_bridged`, whose RAW view places the transitions, and the latch rows
-  have usable RAW brackets (`raw_before`, `raw_after`). RAW is never slewed, so
-  one straight latch map holds for the whole session. Otherwise it is `perf`:
-  the map is a straight line over `perf_counter`, which timesyncd slews, and it
-  ignores the slews (simulated, one line misses by 1.9-4.3 ms p95 after an
-  hour). `usableLatches` counts on that clock.
+  is `raw_bridged`, whose RAW view places the transitions, and every latch
+  usable on perf has a usable RAW bracket too (`raw_before`, `raw_after`), the
+  rule `clocks.latch_clock` holds for the recorder and the latency finalizer
+  alike. RAW is never slewed, so one straight latch map holds for the whole
+  session. Otherwise it is `perf`: the map is a straight line over
+  `perf_counter`, which timesyncd slews, and it ignores the slews (simulated,
+  one line misses by 1.9-4.3 ms p95 after an hour). `usableLatches` counts on
+  that clock.
 - The latch map is a straight line through every latch's bracket (the host
   times before and after the camera clock was read, widened by the clock's
   resolution). Latches no such line passes through together with the rest are
