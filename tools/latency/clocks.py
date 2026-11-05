@@ -732,7 +732,11 @@ class Pairing:
     median_residual: float = math.nan
     """Camera-clock method: transition minus expected host time, over the chosen shift."""
     slip: Optional[dict] = None
-    """Where the votes change shift, as find_slip gives it; None when they do not."""
+    """Where the votes change shift, as find_slip gives it; None when they do not.
+
+    Its reverts is True for a run that returns to the majority. That is a
+    diagnostic for the arrival pairing (a delivery backlog) and a reason to
+    refuse the camera-clock pairing, whose votes delivery cannot move."""
     limit: float = math.nan
     """What the verdict was judged against, in seconds: the arrival margin or the latch tolerance."""
     clock: str = "perf"
@@ -773,6 +777,15 @@ def find_slip(frame_ids, votes, majority: int) -> Optional[dict]:
     or, when the run opens the session, the frame after it, which is the first
     to vote the majority. frames is the run's length. Frame-id gaps are not
     runs: a dropped frame had its exposure edge and still votes the same shift.
+
+    reverts says whether the votes return to the majority: True for a run that
+    neither opens nor closes the session. A lost or spurious NI transition
+    renumbers every frame after it, so its run reaches an end of the session;
+    a run in the middle is frames held back and delivered late, which a host
+    stall causes. The runs that reach an end are tested first, and the longest
+    of those that pass is returned (reverts False). Only when none passes is
+    the longest interior run that does (reverts True), so a long backlog
+    cannot hide a real slip.
     """
     votes = numpy.asarray(votes, dtype=numpy.int64)
     frame_ids = numpy.asarray(frame_ids, dtype=numpy.int64)
@@ -782,19 +795,27 @@ def find_slip(frame_ids, votes, majority: int) -> Optional[dict]:
         return None
     starts = numpy.concatenate(([0], numpy.flatnonzero(numpy.diff(votes)) + 1))
     lengths = numpy.diff(numpy.append(starts, n))
-    longest = int(numpy.argmax(numpy.where(votes[starts] != majority, lengths, 0)))
-    start, length = int(starts[longest]), int(lengths[longest])
     stray_rate = (others + 1) / (n + 2)
-    if not n * stray_rate ** length < FALSE_ALARM_PROBABILITY:
-        return None
-    shift = int(votes[start])
-    opens_session = start == 0 and length < n
-    return {
-        "frameId": int(frame_ids[start + length] if opens_session else frame_ids[start]),
-        "frames": length,
-        "fromShift": shift if opens_session else int(majority),
-        "toShift": int(majority) if opens_session else shift,
-    }
+    runs = [(int(start), int(length)) for start, length in zip(starts, lengths)
+            if votes[start] != majority]
+    at_an_end = [run for run in runs if run[0] == 0 or run[0] + run[1] == n]
+    interior = [run for run in runs if run not in at_an_end]
+    for candidates, reverts in ((at_an_end, False), (interior, True)):
+        passing = [run for run in candidates
+                   if n * stray_rate ** run[1] < FALSE_ALARM_PROBABILITY]
+        if not passing:
+            continue
+        start, length = max(passing, key=lambda run: run[1])
+        shift = int(votes[start])
+        opens_session = start == 0 and length < n
+        return {
+            "frameId": int(frame_ids[start + length] if opens_session else frame_ids[start]),
+            "frames": length,
+            "fromShift": shift if opens_session else int(majority),
+            "toShift": int(majority) if opens_session else shift,
+            "reverts": reverts,
+        }
+    return None
 
 
 def _slip_reason(slip: dict, majority: int) -> str:
@@ -842,8 +863,14 @@ def choose_pairing(frame_ids, arrival_perf, transition_perf, frame_period: float
     The margin is measured: coverage_factor() standard errors of the median
     lag, which are the NI-to-host fit's residual (ni_residual_rms) and the
     median's own error from the spread of the lags (1.2533, the square root
-    of pi/2, is a median's error over a mean's). A shift that changes partway
-    through (find_slip) is ambiguous too, and is reported where it changes.
+    of pi/2, is a median's error over a mean's). ni_residual_rms is the NI-to-
+    host fit's own, so the RAW bridge's knot smoothing (up to about 50 us) is
+    not in the margin. A shift that changes partway through and does not
+    return (find_slip) is ambiguous too, and is reported where it changes. A
+    run that returns to the majority is frames held back and delivered late (a
+    host stall), which moves arrival and not the exposure, so it stays in
+    Pairing.slip (reverts True) as a diagnostic and does not make the pairing
+    ambiguous. A lost or spurious NI transition never returns.
     """
     frame_ids = numpy.asarray(frame_ids, dtype=numpy.int64)
     arrival = numpy.asarray(arrival_perf, dtype=numpy.float64)
@@ -870,7 +897,7 @@ def choose_pairing(frame_ids, arrival_perf, transition_perf, frame_period: float
     lag_ambiguous = not (margin <= median_lag <= frame_period - margin)
     slip = find_slip(voters, votes, shift)
     problems = []
-    if slip is not None:
+    if slip is not None and not slip["reverts"]:
         problems.append(_slip_reason(slip, shift))
     if lag_ambiguous:
         problems.append(
@@ -919,9 +946,11 @@ def fit_latches(latches, *, clock: str) -> ClockFit:
     """Camera timestamp (s) -> host time on clock ("perf" or "raw"), from the camera clock latches.
 
     A latch says the camera clock read camera_ns somewhere inside the latch's
-    host bracket, which is widened by the host clock's resolution
-    (time.get_clock_info, measured) so that a zero-width bracket still holds
-    it. A straight map must pass through every bracket, and no other test is
+    host bracket, which is widened at each end by a pad so that a zero-width
+    bracket still holds it. The pad is perf_counter's resolution on the host
+    finalizing (time.get_clock_info, measured), whichever clock the brackets
+    are on, so a session finalized on another host is padded by that host's.
+    A straight map must pass through every bracket, and no other test is
     applied. When no line passes through them all, the largest set of latches
     one line passes through is kept (ties: the narrower brackets), and each
     latch left out is in dropped and named in the reason. The set is found
@@ -1012,6 +1041,7 @@ def _largest_consistent_set(x, low, high):
     interval at one x there is no such line, and an interval end inside the
     most intervals stands in for one, of slope 0.
     """
+    # O(n^3) is cheap only because the capture loop caps latches at 6 (CLOCK_LATCHES_PER_MARK).
     count = len(x)
     width = [high[k] - low[k] for k in range(count)]
     lines = []
@@ -1168,7 +1198,9 @@ def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_
     period for the nearest transition to be the right one, and a bias near a
     whole period would pair a frame off with a small residual, so a residual
     over latch_tolerance() (a quarter period, at most 2 ms), or a shift that
-    changes partway through (find_slip), marks the pairing ambiguous. So does a
+    changes partway through (find_slip), marks the pairing ambiguous. Any slip
+    does, one that returns to the majority too: delivery cannot move a
+    hardware timestamp, so no backlog explains it. So does a
     latch map too uncertain to choose a transition by (latch_gate_ok: the map's
     uncertainty plus coverage_factor() times ni_residual_rms, the NI-to-host
     fit's residual, against a quarter period); the shift it found is still
