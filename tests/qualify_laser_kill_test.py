@@ -811,10 +811,10 @@ def test_each_row_line_names_the_victims_pid_and_its_notes(daq, tmp_path, capsys
 def test_a_refused_reopen_is_printed_on_its_row(daq, tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(tool, "reopen", lambda configuration, laser: "DaqError: -50103 reserved")
     log = _log([(100 + i / 100, 2.0 if 100 + i / 100 < 106.7 else 0.0) for i in range(0, 900)])
-    # The only row is the last, and a refusal in the last row stops the run (N2),
-    # after its line has been printed.
-    _matrix(daq, tmp_path, _Process(), log, _Clock(), stops="last row")
+    # The only row is the last, and a refusal there is data like any other.
+    observations = _matrix(daq, tmp_path, _Process(), log, _Clock())
     assert "reopen: DaqError: -50103 reserved" in capsys.readouterr().out
+    assert observations[0].reopen_error == "DaqError: -50103 reserved"
 
 # C3: the failure path.
 
@@ -858,6 +858,8 @@ def test_a_failed_run_recovers_and_names_what_it_cannot_confirm(daq, tmp_path, c
     assert "DID NOT COMPLETE" in text and "NOT CONFIRMED SAFE" in text
     assert "PXI1Slot5/port0/line4" in text and "NOT READABLE by this tool" in text
     assert "0.000 V" in text and "DO NOT RECONNECT" in text
+    # A run stopped early takes this path and not the end-state check too.
+    assert "end-state check" not in text and "end state:" not in text
     # The row that finished is kept, in the file as it ended and in the record.
     rows = [json.loads(line) for line in (args.record_dir / f"laser-kill-{_STAMP}.rows.jsonl").read_text().splitlines()]
     assert [list(r)[0] for r in rows] == ["header", "observation", "recovery"]
@@ -1003,7 +1005,7 @@ def test_a_broken_stdout_does_not_lose_rows_or_the_record(daq, tmp_path, monkeyp
     status, args, _ = _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc,clean-software-pulse")
     assert status == 0
     lines = (args.record_dir / f"laser-kill-{_STAMP}.rows.jsonl").read_text().splitlines()
-    assert len(lines) == 3
+    assert [list(json.loads(line))[0] for line in lines] == ["header", "observation", "observation", "end_state"]
     assert (args.record_dir / f"laser-kill-{_STAMP}.json").exists()
 
 # I6: main past the dry run, with fakes.
@@ -1040,11 +1042,14 @@ def test_execute_runs_the_tracking_check_and_stops(daq, tmp_path, capsys):
     def make(case, level):
         pid = 5000 + int(level)
         return _CuedProcess(pid=pid, ready=f"READY pid={pid} timing=software waveform=dc mode=clean level={level:.4f}")
-    status, args, _ = _execute(daq, tmp_path, make, "--tracking-check",
-                               samples=_samples(lambda t: float(int(t - 100.0))))
+    # A level a second until the last victim has closed (at 104), then the minimum.
+    status, args, _ = _execute(daq, tmp_path, make, "--tracking-check", samples=_samples(_tracked_then_down))
     text = capsys.readouterr().out
     assert status == 0 and "reader (V)" in text and "victim pid 5000" in text
     assert not list(args.record_dir.glob("*.json"))
+
+def _tracked_then_down(t):
+    return float(int(t - 100.0)) if t < 104.2 else 0.0
 
 def test_the_config_is_hashed_before_the_run_not_after(daq, tmp_path):
     original = {}
@@ -1283,6 +1288,7 @@ def test_a_timed_out_reopen_stops_the_run_before_the_next_row(daq, tmp_path, cap
     for needle in _FULL_BANNER:
         assert needle in text, needle
     assert [list(r)[0] for r in _read_jsonl(args)] == ["header", "observation", "recovery"]
+    assert "end-state check" not in text and "end state:" not in text
 
 def test_a_timed_out_reset_stops_the_run_too(daq, tmp_path, capsys, monkeypatch):
     release, spawned = threading.Event(), []
@@ -1307,8 +1313,7 @@ def test_a_victim_still_alive_after_sigkill_stops_the_run_before_the_next_row(da
     assert "still alive after sigkill by pid 4242" in text
 
 def test_a_refusal_in_an_earlier_row_is_still_a_measurement_not_a_reason_to_stop(daq, tmp_path, monkeypatch):
-    # -50103 from the reopen is the table's evidence, not a wedge: the run goes
-    # on. (The same refusal in the LAST row is not confirmed safe: see below.)
+    # -50103 from the reopen is the table's evidence, not a wedge: the run goes on.
     calls, spawned = [], []
     def reopen(configuration, laser):
         calls.append(1)
@@ -1336,6 +1341,8 @@ def test_a_run_whose_last_row_leaves_everything_wedged_exits_1_with_the_banner(d
     assert "reopen: timed out" in text and "still alive after sigkill by pid 4242" in text
     record = json.loads((args.record_dir / f"laser-kill-{_STAMP}.json").read_text())
     assert record["recovery"]["reopen"].startswith("timed out")
+    # A victim is alive, so this run gets the recovery and not the end-state check.
+    assert "end-state check" not in text and "end_state" not in record
 
 def test_a_tracking_victim_that_survives_sigkill_stops_the_check(daq, tmp_path, capsys):
     def make(case, level):
@@ -1454,62 +1461,6 @@ def test_a_stale_close_of_a_refused_open_stops_the_run_before_the_next_row(daq, 
     for needle in _FULL_BANNER:
         assert needle in text, needle
     assert [list(r)[0] for r in _read_jsonl(args)] == ["header", "observation", "recovery"]
-
-# N2: the last row's recovery.
-
-def _run_a_last_row(daq, tmp_path, capsys, monkeypatch, *flags, reopen=None, reset=None,
-                    samples=None, cases="--cases=sigkill-hardware-pulse-r1"):
-    if reopen is not None:
-        monkeypatch.setattr(tool, "reopen", reopen)
-    if reset is not None:
-        monkeypatch.setattr(tool, "reset_device", reset)
-    status, args, _ = _execute(daq, tmp_path, _killable, cases, *flags, samples=samples)
-    return status, args, capsys.readouterr().out
-
-def _refused(configuration, laser):
-    return "DaqError: -50103 reserved"
-
-def test_a_last_row_whose_reopen_was_refused_is_not_confirmed_safe_even_at_0_v(daq, tmp_path, capsys, monkeypatch):
-    # reopen -50103, reset ok, 0 V: held_until_reset. Nothing closed the shutter line.
-    samples = _samples(lambda t: 2.0 if t < 106.7 else 0.0)
-    status, args, text = _run_a_last_row(daq, tmp_path, capsys, monkeypatch, reopen=_refused, samples=samples)
-    assert status == 1
-    assert "RunStopped" in text and "its reopen said: DaqError: -50103" in text
-    for needle in _FULL_BANNER:
-        assert needle in text, needle
-    assert _read_jsonl(args)[-1]["recovery"]["shutter_line"] == "PXI1Slot5/port0/line4"
-
-def test_a_last_row_whose_reopen_and_reset_were_both_refused_with_the_output_up_exits_1(daq, tmp_path, capsys, monkeypatch):
-    status, _, text = _run_a_last_row(
-        daq, tmp_path, capsys, monkeypatch, reopen=_refused,
-        reset=lambda nidaqmx, device: "DaqError: reset refused", samples=_high())
-    assert status == 1
-    assert "its reopen said" in text and "ABOVE THE MINIMUM" in text and "DO NOT RECONNECT" in text
-
-def test_a_last_row_with_both_recoveries_ok_but_the_output_still_up_exits_1(daq, tmp_path, capsys, monkeypatch):
-    status, _, text = _run_a_last_row(daq, tmp_path, capsys, monkeypatch, samples=_high())
-    assert status == 1
-    assert "the output read 2.000 V after it" in text
-    for needle in _FULL_BANNER:
-        assert needle in text, needle
-
-def test_a_last_row_run_with_both_recoveries_skipped_and_the_output_up_exits_1(daq, tmp_path, capsys, monkeypatch):
-    status, _, text = _run_a_last_row(
-        daq, tmp_path, capsys, monkeypatch, "--skip-reopen", "--skip-reset", samples=_high())
-    assert status == 1 and "the output read 2.000 V after it" in text
-
-def test_a_last_row_that_the_reader_never_saw_is_not_confirmed_either(daq, tmp_path, capsys, monkeypatch):
-    status, _, text = _run_a_last_row(daq, tmp_path, capsys, monkeypatch, samples=[])
-    assert status == 1 and "the reader saw nothing after it" in text and "NO READING" in text
-
-def test_a_last_row_with_a_clean_recovery_at_the_minimum_still_exits_0(daq, tmp_path, capsys, monkeypatch):
-    status, _, text = _run_a_last_row(daq, tmp_path, capsys, monkeypatch)
-    assert status == 0 and "DO NOT RECONNECT" not in text
-
-def test_a_last_row_the_controller_refused_by_design_is_not_held_to_it(daq, tmp_path, capsys, monkeypatch):
-    status, _, text = _run_a_last_row(
-        daq, tmp_path, capsys, monkeypatch, cases="--cases=clean-software-pulse", samples=_high())
-    assert status == 0 and "DO NOT RECONNECT" not in text
 
 # a. no abbreviations
 
@@ -1650,14 +1601,6 @@ def test_a_failed_tracking_check_writes_its_banner_content_to_disk(daq, tmp_path
     assert "still alive after sigkill" in recovery["reason"]
     assert recovery["shutter_line"] == "PXI1Slot5/port0/line4" and recovery["reopen"] == "ok"
 
-def test_a_tracking_check_that_finished_writes_no_file(daq, tmp_path, capsys):
-    def make(case, level):
-        pid = 5000 + int(level)
-        return _CuedProcess(pid=pid, ready=f"READY pid={pid} timing=software waveform=dc mode=clean level={level:.4f}")
-    status, args, _ = _execute(daq, tmp_path, make, "--tracking-check",
-                               samples=_samples(lambda t: float(int(t - 100.0))))
-    assert status == 0 and not list(args.record_dir.glob("*.jsonl"))
-
 def test_a_signal_while_a_row_waits_on_its_reopen_leaves_that_call_named_in_the_banner(daq, tmp_path, capsys, monkeypatch, gate):
     # The first signal lands while main waits in bounded() on the row's own
     # reopen, which goes on in the driver. The recovery's calls would collide
@@ -1677,3 +1620,427 @@ def test_a_signal_while_a_row_waits_on_its_reopen_leaves_that_call_named_in_the_
     assert reader.by_pid[4242].signals == [signal.SIGKILL] and not reader.by_pid[4242].alive
     outstanding = _read_jsonl(args)[-1]["recovery"]["outstanding"]
     assert [(o["call"], o["finished"]) for o in outstanding] == [("the reopen call", False)]
+
+
+# ---------------------------------------------------------------------------
+# Fix round 4: a run is judged by its end state, not by its last row. A row's
+# refusal is data on any row; what decides the status is one more reopen, reset
+# and reading, made when every row has run and no victim is alive.
+
+_REFUSED = "DaqError: -50103 reserved"
+_END_STATE_OK = "end state: reopen ok, reset of PXI1Slot4 ok, command output on PXI1Slot5/ai3 0.000 V"
+
+def _answering(*answers):
+    """A reopen or reset that answers in turn: the row's call, then the end-state check's."""
+    remaining = list(answers)
+    def call(*_args):
+        return remaining.pop(0)
+    call.remaining = remaining
+    return call
+
+def _record(args):
+    return json.loads((args.record_dir / f"laser-kill-{_STAMP}.json").read_text())
+
+def _keys(args):
+    return [list(line)[0] for line in _read_jsonl(args)]
+
+def _table_row(text, case_id):
+    return next(line for line in text.splitlines() if line.startswith(f"| {case_id} "))
+
+def _run_a_last_row(daq, tmp_path, capsys, monkeypatch, *flags, reopen=None, reset=None,
+                    samples=None, cases="--cases=sigkill-hardware-pulse-r1"):
+    if reopen is not None:
+        monkeypatch.setattr(tool, "reopen", reopen)
+    if reset is not None:
+        monkeypatch.setattr(tool, "reset_device", reset)
+    status, args, _ = _execute(daq, tmp_path, _killable, cases, *flags, samples=samples)
+    return status, args, capsys.readouterr().out
+
+class _Rig:
+    """The fakes' output, clock and reader in one, so what is read is what was done.
+
+    Time passes only in sleep(), which logs the output as it goes by. A victim
+    drives the level from the moment it exists. While one is alive a reopen is
+    refused with -50103 (it holds the lines); once none is, the reopen writes the
+    minimum. A reset always does.
+    """
+    def __init__(self):
+        self.t, self.volts, self.log = 100.0, 0.0, None
+        self.victims, self.calls = [], []
+
+    def now(self):
+        return self.t
+
+    def sleep(self, seconds):
+        end = self.t + seconds
+        while self.t < end - 1e-9:
+            self.t += tool.CHUNK_S
+            self.log.append(LevelSample(self.t, self.volts, self.volts, self.volts))
+
+    def __call__(self, nidaqmx, channel, terminal, log, stop):
+        self.log = log
+        thread = threading.Thread(target=stop.wait, daemon=True)
+        thread.start()
+        return thread
+
+    def alive(self):
+        return tuple(victim.case.case_id for victim in self.victims if victim.alive)
+
+    def spawn(self, case, level):
+        pid = 6000 + len(self.victims)
+        if case.refusal:
+            victim = _Process(pid=pid, ready=f"REFUSED {case.refusal}", alive=False, returncode=2)
+            victim.case = case
+        else:
+            victim = _RigVictim(self, case, pid)
+        self.victims.append(victim)
+        return victim
+
+    def reopen(self, configuration, laser):
+        self.calls.append(("reopen", self.alive()))
+        if self.alive():
+            return _REFUSED
+        self.volts = 0.0
+
+    def reset(self, nidaqmx, device):
+        self.calls.append(("reset", self.alive()))
+        self.volts = 0.0
+
+class _RigVictim(_Process):
+    """A row's victim: it holds the output until it dies, and dies as its mode says."""
+    def __init__(self, rig, case, pid):
+        super().__init__(pid=pid, ready=f"READY pid={pid} timing={case.timing} waveform={case.waveform} mode={case.mode} level=2.0000")
+        self.rig, self.case = rig, case
+        rig.volts = 2.0
+
+    def kill_by(self, pid, sig):
+        super().kill_by(pid, sig)
+        if sig == signal.SIGUSR1 and self.case.mode != "hang":
+            self.alive = False
+            self.returncode = {"clean": 0, "exception": 1, "abort": -int(signal.SIGABRT)}[self.case.mode]
+            if self.case.mode == "clean":
+                self.rig.volts = 0.0
+
+def _on_the_rig(monkeypatch):
+    rig = _Rig()
+    monkeypatch.setattr(tool, "reopen", rig.reopen)
+    monkeypatch.setattr(tool, "reset_device", rig.reset)
+    return rig
+
+# The healthy full run, which is what round 3's last-row rule got wrong.
+
+def test_a_full_run_whose_last_row_was_refused_in_the_row_ends_status_0_with_no_banner(daq, tmp_path, capsys, monkeypatch):
+    rig = _on_the_rig(monkeypatch)
+    status, args, _ = _execute(daq, tmp_path, rig.spawn, reader=rig, clock=rig)
+    text = capsys.readouterr().out
+    # The premise: the matrix's own order ends on a hang row, whose victim is
+    # alive through its row's reopen.
+    cases = tool.kill_cases(pulse_repeats=3)
+    assert [victim.case for victim in rig.victims] == list(cases) and len(cases) == 31
+    assert cases[-1].case_id == "hang-hardware-pulse-r3"
+    assert status == 0
+    for needle in ("!!!", "DID NOT COMPLETE", "NOT CONFIRMED SAFE", "DO NOT RECONNECT", "RunStopped"):
+        assert needle not in text, needle
+    # The refusal is the table's evidence, on that row.
+    last_row = _table_row(text, "hang-hardware-pulse-r3")
+    assert f"| 2.000 ({_REFUSED}) | 0.000 |" in last_row and "held_until_reset" in last_row
+    assert f"reopen: {_REFUSED}" in text
+    assert "verdicts: held_until_reopen 20, held_until_reset 5, refused_by_design 1, safe_on_death 5" in text
+    assert _END_STATE_OK in text
+    rows = _read_jsonl(args)
+    assert _keys(args) == ["header"] + ["observation"] * 31 + ["end_state"]
+    assert rows[-1]["end_state"]["confirmed"] is True and rows[-1]["end_state"]["reason"] is None
+    record = _record(args)
+    assert record["end_state"]["reopen"] == "ok" and record["end_state"]["reset"] == "ok"
+    assert record["end_state"]["volts"] == pytest.approx(0.0) and "recovery" not in record
+
+def test_the_end_state_check_runs_after_the_last_victim_has_ended(daq, tmp_path, capsys, monkeypatch):
+    rig = _on_the_rig(monkeypatch)
+    status, _, _ = _execute(daq, tmp_path, rig.spawn, "--cases=hang-software-dc,hang-hardware-pulse-r3",
+                            reader=rig, clock=rig)
+    assert status == 0
+    assert rig.calls == [
+        ("reopen", ("hang-software-dc",)), ("reset", ("hang-software-dc",)),
+        ("reopen", ("hang-hardware-pulse-r3",)), ("reset", ("hang-hardware-pulse-r3",)),
+        ("reopen", ()), ("reset", ()),                      # no victim alive, reopen first
+    ]
+    assert [victim.signals for victim in rig.victims] == [[signal.SIGUSR1, signal.SIGKILL]] * 2
+
+def test_the_end_state_reading_comes_after_the_settle_that_follows_both_calls(daq, tmp_path, capsys, monkeypatch):
+    # Up until the check's reset, then down: only a reading taken after it shows that.
+    rig = _on_the_rig(monkeypatch)
+    real_reset, resets = rig.reset, []
+    def reset(nidaqmx, device):
+        resets.append(rig.t)
+        if len(resets) == 1:
+            rig.calls.append(("reset", rig.alive()))     # the row's reset does nothing here
+        else:
+            real_reset(nidaqmx, device)
+    def reopen(configuration, laser):
+        rig.calls.append(("reopen", rig.alive()))        # nor does either reopen
+    monkeypatch.setattr(tool, "reset_device", reset)
+    monkeypatch.setattr(tool, "reopen", reopen)
+    status, args, _ = _execute(daq, tmp_path, rig.spawn, "--cases=sigkill-software-dc", reader=rig, clock=rig)
+    assert status == 0 and _read_jsonl(args)[-1]["end_state"]["volts"] == pytest.approx(0.0)
+    assert rig.t == pytest.approx(resets[-1] + tool.RECOVERY_SETTLE_S)
+
+# The three rows of the last-row rule: the row's cells say what the row saw, and
+# the status belongs to the end-state check alone.
+
+@pytest.mark.parametrize("row_reopen, row_reset, drop_at, cells, verdict", [
+    (_REFUSED, None, 106.7, f"| 2.000 ({_REFUSED}) | 0.000 | signal 9 |", "held_until_reset"),
+    (_REFUSED, "DaqError: reset refused", 107.2,
+     f"| 2.000 ({_REFUSED}) | 2.000 (DaqError: reset refused) | signal 9 |", "held_through_reset"),
+    (None, None, 107.2, "| 2.000 | 2.000 | signal 9 |", "held_through_reset"),
+])
+@pytest.mark.parametrize("end_state_reopen, expected_status", [(None, 0), (_REFUSED, 1)])
+def test_a_last_rows_cells_show_what_it_saw_and_the_end_state_check_decides_the_status(
+        daq, tmp_path, capsys, monkeypatch, row_reopen, row_reset, drop_at, cells, verdict,
+        end_state_reopen, expected_status):
+    reopen, reset = _answering(row_reopen, end_state_reopen), _answering(row_reset, None)
+    status, args, text = _run_a_last_row(
+        daq, tmp_path, capsys, monkeypatch, reopen=reopen, reset=reset,
+        samples=_samples(lambda t: 2.0 if t < drop_at else 0.0))
+    row = _table_row(text, "sigkill-hardware-pulse-r1")
+    assert cells in row and verdict in row
+    assert status == expected_status
+    assert ("DO NOT RECONNECT" in text) == bool(expected_status)
+    assert (_END_STATE_OK in text) == (not expected_status)
+    assert reopen.remaining == [] and reset.remaining == []     # one check: a call each, no more
+
+# An end state that is not confirmed: status 1 and the banner, whatever the rows did.
+
+@pytest.mark.parametrize("reopen_answers, reset_answers, samples, says", [
+    ([None, _REFUSED], [None, None], _samples(_held_until_the_reopen),
+     [f"reopen: {_REFUSED}", f"its reopen said: {_REFUSED}"]),
+    ([None, None], [None, "DaqError: reset refused"], _samples(_held_until_the_reopen),
+     ["reset of PXI1Slot4: DaqError: reset refused", "its reset said: DaqError: reset refused"]),
+    ([None, None], [None, None], _high(),
+     ["2.000 V", "ABOVE THE MINIMUM", "the output reads 2.000 V, not its minimum of 0 V"]),
+    # The samples stop just before the check's reading, at 107.5.
+    ([None, None], [None, None], _samples(_held_until_the_reopen, count=740),
+     ["NO READING", "the reader has no reading"]),
+], ids=["reopen-refused", "reset-refused", "reading-high", "no-reading"])
+def test_an_end_state_not_confirmed_is_status_1_and_the_banner(
+        daq, tmp_path, capsys, monkeypatch, reopen_answers, reset_answers, samples, says):
+    reopen, reset = _answering(*reopen_answers), _answering(*reset_answers)
+    status, args, text = _run_a_last_row(
+        daq, tmp_path, capsys, monkeypatch, reopen=reopen, reset=reset, samples=samples)
+    assert status == 1
+    for needle in _FULL_BANNER + tuple(says) + ("every row ran",):
+        assert needle in text, needle
+    assert "end state: reopen" not in text
+    # One check: its calls are not made a second time by the failure path.
+    assert reopen.remaining == [] and reset.remaining == [] and "RunStopped" not in text
+    assert _keys(args) == ["header", "observation", "end_state"]
+    end_state = _read_jsonl(args)[-1]["end_state"]
+    assert end_state["confirmed"] is False and end_state["shutter_line"] == "PXI1Slot5/port0/line4"
+    record = _record(args)
+    assert record["end_state"]["confirmed"] is False and "recovery" not in record
+
+@pytest.mark.parametrize("volts, expected_status, flag", [
+    (0.04, 0, None), (-0.04, 0, None), (0.06, 1, "ABOVE THE MINIMUM"), (-1.0, 1, "BELOW THE MINIMUM"),
+])
+def test_at_the_minimum_means_within_the_judges_tolerance_on_either_side(
+        daq, tmp_path, capsys, monkeypatch, volts, expected_status, flag):
+    samples = _samples(lambda t: 2.0 if t < 107.2 else volts)
+    status, _, text = _run_a_last_row(daq, tmp_path, capsys, monkeypatch, samples=samples)
+    assert status == expected_status
+    assert ("DO NOT RECONNECT" in text) == bool(expected_status)
+    if flag:
+        assert flag in text
+
+def test_a_clean_end_state_says_so_on_one_plain_line(daq, tmp_path, capsys, monkeypatch):
+    status, args, text = _run_a_last_row(daq, tmp_path, capsys, monkeypatch)
+    assert status == 0 and _END_STATE_OK in text and "!!!" not in text
+    assert "its minimum" in next(line for line in text.splitlines() if line.startswith("end state:"))
+
+def test_a_run_ending_on_a_row_refused_by_design_is_checked_like_any_other(daq, tmp_path, capsys, monkeypatch):
+    status, _, text = _run_a_last_row(daq, tmp_path, capsys, monkeypatch, cases="--cases=clean-software-pulse",
+                                      samples=_samples(lambda t: 0.0))
+    assert status == 0 and _END_STATE_OK in text
+    assert daq.writes_to("PXI1Slot4/ao0") == [0.0, 0.0] and daq.resets == ["PXI1Slot4"]
+
+def test_a_run_ending_on_a_row_refused_by_design_with_the_output_up_is_not_confirmed(daq, tmp_path, capsys, monkeypatch):
+    status, _, text = _run_a_last_row(daq, tmp_path, capsys, monkeypatch, cases="--cases=clean-software-pulse",
+                                      samples=_high())
+    assert status == 1 and "ABOVE THE MINIMUM" in text and "DO NOT RECONNECT" in text
+
+# Wedges, and a run stopped before the check.
+
+def test_a_wedge_in_the_middle_of_a_run_stops_before_the_next_row_and_no_check_follows(daq, tmp_path, capsys, monkeypatch):
+    release, calls, spawned = threading.Event(), [], []
+    def reopen(configuration, laser):
+        calls.append(1)
+        if len(calls) == 2:
+            release.wait(5.0)                  # the second row's: stale, still running
+    monkeypatch.setattr(tool, "reopen", reopen)
+    monkeypatch.setattr(tool, "RECOVERY_TIMEOUT_S", 0.05)
+    def make(case, level):
+        spawned.append(case.case_id)
+        return _killable(case, level)
+    status, args, _ = _execute(daq, tmp_path, make, "--cases=sigkill-software-dc,abort-software-dc,hang-software-dc")
+    release.set()
+    text = capsys.readouterr().out
+    assert status == 1 and spawned == ["sigkill-software-dc", "abort-software-dc"]
+    assert len(calls) == 3                     # row 1's, row 2's, the recovery's: no check's
+    assert "end-state check" not in text and "end state:" not in text
+    for needle in _FULL_BANNER:
+        assert needle in text, needle
+    assert _keys(args) == ["header", "observation", "observation", "recovery"]
+
+@pytest.mark.parametrize("wedged", ["reopen", "reset"])
+def test_a_wedged_end_state_call_stops_as_a_wedged_row_does(daq, tmp_path, capsys, monkeypatch, wedged):
+    release, calls = threading.Event(), []
+    def on_the_second_call_never_returns(*_args):
+        calls.append(1)
+        if len(calls) == 2:
+            release.wait(5.0)
+    monkeypatch.setattr(tool, "reopen" if wedged == "reopen" else "reset_device", on_the_second_call_never_returns)
+    monkeypatch.setattr(tool, "RECOVERY_TIMEOUT_S", 0.05)
+    status, args, _ = _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc")
+    release.set()
+    text = capsys.readouterr().out
+    assert status == 1 and "RunStopped" in text and f"the {wedged} timed out" in text
+    assert len(calls) == 3                     # the row's, the check's, the recovery's
+    assert f"the {wedged} call is STILL RUNNING after" in text
+    assert text.count("DID NOT COMPLETE") == 1  # the recovery's banner, once
+    for needle in _FULL_BANNER:
+        assert needle in text, needle
+    assert _keys(args) == ["header", "observation", "end_state", "recovery"]
+    end_state = _read_jsonl(args)[2]["end_state"]
+    assert end_state["confirmed"] is False and end_state[wedged].startswith("timed out")
+    record = _record(args)
+    assert record["end_state"]["confirmed"] is False and "reopen" in record["recovery"]
+
+def test_an_end_state_wedge_is_known_by_its_type_not_its_wording(daq, tmp_path, capsys, monkeypatch):
+    still_closing = tool.WedgedText("LaserControllerStillClosing: its close is still running in the driver")
+    monkeypatch.setattr(tool, "reopen", _answering(None, still_closing, None))
+    status, args, _ = _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc")
+    text = capsys.readouterr().out
+    assert status == 1 and "RunStopped" in text and "LaserControllerStillClosing" in text
+    assert _keys(args) == ["header", "observation", "end_state", "recovery"]
+
+def test_a_check_that_fails_outright_goes_down_the_failure_path_not_to_status_0(daq, tmp_path, capsys, monkeypatch):
+    def broken(**_kwargs):
+        raise RuntimeError("the check's own bug")
+    monkeypatch.setattr(tool, "check_end_state", broken)
+    status, args, _ = _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc")
+    text = capsys.readouterr().out
+    assert status == 1 and "the check's own bug" in text
+    for needle in _FULL_BANNER:
+        assert needle in text, needle
+    assert _keys(args) == ["header", "observation", "recovery"]
+
+def test_a_signal_during_the_end_state_check_is_held_and_the_check_finishes(daq, tmp_path, capsys, monkeypatch, gate):
+    calls = []
+    def reopen(configuration, laser):
+        calls.append(1)
+        if len(calls) == 2:
+            _signal_me(gate, signal.SIGTERM)   # lands on main, waiting in bounded()
+            time.sleep(0.2)
+    monkeypatch.setattr(tool, "reopen", reopen)
+    status, args, _ = _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc", interrupts=gate)
+    text = capsys.readouterr().out
+    assert status == 0 and _END_STATE_OK in text and "DID NOT COMPLETE" not in text
+    assert gate.raised == [] and gate.pending == [signal.SIGTERM] and len(calls) == 2
+    assert "held until everything above was complete" in text
+    assert _read_jsonl(args)[-1]["end_state"]["signals_held"] == {"count": 1, "by_signal": {"SIGTERM": 1}}
+
+# --skip-reopen and --skip-reset skip those parts of the check too. The reader is
+# what confirms the output, so a run that skipped them is status 0 only if it
+# reads the minimum; and --skip-reopen always ends with the shutter warning.
+
+def _counting(calls, name):
+    def call(*_args):
+        calls.append(name)
+    return call
+
+@pytest.mark.parametrize("flags, expected_calls, parts, warned", [
+    (["--skip-reopen"], ["reset", "reset"],
+     ["reopen skipped (--skip-reopen)", "reset of PXI1Slot4 ok"], True),
+    (["--skip-reset"], ["reopen", "reopen"],
+     ["reopen ok", "reset of PXI1Slot4 skipped (--skip-reset)"], False),
+    (["--skip-reopen", "--skip-reset"], [],
+     ["reopen skipped (--skip-reopen)", "reset of PXI1Slot4 skipped (--skip-reset)"], True),
+])
+def test_a_skipped_part_is_skipped_in_the_end_state_check_and_a_reading_at_the_minimum_is_status_0(
+        daq, tmp_path, capsys, monkeypatch, flags, expected_calls, parts, warned):
+    calls = []
+    monkeypatch.setattr(tool, "reopen", _counting(calls, "reopen"))
+    monkeypatch.setattr(tool, "reset_device", _counting(calls, "reset"))
+    status, args, _ = _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc", *flags,
+                               samples=_samples(lambda t: 2.0 if t < 105.0 else 0.0))
+    text = capsys.readouterr().out
+    assert status == 0 and "DID NOT COMPLETE" not in text
+    line = next(line for line in text.splitlines() if line.startswith("end state:"))
+    for part in parts:
+        assert part in line
+    assert "0.000 V" in line
+    assert calls == expected_calls             # one in the row and one in the check, of what is not skipped
+    assert ("nothing in it closed the shutter line" in text) == warned
+    assert ("DO NOT RECONNECT" in text) == warned
+    assert _read_jsonl(args)[-1]["end_state"]["confirmed"] is True
+
+@pytest.mark.parametrize("samples, says", [(_high(), "ABOVE THE MINIMUM"), ([], "NO READING")], ids=["high", "none"])
+@pytest.mark.parametrize("flags", [["--skip-reopen"], ["--skip-reopen", "--skip-reset"]])
+def test_a_run_that_skipped_the_reopen_is_not_status_0_unless_the_reading_is_at_the_minimum(
+        daq, tmp_path, capsys, monkeypatch, flags, samples, says):
+    calls = []
+    monkeypatch.setattr(tool, "reopen", _counting(calls, "reopen"))
+    monkeypatch.setattr(tool, "reset_device", _counting(calls, "reset"))
+    status, args, _ = _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc", *flags, samples=samples)
+    text = capsys.readouterr().out
+    assert status == 1 and says in text and "NOT CONFIRMED SAFE" in text and "DO NOT RECONNECT" in text
+    assert "reopen: skipped (--skip-reopen)" in text
+    assert "nothing in it closed the shutter line" in text      # the warning, after the banner
+    assert "reopen" not in calls                                # the flag holds here too
+    assert _keys(args) == ["header", "observation", "end_state"]
+    assert _read_jsonl(args)[-1]["end_state"]["reopen"] == "skipped (--skip-reopen)"
+
+def test_a_refused_reset_is_not_excused_by_skipping_the_reopen(daq, tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(tool, "reset_device", _answering(None, "DaqError: reset refused"))
+    status, _, _ = _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc", "--skip-reopen",
+                            samples=_samples(lambda t: 2.0 if t < 105.0 else 0.0))
+    text = capsys.readouterr().out
+    assert status == 1 and "reset of PXI1Slot4: DaqError: reset refused" in text
+
+# The tracking check is a run too: its last victim commanded 4 V.
+
+def _tracking_victim(case, level):
+    pid = 5000 + int(level)
+    return _CuedProcess(pid=pid, ready=f"READY pid={pid} timing=software waveform=dc mode=clean level={level:.4f}")
+
+def _tracking_lines(args):
+    path = args.record_dir / f"laser-kill-{_STAMP}.tracking.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+def test_a_tracking_check_ends_with_the_end_state_check_and_writes_it(daq, tmp_path, capsys, monkeypatch):
+    victims, alive_at_reopen = [], []
+    real_reopen = tool.reopen
+    def make(case, level):
+        victims.append(_tracking_victim(case, level))
+        return victims[-1]
+    def reopen(configuration, laser):
+        alive_at_reopen.append([victim.alive for victim in victims])
+        return real_reopen(configuration, laser)
+    monkeypatch.setattr(tool, "reopen", reopen)
+    status, args, _ = _execute(daq, tmp_path, make, "--tracking-check", samples=_samples(_tracked_then_down))
+    text = capsys.readouterr().out
+    assert status == 0 and _END_STATE_OK in text and "!!!" not in text
+    assert alive_at_reopen == [[False] * 4] and daq.resets == ["PXI1Slot4"]
+    lines = _tracking_lines(args)
+    assert [list(line)[0] for line in lines] == ["header", "end_state"]
+    assert lines[1]["end_state"]["confirmed"] is True
+    assert not list(args.record_dir.glob("*.rows.jsonl")) and not list(args.record_dir.glob("*.json"))
+
+def test_a_tracking_check_that_leaves_the_output_up_is_status_1_and_the_banner(daq, tmp_path, capsys):
+    status, args, _ = _execute(daq, tmp_path, _tracking_victim, "--tracking-check", samples=_samples(lambda t: 4.0))
+    text = capsys.readouterr().out
+    assert status == 1
+    for needle in _FULL_BANNER + ("4.000 V", "ABOVE THE MINIMUM"):
+        assert needle in text, needle
+    assert _tracking_lines(args)[-1]["end_state"]["confirmed"] is False
+
+def test_the_preconditions_say_the_check_at_the_end_of_a_run_rewrites_the_outputs_too():
+    assert "the check at the end of every run" in tool.preconditions(1, "PXI1Slot4")
