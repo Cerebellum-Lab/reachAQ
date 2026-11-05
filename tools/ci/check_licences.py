@@ -1,12 +1,20 @@
-"""Fail CI when an installed dependency carries an AGPL or GPL licence.
+"""Fail CI when an installed dependency carries an AGPL or GPL licence, or none we can identify.
 
 Reads the licence metadata of every distribution installed in the current
 environment (standard library only, so it runs before or after the project is
-installed) and compares the AGPL/GPL ones against an allowlist of known,
-scheduled-for-removal exceptions. The allowlist may only shrink: an entry that
-no longer matches an installed AGPL/GPL distribution is stale and also fails
-the check. LGPL is allowed. Distributions whose licence cannot be identified
-are reported but do not fail the check.
+installed) and fails on two kinds of distribution unless an allowlist names them
+with a reason:
+
+- AGPL and GPL distributions: the known, scheduled-for-removal exceptions.
+- Distributions whose licence cannot be identified, classified "unknown" (the
+  metadata names something unrecognised) or "none" (it names nothing). A
+  dependency with no licence metadata cannot pass silently; an entry says why
+  it is tolerated.
+
+The allowlist may only shrink: an entry that no installed AGPL/GPL or
+unidentified distribution matches is stale and also fails the check. That
+covers a package that is gone, and one whose metadata now names a licence that
+needs no exception, as an LGPL or permissive licence does. LGPL is allowed.
 
 Licence expressions are not parsed. Classification is first-match in the order
 AGPL, then LGPL, then GPL, so an expression such as "LGPL-2.1-only AND
@@ -147,22 +155,23 @@ def load_allowlist(text: str) -> dict[str, str]:
 
 @dataclass
 class Evaluation:
-    violations: list[DistLicence]
-    stale: list[str]
-    unknown: list[DistLicence]
+    violations: list[DistLicence]  # AGPL/GPL, not on the allowlist
+    unidentified: list[DistLicence]  # licence unknown or missing, not on the allowlist
+    stale: list[str]  # allowlist entries matching no installed AGPL/GPL or unidentified package
 
     @property
     def ok(self) -> bool:
-        return not self.violations and not self.stale
+        return not self.violations and not self.unidentified and not self.stale
 
 
 def evaluate(dists: list[DistLicence], allowlist: dict[str, str]) -> Evaluation:
     needing = [d for d in dists if d.flag in _FLAGS_NEEDING_ALLOWLIST]
-    needing_names = {d.name for d in needing}
+    unidentified = [d for d in dists if d.flag in _FLAGS_UNIDENTIFIED]
+    matched_names = {d.name for d in needing + unidentified}
     return Evaluation(
         violations=[d for d in needing if d.name not in allowlist],
-        stale=sorted(name for name in allowlist if name not in needing_names),
-        unknown=[d for d in dists if d.flag in _FLAGS_UNIDENTIFIED],
+        unidentified=[d for d in unidentified if d.name not in allowlist],
+        stale=sorted(name for name in allowlist if name not in matched_names),
     )
 
 
@@ -183,24 +192,31 @@ def _table(dists: list[DistLicence]) -> list[str]:
 
 def render_markdown(ev: Evaluation, dists: list[DistLicence]) -> str:
     allowed = [d for d in dists if d.flag in _FLAGS_NEEDING_ALLOWLIST and d not in ev.violations]
+    allowed_unidentified = [d for d in dists if d.flag in _FLAGS_UNIDENTIFIED and d not in ev.unidentified]
     lines = [
         f"## Licence check: {'PASS' if ev.ok else 'FAIL'}",
         "",
-        f"checked: {len(dists)} | violations: {len(ev.violations)} | "
-        f"stale allowlist entries: {len(ev.stale)} | unknown: {len(ev.unknown)}",
+        f"checked: {len(dists)} | violations: {len(ev.violations)} | unidentified: {len(ev.unidentified)} | "
+        f"stale allowlist entries: {len(ev.stale)} | allowlisted: {len(allowed) + len(allowed_unidentified)}",
     ]
     if ev.violations:
         lines += ["", "### AGPL/GPL packages not on the allowlist", ""] + _table(ev.violations)
+    if ev.unidentified:
+        lines += [
+            "",
+            "### Licence not identified and not on the allowlist (fix its metadata or allowlist it with a reason)",
+            "",
+        ] + _table(ev.unidentified)
     if ev.stale:
         lines += [
             "",
-            "### Stale allowlist entries (no installed AGPL/GPL package matches; remove them)",
+            "### Stale allowlist entries (no installed AGPL/GPL or unidentified package matches; remove them)",
             "",
         ] + [f"- {name}" for name in ev.stale]
     if allowed:
         lines += ["", "### Allowlisted AGPL/GPL packages still installed", ""] + _table(allowed)
-    if ev.unknown:
-        lines += ["", "### Licence not identified (reported, not failed)", ""] + _table(ev.unknown)
+    if allowed_unidentified:
+        lines += ["", "### Allowlisted packages with no identifiable licence", ""] + _table(allowed_unidentified)
     return "\n".join(lines) + "\n"
 
 
