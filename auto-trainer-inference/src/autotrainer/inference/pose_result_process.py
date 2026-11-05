@@ -79,16 +79,42 @@ def _close_fhs(cams_frame_idx_fhs: Optional[List[Optional[TextIO]]]):
 #
 
 def split_pose_item(item):
-    """(pose, mode, frame indices, latency) from one data-queue item.
+    """(pose, mode, frame indices, latency, frame exposure times) from one data-queue item.
 
-    The pose process sends a fourth element with the batch's latency stamps;
-    the end-of-offline marker and older producers send three.
+    The pose process sends five elements: the batch's latency stamps, then
+    each live frame's exposure time. The end-of-offline marker and older
+    producers send three; a producer from before the exposure times sends
+    four, which is the latency only.
     """
-    if len(item) == 3:
-        pose_data, mode, frames_indices = item
-        return pose_data, mode, frames_indices, None
-    pose_data, mode, frames_indices, latency = item
-    return pose_data, mode, frames_indices, latency
+    pose_data, mode, frames_indices, *rest = item
+    latency = rest[0] if len(rest) > 0 else None
+    frames_perf = rest[1] if len(rest) > 1 else None
+    return pose_data, mode, frames_indices, latency, frames_perf
+
+
+def live_source_frames(frames_indices, frames_perf):
+    """(source frame ids, source frame exposure times) for the live workers.
+
+    A padded slot has a negative id and no frame, so its time is dropped with
+    it and the two tuples stay parallel. ``frames_perf`` is None from a
+    producer that sends no exposure times; the times are then empty, not
+    invented.
+    """
+    source_frame_ids = tuple(
+        tuple(int(frame_id) for frame_id in cam_frame_ids if frame_id >= 0)
+        for cam_frame_ids in frames_indices
+    )
+    if frames_perf is None:
+        return source_frame_ids, ()
+    source_frame_perf_times = tuple(
+        tuple(
+            float(frame_perf)
+            for frame_id, frame_perf in zip(cam_frame_ids, cam_frames_perf)
+            if frame_id >= 0
+        )
+        for cam_frame_ids, cam_frames_perf in zip(frames_indices, frames_perf)
+    )
+    return source_frame_ids, source_frame_perf_times
 
 
 def _finish_latency_writer(writer):
@@ -502,12 +528,12 @@ class InferenceMonitorDataProc(multiprocessing.Process):
             else:
                 cur_qsize = 0
 
-            next_pose_data = next_mode = next_frames_indices = next_latency = None
+            next_pose_data = next_mode = next_frames_indices = next_latency = next_frames_perf = None
 
             while self._is_running:
                 if prev_pose_data is None:
                     try:
-                        next_pose_data, next_mode, next_frames_indices, next_latency = split_pose_item(
+                        next_pose_data, next_mode, next_frames_indices, next_latency, next_frames_perf = split_pose_item(
                             self._data_queue.get_nowait())
                     except queue.Empty:
                         if tot_flushed > 0:
@@ -516,7 +542,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                             break
                         raise  # nothing we can do, so re-raise to caller
                 else:
-                    next_pose_data, next_mode, next_frames_indices, next_latency = split_pose_item(
+                    next_pose_data, next_mode, next_frames_indices, next_latency, next_frames_perf = split_pose_item(
                         self._data_queue.get(timeout=timeout))
                     break
                 if (
@@ -536,7 +562,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                                cur_qsize, tot_flushed)
                 nonlocal skip_next_pose_data
                 skip_next_pose_data = 0
-            return next_pose_data, next_mode, next_frames_indices, next_latency
+            return next_pose_data, next_mode, next_frames_indices, next_latency, next_frames_perf
 
         def live_old_worker_give_up(w: LivePoseResultProcessWorker):
             if not w.is_alive():
@@ -589,7 +615,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
             prev_mode = next_prev_mode  # don't forget
 
             try:
-                (pose_data, mode, frames_indices, pose_latency_item) = get_next_pose_data()
+                (pose_data, mode, frames_indices, pose_latency_item, frames_perf) = get_next_pose_data()
             except queue.Empty:
                 continue
             monitor_recv_perf = time.perf_counter()
@@ -824,13 +850,12 @@ class InferenceMonitorDataProc(multiprocessing.Process):
 
                     if len(live_pose_workers) > 0:
                         try:
-                            source_frame_ids = tuple(
-                                tuple(int(frame_id) for frame_id in cam_frame_ids if frame_id >= 0)
-                                for cam_frame_ids in frames_indices
-                            )
+                            source_frame_ids, source_frame_perf_times = live_source_frames(
+                                frames_indices, frames_perf)
                             live_put_perf = time.perf_counter()
                             self._live_input_q.put(
-                                (pose_data, live_pose_sequence, source_frame_ids),
+                                (pose_data, live_pose_sequence, source_frame_ids,
+                                 source_frame_perf_times),
                                 block=False,
                             )
                         except queue.Full:

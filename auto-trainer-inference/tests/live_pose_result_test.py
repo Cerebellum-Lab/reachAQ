@@ -21,7 +21,7 @@ from autotrainer.inference import (
     PoseResponse,
     pose_result_process,
 )
-from autotrainer.inference.pose_result_process import InferenceMonitorDataProc
+from autotrainer.inference.pose_result_process import InferenceMonitorDataProc, live_source_frames
 from top_fixtures import collect_log_queue_to_caplog
 
 frames_idc_online_no_recording = np.asarray([(-1, -1, -1), (-1, -1, -1)])
@@ -134,6 +134,38 @@ def test_live_response_preserves_actual_source_frame_ids(
     _, (args, _) = proc._msg_queue.get(timeout=3)
     pose_rsp = args[0]
     assert pose_rsp.source_frame_ids == ((101, 102, 103), (201, 202, 203))
+
+
+def test_live_response_carries_each_source_frames_exposure_time(
+    inference_data_proc, monkeypatch, tmp_path
+):
+    """Consumers time live pose from these, not from a nominal frame rate."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ProjectInfo().get_session_path()[0]).mkdir(parents=True)
+    proc = inference_data_proc
+    proc.start()
+    assert proc._cmd_ack_event.wait(3)
+    proc._cmd_ack_event.clear()
+    frame_ids = np.asarray(((101, 102, 103), (101, 102, 103)))
+    frames_perf = np.asarray(((10.0, 10.5, 11.0), (10.25, 10.75, 11.25)))
+    for _ in range(8):
+        proc._data_queue.put((zero_pose_data, InferenceMode.Live, frame_ids, None, frames_perf))
+        time.sleep(0.1)
+    _, (args, _) = proc._msg_queue.get(timeout=3)
+    pose_rsp = args[0]
+    assert pose_rsp.source_frame_ids == ((101, 102, 103), (101, 102, 103))
+    assert pose_rsp.source_frame_perf_times == ((10.0, 10.5, 11.0), (10.25, 10.75, 11.25))
+
+
+def test_live_source_frames_drops_a_padded_frames_time_with_its_id():
+    ids = np.asarray(((101, 102, -1), (201, -1, 203)))
+    perf = np.asarray(((1.0, 2.0, 3.0), (4.0, 5.0, 6.0)))
+    assert live_source_frames(ids, perf) == (((101, 102), (201, 203)), ((1.0, 2.0), (4.0, 6.0)))
+
+
+def test_live_source_frames_without_times_reports_none_rather_than_inventing_them():
+    ids = np.asarray(((101, 102), (201, 202)))
+    assert live_source_frames(ids, None) == (((101, 102), (201, 202)), ())
 
 
 def test_renew_workers(request, monkeypatch, caplog, capture_multiprocess_logs):
