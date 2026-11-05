@@ -1,3 +1,4 @@
+import dataclasses
 import gc
 import hashlib
 import json
@@ -50,6 +51,16 @@ def _slew(host, slew):
     return slew * np.clip(1.0 - np.abs(t - 1.25) / SLEW_HALF_WIDTH, 0.0, None)
 
 
+def _perf_step(host, step):
+    """What a sustained perf step adds at host time `host`: step is (start, stop, size), in
+    seconds from HOST, and None adds nothing."""
+    if step is None:
+        return 0.0
+    start, stop, size = step
+    t = np.asarray(host, dtype=np.float64) - HOST
+    return np.where((t >= start) & (t < stop), size, 0.0)
+
+
 def _write(path, datasets, attrs=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(path, "w") as store:
@@ -61,7 +72,8 @@ def _write(path, datasets, attrs=None):
 
 
 def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival_lag=ARRIVAL_LAG,
-             latches=True, raw=False, raw_ni=False, raw_latches=False, slew=0.0):
+             latches=True, raw=False, raw_ni=False, raw_latches=False, slew=0.0,
+             seconds=2.5, frame_count=FRAMES, perf_step=None):
     # raw puts CLOCK_MONOTONIC_RAW on both sides: nidaq.h5's stamps and the latch brackets.
     raw_ni, raw_latches = raw_ni or raw, raw_latches or raw
     rng = np.random.default_rng(7)
@@ -70,8 +82,11 @@ def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival
     # Not `raw`: that name is the keyword above, and a Path there is always truthy.
     latency_dir = streams / "latency"
 
-    samples = int(2.5 * RATE)
-    exposure_ni = 0.05 + np.arange(FRAMES) * PERIOD
+    def on_perf(host):
+        return host + _slew(host, slew) + _perf_step(host, perf_step)
+
+    samples = int(seconds * RATE)
+    exposure_ni = 0.05 + np.arange(frame_count) * PERIOD
     transition_samples = np.round(exposure_ni * RATE).astype(np.int64)
     cam = np.zeros(samples, dtype=np.float32)
     level = 0.0
@@ -92,7 +107,7 @@ def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival
     seen = seen_per_block[block].astype(np.float64)
     nidaq = {
         "sample_index": first_sample + np.arange(samples, dtype=np.int64),
-        "block_observation_perf_time": seen + _slew(seen, slew),
+        "block_observation_perf_time": on_perf(seen),
         "epoch": np.ones(samples, dtype=np.uint64),
         "values": np.vstack([cam, command, diode]).astype(np.float32),
     }
@@ -103,13 +118,12 @@ def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival
            {"channel_names": np.array([b"cam_frames", b"laser1_command_copy", b"laser1_diode"]),
             "sample_rate_hz": RATE})
 
-    ids = np.arange(FRAMES)
+    ids = np.arange(frame_count)
     exposure_host = HOST + exposure_ni
-    frames = np.zeros(FRAMES, dtype=CAMERA_FRAME_DTYPE)
+    frames = np.zeros(frame_count, dtype=CAMERA_FRAME_DTYPE)
     frames["frame_id"] = ids + first_frame
     frames["camera_ts_ns"] = np.round((exposure_ni + CAMERA_OFFSET) * 1e9).astype(np.int64)
-    arrival = exposure_host + arrival_lag
-    frames["arrival_perf"] = arrival + _slew(arrival, slew)
+    frames["arrival_perf"] = on_perf(exposure_host + arrival_lag)
     frames["poll_perf"] = frames["arrival_perf"] - 0.0005
     frames["capture_return_perf"] = frames["arrival_perf"] + 0.0001
     batches = np.zeros(2, dtype=RECORD_BATCH_DTYPE)
@@ -134,8 +148,8 @@ def _session(tmp_path, *, first_sample=0, first_frame=0, primary="left", arrival
         latch_ni = np.repeat([exposure_ni[0] + 0.001, exposure_ni[-1] + 0.001], 3)
         clock_latches = np.zeros(latch_ni.size, dtype=CLOCK_LATCH_DTYPE)
         before, after = HOST + latch_ni - 0.00005, HOST + latch_ni + 0.00005
-        clock_latches["perf_before"] = before + _slew(before, slew)
-        clock_latches["perf_after"] = after + _slew(after, slew)
+        clock_latches["perf_before"] = on_perf(before)
+        clock_latches["perf_after"] = on_perf(after)
         # The capture loop leaves RAW NaN where the host or the camera class has none.
         clock_latches["raw_before"] = before + RAW_OFFSET if raw_latches else np.nan
         clock_latches["raw_after"] = after + RAW_OFFSET if raw_latches else np.nan
@@ -357,12 +371,77 @@ def test_with_raw_the_latch_pairing_ignores_a_perf_slew(tmp_path):
     assert camera["arrivalPairing"]["shift"] == camera["pairing"]["shift"] == 0
 
 
+def test_a_sustained_perf_step_does_not_invalidate_a_raw_pairing(tmp_path):
+    # 3 ms of perf held from 2 s to 28 s of 30 s. It starts after the first latch burst and
+    # ends before the last, so the perf chord through them misses it; it is clear of the 1 s
+    # windows of the bridge's end knots and in those of its 10 s knots, so ni_to_host.map
+    # follows it. It holds over most of the frames because a median over them moves only
+    # when it holds over more than half (a step over the middle third would not move it).
+    session = _session(tmp_path, raw=True, seconds=30.0, frame_count=4425,
+                       perf_step=(2.0, 28.0, 0.003))
+
+    status = finalize_session_latency(session, primary_camera="left")
+
+    camera = status["clocks"]["cameraToNi"]
+    tolerance = finalize.clocks.latch_tolerance(PERIOD)
+    assert status["clocks"]["niToHost"]["method"] == "raw_bridged"
+    # The perf figures read the chord's error as a disagreement, or this test has no teeth.
+    assert abs(camera["latchDirectLagP50"] - camera["niDerivedLagP50"]) > tolerance
+    assert camera["valid"] is True, camera
+    assert camera["pairing"]["clock"] == "raw"
+    assert camera["pairing"]["slip"] is None and camera["pairing"]["ambiguous"] is False
+    assert abs(camera["latchVersusNiRawSeconds"]) < tolerance
+    assert camera["arrivalPairing"]["shift"] == 0 and camera["arrivalPairing"]["ambiguous"] is False
+
+
+@pytest.mark.parametrize("off, gated", [(0.0025, True), (0.0005, False)],
+                         ids=["over_tolerance", "within_tolerance"])
+def test_a_raw_pairing_is_checked_by_its_two_exposure_paths_on_raw(tmp_path, monkeypatch, off, gated):
+    # A camera-to-NI line off by `off` moves the NI path's exposure and not the latches'.
+    real = finalize.clocks.fit_camera_to_ni
+
+    def shifted(*args, **kwargs):
+        fit = real(*args, **kwargs)
+        return dataclasses.replace(fit, offset=fit.offset + off)
+
+    monkeypatch.setattr(finalize.clocks, "fit_camera_to_ni", shifted)
+
+    status = finalize_session_latency(_session(tmp_path, raw=True), primary_camera="left")
+
+    camera = status["clocks"]["cameraToNi"]
+    difference = camera["latchVersusNiRawSeconds"]
+    assert camera["pairing"]["clock"] == "raw"
+    # NI minus latch: the pairing residual again, through the camera-to-NI line.
+    assert difference == pytest.approx(camera["pairing"]["median_residual"] + off, abs=1e-4)
+    assert camera["pairing"]["ambiguous"] is gated
+    assert camera["valid"] is not gated
+    if gated:
+        reason = camera["pairing"]["reason"]
+        assert "NI-derived exposure" in reason and "latch-derived exposure" in reason
+        # The difference, in ms, and the tolerance: a quarter of a 150 fps period.
+        assert f"{difference * 1e3:.3f} ms" in reason and "1.667 ms" in reason
+        assert camera["reason"] == reason
+
+
+def test_a_raw_comparison_that_measured_nothing_does_not_invalidate_the_pairing(tmp_path, monkeypatch):
+    assert np.isnan(finalize._latch_versus_ni_raw(None, None, None, None))  # never raises
+    monkeypatch.setattr(finalize, "_latch_versus_ni_raw", lambda *args: float("nan"))
+
+    status = finalize_session_latency(_session(tmp_path, raw=True), primary_camera="left")
+
+    camera = status["clocks"]["cameraToNi"]
+    assert camera["pairing"]["clock"] == "raw"
+    assert camera["valid"] is True, camera
+    assert camera["latchVersusNiRawSeconds"] is None  # NaN, made JSON-safe
+
+
 def test_without_raw_the_latch_pairing_is_on_perf_and_says_so(tmp_path):
     status = finalize_session_latency(_session(tmp_path, raw=False), primary_camera="left")
 
     camera = status["clocks"]["cameraToNi"]
     assert camera["valid"] is True, camera
     assert camera["pairing"]["method"] == "camera_latch" and camera["pairing"]["clock"] == "perf"
+    assert "latchVersusNiRawSeconds" not in camera
 
 
 @pytest.mark.parametrize("side, ni_method", [("raw_ni", "raw_bridged"),
