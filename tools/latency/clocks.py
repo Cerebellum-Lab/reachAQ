@@ -734,9 +734,10 @@ class Pairing:
     slip: Optional[dict] = None
     """Where the votes change shift, as find_slip gives it; None when they do not.
 
-    Its reverts is True for a run that returns to the majority. That is a
-    diagnostic for the arrival pairing (a delivery backlog) and a reason to
-    refuse the camera-clock pairing, whose votes delivery cannot move."""
+    Its reverts is True for a run that looks like a delivery backlog (find_slip
+    gives the three conditions). That is a diagnostic for the arrival pairing,
+    and no reason to refuse it; the camera-clock pairing refuses any slip,
+    whose votes delivery cannot move."""
     limit: float = math.nan
     """What the verdict was judged against, in seconds: the arrival margin or the latch tolerance."""
     clock: str = "perf"
@@ -778,14 +779,18 @@ def find_slip(frame_ids, votes, majority: int) -> Optional[dict]:
     to vote the majority. frames is the run's length. Frame-id gaps are not
     runs: a dropped frame had its exposure edge and still votes the same shift.
 
-    reverts says whether the votes return to the majority: True for a run that
-    neither opens nor closes the session. A lost or spurious NI transition
-    renumbers every frame after it, so its run reaches an end of the session;
-    a run in the middle is frames held back and delivered late, which a host
-    stall causes. The runs that reach an end are tested first, and the longest
-    of those that pass is returned (reverts False). Only when none passes is
-    the longest interior run that does (reverts True), so a long backlog
-    cannot hide a real slip.
+    reverts says whether the run looks like a delivery backlog, frames a host
+    stall held and delivered late. It is True only when all three hold: the
+    run is interior (it neither opens nor closes the session), the votes on
+    both sides of it are the majority, and it votes below the majority. A
+    frame delivered late has the latest transition at or before its arrival
+    move on to a later one, so its vote (frame id minus transition number) can
+    only fall; a run above the majority is not a backlog. A lost or spurious
+    NI transition renumbers every frame after it, so its run reaches an end of
+    the session, or leads to another shift (a staircase), and does not revert.
+    Every other run that passes is tested first and the longest of those is
+    returned (reverts False). Only when none passes is the longest backlog-like
+    run that does (reverts True), so a long backlog cannot hide a real slip.
     """
     votes = numpy.asarray(votes, dtype=numpy.int64)
     frame_ids = numpy.asarray(frame_ids, dtype=numpy.int64)
@@ -798,9 +803,14 @@ def find_slip(frame_ids, votes, majority: int) -> Optional[dict]:
     stray_rate = (others + 1) / (n + 2)
     runs = [(int(start), int(length)) for start, length in zip(starts, lengths)
             if votes[start] != majority]
-    at_an_end = [run for run in runs if run[0] == 0 or run[0] + run[1] == n]
-    interior = [run for run in runs if run not in at_an_end]
-    for candidates, reverts in ((at_an_end, False), (interior, True)):
+    backlog_like = [
+        (start, length) for start, length in runs
+        if 0 < start and start + length < n
+        and votes[start - 1] == majority and votes[start + length] == majority
+        and votes[start] < majority
+    ]
+    not_a_backlog = [run for run in runs if run not in backlog_like]
+    for candidates, reverts in ((not_a_backlog, False), (backlog_like, True)):
         passing = [run for run in candidates
                    if n * stray_rate ** run[1] < FALSE_ALARM_PROBABILITY]
         if not passing:
@@ -865,12 +875,18 @@ def choose_pairing(frame_ids, arrival_perf, transition_perf, frame_period: float
     median's own error from the spread of the lags (1.2533, the square root
     of pi/2, is a median's error over a mean's). ni_residual_rms is the NI-to-
     host fit's own, so the RAW bridge's knot smoothing (up to about 50 us) is
-    not in the margin. A shift that changes partway through and does not
-    return (find_slip) is ambiguous too, and is reported where it changes. A
-    run that returns to the majority is frames held back and delivered late (a
-    host stall), which moves arrival and not the exposure, so it stays in
+    not in the margin. A shift that changes partway through (find_slip) is
+    ambiguous too, and is reported where it changes. The exception is a run
+    that looks like a delivery backlog, frames a host stall held and delivered
+    late, which moves arrival and not the exposure: an interior run, between
+    votes for the majority, that votes below it (late delivery can only move
+    a frame's candidate transition later, so its vote only falls). It stays in
     Pairing.slip (reverts True) as a diagnostic and does not make the pairing
-    ambiguous. A lost or spurious NI transition never returns.
+    ambiguous. Two limits: a spurious transition later cancelled by a lost
+    one votes below the majority and reads as a backlog here (the camera-clock
+    pairing still flags it, a session with no latches does not); and a stall
+    holding the first or last frames reaches a session end and reads as a lost
+    transition, which errs on the side of flagging.
     """
     frame_ids = numpy.asarray(frame_ids, dtype=numpy.int64)
     arrival = numpy.asarray(arrival_perf, dtype=numpy.float64)
@@ -1199,7 +1215,7 @@ def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_
     whole period would pair a frame off with a small residual, so a residual
     over latch_tolerance() (a quarter period, at most 2 ms), or a shift that
     changes partway through (find_slip), marks the pairing ambiguous. Any slip
-    does, one that returns to the majority too: delivery cannot move a
+    does, one that looks like a backlog (reverts) too: delivery cannot move a
     hardware timestamp, so no backlog explains it. So does a
     latch map too uncertain to choose a transition by (latch_gate_ok: the map's
     uncertainty plus coverage_factor() times ni_residual_rms, the NI-to-host

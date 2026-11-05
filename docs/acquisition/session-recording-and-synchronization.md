@@ -506,17 +506,24 @@ the primary camera's latency stream:
     run's length), `fromShift`, `toShift` and `reverts`. In frame-ID order the
     stray rate is p̂ = (votes off the majority + 1) / (n + 2), and a run of L
     frames voting one other shift is a slip when n·p̂^L is under
-    `FALSE_ALARM_PROBABILITY`. Runs that reach an end of the session are
-    tested first and the longest that passes is reported; only if none does,
-    the longest interior run that passes, so a long backlog cannot hide a real
-    slip. `frameId` is the run's first frame, or, for a run that opens the
-    session, the frame after it. `reverts` is true for an interior run, one
-    that returns to the majority: frames held late in delivery by a host
-    stall. A lost or spurious NI transition puts every later frame on the next
-    shift, so its run reaches an end of the session and never reverts. A run
-    that returns to the majority does not make the arrival pairing ambiguous;
-    the camera-clock pairing flags any slip. `agreement` stays as a
-    diagnostic.
+    `FALSE_ALARM_PROBABILITY`. `frameId` is the run's first frame, or, for a
+    run that opens the session, the frame after it. `reverts` is true only for
+    a run that looks like a delivery backlog (frames a host stall held and
+    delivered late): it is interior, the votes on both sides of it are the
+    majority, and it votes below the majority (late delivery can only move a
+    frame's candidate transition later, so its vote only falls). Every other
+    run that passes is tested first and the longest of those is reported; only
+    if none passes, the longest run with `reverts` true, so a long backlog
+    cannot hide a real slip. A lost or spurious NI transition puts every later
+    frame on the next shift, so its run reaches an end of the session or leads
+    to another shift, and does not revert. A run with `reverts` true does not
+    make the arrival pairing ambiguous; the camera-clock pairing flags any
+    slip. Two limits: a spurious transition later cancelled by a lost one
+    votes below the majority and reads as a backlog to the arrival pairing
+    (the camera-clock pairing still flags it; a session with no latches does
+    not); and a stall holding the first or last frames reaches a session end
+    and reads as a lost transition, which errs on the side of flagging.
+    `agreement` stays as a diagnostic.
   - These replace the fixed 0.95 agreement, 0.1 ms arrival margin and 2 ms
     latch bracket cap.
 - `anchorMethod` is the first that yields a transition: `camera_latch` when the
