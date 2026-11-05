@@ -1,4 +1,5 @@
-import importlib.util, sys, dataclasses
+import importlib.util, io, os, sys, time, dataclasses
+from types import SimpleNamespace
 from pathlib import Path
 import pytest
 from autotrainer.device import LaserChannelId, nidaq_laser
@@ -32,7 +33,8 @@ def _args(**overrides):
     values = dict(timing="hardware", waveform="dc", mode="clean", laser=1, level=2.0,
                   pulse_seconds=2.0, ready_settle=0.0, cue_timeout=1.0, config="unused")
     values.update(overrides)
-    return victim.parse_args([f"--{k.replace('_', '-')}={v}" for k, v in values.items()])
+    flags = [f"--{k.replace('_', '-')}={v}" for k, v in values.items()]
+    return victim.parse_args(flags + ["--laser-disconnected"])
 
 def _run(daq, args, cued=True):
     lines = []
@@ -140,3 +142,60 @@ def test_wait_for_cue_reports_a_cue_and_a_timeout():
         assert victim.wait_for_cue(0.05) is True
     finally:
         victim._cued.clear()
+
+
+# Fix round 2 (Task 3 review).
+
+def test_the_victim_refuses_to_run_without_the_laser_disconnected_flag():
+    base = ["--timing=software", "--waveform=dc", "--mode=clean"]
+    with pytest.raises(SystemExit):
+        victim.parse_args(base)
+    assert victim.parse_args(base + ["--laser-disconnected"]).laser_disconnected
+
+def test_wait_for_cue_gives_up_at_once_when_its_parent_has_gone(monkeypatch):
+    victim._cued.clear()
+    monkeypatch.setattr(victim, "_PARENT_PID", os.getppid() + 1)
+    started = time.monotonic()
+    assert victim.wait_for_cue(30.0) is False
+    assert time.monotonic() - started < 2.0
+
+def test_an_orphaned_victim_closes_the_output_and_says_it_was_orphaned(daq, monkeypatch):
+    monkeypatch.setattr(victim, "_PARENT_PID", os.getppid() + 1)
+    code, lines = _run(daq, _args(timing="software", mode="hang"), cued=False)
+    assert code == 3 and lines[-1] == "ORPHANED"
+    assert daq.task("laser_1_ao").closed
+    assert daq.writes_to("PXI1Slot4/ao0", task_suffix="laser_1_ao")[-1] == 0.0
+
+def _pause_that_gives_up(calls):
+    """A pause for a loop that must end: a loop that never does fails the test, not hangs it."""
+    def pause(seconds):
+        calls.append(("pause", seconds))
+        if len(calls) > 20:
+            raise AssertionError("the hang loop never noticed its parent had gone")
+    return pause
+
+def test_the_hang_mode_closes_the_output_when_its_parent_goes_away():
+    closed, calls = [], []
+    gone = iter([False, False, True])
+    code = victim.act("hang", model=SimpleNamespace(close=lambda: closed.append(True)),
+                      operation=None, ignore_sigterm=lambda: calls.append("ignore"),
+                      pause=_pause_that_gives_up(calls),
+                      is_orphaned=lambda: next(gone))
+    assert code == 3 and closed == [True]
+    assert calls == ["ignore", ("pause", 1), ("pause", 1), ("pause", 1)]
+
+def test_an_orphaned_hang_victim_also_cancels_its_train():
+    ended = []
+    operation = SimpleNamespace(cancel=lambda: ended.append("cancel"),
+                                wait_until_finished=lambda timeout: ended.append("wait"))
+    victim.act("hang", model=SimpleNamespace(close=lambda: ended.append("close")),
+               operation=operation, ignore_sigterm=lambda: None,
+               pause=_pause_that_gives_up([]), is_orphaned=lambda: True)
+    assert ended == ["cancel", "wait", "close"]
+
+def test_announcing_into_a_closed_pipe_does_not_raise(monkeypatch):
+    class _Closed(io.StringIO):
+        def write(self, text):
+            raise BrokenPipeError("the orchestrator is gone")
+    monkeypatch.setattr(sys, "stdout", _Closed())
+    victim._announce("READY pid=1")
