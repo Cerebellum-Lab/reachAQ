@@ -2090,7 +2090,7 @@ def test_a_run_ends_on_its_exit_status_with_do_not_reconnect_again_after_the_tab
     if expected_status:
         assert lines[-2] == tool._DO_NOT_RECONNECT and record < len(lines) - 2
     else:
-        assert tool._DO_NOT_RECONNECT not in lines and lines[-2] == f"record: {lines[record][8:]}"
+        assert tool._DO_NOT_RECONNECT not in lines and lines[-2] == lines[record]
 
 # 3. The settle before the check
 
@@ -2143,8 +2143,11 @@ def test_pulse_repeats_below_1_are_refused_not_a_matrix_with_no_hardware_pulse_r
 
 def test_the_tool_and_the_judge_share_one_tolerance():
     assert tool.LEVEL_TOLERANCE_V is matrix.LEVEL_TOLERANCE_V
-    for function in (matrix.judge, matrix.format_table):
-        assert function.__kwdefaults__["tolerance_volts"] is matrix.LEVEL_TOLERANCE_V
+    # Not by identity: equal constants in one module are one object, so a literal
+    # default would pass that too.
+    source = Path(matrix.__file__).read_text(encoding="utf-8")
+    assert source.count("tolerance_volts: float =") == 2
+    assert source.count("tolerance_volts: float = LEVEL_TOLERANCE_V") == 2
 
 # 7. Every sample of the reading, not its mean
 
