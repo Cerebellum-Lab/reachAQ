@@ -30,6 +30,18 @@ SOFTWARE_PULSE_REFUSAL = (
     "run_synchronized_pulse_train refuses a pulse train unless hardware_timed=True"
 )
 
+#: How the victim's process ends in each mode, as the orchestrator writes it.
+#: A row whose victim ended any other way (it closed itself at its own cue
+#: timeout, or was ended some other way) did not die the way the row says.
+EXPECTED_VICTIM_EXIT = {
+    "clean": "exit 0",
+    "sigterm": "signal 15",
+    "sigkill": "signal 9",
+    "exception": "exit 1",
+    "abort": "signal 6",
+    "hang": "killed after hang (sigkill by pid)",
+}
+
 SCHEMA = 1
 
 
@@ -159,7 +171,11 @@ def judge(
     """The verdict on one row.
 
     The table sizes a safety interlock, so a reading that is missing or does
-    not settle the question gives UNKNOWN, never a safe verdict.
+    not settle the question gives UNKNOWN, never a safe verdict. That includes
+    a row whose output was not at the level just before the kill (a train that
+    had ended by itself, a victim that had closed itself: the kill then killed
+    nothing), a victim that did not end the way its mode says, and levels too
+    close to the minimum to tell apart.
 
     The hold window is read before the after-kill instant is trusted: a kill
     that lands on a pulse's low phase reads low at +0.10 s while the train goes
@@ -168,6 +184,13 @@ def judge(
     """
     if observation.case.refusal:
         return REFUSED_BY_DESIGN
+    if level_volts - minimum_volts <= 2 * tolerance_volts:
+        return UNKNOWN
+    before = observation.before
+    if before is None or before.maximum < level_volts - tolerance_volts:
+        return UNKNOWN
+    if observation.victim_exit != EXPECTED_VICTIM_EXIT.get(observation.case.mode):
+        return UNKNOWN
     if observation.after_kill is None:
         return UNKNOWN
     hold = observation.hold
@@ -233,11 +256,13 @@ def _row(observation: KillObservation, verdict: str) -> str:
     after_kill = _volts(observation.after_kill)
     if case.refusal:
         after_kill = case.refusal
+    # A refusal is shown whether or not the reader saw a level after it: the
+    # procedure reads the error text (-50103) as the proof of what held the output.
     after_reopen = _volts(observation.after_reopen)
-    if observation.after_reopen is None and observation.reopen_error:
+    if observation.reopen_error:
         after_reopen += f" ({observation.reopen_error})"
     after_reset = _volts(observation.after_reset)
-    if observation.after_reset is None and observation.reset_error:
+    if observation.reset_error:
         after_reset += f" ({observation.reset_error})"
     cells = {
         "case": case.case_id,
@@ -258,6 +283,8 @@ def _row(observation: KillObservation, verdict: str) -> str:
         "verdict": verdict,
     }
     cells = {column: _escape(text) for column, text in cells.items()}
+    if observation.notes:
+        cells["victim exit"] += "<br>" + _escape("; ".join(observation.notes))
     for instant, value in observation.dmm.items():
         if value is None:
             continue
