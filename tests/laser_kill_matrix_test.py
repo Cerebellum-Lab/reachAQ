@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from tools.acquisition.model.laser_kill_matrix import (
     HELD_THROUGH_RESET, HELD_UNTIL_REOPEN, HELD_UNTIL_RESET, REFUSED_BY_DESIGN,
     SAFE_ON_DEATH, TRAIN_RAN_ON, UNKNOWN, KillCase, KillObservation,
@@ -118,3 +120,63 @@ def test_a_dmm_value_that_is_none_is_skipped_by_the_table():
                         minimum_volts=0.0, level_volts=2.0)
     assert text.count("dmm=") == 1 and "dmm=1.98" in text
     assert "dmm=None" not in text
+
+
+# Fix round 2 (Task 3 review): a verdict needs a before reading at the level, the
+# exit the mode should give, and levels the judge can tell apart.
+
+_EXITS = {
+    "clean": "exit 0", "sigterm": "signal 15", "sigkill": "signal 9",
+    "exception": "exit 1", "abort": "signal 6",
+    "hang": "killed after hang (sigkill by pid)",
+}
+
+def test_a_row_with_no_before_reading_is_unknown():
+    assert judge(_observation(before=None), minimum_volts=0.0, level_volts=2.0) == UNKNOWN
+
+def test_a_row_whose_output_was_already_down_before_the_kill_is_unknown_not_safe():
+    # A train that ended by itself during a slow prompt, then a kill, then
+    # nothing to see: every later reading is at the minimum.
+    ended = _observation(before=_reading(0.0), after_kill=_reading(0.0), hold=_reading(0.0))
+    assert judge(ended, minimum_volts=0.0, level_volts=2.0) == UNKNOWN
+
+def test_a_before_window_that_reaches_the_level_counts_even_when_its_mean_does_not():
+    pulse = KillCase("sigkill", "hardware", "pulse", 1)
+    running = _observation(pulse, before=_reading(1.0, 0.0, 2.0),
+                           after_kill=_reading(0.0), hold=_reading(1.0, 0.0, 2.0))
+    assert judge(running, minimum_volts=0.0, level_volts=2.0) == TRAIN_RAN_ON
+
+@pytest.mark.parametrize("mode", sorted(_EXITS))
+def test_each_mode_has_to_end_the_way_it_should(mode):
+    case = KillCase(mode, "software", "dc")
+    assert judge(_observation(case, victim_exit=_EXITS[mode]),
+                 minimum_volts=0.0, level_volts=2.0) == HELD_UNTIL_REOPEN
+    # A victim that closed itself at its own cue timeout, or was ended some
+    # other way, did not die the way the row says.
+    assert judge(_observation(case, victim_exit="exit 3"),
+                 minimum_volts=0.0, level_volts=2.0) == UNKNOWN
+
+def test_a_safe_looking_row_with_the_wrong_exit_is_unknown():
+    zombie = _observation(after_kill=_reading(0.0), hold=_reading(0.0), victim_exit="exit 3")
+    assert judge(zombie, minimum_volts=0.0, level_volts=2.0) == UNKNOWN
+
+def test_a_refused_row_stays_refused_whatever_its_exit_and_before():
+    refused = KillCase("clean", "software", "pulse")
+    assert judge(_observation(refused, before=None, victim_exit="exit 2"),
+                 minimum_volts=0.0, level_volts=2.0) == REFUSED_BY_DESIGN
+
+def test_levels_too_close_to_tell_apart_are_unknown():
+    assert judge(_observation(), minimum_volts=0.0, level_volts=0.08) == UNKNOWN
+
+def test_a_refusal_is_in_its_cell_even_when_the_reader_saw_a_level():
+    text = format_table(
+        [_observation(after_reopen=_reading(2.0), reopen_error="DaqError: -50103 reserved",
+                      after_reset=_reading(0.0), reset_error="DaqError: reset refused")],
+        minimum_volts=0.0, level_volts=2.0)
+    assert "2.000 (DaqError: -50103 reserved)" in text
+    assert "0.000 (DaqError: reset refused)" in text
+
+def test_notes_are_in_the_table_beside_the_exit():
+    text = format_table([_observation(notes=("reopen skipped", "reset skipped"))],
+                        minimum_volts=0.0, level_volts=2.0)
+    assert "signal 9<br>reopen skipped; reset skipped" in text
