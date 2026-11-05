@@ -1,11 +1,11 @@
-import importlib.util, io, json, queue, signal, sys, threading, time
+import hashlib, importlib.util, io, json, queue, signal, sys, threading, time
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
 from autotrainer.core import SystemConfiguration
 from autotrainer.device import nidaq_laser
 from tools.acquisition.model.laser_kill_matrix import (
-    HELD_UNTIL_RESET, UNKNOWN, KillCase, LevelSample, from_record, judge)
+    HELD_UNTIL_RESET, SAFE_ON_DEATH, UNKNOWN, KillCase, LevelSample, from_record, judge)
 
 _TOOL = Path(__file__).resolve().parents[1] / "tools" / "hardware" / "qualify_laser_kill.py"
 _spec = importlib.util.spec_from_file_location("qualify_laser_kill", _TOOL)
@@ -37,8 +37,8 @@ def _no_real_hardware(monkeypatch):
     monkeypatch.setattr(tool, "make_spawn", refuse)
     # And no test may signal a real process: a call that leaves out kill= would
     # otherwise reach os.kill with a made-up pid.
-    for function in (tool.apply_kill, tool.end_victim, tool.run_case,
-                     tool.tracking_check, tool.run_matrix):
+    for function in (tool.apply_kill, tool.end_victim, tool.kill_victim, tool.run_case,
+                     tool.tracking_check, tool.run_matrix, tool.execute):
         monkeypatch.setitem(function.__kwdefaults__, "kill", refuse)
 
 
@@ -47,6 +47,14 @@ def daq(monkeypatch):
     daq = fake.FakeDaqmx()
     # The fake has no continuous acquisition, and nothing like Device.
     daq.constants.AcquisitionType.CONTINUOUS = "continuous"
+    daq.resets = []
+
+    class _Device:
+        def __init__(self, name):
+            self.name = name
+        def reset_device(self):
+            daq.resets.append(self.name)
+    daq.system = SimpleNamespace(Device=_Device)
     monkeypatch.setattr(nidaq_laser, "_load_nidaqmx", lambda: daq)
     yield daq
     daq.waits_released.set()
@@ -270,7 +278,8 @@ def test_a_victim_that_never_says_ready_is_ended_by_pid_and_recorded(monkeypatch
     observation = _run(KillCase("sigkill", "software", "dc"), process, _log([]), _Clock())
     assert process.signals == [signal.SIGKILL]
     assert observation.after_kill is None and "READY" in observation.notes[0]
-    assert observation.victim_exit == "killed after hang (sigkill by pid)"
+    # Not "after hang": the row never cued it, and it never said READY.
+    assert "sigkill by pid" in observation.victim_exit and "hang" not in observation.victim_exit
 
 def test_a_victim_whose_output_ends_before_ready_is_a_row_without_waiting_for_the_timeout():
     process = _Process(ready=tool.STREAM_CLOSED, alive=False, returncode=1)
@@ -374,6 +383,9 @@ def test_the_reader_logs_each_chunk_and_keeps_going_after_a_read_error(daq):
     assert len(samples) >= 3
     assert (samples[0].mean, samples[0].minimum, samples[0].maximum) == (2.0, 1.0, 3.0)
     assert log.error.startswith("RuntimeError: DAQmx -200279")
+    # The error stopped and started the task again, and the log says so.
+    assert daq.starts.count("laser_kill_reader") == 2
+    assert len(log.restarts) == 1 and "-200279" in log.restarts[0] and "restarted" in log.restarts[0]
     assert not thread.is_alive() and task.closed
 
 def test_a_reader_with_no_terminal_configuration_leaves_it_to_daqmx(daq):
@@ -570,3 +582,457 @@ def test_run_matrix_keeps_the_rows_it_finished_when_one_fails(daq, tmp_path):
             spawn=spawn, log=log, instrument="PXI1Slot5/ai3", level_volts=2.0, minimum_volts=0.0,
             now=clock.now, sleep=clock.sleep, kill=first.kill_by)
     assert [o.case.mode for o in observations] == ["sigkill"]
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 (Task 3 review).
+
+class _Immortal(_Process):
+    """A victim stuck in the driver: SIGKILL is recorded and does nothing."""
+    def kill_by(self, pid, sig):
+        assert pid == self.pid
+        self.signals.append(sig)
+
+def _config_file(tmp_path):
+    configuration = SystemConfiguration()
+    configuration.laser = fake.rig_lasers()
+    configuration.save_file(tmp_path / "system_configuration", as_yaml=True)
+    return tmp_path / "system_configuration.yaml"
+
+def _plan(tmp_path, *flags):
+    path = _config_file(tmp_path)
+    args = tool.parse_args(["--dry-run", f"--config={path}", f"--record-dir={tmp_path / 'rec'}", *flags])
+    configuration = _system(fake.rig_lasers())
+    return args, configuration, tool.make_plan(args, configuration)
+
+_STARTED = tool.datetime(2026, 11, 5, 14, 30, 0, tzinfo=tool.timezone.utc)
+_STAMP = "20261105T143000Z"
+
+def _samples(level_at, count=3000):
+    return [LevelSample(100 + i / 100, level_at(100 + i / 100), level_at(100 + i / 100),
+                        level_at(100 + i / 100)) for i in range(count)]
+
+def _held_until_the_reopen(t):
+    return 2.0 if t < 106.2 else 0.0
+
+class _FakeReader:
+    """start_reader's stand-in: fills the log with chosen samples, lives until stopped."""
+    def __init__(self, samples=()):
+        self.samples, self.calls, self.thread = list(samples), [], None
+    def __call__(self, nidaqmx, channel, terminal, log, stop):
+        self.calls.append((channel, terminal))
+        for sample in self.samples:
+            log.append(sample)
+        self.thread = threading.Thread(target=stop.wait, daemon=True)
+        self.thread.start()
+        return self.thread
+
+def _factory(make):
+    def spawn_factory(args, *, stamp):
+        return lambda case, level=None: make(case, level)
+    return spawn_factory
+
+def _execute(daq, tmp_path, make, *flags, samples=None, reader=None, clock=None, **seams):
+    args, configuration, plan = _plan(tmp_path, *flags)
+    clock = clock or _Clock()
+    by_pid = {}
+    def tracked(case, level):
+        process = make(case, level)
+        by_pid[process.pid] = process
+        return process
+    reader = reader or _FakeReader(_samples(_held_until_the_reopen) if samples is None else samples)
+    seams.setdefault("kill", lambda pid, sig: by_pid[pid].kill_by(pid, sig))
+    status = tool.execute(
+        args, configuration, plan, _STARTED, load_nidaqmx=lambda: daq,
+        spawn_factory=_factory(tracked), reader_factory=reader,
+        now=clock.now, sleep=clock.sleep, **seams)
+    return status, args, reader
+
+def _killable(case, level):
+    if case.refusal:
+        return _Process(pid=4300, ready="REFUSED run_synchronized_pulse_train refuses ...",
+                        alive=False, returncode=2)
+    return _Process(pid=4242, ready=f"READY pid=4242 timing={case.timing} waveform={case.waveform} mode={case.mode} level=2.0000")
+
+# C1: a slow before prompt cannot make a dead train read safe.
+
+def test_the_before_prompt_is_asked_first_and_before_is_read_at_the_kill():
+    clock = _Clock()
+    # 2 V until 129.5: the operator's before prompt takes 40 s, and the train
+    # (30 s) is over by the time the kill lands.
+    log = _log([(100 + i / 100, 2.0 if 100 + i / 100 < 129.5 else 0.0) for i in range(0, 5500)])
+    process = _Process()
+    events = []
+    def kill(pid, sig):
+        events.append(("kill", clock.t))
+        process.kill_by(pid, sig)
+    def dmm(instant):
+        events.append((instant, clock.t))
+        if instant == "before":
+            clock.sleep(40.0)
+        return None
+    observation = tool.run_case(
+        KillCase("sigkill", "software", "dc"), spawn=lambda c: process, log=log, now=clock.now,
+        sleep=clock.sleep, kill=kill, reopen=lambda: None, reset=lambda: None,
+        hold_seconds=5.0, instrument="ai3", dmm=dmm)
+    assert [name for name, _ in events][:2] == ["before", "kill"]
+    assert events[1][1] >= 141.0                       # the kill came after the prompt
+    assert observation.before.maximum == 0.0           # read after it, at the kill
+    verdict = judge(observation, minimum_volts=0.0, level_volts=2.0)
+    assert verdict != SAFE_ON_DEATH and verdict == UNKNOWN
+
+def test_a_victim_that_closed_itself_during_the_prompt_is_not_a_safe_row():
+    # The 60 s cue timeout: the victim closed, the signal lands on a zombie.
+    clock = _Clock()
+    log = _log([(100 + i / 100, 2.0 if 100 + i / 100 < 160.0 else 0.0) for i in range(0, 9000)])
+    process = _Process(alive=False, returncode=3)
+    def dmm(instant):
+        if instant == "before":
+            clock.sleep(65.0)
+    observation = tool.run_case(
+        KillCase("sigkill", "software", "dc"), spawn=lambda c: process, log=log, now=clock.now,
+        sleep=clock.sleep, kill=lambda pid, sig: None, reopen=lambda: None, reset=lambda: None,
+        hold_seconds=5.0, instrument="ai3", dmm=dmm)
+    assert observation.victim_exit == "exit 3"
+    assert judge(observation, minimum_volts=0.0, level_volts=2.0) == UNKNOWN
+
+# C2: the orchestrator's own death.
+
+def test_the_first_interrupt_raises_and_later_ones_are_ignored():
+    handler = tool.InterruptOnce()
+    with pytest.raises(KeyboardInterrupt, match="15"):
+        handler(signal.SIGTERM, None)
+    handler(signal.SIGINT, None)        # a second one cannot cut the recovery short
+    handler(signal.SIGTERM, None)
+
+def test_sigint_sigterm_and_sighup_all_become_the_one_interrupt():
+    installed = {}
+    handler = tool.install_interrupt_handlers(install=lambda number, h: installed.__setitem__(number, h))
+    assert set(installed) == {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+    assert all(h is handler for h in installed.values())
+
+def _matrix(daq, tmp_path, process, log, clock, *flags, cases=(KillCase("sigkill", "software", "dc"),)):
+    observations = []
+    tool.run_matrix(
+        list(cases), observations,
+        args=tool.parse_args(["--dry-run", f"--record-dir={tmp_path}", *flags]),
+        configuration=_system(fake.rig_lasers()), nidaqmx=daq,
+        spawn=lambda case, level=None: process, log=log, instrument="PXI1Slot5/ai3",
+        level_volts=2.0, minimum_volts=0.0, now=clock.now, sleep=clock.sleep, kill=process.kill_by)
+    return observations
+
+def test_each_row_line_names_the_victims_pid_and_its_notes(daq, tmp_path, capsys):
+    log = _log([(100 + i / 100, 2.0 if 100 + i / 100 < 106.7 else 0.0) for i in range(0, 900)])
+    _matrix(daq, tmp_path, _Process(), log, _Clock(), "--skip-reset")
+    text = capsys.readouterr().out
+    assert "sigkill-software-dc (victim pid 4242)" in text
+    assert "note: reset skipped" in text
+
+def test_a_refused_reopen_is_printed_on_its_row(daq, tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(tool, "reopen", lambda configuration, laser: "DaqError: -50103 reserved")
+    log = _log([(100 + i / 100, 2.0 if 100 + i / 100 < 106.7 else 0.0) for i in range(0, 900)])
+    _matrix(daq, tmp_path, _Process(), log, _Clock())
+    assert "reopen: DaqError: -50103 reserved" in capsys.readouterr().out
+
+# C3: the failure path.
+
+def test_a_row_that_fails_sigkills_its_victim_at_once_and_says_if_it_survives(capsys):
+    process = _Immortal()
+    clock = _Clock()
+    log = _log([(100 + i / 100, 2.0) for i in range(0, 900)])
+    def broken_reopen():
+        raise RuntimeError("the orchestrator's own bug")
+    with pytest.raises(RuntimeError, match="own bug"):
+        _run(KillCase("hang", "software", "dc"), process, log, clock, reopen=broken_reopen)
+    assert process.signals == [signal.SIGUSR1, signal.SIGKILL]
+    text = capsys.readouterr().out
+    assert "STILL ALIVE" in text and "4242" in text
+
+def test_kill_victim_does_not_signal_a_pid_that_has_already_been_reaped():
+    process = _Process(alive=False, returncode=0)
+    assert tool.kill_victim(process, kill=process.kill_by, timeout=0.01) is True
+    assert process.signals == []
+
+def test_end_victim_says_what_happened_not_always_hang():
+    quiet = _Process(ignores_sigterm=True)
+    text = tool.end_victim(quiet, kill=quiet.kill_by, timeout=0.01, mode="clean")
+    assert "sigkill by pid" in text and "hang" not in text
+    immortal = _Immortal()
+    assert tool.end_victim(immortal, kill=immortal.kill_by, timeout=0.01) == (
+        "still alive after sigkill by pid 4242")
+
+def test_a_failed_run_recovers_and_names_what_it_cannot_confirm(daq, tmp_path, capsys):
+    def make(case, level):
+        if case.mode == "abort":
+            raise OSError("fork failed")
+        return _killable(case, level)
+    status, args, _ = _execute(daq, tmp_path, make, "--cases=sigkill-software-dc,abort-software-dc")
+    text = capsys.readouterr().out
+    assert status == 1
+    # Row 1's own reopen and reset, then the recovery's: the output was written
+    # to its minimum and the 6713 reset again.
+    assert daq.writes_to("PXI1Slot4/ao0") == [0.0] * 4
+    assert daq.resets == ["PXI1Slot4", "PXI1Slot4"]
+    assert "DID NOT COMPLETE" in text and "NOT CONFIRMED SAFE" in text
+    assert "PXI1Slot5/port0/line4" in text and "NOT READABLE by this tool" in text
+    assert "0.000 V" in text and "DO NOT RECONNECT" in text
+    # The row that finished is kept, in the file as it ended and in the record.
+    rows = [json.loads(line) for line in (args.record_dir / f"laser-kill-{_STAMP}.rows.jsonl").read_text().splitlines()]
+    assert [list(r)[0] for r in rows] == ["header", "observation", "recovery"]
+    record = json.loads((args.record_dir / f"laser-kill-{_STAMP}.json").read_text())
+    assert record["recovery"]["reopen"] == "ok" and record["recovery"]["volts"] == pytest.approx(0.0)
+
+def test_an_interrupt_during_a_row_gets_the_same_recovery(daq, tmp_path, capsys):
+    def make(case, level):
+        raise KeyboardInterrupt("signal 15")
+    status, _, _ = _execute(daq, tmp_path, make, "--cases=sigkill-software-dc")
+    text = capsys.readouterr().out
+    assert status == 1 and "KeyboardInterrupt" in text and "NOT CONFIRMED SAFE" in text
+    assert daq.writes_to("PXI1Slot4/ao0") == [0.0, 0.0] and daq.resets == ["PXI1Slot4"]
+
+def test_the_recovery_banner_reports_a_level_it_read_above_the_minimum(daq, tmp_path, capsys):
+    def make(case, level):
+        raise OSError("fork failed")
+    stuck_high = [LevelSample(100 + i / 100, 2.0, 2.0, 2.0) for i in range(0, 3000)]
+    _execute(daq, tmp_path, make, "--cases=sigkill-software-dc", samples=stuck_high)
+    text = capsys.readouterr().out
+    assert "2.000 V" in text and "ABOVE THE MINIMUM" in text
+
+def test_the_recovery_banner_says_when_the_reader_has_nothing(daq, tmp_path, capsys):
+    def make(case, level):
+        raise OSError("fork failed")
+    _execute(daq, tmp_path, make, "--cases=sigkill-software-dc", samples=[])
+    assert "NO READING" in capsys.readouterr().out
+
+def test_a_recovery_the_driver_refuses_is_named_in_the_banner(daq, tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(tool, "reopen", lambda configuration, laser: "DaqError: -50103 reserved")
+    def make(case, level):
+        raise OSError("fork failed")
+    _execute(daq, tmp_path, make, "--cases=sigkill-software-dc")
+    text = capsys.readouterr().out
+    assert "reopen: DaqError: -50103 reserved" in text and "closes it" in text
+
+def test_a_run_that_skipped_the_reopen_ends_with_the_shutter_warning(daq, tmp_path, capsys):
+    status, _, _ = _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc", "--skip-reopen")
+    text = capsys.readouterr().out
+    assert status == 0
+    assert "--skip-reopen" in text and "shutter line" in text and "DO NOT RECONNECT" in text
+
+def test_a_run_that_reopened_does_not_print_that_warning(daq, tmp_path, capsys):
+    status, _, _ = _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc")
+    assert status == 0 and "--skip-reopen" not in capsys.readouterr().out
+
+# I1: a wedged driver cannot hold the row.
+
+def test_a_call_that_blocks_is_given_up_on_and_reported_as_timed_out():
+    release = threading.Event()
+    started = time.monotonic()
+    text = tool.bounded(lambda: release.wait(5.0) and None, 0.05, "reopen")
+    release.set()
+    assert text.startswith("timed out") and time.monotonic() - started < 2.0
+
+def test_a_call_that_finishes_or_fails_is_reported_as_it_is():
+    assert tool.bounded(lambda: None, 1.0, "reopen") is None
+    assert tool.bounded(lambda: "DaqError: x", 1.0, "reopen") == "DaqError: x"
+    def boom():
+        raise RuntimeError("driver said no")
+    assert tool.bounded(boom, 1.0, "reset") == "RuntimeError: driver said no"
+
+def test_a_reset_that_never_returns_does_not_hold_the_row(daq, tmp_path, monkeypatch):
+    release = threading.Event()
+    class _Wedged:
+        def __init__(self, name):
+            pass
+        def reset_device(self):
+            release.wait(5.0)
+    daq.system = SimpleNamespace(Device=_Wedged)
+    monkeypatch.setattr(tool, "RECOVERY_TIMEOUT_S", 0.05)
+    log = _log([(100 + i / 100, 2.0 if 100 + i / 100 < 106.2 else 0.0) for i in range(0, 900)])
+    observations = _matrix(daq, tmp_path, _Process(), log, _Clock())
+    release.set()
+    assert observations[0].reset_error.startswith("timed out")
+    assert observations[0].victim_exit == "signal 9"
+
+def test_a_reopen_that_never_returns_does_not_hold_the_row(daq, tmp_path, monkeypatch):
+    release = threading.Event()
+    monkeypatch.setattr(tool, "reopen", lambda configuration, laser: release.wait(5.0) and None)
+    monkeypatch.setattr(tool, "RECOVERY_TIMEOUT_S", 0.05)
+    log = _log([(100 + i / 100, 2.0 if 100 + i / 100 < 106.2 else 0.0) for i in range(0, 900)])
+    observations = _matrix(daq, tmp_path, _Process(), log, _Clock())
+    release.set()
+    assert observations[0].reopen_error.startswith("timed out")
+    assert observations[0].reset_error is None and observations[0].victim_exit == "signal 9"
+
+def test_a_reopen_that_never_returns_is_reported_by_the_same_bound(daq):
+    daq.hang = {"task_close"}
+    daq.held_wait_limit = 5.0
+    text = tool.bounded(lambda: tool.reopen(_system(fake.rig_lasers()), 1), 0.05, "reopen")
+    daq.hang_released.set()
+    assert text.startswith("timed out")
+
+# I2
+
+def test_the_preconditions_name_the_laser_being_run_and_every_channel_the_reopen_rewrites():
+    text = tool.preconditions(2, "PXI1Slot4")
+    assert "laser 2 key OFF" in text and "laser 1" not in text
+    assert "EVERY configured laser channel" in text and "PXI1Slot4" in text
+    assert "minimum" in text and "shutter closed" in text
+
+# I3
+
+def test_a_level_too_close_to_the_minimum_is_refused_when_the_run_is_planned(tmp_path, capsys):
+    path = _config_file(tmp_path)
+    args = tool.parse_args(["--dry-run", f"--config={path}", "--level=0.1"])
+    with pytest.raises(ValueError, match="tell apart"):
+        tool.make_plan(args, _system(fake.rig_lasers()))
+    assert tool.main(["--dry-run", f"--config={path}", "--level=0.1"]) == 2
+    assert "tell apart" in capsys.readouterr().out
+
+# I5: rows survive, the table comes first, and a broken stdout loses nothing.
+
+def test_the_table_is_printed_before_the_record_is_written(daq, tmp_path, capsys, monkeypatch):
+    def write_record_fails(*args, **kwargs):
+        raise OSError("disk full")
+    monkeypatch.setattr(tool, "write_record", write_record_fails)
+    status, args, _ = _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc")
+    text = capsys.readouterr().out
+    assert "| case |" in text and "sigkill-software-dc" in text and "verdicts:" in text
+    # The failed write is reported, with where the rows are.
+    assert status == 1 and "could not write the record: disk full" in text and ".rows.jsonl" in text
+
+def test_a_row_is_on_disk_as_it_ends_not_only_in_the_final_record(daq, tmp_path, monkeypatch):
+    seen = []
+    real = tool._append_row
+    def spy(path, observation):
+        real(path, observation)
+        seen.append(len(path.read_text().splitlines()))
+    monkeypatch.setattr(tool, "_append_row", spy)
+    _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc,clean-software-pulse")
+    assert seen == [2, 3]    # header + row 1, then + row 2
+
+def test_a_broken_stdout_does_not_lose_rows_or_the_record(daq, tmp_path, monkeypatch):
+    class _Closed(io.StringIO):
+        def write(self, text):
+            raise BrokenPipeError("tee is gone")
+        def flush(self):
+            raise BrokenPipeError("tee is gone")
+    monkeypatch.setattr(sys, "stdout", _Closed())
+    status, args, _ = _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc,clean-software-pulse")
+    assert status == 0
+    lines = (args.record_dir / f"laser-kill-{_STAMP}.rows.jsonl").read_text().splitlines()
+    assert len(lines) == 3
+    assert (args.record_dir / f"laser-kill-{_STAMP}.json").exists()
+
+# I6: main past the dry run, with fakes.
+
+@pytest.mark.parametrize("argv", [[], ["--tracking-check"], ["--cases", "sigkill-software-dc"],
+                                  ["--pause-for-dmm", "--skip-reopen"]])
+def test_every_way_of_running_without_dry_run_still_needs_the_disconnected_flag(argv):
+    with pytest.raises(SystemExit):
+        tool.parse_args(argv)
+
+def test_execute_runs_the_rows_prints_the_table_then_writes_the_record(daq, tmp_path, capsys):
+    status, args, reader = _execute(daq, tmp_path, _killable, "--cases=sigkill-software-dc,clean-software-pulse")
+    text = capsys.readouterr().out
+    assert status == 0 and reader.calls == [("PXI1Slot5/ai3", "rse")]
+    assert text.index("| case |") < text.index("record: ")
+    assert "refused_by_design" in text and "verdicts:" in text
+    record = json.loads((args.record_dir / f"laser-kill-{_STAMP}.json").read_text())
+    assert [c["case"]["mode"] for c in record["cases"]] == ["sigkill", "clean"]
+    assert (args.record_dir / f"laser-kill-{_STAMP}.md").exists()
+    reader.thread.join(2.0)
+    assert not reader.thread.is_alive()                  # stopped with the run
+
+def test_execute_stops_with_a_message_when_the_reader_cannot_start(daq, tmp_path, capsys):
+    def reader(*args):
+        raise RuntimeError("DAQmx -50103: the specified resource is reserved")
+    def make(case, level):
+        raise AssertionError("no victim may start without the reader")
+    status, args, _ = _execute(daq, tmp_path, make, "--cases=sigkill-software-dc", reader=reader)
+    text = capsys.readouterr().out
+    assert status == 1 and "reachAQ may be running" in text and "-50103" in text
+    assert not args.record_dir.exists()
+
+def test_execute_runs_the_tracking_check_and_stops(daq, tmp_path, capsys):
+    def make(case, level):
+        pid = 5000 + int(level)
+        return _CuedProcess(pid=pid, ready=f"READY pid={pid} timing=software waveform=dc mode=clean level={level:.4f}")
+    status, args, _ = _execute(daq, tmp_path, make, "--tracking-check",
+                               samples=_samples(lambda t: float(int(t - 100.0))))
+    text = capsys.readouterr().out
+    assert status == 0 and "reader (V)" in text and "victim pid 5000" in text
+    assert not list(args.record_dir.glob("*.json"))
+
+def test_the_config_is_hashed_before_the_run_not_after(daq, tmp_path):
+    original = {}
+    def make(case, level):
+        # The run itself changes the file, as a rig run that saved on exit would.
+        path = tmp_path / "system_configuration.yaml"
+        original.setdefault("sha", hashlib.sha256(path.read_bytes()).hexdigest())
+        path.write_text(path.read_text() + "# changed during the run\n")
+        return _killable(case, level)
+    status, args, _ = _execute(daq, tmp_path, make, "--cases=sigkill-software-dc")
+    record = json.loads((args.record_dir / f"laser-kill-{_STAMP}.json").read_text())
+    assert record["config_sha256"] == original["sha"]
+
+# Minors.
+
+def test_an_empty_cases_option_is_an_error_not_every_row(tmp_path, capsys):
+    path = _config_file(tmp_path)
+    assert tool.main(["--dry-run", f"--config={path}", "--cases="]) == 2
+    assert "no case id" in capsys.readouterr().out
+    with pytest.raises(ValueError, match="no case id"):
+        tool.select_cases(tool.kill_cases(), "")
+
+def test_an_unreadable_ready_line_is_a_row_without_a_kill_like_the_other_no_ready_cases():
+    process = _Process(ready="READY pid=not-a-number level=2.0")
+    observation = _run(KillCase("sigkill", "software", "dc"), process, _log([]), _Clock())
+    assert "unreadable READY" in observation.notes[0]
+    assert process.signals == [signal.SIGKILL]     # the end of the spawned process only
+    assert observation.before is None
+
+def test_the_reader_restarts_its_task_after_a_read_error_but_only_so_often(daq):
+    def always_fails(task, count):
+        raise RuntimeError("DAQmx -200279")
+    daq.read_samples = always_fails
+    log, stop = tool.LevelLog(), threading.Event()
+    thread = tool.start_reader(daq, "PXI1Slot5/ai3", "rse", log, stop)
+    deadline = time.monotonic() + 5.0
+    while len(log.restarts) < tool.READER_MAX_RESTARTS and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.3)
+    stop.set()
+    thread.join(5.0)
+    assert len(log.restarts) == tool.READER_MAX_RESTARTS
+    assert log.error.startswith("RuntimeError: DAQmx -200279")
+
+def test_a_restart_that_fails_is_recorded_and_the_reader_goes_on(daq):
+    calls = []
+    def read_samples(task, count):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("DAQmx -200279")
+        time.sleep(0.002)
+        return [1.0]
+    daq.read_samples = read_samples
+    starts = []
+    real_fail_start = daq.fail_start
+    def fail_every_start_after_the_first(task):
+        starts.append(task.label)
+        if len(starts) > 1:
+            raise RuntimeError(f"DAQmx refused to start {task.label}")
+    daq.fail_start = fail_every_start_after_the_first
+    log, stop = tool.LevelLog(), threading.Event()
+    thread = tool.start_reader(daq, "PXI1Slot5/ai3", "rse", log, stop)
+    deadline = time.monotonic() + 5.0
+    while len(log.samples()) < 2 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    stop.set()
+    thread.join(5.0)
+    assert any("failed" in text and "refused to start" in text for text in log.restarts)
+    assert len(log.samples()) >= 2
+
+def test_the_victim_command_passes_the_disconnected_attestation():
+    args = tool.parse_args(["--dry-run"])
+    command = tool.victim_command("python", Path("/w/v.py"), args, KillCase("clean", "software", "dc"))
+    assert "--laser-disconnected" in command
