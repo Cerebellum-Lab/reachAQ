@@ -59,6 +59,9 @@ def _app():
         ),
     )
     app._live_tracking = LiveTrackingBuffer(capacity=100)
+    # _on_pose_response_ready hands every response to the latency record first;
+    # what it records is not under test here.
+    app._session_data_recorder = mock.Mock()
     app._coordinates = SimpleNamespace(validate_pose=lambda *_args, **_kwargs: None)
     app._p_inference_live_begin = 0.0
     return app
