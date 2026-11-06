@@ -1021,9 +1021,13 @@ class TrialActionExecutor:
                     )
                     pellet_present = None
 
-        if self._reach_state is not None:
+        if self._reach_state is not None and self._reach_state.is_enabled:
             reach = self._reach_state.observe(now_perf_time)
-            if reach is not None:
+            if reach is None:
+                # The resolver has already refused this as missing, stale or
+                # broken. Reading it as "not reaching" is what fires Tone 2.
+                reach_active = None
+            else:
                 reach_active, reach_at = reach
                 observed_at = min(observed_at, reach_at)
 
