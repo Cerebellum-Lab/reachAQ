@@ -934,6 +934,83 @@ def test_a_sparse_tail_window_merges_into_the_window_before_it():
     assert fit.valid and fit.knots.size == 7  # 0,120,...,600,700: the 100 s tail keeps its own window
 
 
+def _pairs_past_the_last_bin(ends, host, count, apart, late, rate=10_000.0):
+    """Pairs that end the stamps: the first alone in a new envelope bin, the rest `apart` s
+    after it, each stamped `late` s after its sample was in hand."""
+    start, end = ends[0] / rate, ends[-1] / rate
+    width = clocks.KNOT_SECONDS / clocks.ENVELOPE_BINS
+    edge = start + np.ceil((end - start) / width) * width
+    sample = edge + 0.001 + apart * np.arange(count)
+    return np.round(sample * rate).astype(np.int64), host(sample) + 0.0002 + late
+
+
+@pytest.mark.parametrize("count, apart, late", [
+    (1, 0.0, 0.02), (1, 0.0, 0.1), (1, 0.0, 0.5), (1, 0.0, 5.0),  # one late copy
+    (1, 0.0, -0.5),  # one stamp that cannot be true: a bound can't be early
+    (3, 6.0, 0.5),  # three bins of them
+])
+def test_late_pairs_at_the_end_cost_the_fit_only_themselves(count, apart, late):
+    rng = np.random.default_rng(14)
+    host = _slewed_host(-10.0, [])
+    ends, seen = _stamped_reads(2700.0, host, rng)
+    clean = clocks.fit_piecewise_envelope(ends, seen, 10_000.0)
+    tail_ends, tail_seen = _pairs_past_the_last_bin(ends, host, count, apart, late)
+
+    fit = clocks.fit_piecewise_envelope(np.append(ends, tail_ends), np.append(seen, tail_seen),
+                                        10_000.0)
+
+    assert fit.valid, fit.reason
+    assert fit.points >= clean.points - 2  # the late pairs go, not the windows around them
+    probe = np.linspace(ends[0] / 10_000.0, ends[-1] / 10_000.0, 5_000)
+    assert np.abs(fit.map(probe) - clean.map(probe)).max() < 0.0001
+
+
+def test_a_late_pair_at_the_end_leaves_the_raw_bridge_standing():
+    rng = np.random.default_rng(15)
+    host = _slewed_host(-10.0, [])
+    ends, seen = _stamped_reads(2700.0, host, rng)
+    tail_ends, tail_seen = _pairs_past_the_last_bin(ends, host, 1, 0.0, 0.5)
+    all_seen = np.append(seen, tail_seen)
+    stamps = clocks.BlockStamps(np.append(ends, tail_ends), all_seen, all_seen - 7.0)
+
+    fit = clocks.fit_ni_to_host_timeline(stamps, 10_000.0)
+
+    assert fit.valid, fit.reason
+    assert fit.method == clocks.RAW_BRIDGED
+
+
+def test_a_window_left_sparse_by_late_pairs_merges_into_the_window_before_it():
+    rng = np.random.default_rng(16)
+    host = _slewed_host(-10.0, [])
+    # 2400 s of windows, then 48 s: 8 good points, and 4 late ones that keep it from merging at first.
+    ends, seen = _stamped_reads(2448.0, host, rng)
+    tail_ends, tail_seen = _pairs_past_the_last_bin(ends, host, 4, 6.0, 3.0)
+
+    fit = clocks.fit_piecewise_envelope(np.append(ends, tail_ends), np.append(seen, tail_seen),
+                                        10_000.0)
+
+    assert fit.valid, fit.reason
+    assert fit.knots.size == 21  # 0,120,...,2280 and the end: the last window merged
+    assert fit.knots[-1] == pytest.approx(tail_ends[-1] / 10_000.0)
+
+
+@pytest.mark.parametrize("late", [0.02, 0.5, 3.0])
+def test_a_stall_inside_the_session_costs_the_fit_only_its_own_pairs(late):
+    rng = np.random.default_rng(17)
+    host = _slewed_host(-10.0, [])
+    ends, seen = _stamped_reads(2700.0, host, rng)
+    clean = clocks.fit_piecewise_envelope(ends, seen, 10_000.0)
+    t = ends / 10_000.0
+
+    fit = clocks.fit_piecewise_envelope(ends, np.where((t > 1500.0) & (t < 1530.0), seen + late, seen),
+                                        10_000.0)
+
+    assert fit.valid, fit.reason
+    assert fit.points >= clean.points - 7  # 30 s is five bins, and any of them can straddle
+    probe = np.linspace(t[0], t[-1], 5_000)
+    assert np.abs(fit.map(probe) - clean.map(probe)).max() < 0.0002
+
+
 def test_map_and_inverse_round_trip_and_extrapolate_past_the_knots():
     fit = clocks.PiecewiseClockFit(knots=np.array([0.0, 120.0, 240.0]),
                                    knot_host=np.array([1000.0, 1120.001, 1239.999]),
