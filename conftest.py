@@ -80,11 +80,11 @@ def pytest_collection_modifyitems(config, items):
 def pytest_unconfigure(config):
     """CI only: report what is alive as pytest hands over to interpreter exit.
 
-    The job once hung at exit with every test passed. That is an exit blocked on a
-    child that never died, so name the children and the process tree. The dump
-    below fires only if this process is still alive 5 minutes from now; a healthy
-    exit takes about 22 s on CI, measured from here to the end of the step, and cancels it.
-    Nothing here may fail a healthy run.
+    The job once hung at exit with every test passed. A likely cause is an exit
+    blocked on a child that never died, so name the children and the process tree.
+    The timer armed first dumps every thread's stack only if this process is still
+    alive 5 minutes from now; a healthy exit takes about 22 s on CI, measured from
+    here to the end of the step, and cancels it. Nothing here may fail a healthy run.
     """
     if not os.environ.get("GITHUB_ACTIONS"):
         return
@@ -94,6 +94,11 @@ def pytest_unconfigure(config):
     import threading
 
     out = sys.__stderr__ or sys.stderr
+    try:
+        # Armed before anything that could block, ps on a wedged process included.
+        faulthandler.dump_traceback_later(300, file=out)
+    except Exception:
+        pass
     try:
         print("\n=== exit diagnostics ===", file=out)
         for proc in multiprocessing.active_children():
@@ -111,5 +116,7 @@ def pytest_unconfigure(config):
             timeout=30,
         )
     except Exception as error:  # a diagnostic must never change the exit status
-        print(f"exit diagnostics failed: {error!r}", file=out)
-    faulthandler.dump_traceback_later(300, file=out)
+        try:
+            print(f"exit diagnostics failed: {error!r}", file=out)
+        except Exception:
+            pass

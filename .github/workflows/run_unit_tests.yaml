@@ -152,6 +152,6 @@ jobs:
           for pid in $(pgrep -x coverage; pgrep -x python); do
             echo "::group::pid $pid $(tr '\0' ' ' < /proc/$pid/cmdline | cut -c1-120)"
             grep -E '^(SigCgt|SigPnd|ShdPnd|Threads):' /proc/$pid/status || true
-            sudo "$(command -v py-spy)" dump --pid "$pid" || true
+            timeout -k 5 20 sudo "$(command -v py-spy)" dump --pid "$pid" || true
             echo "::endgroup::"
           done
