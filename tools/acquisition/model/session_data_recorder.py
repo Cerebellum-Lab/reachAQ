@@ -2932,7 +2932,7 @@ class SessionDataRecorder:
         The spool runs on past the last frame until Stop closes it. Copies made
         there can be late while Stop is busy, and one late stamp alone at the
         end cost a 45-minute session its whole fit (2026-11-05). The latency
-        finalizer fits nidaq.h5, which ends at the last frame: the same stamps.
+        finalizer fits nidaq.h5, which ends at the last frame too.
         """
         try:
             period = SessionDataRecorder._nidaq_sample_period(chunks)
