@@ -553,16 +553,17 @@ def fit_piecewise_envelope(end_index, seen_perf, sample_rate: float, *,
         # through itself, so until it has gone the good points beside it look like
         # outliers too, against a spread the undisturbed windows keep small: taking
         # them all at once could empty the window, or leave a fit through the late
-        # ones. But a window with most of its points "outliers" has no majority to
-        # say which are. If what is left is more than the fit may leave, as with a
-        # lasting step in the delay, that is refused: merging the window instead lets
-        # the rejection eat along the session, to a valid fit through what remains,
-        # milliseconds off (planning.md, 2026-11-06). If it is less, it is the host
-        # clock's slew curving inside a window, and the rejection stops there.
+        # ones. But a window with most of its points off the fit has no majority to
+        # say which are outliers. If what is left is more than the fit may leave, as
+        # with a lasting step in the delay, that is refused: merging the window instead
+        # lets the rejection eat along the session, to a valid fit through what remains,
+        # milliseconds off (planning.md, 2026-11-06). If it is less, the rejection stops
+        # there: that is the host clock's slew curving inside a window, or a step too
+        # small to tell from one (up to about 2.5 ms), which the fit then follows.
         fewer_x = numpy.delete(x, worst)
         if numpy.any(numpy.histogram(fewer_x, bins=knots)[0] < window_floor):
             if deviation[worst] > NI_MAX_RESIDUAL_SECONDS:
-                return invalid_piecewise_fit("over half of a knot window's envelope points are outliers")
+                return invalid_piecewise_fit("over half of a knot window's envelope points are off the fit")
             break
         x, y = fewer_x, numpy.delete(y, worst)
     rms = float(numpy.sqrt(numpy.mean(residual ** 2)))
