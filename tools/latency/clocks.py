@@ -532,7 +532,7 @@ def fit_piecewise_envelope(end_index, seen_perf, sample_rate: float, *,
     inner = numpy.arange(t[0], t[-1], knot_seconds)
     knots = _merge_sparse_windows(numpy.append(inner[inner < t[-1]], t[-1]), x, MIN_WINDOW_POINTS)
     needed = ENVELOPE_BINS // 2
-    for attempt in range(2):
+    while True:
         if x.size < max(needed, knots.size):
             return invalid_piecewise_fit(f"{x.size} envelope points, need {max(needed, knots.size)}")
         design = _hat_design(x, knots)
@@ -543,14 +543,19 @@ def fit_piecewise_envelope(end_index, seen_perf, sample_rate: float, *,
         if rank < knots.size:
             return invalid_piecewise_fit("a knot window has no envelope point")
         residual = y - y0 - design @ coefficients
-        if attempt == 1:
+        deviation = numpy.abs(residual - numpy.median(residual))
+        spread = 1.4826 * float(numpy.median(deviation))
+        worst = int(numpy.argmax(deviation))
+        if deviation[worst] <= max(5.0 * spread, 1e-9) or x.size <= needed:
             break
-        median_residual = numpy.median(residual)
-        spread = 1.4826 * float(numpy.median(numpy.abs(residual - median_residual)))
-        inliers = numpy.abs(residual - median_residual) <= max(5.0 * spread, 1e-9)
-        if inliers.all() or inliers.sum() < needed:
-            break
-        x, y = x[inliers], y[inliers]
+        # One at a time, refitting between. A late pair bends its window's segment
+        # through itself, so until it has gone the good points beside it look like
+        # outliers too, against a spread the undisturbed windows keep small: taking
+        # them all at once could empty the window, or leave a fit through the late
+        # ones. Several bins of late pairs ending a window can still bend it, by up
+        # to 20 ms in a stall added to real stamps (planning.md, 2026-11-06).
+        x, y = numpy.delete(x, worst), numpy.delete(y, worst)
+        knots = _merge_sparse_windows(knots, x, MIN_WINDOW_POINTS)
     rms = float(numpy.sqrt(numpy.mean(residual ** 2)))
     knot_host = coefficients + y0
     valid = rms <= NI_MAX_RESIDUAL_SECONDS

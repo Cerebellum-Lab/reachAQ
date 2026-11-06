@@ -423,7 +423,8 @@ def test_a_late_copy_after_the_last_frame_does_not_cost_a_long_session_its_fit()
     # and its anchor fell back to the epoch, while the nidaq.h5 written from the same spool
     # fitted cleanly: that file ends at the last frame, and the spool runs on through Stop.
     chunks, end_perf = _copies_of_a_long_session_then_one_late_at_stop()
-    assert not SessionDataRecorder._fit_nidaq_to_host(chunks).valid  # what the whole spool gives
+    # The rejection survives this tail now, so the whole spool's fit runs on past the session.
+    assert SessionDataRecorder._fit_nidaq_to_host(chunks).x_max == pytest.approx(2700.2)
 
     fit = SessionDataRecorder._fit_nidaq_to_host(chunks, end_perf=end_perf)
 
