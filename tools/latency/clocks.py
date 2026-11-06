@@ -532,6 +532,7 @@ def fit_piecewise_envelope(end_index, seen_perf, sample_rate: float, *,
     inner = numpy.arange(t[0], t[-1], knot_seconds)
     knots = _merge_sparse_windows(numpy.append(inner[inner < t[-1]], t[-1]), x, MIN_WINDOW_POINTS)
     needed = ENVELOPE_BINS // 2
+    window_floor = numpy.histogram(x, bins=knots)[0] / 2.0
     while True:
         if x.size < max(needed, knots.size):
             return invalid_piecewise_fit(f"{x.size} envelope points, need {max(needed, knots.size)}")
@@ -552,10 +553,18 @@ def fit_piecewise_envelope(end_index, seen_perf, sample_rate: float, *,
         # through itself, so until it has gone the good points beside it look like
         # outliers too, against a spread the undisturbed windows keep small: taking
         # them all at once could empty the window, or leave a fit through the late
-        # ones. Several bins of late pairs ending a window can still bend it, by up
-        # to 20 ms in a stall added to real stamps (planning.md, 2026-11-06).
-        x, y = numpy.delete(x, worst), numpy.delete(y, worst)
-        knots = _merge_sparse_windows(knots, x, MIN_WINDOW_POINTS)
+        # ones. But a window with most of its points "outliers" has no majority to
+        # say which are. If what is left is more than the fit may leave, as with a
+        # lasting step in the delay, that is refused: merging the window instead lets
+        # the rejection eat along the session, to a valid fit through what remains,
+        # milliseconds off (planning.md, 2026-11-06). If it is less, it is the host
+        # clock's slew curving inside a window, and the rejection stops there.
+        fewer_x = numpy.delete(x, worst)
+        if numpy.any(numpy.histogram(fewer_x, bins=knots)[0] < window_floor):
+            if deviation[worst] > NI_MAX_RESIDUAL_SECONDS:
+                return invalid_piecewise_fit("over half of a knot window's envelope points are outliers")
+            break
+        x, y = fewer_x, numpy.delete(y, worst)
     rms = float(numpy.sqrt(numpy.mean(residual ** 2)))
     knot_host = coefficients + y0
     valid = rms <= NI_MAX_RESIDUAL_SECONDS

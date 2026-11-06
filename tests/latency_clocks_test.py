@@ -979,19 +979,32 @@ def test_a_late_pair_at_the_end_leaves_the_raw_bridge_standing():
     assert fit.method == clocks.RAW_BRIDGED
 
 
-def test_a_window_left_sparse_by_late_pairs_merges_into_the_window_before_it():
+@pytest.mark.parametrize("late", [0.005, 0.01, 0.1, 3.0])
+def test_a_lasting_step_in_the_delay_is_refused_and_not_fitted_around(late):
+    # Nothing about any one stamp is wrong here, so no rejection can explain it. Merging the
+    # window it emptied gave a valid fit milliseconds off, on the points that were left.
+    rng = np.random.default_rng(18)
+    ends, seen = _stamped_reads(2700.0, _slewed_host(-10.0, []), rng)
+    t = ends / 10_000.0
+
+    fit = clocks.fit_piecewise_envelope(ends, seen + late * (t > 1500.0), 10_000.0)
+
+    assert not fit.valid
+    assert "over half" in fit.reason
+
+
+def test_a_window_mostly_of_late_pairs_is_refused_and_not_fitted_through():
     rng = np.random.default_rng(16)
     host = _slewed_host(-10.0, [])
-    # 2400 s of windows, then 48 s: 8 good points, and 4 late ones that keep it from merging at first.
-    ends, seen = _stamped_reads(2448.0, host, rng)
-    tail_ends, tail_seen = _pairs_past_the_last_bin(ends, host, 4, 6.0, 3.0)
+    # 2400 s of windows, then 30 s: 5 good points, and 8 late ones that outnumber them.
+    ends, seen = _stamped_reads(2430.0, host, rng)
+    tail_ends, tail_seen = _pairs_past_the_last_bin(ends, host, 8, 6.0, 3.0)
 
     fit = clocks.fit_piecewise_envelope(np.append(ends, tail_ends), np.append(seen, tail_seen),
                                         10_000.0)
 
-    assert fit.valid, fit.reason
-    assert fit.knots.size == 21  # 0,120,...,2280 and the end: the last window merged
-    assert fit.knots[-1] == pytest.approx(tail_ends[-1] / 10_000.0)
+    assert not fit.valid
+    assert "over half" in fit.reason
 
 
 @pytest.mark.parametrize("late", [0.02, 0.5, 3.0])
