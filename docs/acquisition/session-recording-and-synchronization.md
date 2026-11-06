@@ -580,8 +580,10 @@ Three things to know when reading `cameraNidaqAlignment`:
   edge (`start_perf` less the expected lag) on the fitted path.
 - `latency.h5` (`clock/ni_to_host`) and `alignment.json` (`niToHost`) are
   separate fits of the same stamps: the first from the published, boundary-trimmed
-  `nidaq.h5`, the second from the whole spool. Their `knotCount` and `x_min`
-  differ, and neither is derived from the other.
+  `nidaq.h5`, the second from the spool's stamps up to the last frame: the spool
+  runs on through Stop, and a copy delayed there can cost a long session its whole
+  fit. Their `knotCount` and `x_min` can differ, and neither is derived from the
+  other.
 
 The latency finalizer's own `cameraToNi` record (`latency.h5`
 `clock/camera_to_ni`, and `clocks.cameraToNi` in its status) carries the
