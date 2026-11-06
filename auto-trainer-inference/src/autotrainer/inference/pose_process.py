@@ -655,9 +655,10 @@ class PoseProcess(Process):
             # It could be eventually explained if the serialization
             # of the frames_indices numpy array happens after the return of the queue put()..
             # which is not totally impossible.
-            # The live frames' exposure times go with them, copied for the same
-            # reason, so live tracking can place each frame on the session clock
-            # instead of extrapolating a nominal frame rate. Offline has none.
+            # The live frames' capture times (frame_perf_c: host arrival, not the
+            # exposure instant) go with them, copied for the same reason, so live
+            # tracking can place each frame on the session clock instead of
+            # extrapolating a nominal frame rate. Offline has none.
             frames_perf_out = frames_perf_c1.copy() if i_q is live_input else None
 
             # reminder: on the other side: we don't copy the pose_data output, given we assume

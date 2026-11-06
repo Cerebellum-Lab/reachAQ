@@ -62,9 +62,10 @@ class PoseResponse:
     """
 
     source_frame_perf_times: Tuple[Tuple[float, ...], ...] = ()
-    """Host perf time each source frame was exposed, parallel to ``source_frame_ids``.
+    """Host perf time of each source frame on the capture's clock, parallel to ``source_frame_ids``.
 
-    Empty when the producer did not supply them.
+    ``frame_perf_c``: the camera stamp fitted to host arrival, not the exposure
+    instant (see ``video_capture``). Empty when the producer did not supply them.
     """
 
     live_recv_perf_c: float = math.nan

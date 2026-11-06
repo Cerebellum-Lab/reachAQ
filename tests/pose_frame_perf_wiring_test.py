@@ -1,15 +1,16 @@
-"""A live pose batch has to leave the pose process with its exposure times.
+"""A live pose batch has to leave the pose process with its frames' capture times.
 
-The camera stamps every frame with the host time it was exposed, and the live
-queue hands those times to the pose process with the frames. Live tracking needs
-them downstream: timing pose by frame ID and a nominal frame rate drifts by the
-camera's rate error, about 100 ppm on the rig, which ages reach evidence past
-the cue gate's limit within the first hour of a session.
+The capture stamps every frame with frame_perf_c, the camera's timestamp fitted
+to when the host saw the frame (not the exposure instant; see video_capture),
+and the live queue hands those times to the pose process with the frames. Live
+tracking needs them downstream: timing pose by frame ID and a nominal frame rate
+drifts by the camera's rate error, about 100 ppm on the rig, which ages reach
+evidence past the cue gate's limit within the first hour of a session.
 
 Checked by reading the wiring rather than by starting the process: a real start
 needs a GPU, a trained model and a multiprocessing queue.
 
-The batch's latency stamps ride fourth on the data queue and the exposure times
+The batch's latency stamps ride fourth on the data queue and the capture times
 fifth.
 """
 

@@ -145,7 +145,7 @@ def _exposure(recorded_frame_index):
 
 def test_pellet_window_an_hour_into_a_session_holds_its_own_frames():
     # By frame 540000 the nominal rate places frames 0.37 s (56 frames) away
-    # from when the camera exposed them.
+    # from their own capture times.
     app = _app()
     for sequence, first in enumerate(range(539900, 540000, 5)):
         ids = range(first, first + 5)
