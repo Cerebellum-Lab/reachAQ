@@ -96,6 +96,14 @@ def test_locked_deadline_with_stale_evidence_skips_and_resets():
     assert evaluation.reason is CueCancelReason.LOCK_DEADLINE_GATE_STATE_STALE
 
 
+def test_unknown_reach_is_treated_as_stale_not_clear():
+    policy = _policy()
+    policy.start(100.0, 900)
+    unknown = CueGateState(observed_at=100.9, pellet_present=True, reach_active=None)
+    evaluation = policy.evaluate(100.9, unknown)
+    assert evaluation.reason is CueCancelReason.LOCK_DEADLINE_GATE_STATE_STALE
+
+
 def test_unknown_presence_is_treated_as_stale_not_clear():
     policy = _policy()
     policy.start(100.0, 900)

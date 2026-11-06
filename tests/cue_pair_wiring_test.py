@@ -271,10 +271,47 @@ def test_a_reach_observation_past_its_own_limit_is_dropped_not_trusted():
     _prepare(harness, _recipe())
     gate = harness.executor._cue_gate_state(100.4)
 
-    assert gate.reach_active is False
+    assert gate.reach_active is None, "dropped reach state is unknown, not 'still'"
     assert gate.observed_at == pytest.approx(100.39), (
         "a dropped reach observation must not drag the gate age backwards"
     )
+
+
+def test_unknown_reach_at_the_deadline_skips_and_resets():
+    """No reach evidence must not read as "the animal is still"."""
+    resolver = ReachStateResolver(
+        ReachStateConfiguration(source=ReachStateSource.LIVE_TRACKING),
+        live_tracking_provider=lambda: None,
+    )
+    harness = _Harness(
+        pellet_presence_provider=lambda: (True, 100.39),
+        reach_state_resolver=resolver,
+    )
+    operation = _prepare(harness, _recipe())
+    harness.now = 100.4
+    harness.timer.fire(at=100.4)
+
+    assert ("tone2", "tone_2") not in harness.tones
+    assert any(
+        "skipped and reset" in detail and "gate_state_stale" in detail
+        for detail in _details(operation)
+    )
+
+
+def test_a_reach_source_set_to_none_never_blocks_the_cue():
+    resolver = ReachStateResolver(
+        ReachStateConfiguration(source=ReachStateSource.NONE),
+        live_tracking_provider=lambda: None,
+    )
+    harness = _Harness(
+        pellet_presence_provider=lambda: (True, 100.39),
+        reach_state_resolver=resolver,
+    )
+    _prepare(harness, _recipe())
+    harness.now = 100.4
+    harness.timer.fire(at=100.4)
+
+    assert ("tone2", "tone_2") in harness.tones
 
 
 def test_an_unlocked_trial_waits_for_the_block_then_fires():
