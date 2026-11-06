@@ -1747,10 +1747,10 @@ class SessionDataRecorder:
         nidaq_perf = SessionDataRecorder._nidaq_perf_values(
             nidaq_chunks, start_perf, end_perf,
         )
-        # The drift-corrected NI-to-host map of the whole spool. Invalid, with
-        # its reason, rather than raised when the spool cannot support one; the
-        # anchor and every timeline below then use the epoch mapping as before.
-        ni_fit = SessionDataRecorder._fit_nidaq_to_host(nidaq_chunks)
+        # The drift-corrected NI-to-host map of the session's stamps. Invalid,
+        # with its reason, rather than raised when the spool cannot support one;
+        # the anchor and every timeline below then use the epoch mapping as before.
+        ni_fit = SessionDataRecorder._fit_nidaq_to_host(nidaq_chunks, end_perf=end_perf)
         primary_exposure = (
             None
             if boundary is None or not camera_exposure_seconds
@@ -2926,13 +2926,21 @@ class SessionDataRecorder:
         return ni_fit.map(np.asarray(indices, dtype=np.float64) / float(rate))
 
     @staticmethod
-    def _fit_nidaq_to_host(chunks):
-        """The spool's NI-to-host map; invalid with a reason rather than raised."""
+    def _fit_nidaq_to_host(chunks, *, end_perf=math.inf):
+        """The NI-to-host map of the stamps up to end_perf; invalid with a reason rather than raised.
+
+        The spool runs on past the last frame until Stop closes it. Copies made
+        there can be late while Stop is busy, and one late stamp alone at the
+        end cost a 45-minute session its whole fit (2026-11-05). The latency
+        finalizer fits nidaq.h5, which ends at the last frame: the same stamps.
+        """
         try:
             period = SessionDataRecorder._nidaq_sample_period(chunks)
             if period <= 0:
                 return clocks.invalid_piecewise_fit("NI sample rate unknown")
             stamps, raw_problem = SessionDataRecorder._nidaq_block_stamps_and_raw_problem(chunks)
+            within = stamps.perf <= end_perf
+            stamps = clocks.BlockStamps(stamps.end_index[within], stamps.perf[within], stamps.raw[within])
             fit = clocks.fit_ni_to_host_timeline(stamps, 1.0 / period)
             if raw_problem:
                 # As the selector names a RAW that failed: the perf stamps were fitted alone.

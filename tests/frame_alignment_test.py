@@ -32,12 +32,14 @@ def _project(tmp_path, session=1):
 def _record(tmp_path, *, t0, lag, seconds=20.0, latches=True, stream=True, exposure=EXPOSURE,
             polls=(), raw=False, stamps=True, tone_pulses=(), device_rows=(), laser_rows=(),
             trial_records=(), arrival=ARRIVAL, latch_error=0.0, stream_tail_seconds=0.0,
-            raw_latches=False, drop_edge_at=None, latch_half_bracket=LATCH_HALF_BRACKET):
+            raw_latches=False, drop_edge_at=None, latch_half_bracket=LATCH_HALF_BRACKET,
+            spool_tail_seconds=0.0):
     """One finalized session: the spool holds 5 s before the recording and `seconds` of it.
 
     The latency stream runs stream_tail_seconds past the end of the spool. raw puts RAW
     stamps on the NI reads and raw_latches a RAW bracket on the latches; drop_edge_at
-    (NI seconds) loses one cam_frames transition."""
+    (NI seconds) loses one cam_frames transition. The spool runs spool_tail_seconds past
+    the recording, as it does through Stop."""
     rig = SyntheticRig(polls=polls)
     project = _project(tmp_path)
     session_dir = Path(project.get_session_path().location)
@@ -45,8 +47,8 @@ def _record(tmp_path, *, t0, lag, seconds=20.0, latches=True, stream=True, expos
     count = int(seconds * FPS) - 2
     start_perf, start_wall, boundary = rig.start(project, n0, lag)
     end_perf = rig.frame_perf_c(n0 + count - 1, lag)
-    spool = rig.write_spool(session_dir / "nidaq_capture.h5", t_from=t0 - 5.0, t_to=t0 + seconds,
-                            tone_pulses=tone_pulses, raw=raw, stamps=stamps,
+    spool = rig.write_spool(session_dir / "nidaq_capture.h5", t_from=t0 - 5.0,
+                            t_to=t0 + seconds + spool_tail_seconds, tone_pulses=tone_pulses, raw=raw, stamps=stamps,
                             drop_edge_at=drop_edge_at)
     rig.write_frame_ledger(project, n0, count, lag)
     if stream:
@@ -375,6 +377,50 @@ def test_raw_stamps_bridge_the_fit_through_an_ntp_step(tmp_path):
     probe = np.linspace(5.0, 24.0, 2000)
     error = fit.map(probe) - rig.host(probe)
     assert 0.0 < error.min() and error.max() < 0.0006  # late by the delivery floor, through the step
+
+
+def _copies_of_a_long_session_then_one_late_at_stop():
+    """(chunks, end_perf): 45 minutes of recorder copies, one sample each so the test is
+    light, then a copy after the last frame whose stamp is alone in its envelope bin."""
+    rng = np.random.default_rng(7)
+
+    def copy_of(sample, stamp):
+        index = np.array([sample], dtype=np.int64)
+        return (index, index / RATE, index / RATE, np.zeros((1, 1), dtype=np.float32), ("barcode",),
+                RATE, 1, 0, 0, stamp, stamp + 90.0, stamp - 7.0)
+
+    samples = np.arange(1, 27_000) * 1_000  # one every 0.1 s
+    stamps = samples / RATE + 0.0002 + rng.uniform(0, 0.001, samples.size)
+    chunks = [copy_of(int(sample), float(stamp)) for sample, stamp in zip(samples, stamps)]
+    end_perf = float(stamps[-1])
+    # 2700.2 s opens a new 6 s bin; the next stamp is the only one to bound that sample.
+    chunks.append(copy_of(27_002_000, 2700.2005))
+    chunks.append(copy_of(27_003_000, 2701.3))
+    return tuple(chunks), end_perf
+
+
+def test_a_late_copy_after_the_last_frame_does_not_cost_a_long_session_its_fit():
+    # 2026-11-05: a 45-minute session's fit came back "a knot window has no envelope point",
+    # and its anchor fell back to the epoch, while the nidaq.h5 written from the same spool
+    # fitted cleanly: that file ends at the last frame, and the spool runs on through Stop.
+    chunks, end_perf = _copies_of_a_long_session_then_one_late_at_stop()
+    assert not SessionDataRecorder._fit_nidaq_to_host(chunks).valid  # what the whole spool gives
+
+    fit = SessionDataRecorder._fit_nidaq_to_host(chunks, end_perf=end_perf)
+
+    assert fit.valid, fit.reason
+    assert fit.method == clocks.RAW_BRIDGED
+    assert fit.x_max < end_perf
+
+
+def test_the_session_is_fitted_on_its_own_stamps_and_not_the_spools_tail(tmp_path):
+    rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001, raw=True, spool_tail_seconds=3.0)
+
+    camera = result["cameraNidaqAlignment"]
+    assert camera["niToHost"]["valid"]
+    assert 24.0 < camera["niToHost"]["x_max"] < 25.0
+    assert camera["confidence"] == "hardware_edge"
+    assert camera["matchedSampleIndex"] == rig.edge_sample(n0)
 
 
 def test_with_raw_latches_a_perf_slew_does_not_cost_the_anchor(tmp_path):
