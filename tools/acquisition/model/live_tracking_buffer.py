@@ -103,8 +103,9 @@ class LiveTrackingSample:
             return None
         if any(current <= previous for previous, current in zip(primary_ids, primary_ids[1:])):
             raise ValueError("Live primary source frame IDs must be strictly increasing")
-        # The camera's own exposure time for each frame when the response has
-        # one for every frame; the anchor's nominal rate drifts from it.
+        # Each frame's own capture time (frame_perf_c: the camera stamp fitted to
+        # host arrival, not the exposure instant) when the response has one for
+        # every frame; the anchor's nominal rate drifts from it.
         source_perfs = tuple(getattr(response, "source_frame_perf_times", ()))
         primary_perfs = tuple(float(value) for value in source_perfs[0]) if source_perfs else ()
         if len(primary_perfs) != len(primary_ids) or not all(map(math.isfinite, primary_perfs)):

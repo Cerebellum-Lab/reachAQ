@@ -79,12 +79,12 @@ def _close_fhs(cams_frame_idx_fhs: Optional[List[Optional[TextIO]]]):
 #
 
 def split_pose_item(item):
-    """(pose, mode, frame indices, latency, frame exposure times) from one data-queue item.
+    """(pose, mode, frame indices, latency, frame capture times) from one data-queue item.
 
     The pose process sends five elements: the batch's latency stamps, then
-    each live frame's exposure time. The end-of-offline marker and older
-    producers send three; a producer from before the exposure times sends
-    four, which is the latency only.
+    each live frame's capture time (``frame_perf_c``, host arrival). The
+    end-of-offline marker and older producers send three; a producer from
+    before the capture times sends four, which is the latency only.
     """
     pose_data, mode, frames_indices, *rest = item
     latency = rest[0] if len(rest) > 0 else None
@@ -93,11 +93,11 @@ def split_pose_item(item):
 
 
 def live_source_frames(frames_indices, frames_perf):
-    """(source frame ids, source frame exposure times) for the live workers.
+    """(source frame ids, source frame capture times) for the live workers.
 
     A padded slot has a negative id and no frame, so its time is dropped with
     it and the two tuples stay parallel. ``frames_perf`` is None from a
-    producer that sends no exposure times; the times are then empty, not
+    producer that sends no capture times; the times are then empty, not
     invented.
     """
     source_frame_ids = tuple(

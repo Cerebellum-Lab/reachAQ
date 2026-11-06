@@ -10820,10 +10820,10 @@ class AppModel(ObservableObject):
         count since acquisition began; anchoring on it put every sample earlier
         by however long the camera ran before Record.
 
-        The rate is measured once a second of frames carries its own exposure
-        times: the rig's cameras deliver 149.9845 frames per host second for a
-        configured 150, and the configured rate an hour in misplaces a frame by
-        0.37 s.
+        The rate is measured once a second of frames carries its own capture
+        times (frame_perf_c, host arrival): the rig's cameras deliver 149.9845
+        frames per host second for a configured 150, and the configured rate an
+        hour in misplaces a frame by 0.37 s.
         """
         primary = self._ordered_reach_cameras(enabled_only=True)[0]
         frame_rate = float(
