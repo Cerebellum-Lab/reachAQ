@@ -36,7 +36,7 @@ def _record(tmp_path, *, t0, lag, seconds=20.0, latches=True, stream=True, expos
             spool_tail_seconds=0.0):
     """One finalized session: the spool holds 5 s before the recording and `seconds` of it.
 
-    The latency stream runs stream_tail_seconds past the end of the spool. raw puts RAW
+    The latency stream runs stream_tail_seconds past the recording. raw puts RAW
     stamps on the NI reads and raw_latches a RAW bracket on the latches; drop_edge_at
     (NI seconds) loses one cam_frames transition. The spool runs spool_tail_seconds past
     the recording, as it does through Stop."""
@@ -410,7 +410,7 @@ def test_a_late_copy_after_the_last_frame_does_not_cost_a_long_session_its_fit()
 
     assert fit.valid, fit.reason
     assert fit.method == clocks.RAW_BRIDGED
-    assert fit.x_max < end_perf
+    assert fit.x_max == pytest.approx(2699.8)  # the sample the session's last stamp bounds
 
 
 def test_the_session_is_fitted_on_its_own_stamps_and_not_the_spools_tail(tmp_path):

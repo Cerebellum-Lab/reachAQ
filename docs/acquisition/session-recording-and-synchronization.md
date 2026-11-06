@@ -582,8 +582,8 @@ Three things to know when reading `cameraNidaqAlignment`:
   separate fits of the same stamps: the first from the published, boundary-trimmed
   `nidaq.h5`, the second from the spool's stamps up to the last frame: the spool
   runs on through Stop, and a copy delayed there can cost a long session its whole
-  fit. Their `knotCount` and `x_min` can differ, and neither is derived from the
-  other.
+  fit. `nidaq.h5` is cut on the epoch timeline, so their `knotCount`, `x_min` and
+  `x_max` can differ, and neither is derived from the other.
 
 The latency finalizer's own `cameraToNi` record (`latency.h5`
 `clock/camera_to_ni`, and `clocks.cameraToNi` in its status) carries the
