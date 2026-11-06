@@ -64,10 +64,97 @@ def test_stale_allowlist_entry_fails():
     assert ev.stale == ["a"] and not ev.ok
 
 
-def test_unknown_is_reported_not_failed():
-    ev = evaluate([d("u", "unknown"), d("n", "none")], {})
-    assert ev.ok and {x.name for x in ev.unknown} == {"u", "n"}
-    assert "unknown: 2" in render_markdown(ev, [d("u", "unknown"), d("n", "none")])
+@pytest.mark.parametrize("flag", ["unknown", "none"])
+def test_unidentified_licence_not_on_the_allowlist_fails(flag):
+    ev = evaluate([d("u", flag), d("ok", "permissive")], {})
+    assert [x.name for x in ev.unidentified] == ["u"] and not ev.ok
+    # Unidentified is its own failure: the AGPL/GPL violations stay AGPL/GPL only.
+    assert ev.violations == [] and ev.stale == []
+
+
+@pytest.mark.parametrize("flag", ["unknown", "none"])
+def test_allowlisted_unidentified_licence_passes(flag):
+    ev = evaluate([d("u", flag)], {"u": "why"})
+    assert ev.ok and ev.unidentified == [] and ev.violations == [] and ev.stale == []
+
+
+@pytest.mark.parametrize("flag", ["permissive", "LGPL"])
+def test_allowlisted_package_with_an_identified_licence_is_stale(flag):
+    # The entry was written when the metadata named no licence. Once it names an
+    # identified licence that needs no exception, the entry has done its job.
+    ev = evaluate([d("n", flag)], {"n": "why"})
+    assert ev.stale == ["n"] and not ev.ok
+    assert ev.unidentified == [] and ev.violations == []
+
+
+def test_allowlist_entry_for_a_package_that_is_not_installed_is_stale():
+    ev = evaluate([d("other", "none")], {"gone": "why", "other": "why"})
+    assert ev.stale == ["gone"] and not ev.ok
+
+
+def test_agpl_gpl_and_unidentified_are_judged_independently():
+    dists = [d("a", "AGPL"), d("g", "GPL"), d("u", "none"), d("n", "unknown"), d("p", "permissive")]
+    ev = evaluate(dists, {"a": "why", "n": "why"})
+    assert [x.name for x in ev.violations] == ["g"]
+    assert [x.name for x in ev.unidentified] == ["u"]
+    assert ev.stale == [] and not ev.ok
+    assert evaluate(dists, {"a": "why", "g": "why", "u": "why", "n": "why"}).ok
+
+
+def sections(markdown):
+    """The Markdown split into {heading: body}, the title and summary under ''."""
+    head, *rest = markdown.split("\n### ")
+    parts = {"": head}
+    for chunk in rest:
+        title, _, body = chunk.partition("\n")
+        parts[title] = body
+    return parts
+
+
+def test_markdown_separates_failing_from_allowlisted_unidentified_packages():
+    dists = [d("u", "none"), d("n", "unknown"), d("p", "permissive")]
+    ev = evaluate(dists, {"n": "why"})
+    parts = sections(render_markdown(ev, dists))
+    assert parts[""].startswith("## Licence check: FAIL")
+    assert "unidentified: 1" in parts[""]
+    failing = next(body for title, body in parts.items() if title.startswith("Licence not identified"))
+    allowed = next(body for title, body in parts.items() if title.startswith("Allowlisted packages with no"))
+    assert "| u |" in failing and "| n |" not in failing
+    assert "| n |" in allowed and "| u |" not in allowed
+    assert "| p |" not in failing + allowed
+
+
+def test_markdown_passes_with_the_unidentified_package_only_in_the_allowlisted_section():
+    dists = [d("n", "none")]
+    markdown = render_markdown(evaluate(dists, {"n": "why"}), dists)
+    parts = sections(markdown)
+    assert parts[""].startswith("## Licence check: PASS")
+    assert not any(title.startswith("Licence not identified") for title in parts)
+    assert any(title.startswith("Allowlisted packages with no") for title in parts)
+
+
+def run_main(tmp_path, monkeypatch, capsys, dists, allowlist_text):
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text(allowlist_text, encoding="utf-8")
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    monkeypatch.setattr("tools.ci.check_licences.installed_licences", lambda: dists)
+    code = main(["--allowlist", str(allowlist)])
+    return code, capsys.readouterr().out
+
+
+def test_main_exits_1_for_an_unidentified_package_that_is_not_allowlisted(tmp_path, monkeypatch, capsys):
+    code, out = run_main(tmp_path, monkeypatch, capsys, [d("u", "none")], "# no entries\n")
+    assert code == 1 and "## Licence check: FAIL" in out
+
+
+def test_main_exits_0_once_the_unidentified_package_is_allowlisted(tmp_path, monkeypatch, capsys):
+    code, out = run_main(tmp_path, monkeypatch, capsys, [d("u", "none")], "u  # why\n")
+    assert code == 0 and "## Licence check: PASS" in out
+
+
+def test_main_exits_1_when_the_allowlisted_package_now_names_a_licence(tmp_path, monkeypatch, capsys):
+    code, out = run_main(tmp_path, monkeypatch, capsys, [d("u", "permissive", "MIT")], "u  # why\n")
+    assert code == 1 and "Stale allowlist entries" in out and "- u" in out
 
 
 class FakeDist:
@@ -138,3 +225,11 @@ def test_undeclared_licence_is_none_and_freebsd_is_permissive(monkeypatch):
     got = installed(monkeypatch, FakeDist("u", "UNKNOWN"), FakeDist("f", "FreeBSD"))
     assert got["u"].flag == "none" and got["u"].licence_text == ""
     assert got["f"].flag == "permissive"
+
+
+def test_no_metadata_at_all_cannot_pass_silently(monkeypatch):
+    # The roadmap case: a dependency that ships no licence metadata whatsoever.
+    got = installed(monkeypatch, FakeDist("bare"))
+    assert got["bare"].flag == "none"
+    ev = evaluate(list(got.values()), {})
+    assert not ev.ok and [x.name for x in ev.unidentified] == ["bare"]
