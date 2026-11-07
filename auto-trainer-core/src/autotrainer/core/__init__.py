@@ -298,12 +298,22 @@ from .fixed_array_multiqueue import FixedArrayMultiQueue
 from .fixed_array_queue import FixedArrayQueue
 
 from .project import ProjectInfo, ProjectInterval
-from .animal import AnimalSubject
+from .animal import (
+    AnimalSubject,
+    ExternalAnimalRecord,
+    ExternalIdentity,
+    ExternalMetadataSnapshot,
+    NormalizedAnimalBatch,
+    normalize_rfid,
+    reader_payload_to_rfid,
+)
 
 from .perf_monitor import PerfMonitor
 from .queue_util import clear_queue
 from .notification import NotificationCenter, Notification, TriggerNotification, post_trigger_enable
-from .configuration import HardwareConfiguration, InferenceConfiguration, PersistenceConfiguration
+from .configuration import HardwareConfiguration, InferenceConfiguration, LaserChannelConfiguration, LaserChannelId, \
+    LaserSystemConfiguration, NidaqDeviceIdentity, NidaqPortConfiguration, NidaqTimingConfiguration, NidaqTimingPlan, NidaqTimingRoute, NidaqTaskGraph, NidaqTaskSpecification, NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration, \
+    PersistenceConfiguration, normalize_laser_channel_id
 
 from .message import MotorConfigurations, Motor
 from .message import SystemStatusMessageKind, SystemCommandKind, MeasurementMessageProtocol, AudioSpectrumMessage
@@ -311,8 +321,7 @@ from .configuration import SystemConfiguration, BehaviorConfiguration, CameraCon
     SystemConfigurationLoader
 
 from .message import MessageHandler, SystemMessageHandler
-from .analysis import SensorAnalysis, MeasurementData, AudioSpectrumData
-from .analysis import LoadCellMonitor, HeadbarPressureMonitor
+from .analysis import ReachAnalysis
 
 from .event.api_event_kind import ApiEventKind
 from .event.event_info import EventInfo

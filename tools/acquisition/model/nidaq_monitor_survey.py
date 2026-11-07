@@ -1,0 +1,356 @@
+"""Every line on every card, so a configuration can be read off the rig.
+
+The configured stream carries the ten channels this rig was told about. That
+is the wrong set for deciding what to tell it: working out which line a
+stimulus arrives on means watching the lines nobody has claimed yet, which is
+exactly what the configured stream leaves out. Someone with a cable and no
+documentation had to guess, patch, restart and look - and the loop that
+produced "there is no slot for PFI1" and a stimulus on a dead APFI connector.
+
+So the survey asks the driver what exists and streams all of it, named after
+the terminal rather than after a role nothing has assigned yet.
+
+Two limits are the hardware's, and both are why this is not simply "all the
+lines in one task":
+
+  * correlated digital input on an M Series board is port0 only. port1 and
+    port2 are the PFI pins, which are static digital I/O - they have levels
+    but no sample clock, so they are polled beside the stream rather than in
+    it;
+  * some boards have no correlated digital input at all. A PXI-6713's
+    digital lines hold a level and cannot be clocked, and the driver says so
+    by refusing the DI maximum rate property outright. Measured here: putting
+    its port0 in a buffered task fails at -200452 on DI_DataXferMech and
+    takes the whole survey with it. Which port is streamable is therefore
+    asked, not assumed;
+  * an analog output board has no analog input either, so it contributes
+    digital lines and nothing else. Asking it for ai0 is how the availability
+    barrier once waited forever.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import re
+from typing import Dict, Optional, Sequence, Tuple
+
+from autotrainer.core import (
+    NidaqSignalChannelConfiguration,
+    NidaqSignalStreamConfiguration,
+)
+
+from tools.acquisition.model.nidaq_breakout import (
+    breakout_for_device,
+    describe_terminal,
+)
+
+#: A line that exists on the card and cannot be watched from it. Listed
+#: rather than omitted: "ao3 is here and cannot be read without a cable back
+#: into an input" is an answer, and a channel silently missing from the
+#: window is not.
+UNREADABLE = "unreadable"
+
+#: The only port an M Series board can clock. The others are static.
+BUFFERED_PORT = "port0"
+#: Polled beside the stream, for level rather than waveform.
+STATIC_PORTS = ("port1", "port2")
+
+#: One line of the buffered port, as in Dev1/port0/line3.
+_STREAMABLE_LINE = re.compile(rf"^/?[^/]+/{BUFFERED_PORT}/line\d+$", re.IGNORECASE)
+
+
+def is_streamable_line(terminal) -> bool:
+    """Whether `terminal` is one port0 line: the only digital line streamed.
+
+    The stream puts every digital input in one clocked task, and an M Series
+    board clocks port0 only; port1 and port2 are its static PFI pins. Edit
+    DAQ Ports, the acquisition plan and this survey all use this one rule.
+    """
+    return bool(_STREAMABLE_LINE.match(str(terminal or "")))
+
+
+def clocks_digital_input(device) -> bool:
+    """Whether discovery says `device` can clock digital input at all.
+
+    The driver's own answer, not a board model: a board with no correlated
+    digital input, such as a PXI-6713, reports no maximum DI rate, and a
+    clocked task on any of its lines fails at -200452.
+    """
+    return getattr(device, "digital_input_max_rate", None) is not None
+
+#: Slow enough that sixteen inputs and eight lines cost nothing, fast enough
+#: to see a stimulus pulse a human is triggering by hand.
+DEFAULT_SURVEY_RATE_HZ = 2_000.0
+DEFAULT_SURVEY_CHUNK = 200
+
+
+def _tail(name: str) -> str:
+    text = str(name or "").strip("/")
+    return text.split("/", 1)[-1] if "/" in text else text
+
+
+def _port_of(physical_channel: str) -> str:
+    tail = _tail(physical_channel)
+    return tail.split("/", 1)[0] if "/" in tail else ""
+
+
+def _channel_name(physical_channel: str) -> str:
+    """A name that says where it is, because nothing else knows yet.
+
+    `PXI1Slot5/port0/line3` becomes `PXI1Slot5.port0.line3`: unique across
+    boards, and readable as a location rather than as a role.
+    """
+    return str(physical_channel or "").strip("/").replace("/", ".")
+
+
+@dataclasses.dataclass(frozen=True)
+class SurveyLine:
+    """One line the survey watches, and everything known about it up front."""
+
+    name: str
+    physical_channel: str
+    device: str
+    kind: str
+    #: "stream" when it is clocked into the shared ring, "static" when it is
+    #: polled for a level, "unreadable" when the card cannot watch it at all.
+    acquisition: str
+    #: The breakout connector, when the device has a block named.
+    label: str = ""
+    #: What the configuration already calls this line, when anything does.
+    assigned_to: str = ""
+    #: Why it cannot be watched, when acquisition is UNREADABLE.
+    reason: str = ""
+    #: The channel a task must open to see this line, when that is not the
+    #: line itself. An analog output is watched through the board's internal
+    #: readback channel; `physical_channel` stays the pin a cable goes to,
+    #: because that is the one printed on the block and named in a
+    #: configuration.
+    watched_through: str = ""
+
+    @property
+    def terminal(self) -> str:
+        return _tail(self.physical_channel)
+
+    @property
+    def acquired_channel(self) -> str:
+        """What a task opens for this line."""
+        return self.watched_through or self.physical_channel
+
+    def describe(self) -> str:
+        text = self.assigned_to or self.terminal
+        return f"{text} — {self.label}" if self.label else text
+
+
+@dataclasses.dataclass(frozen=True)
+class MonitorSurvey:
+    """What the rig has, split by how it can be watched."""
+
+    lines: Tuple[SurveyLine, ...] = tuple()
+    devices: Tuple[str, ...] = tuple()
+    #: Why a device contributes nothing of some kind, keyed by device.
+    notes: Tuple[Tuple[str, str], ...] = tuple()
+
+    def for_device(self, device: str) -> Tuple[SurveyLine, ...]:
+        return tuple(line for line in self.lines if line.device == device)
+
+    def streamed(self) -> Tuple[SurveyLine, ...]:
+        return tuple(line for line in self.lines if line.acquisition == "stream")
+
+    def unreadable(self) -> Tuple[SurveyLine, ...]:
+        return tuple(line for line in self.lines
+                     if line.acquisition == UNREADABLE)
+
+    def static(self) -> Tuple[SurveyLine, ...]:
+        return tuple(line for line in self.lines if line.acquisition == "static")
+
+    def notes_for(self, device: str) -> Tuple[str, ...]:
+        """Everything worth saying about this card - often more than one thing.
+
+        A PXI-6713 has neither analog input nor clocked digital input, and
+        returning only the first would leave half the explanation out.
+        """
+        return tuple(note for name, note in self.notes if name == device)
+
+
+def _assignments(configuration) -> Dict[str, str]:
+    """Every terminal the configuration already claims, by full channel name."""
+    found: Dict[str, str] = {}
+
+    def record(value, owner):
+        text = str(value or "").strip("/").lower()
+        if text:
+            found.setdefault(text, owner)
+
+    stream = getattr(configuration, "nidaq_stream", None)
+    for channel in getattr(stream, "channels", ()) or ():
+        record(getattr(channel, "physical_channel", ""),
+               getattr(channel, "name", ""))
+    laser = getattr(configuration, "laser", None)
+    for channel in getattr(laser, "channels", ()) or ():
+        number = getattr(getattr(channel, "channel_id", None), "value", "?")
+        for attribute, described in (
+            ("analog_output", f"laser {number} command"),
+            ("diode_input", f"laser {number} diode"),
+            ("shutter_output", f"laser {number} shutter"),
+            ("trigger_route_source", f"laser {number} trigger in"),
+        ):
+            record(getattr(channel, attribute, ""), described)
+    ports = getattr(configuration, "nidaq_ports", None)
+    for attribute in ("tone1", "tone2", "tone3_r", "tone3_l", "cam_frames",
+                      "barcode"):
+        record(getattr(ports, attribute, ""), attribute)
+    return found
+
+
+def build_survey(devices: Sequence, configuration=None) -> MonitorSurvey:
+    """Every watchable line the driver reports, located and cross-referenced."""
+    ports = getattr(configuration, "nidaq_ports", None)
+    assignments = _assignments(configuration)
+    lines, notes, names = [], [], []
+
+    for device in devices:
+        device_name = getattr(device, "name", "")
+        if not device_name:
+            continue
+        names.append(device_name)
+        model = breakout_for_device(ports, device_name)
+
+        def claimed_by(physical_channel) -> str:
+            """What the configuration calls this pin, under any of its names.
+
+            A pin has more than one name: the PFI 0 BNC is port1/line0 to the
+            digital subsystem and PFI0 to everything that triggers on it, and
+            this rig's laser trigger is configured as the second. Matching
+            only the literal string would survey the line somebody wired a
+            stimulus to and report it as spare.
+            """
+            candidates = [str(physical_channel).strip("/").lower()]
+            for connector in (model.connectors_for(_tail(physical_channel))
+                              if model is not None else ()):
+                for name in connector.terminals:
+                    candidates.append(f"{device_name}/{name}".lower())
+            for candidate in candidates:
+                if candidate in assignments:
+                    return assignments[candidate]
+            return ""
+
+        def add(physical_channel, kind, acquisition, *, reason="",
+                watched_through="", named_as=None):
+            named_as = named_as or physical_channel
+            lines.append(SurveyLine(
+                name=_channel_name(named_as),
+                physical_channel=physical_channel,
+                device=device_name,
+                kind=kind,
+                acquisition=acquisition,
+                label=describe_terminal(model, _tail(named_as)),
+                assigned_to=claimed_by(named_as),
+                reason=reason,
+                watched_through=watched_through,
+            ))
+
+        analog_inputs = tuple(getattr(device, "analog_inputs", ()) or ())
+        for channel in analog_inputs:
+            add(channel, "analog", "stream")
+        if not analog_inputs:
+            notes.append((
+                device_name,
+                f"{device_name} reports no analog input, so it contributes "
+                "digital lines only"))
+
+        # The driver's own answer. A board with no correlated digital input
+        # does not report a maximum rate for it, and none of its lines can go
+        # in a clocked task however they are named.
+        can_clock_digital = clocks_digital_input(device)
+        if not can_clock_digital and getattr(device, "digital_inputs", ()):
+            notes.append((
+                device_name,
+                f"{device_name} reports no clocked digital input, so its "
+                "lines are polled for a level rather than streamed"))
+
+        # An analog output cannot be read directly - DAQmx refuses it as
+        # the wrong I/O type - but a board with an input multiplexer can
+        # route its own output back through it. The line is named after the
+        # output somebody wired a cable to, not after the internal channel.
+        readbacks = dict(getattr(device, "analog_output_readbacks", ()) or ())
+        for channel in tuple(getattr(device, "analog_outputs", ()) or ()):
+            internal = readbacks.get(channel)
+            if internal:
+                add(channel, "analog", "stream", watched_through=internal)
+            else:
+                add(channel, "analog", UNREADABLE, named_as=channel,
+                    reason="this card cannot read its own analog output; it "
+                           "can only be seen on an input it is cabled to")
+
+        for channel in tuple(getattr(device, "digital_inputs", ()) or ()):
+            port = _port_of(channel)
+            if can_clock_digital and is_streamable_line(channel):
+                add(channel, "digital", "stream")
+            elif port in STATIC_PORTS or not can_clock_digital:
+                # A level, not a waveform. Polled beside the stream.
+                add(channel, "digital", "static")
+
+        # PFI pins that are not port lines. On an M Series board PFI is
+        # port1 and port2 and is already covered; on a board where it is
+        # neither, there is no way to read a level from it.
+        port_terminals = {_tail(c).lower()
+                          for c in (getattr(device, "digital_inputs", ()) or ())}
+        for terminal in _pfi_terminals(device):
+            connectors = (model.connectors_for(terminal)
+                          if model is not None else ())
+            aliases = {name.lower() for c in connectors for name in c.terminals}
+            if terminal.lower() in port_terminals or aliases & port_terminals:
+                continue
+            add(f"{device_name}/{terminal}", "digital", UNREADABLE,
+                reason="this card does not expose this PFI line as a digital "
+                       "input, so it has no level to read")
+
+        for terminal in tuple(getattr(device, "counter_inputs", ()) or ()):
+            add(terminal, "counter", "static")
+
+    return MonitorSurvey(lines=tuple(lines), devices=tuple(names),
+                         notes=tuple(notes))
+
+
+def _pfi_terminals(device) -> Tuple[str, ...]:
+    """Every PFI terminal the driver reports, without its device prefix."""
+    found = []
+    for terminal in (getattr(device, "terminals", ()) or ()):
+        tail = str(terminal).strip("/").rsplit("/", 1)[-1]
+        if tail.upper().startswith("PFI") and tail not in found:
+            found.append(tail)
+    return tuple(found)
+
+
+def survey_stream_configuration(
+    survey: MonitorSurvey,
+    *,
+    sample_rate_hz: float = DEFAULT_SURVEY_RATE_HZ,
+    read_chunk_size: int = DEFAULT_SURVEY_CHUNK,
+    analog_terminal_config: Optional[str] = None,
+    devices: Optional[Sequence[str]] = None,
+) -> NidaqSignalStreamConfiguration:
+    """The clocked half of the survey, as a stream configuration.
+
+    `analog_terminal_config` is passed through rather than defaulted. Letting
+    DAQmx choose is not neutral - on a PXI-6221 it gives ai0 to ai7
+    differential, pairing each with ai8 to ai15, so a survey of the whole
+    range would read half its channels against pins it is also reading
+    directly, and show one signal in three places.
+    """
+    streamed = [line for line in survey.streamed()
+                if devices is None or line.device in devices]
+    return NidaqSignalStreamConfiguration(
+        channels=tuple(
+            NidaqSignalChannelConfiguration(
+                name=line.name,
+                physical_channel=line.acquired_channel,
+                kind=line.kind,
+            )
+            for line in streamed
+        ),
+        is_enabled=bool(streamed),
+        sample_rate_hz=sample_rate_hz,
+        read_chunk_size=read_chunk_size,
+        analog_terminal_config=analog_terminal_config or "",
+    )

@@ -1,0 +1,283 @@
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
+
+from autotrainer.core import NotificationCenter, TriggerNotification
+from autotrainer.inference import PoseLocation, PoseResponse
+from autotrainer.pyside import PGWidget
+from autotrainer.pyside.content_widget import ContentWidget
+from tools.acquisition.view import main_content as main_content_module
+from tools.acquisition.view.behavior_content import inference_status_display
+from tools.acquisition.view.main_content import MainContent
+from tools.acquisition.view.main_window import _allow_bidirectional_window_resizing
+from tools.acquisition.view.persistent_splitter import PersistentSplitter
+
+
+@pytest.fixture
+def qapp():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    return app
+
+
+def test_post_session_inference_status_uses_operator_wording():
+    from autotrainer.inference import InferenceStatus
+
+    assert inference_status_display(InferenceStatus.intersession) == (
+        "Post-session analysis"
+    )
+
+
+def test_persistent_splitter_restores_user_sizes(qapp, user_pref):
+    first = PersistentSplitter(Qt.Orientation.Horizontal, user_pref, "test_panels")
+    first.addWidget(QWidget())
+    first.addWidget(QWidget())
+    first.resize(600, 200)
+    first.show()
+    first.setSizes([450, 150])
+    qapp.processEvents()
+    first.save_state()
+
+    restored = PersistentSplitter(Qt.Orientation.Horizontal, user_pref, "test_panels")
+    restored.addWidget(QWidget())
+    restored.addWidget(QWidget())
+    restored.resize(600, 200)
+    restored.show()
+    assert restored.apply_saved_or_default_sizes([300, 300])
+    qapp.processEvents()
+
+    assert restored.sizes()[0] > restored.sizes()[1]
+    assert not restored.opaqueResize()
+    assert restored.handleWidth() == 6
+    first.close()
+    restored.close()
+
+
+def test_main_window_resizes_freely_in_width_and_height(qapp):
+    window = QMainWindow()
+    central_widget = QWidget()
+    central_widget.setMinimumSize(1200, 800)
+    window.setCentralWidget(central_widget)
+    _allow_bidirectional_window_resizing(window)
+    window.show()
+    assert (window.minimumWidth(), window.minimumHeight()) == (320, 240)
+
+    window.resize(480, 320)
+    qapp.processEvents()
+    assert (window.width(), window.height()) == (480, 320)
+
+    window.resize(960, 720)
+    qapp.processEvents()
+    assert (window.width(), window.height()) == (960, 720)
+    window.close()
+
+
+def test_graph_widget_tracks_container_width_and_height(qapp):
+    container = QWidget()
+    layout = QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    graph = PGWidget(container)
+    layout.addWidget(graph)
+    container.show()
+
+    container.resize(800, 600)
+    qapp.processEvents()
+    large_size = graph.size()
+
+    container.resize(400, 250)
+    qapp.processEvents()
+    small_size = graph.size()
+
+    assert small_size.width() < large_size.width()
+    assert small_size.height() < large_size.height()
+    assert graph.minimumWidth() == graph.minimumHeight() == 0
+    container.close()
+
+
+def test_all_visible_main_panel_boundaries_are_splitters(qapp, app_model, monkeypatch):
+    class _BehaviorPanelStub(ContentWidget):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(main_content_module, "BehaviorContent", _BehaviorPanelStub)
+    assert app_model.load_configuration() is True
+    content = MainContent(app_model)
+    try:
+        content.resize(1500, 900)
+        content.show()
+        qapp.processEvents()
+
+        assert content._main_splitter.count() == 2
+        assert content._section_splitter.count() == 4
+        assert content._mid_splitter.count() == 2
+        assert content._hardware_splitter.count() == 2
+        assert content._camera_rows_splitter.count() == 1
+        assert content._camera_row_splitters[0].count() == 2
+        assert all(
+            not splitter.childrenCollapsible()
+            for splitter in (
+                content._main_splitter,
+                content._section_splitter,
+                content._mid_splitter,
+                content._hardware_splitter,
+                content._camera_rows_splitter,
+                *content._camera_row_splitters,
+            )
+        )
+
+        content.set_is_editable(True)
+        qapp.processEvents()
+        assert content._camera_rows_splitter.count() == 1
+        assert content._camera_row_splitters[0].count() == 3
+        assert tuple(camera.name for camera, _panel in content._reach_camera_contents) == (
+            "left",
+            "right",
+            "stimCam",
+        )
+        stim_panel = content._reach_camera_content_by_model[app_model.stim_camera]
+        assert stim_panel.camera_view._content_stack.currentIndex() == 1
+        assert not stim_panel._settings.isCaptureEnabled
+        assert app_model.stim_camera._display_update_fcn == stim_panel.refresh_image
+
+        stim_panel._settings.setIsVideoCaptureEnabled(True)
+        qapp.processEvents()
+        assert app_model.stim_camera.is_enabled
+        content.set_is_editable(False)
+        qapp.processEvents()
+        assert tuple(camera.name for camera, _panel in content._reach_camera_contents) == (
+            "left",
+            "right",
+            "stimCam",
+        )
+
+        content.set_is_editable(True)
+        qapp.processEvents()
+        stim_panel = content._reach_camera_content_by_model[app_model.stim_camera]
+        stim_panel._settings.setIsVideoCaptureEnabled(False)
+        qapp.processEvents()
+        content.set_is_editable(False)
+        qapp.processEvents()
+        assert tuple(camera.name for camera, _panel in content._reach_camera_contents) == (
+            "left",
+            "right",
+        )
+    finally:
+        camera_panels = [panel for _camera, panel in content._reach_camera_contents]
+        content.close()
+        subscribers = NotificationCenter.default_center()._subscribers.get(
+            TriggerNotification.CAPTURE_ID,
+            (),
+        )
+        assert all(
+            panel._trigger_received not in subscribers for panel in camera_panels
+        )
+        content.deleteLater()
+
+
+def test_main_content_coalesces_pose_bursts_at_display_rate(qapp, app_model, monkeypatch):
+    class _BehaviorPanelStub(ContentWidget):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(main_content_module, "BehaviorContent", _BehaviorPanelStub)
+    assert app_model.load_configuration() is True
+    app_model.left_camera.is_enabled = True
+    app_model._inference_cameras = (app_model.left_camera,)
+    content = MainContent(app_model)
+    content._timer.stop()
+    try:
+        inference_camera = app_model.inference_cameras[0]
+        camera_panel = content._reach_camera_content_by_model[inference_camera]
+        first = PoseResponse(
+            sequence=1,
+            locations=[{"nose": PoseLocation(1, 10.0, 20.0)}],
+        )
+        newest = PoseResponse(
+            sequence=2,
+            locations=[{"nose": PoseLocation(2, 30.0, 40.0)}],
+        )
+
+        content.refresh_pose(first)
+        content.refresh_pose(newest)
+
+        # Nothing reaches the panel before the tick. That is the guarantee:
+        # dispatching each result as it arrives floods the UI thread and delays
+        # unrelated timers.
+        assert camera_panel.camera_view._next_frame_points == {}
+
+        content.update_image()
+
+        # Both are handed over on the tick, newest last, so the panel can pick
+        # the one matching the frame it is showing rather than being left with
+        # only the newest. Painting still happens once per tick.
+        assert camera_panel.camera_view._next_frame_points == newest.locations[0]
+        assert content._pending_pose_responses == [], "the buffer must drain"
+    finally:
+        content.close()
+        content.deleteLater()
+
+
+def test_selecting_a_subject_does_not_crash_the_training_plan_panel(
+        qapp, app_model, monkeypatch):
+    """The progress widgets must survive construction.
+
+    They are built by _create_protocol_phase_progress_widget and were then
+    overwritten by a block of `= None` defaults that ran afterwards, so with
+    the protocol UI enabled _update_training_plan raised AttributeError on
+    _training_plan_progress_content the moment a subject was selected. The
+    handler caught it as a fatal main-thread exception, marked
+    runtime_diagnostics failed and left an error banner up for the rest of the
+    session, while the selection itself completed.
+    """
+    class _BehaviorPanelStub(ContentWidget):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(main_content_module, "BehaviorContent", _BehaviorPanelStub)
+    assert app_model.load_configuration() is True
+    content = MainContent(app_model)
+    try:
+        assert content.protocol_ui_enabled, (
+            "this guards the enabled path; disabled has its own early return")
+        for name in ("_training_plan_content",
+                     "_training_phase_content",
+                     "_training_plan_progress_content",
+                     "_training_phase_progress_content",
+                     "_protocol_phase_end_widget"):
+            assert getattr(content, name) is not None, (
+                f"{name} was reset to None after it was built")
+
+        # The call that used to raise. None is the no-plan case an operator
+        # hits first, and it reaches every one of the widgets above.
+        content._update_training_plan(None)
+    finally:
+        content.close()
+
+
+def test_main_content_bounds_the_pose_buffer(qapp, app_model, monkeypatch):
+    """A stall must not grow the pose buffer without limit."""
+    class _BehaviorPanelStub(ContentWidget):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(main_content_module, "BehaviorContent", _BehaviorPanelStub)
+    assert app_model.load_configuration() is True
+    content = MainContent(app_model)
+    content._timer.stop()
+    try:
+        limit = main_content_module.PENDING_POSE_LIMIT
+        for sequence in range(limit * 3):
+            content.refresh_pose(PoseResponse(sequence=sequence, locations=[{}]))
+        assert len(content._pending_pose_responses) == limit
+        # The newest survive; the oldest are the ones dropped.
+        kept = [response.sequence for response in content._pending_pose_responses]
+        assert kept[-1] == limit * 3 - 1
+        assert kept[0] == limit * 2
+    finally:
+        content.close()
+        content.deleteLater()

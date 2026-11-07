@@ -34,7 +34,7 @@ class DiagnosticsContent(QWidget):
         layout = QHBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
 
-        title = QLabel("Diagnostics")
+        title = QLabel("Logging")
         title.setStyleSheet("font-weight: bold")
         layout.addWidget(title)
 

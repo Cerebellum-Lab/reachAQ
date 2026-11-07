@@ -15,8 +15,8 @@ from autotrainer.pyside import QCaptureView
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 
 from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.app_model_status import AppModelStatus
 from tools.acquisition.model.video_capture_model import VideoCaptureModel
+from tools.acquisition.view.capture_telemetry_panel import CaptureTelemetryPanel
 
 logger = get_verbose_logger(__name__)
 
@@ -32,17 +32,18 @@ class CameraContent(ContentWidget):
         self._text_overlay_color = Qt.GlobalColor.yellow
 
         layout = QGridLayout()
-        layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
         capture_view = self._capture_view = QCaptureView()
-        capture_view.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        capture_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         settings = self._settings = capture_view.settings
+        capture_model.record_mode = VideoRecordMode.TRIGGER
         settings.setIsVideoCaptureEnabled(capture_model.is_enabled)
         settings.setIsVideoRecordEnabled(capture_model.is_recording_enabled)
-        settings.setRecordMode(capture_model.record_mode)
+        settings.setRecordMode(VideoRecordMode.TRIGGER)
+        settings.setRecordModeVisible(False)
         settings.setStillImageCaptureEnabled(capture_model.is_still_capture_enabled)
         settings.setStillImageCaptureInterval(capture_model.still_image_capture_interval)
 
@@ -58,6 +59,13 @@ class CameraContent(ContentWidget):
 
         layout.addWidget(self._capture_view)
 
+        # Below the video, collapsed. It expands into the preview rather than
+        # pushing it, so opening it costs a fixed sliver of video rather than
+        # reflowing the panel.
+        telemetry_panel = self._telemetry_panel = CaptureTelemetryPanel(
+            app_model.session_telemetry)
+        layout.addWidget(telemetry_panel)
+
         self.setLayout(layout)
 
         NotificationCenter.default_center().add_observer(TriggerNotification.CAPTURE_ID, self._trigger_received)
@@ -66,7 +74,6 @@ class CameraContent(ContentWidget):
 
         # Swap because model shape is row x col == height x width
         capture_view.setShape(capture_model.shape[1], capture_model.shape[0])
-        capture_view.set_presence_detection(capture_model.presence_detection)
 
     def __repr__(self):
         return f"{self.__class__.__name__}(name={self._model.name!r})"
@@ -75,10 +82,20 @@ class CameraContent(ContentWidget):
     def camera_view(self) -> QCaptureView:
         return self._capture_view
 
+    def close(self):
+        NotificationCenter.default_center().remove_observer(TriggerNotification.CAPTURE_ID, self._trigger_received)
+        self._model.property_changed -= self._on_model_property_changed
+        # The panel holds a running timer and an observer on the telemetry
+        # model, which outlives this view; leaving either attached keeps the
+        # widget alive and ticking after it is gone.
+        self._telemetry_panel.close()
+        super().close()
+
     @Slot(ndarray, float)
-    def refresh_image(self, data: ndarray, fps: float):
+    def refresh_image(self, data: ndarray, fps: float, frame_id: int = -1):
         row, col = data.shape
-        self._capture_view.refresh_image(ImageData(data, col, row), fps)
+        self._capture_view.refresh_image(
+            ImageData(data, col, row, frame_id), fps)
 
     @invoke_method
     def set_is_editable(self, is_editable: bool):
@@ -86,8 +103,7 @@ class CameraContent(ContentWidget):
 
     @invoke_method
     def set_is_capture_active(self, is_active: bool):
-        self._capture_view.set_is_capture_active(
-            is_active and self._app_model.status == AppModelStatus.ANIMAL_IN_TRAINING)
+        self._capture_view.set_is_capture_active(is_active)
 
     @invoke_method
     def update_image(self):
@@ -95,8 +111,13 @@ class CameraContent(ContentWidget):
         self._capture_view.update_pose()
 
     @invoke_method
-    def refresh_pose(self, points: Dict[str, PoseLocation]):
-        self._capture_view.refresh_pose(points)
+    def set_overlay_parts(self, parts) -> None:
+        self._capture_view.set_overlay_parts(parts)
+
+    @invoke_method
+    def refresh_pose(self, points: Dict[str, PoseLocation],
+                     frame_id: int = -1):
+        self._capture_view.refresh_pose(points, frame_id)
 
     def _camera_source_changed(self, camera):
         self._model.camera_source = camera
@@ -106,8 +127,7 @@ class CameraContent(ContentWidget):
 
     def _recording_enabled_changed(self, is_enabled):
         self._model.is_recording_enabled = is_enabled
-        self._model.record_mode = VideoRecordMode.TRIGGER if \
-            self._settings.isTriggerRecordMode else VideoRecordMode.CONTINUOUS
+        self._model.record_mode = VideoRecordMode.TRIGGER
 
     def _is_still_image_capture_enabled_changed(self, is_enabled):
         self._model.is_still_capture_enabled = is_enabled

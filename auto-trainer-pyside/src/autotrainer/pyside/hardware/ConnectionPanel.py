@@ -25,7 +25,7 @@ class ConnectionPanel(QWidget):
         layout.addWidget(self._connect_button, 0, Qt.AlignRight)
 
         self._connection_status = QLabel("Not Connected")
-        self._connection_status.setStyleSheet("color: white")
+        self._connection_status.setStyleSheet("color: #20242a")
         self._connection_status.setContentsMargins(0, 0, 4, 0)
 
         panel = CardWidget(title="Connection", content_layout=layout, header_right_layout=self._connection_status)

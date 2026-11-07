@@ -4,7 +4,35 @@ import time
 import sys
 import faulthandler
 from multiprocessing import set_start_method
+from pathlib import Path
 # NB: do not put any imports of autotrainer* or any module not part from standard python lib.
+
+
+def _bootstrap_repo_sources():
+    """Prefer packages beside this launcher over stale editable installs."""
+    repo_root = Path(__file__).resolve().parents[2]
+    source_roots = (
+        repo_root,
+        *(repo_root / package / "src" for package in (
+            "auto-trainer-behavior",
+            "auto-trainer-core",
+            "auto-trainer-device",
+            "auto-trainer-inference",
+            "auto-trainer-model",
+            "auto-trainer-pyside",
+            "auto-trainer-video",
+        )),
+    )
+    for source_root in reversed(source_roots):
+        if not source_root.exists():
+            continue
+        source_text = str(source_root)
+        if source_text in sys.path:
+            sys.path.remove(source_text)
+        sys.path.insert(0, source_text)
+
+
+_bootstrap_repo_sources()
 
 
 def _exec_main(args):
@@ -33,13 +61,27 @@ def _exec_main(args):
 
     plugin = try_register_api_event_plugin()
     app_model.rpc_service = plugin.service
+    # There is no Edit DAQ Ports here: a refused NI-DAQ plan is fixed in the
+    # file, at the field each refusal names.
+    app_model.nidaq_plan_remedy = f"fix the field it names in {config_file}"
 
     try:
-        app_model.load_configuration(config_file)
+        app_model.load_configuration(config_file, random_cameras=args.random_cameras)
     except Exception as err:
         logger.exception("Could not load config: %s", err)
         app_model.on_close()
         return 1
+    # The GUI loads a line the NI-DAQ stream cannot acquire and holds the
+    # stream until Edit DAQ Ports fixes it. There is no dialog here, so this
+    # refuses to run on it, as every load did before.
+    if app_model.nidaq_plan_error:
+        logger.error("Could not load config: NI-DAQ plan refused: %s",
+                     app_model.nidaq_plan_error)
+        app_model.on_close()
+        return 1
+
+    if args.live_inference is not None:
+        app_model.set_runtime_live_inference_override(args.live_inference)
 
     target_status = args.start_mode
     if not app_model.capture_start(target_status=target_status):
@@ -87,13 +129,31 @@ def main():
 
     from tools.acquisition.args import make_autotrainer_parser
 
-    parser = make_autotrainer_parser()
+    # Headless operation still starts acquisition by default; an idle headless
+    # process has no UI from which acquisition can subsequently be started.
+    from tools.acquisition.model.app_model_status import AppModelStatus
+    parser = make_autotrainer_parser(default_start_mode=AppModelStatus.RUNNING)
 
     args = parser.parse_args()
 
+    # After argument parsing, so -h still answers while an instance runs, and
+    # before logging, so a refused start leaves no log behind.
+    from tools.acquisition.instance_lock import (
+        ALREADY_RUNNING_EXIT, AlreadyRunning, acquire_instance_lock)
+    try:
+        instance_lock = acquire_instance_lock()  # noqa: F841 - held until exit
+    except AlreadyRunning as err:
+        print(err, file=sys.stderr)
+        return ALREADY_RUNNING_EXIT
+
     from autotrainer.core.logging import setup_logging, stop_multiproc_logging
 
+    # BEFORE setup_logging: after it, a level set in this process no longer takes effect.
+    from tools.acquisition.can_frame_logging import limit_can_frame_logging, log_can_frame_logging
+    can_frame_logging = limit_can_frame_logging()
+
     logger = setup_logging(logger_level=logging.DEBUG, time_precision=6, multiprocess_enabled=True)
+    log_can_frame_logging(logger, can_frame_logging)
 
     try:
         return _exec_main(args)

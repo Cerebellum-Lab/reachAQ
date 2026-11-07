@@ -1,5 +1,7 @@
 import math
 import os
+import threading
+import time
 from functools import partial
 from typing import Callable, Optional, get_type_hints, Protocol
 
@@ -31,8 +33,18 @@ class PelletLoadFailedEventT(Protocol):
 
 
 class PelletSentEventT(Protocol):
-    def __call__(self, *, perf_c: Optional[float]=None):
+    def __call__(
+        self,
+        *,
+        perf_c: Optional[float] = None,
+        context: Optional[str] = None,
+    ):
         """Pellet Sent event signature"""
+
+
+class PelletSendingEventT(Protocol):
+    def __call__(self, *, perf_c: float, context: str):
+        """Pellet send dispatch event signature."""
 
 
 class PelletReleasedEventT(Protocol):
@@ -40,14 +52,20 @@ class PelletReleasedEventT(Protocol):
         """Pellet Released event signature"""
 
 
+class PelletCycleCompletedEventT(Protocol):
+    def __call__(self, *, perf_c: float):
+        """Pellet became missing after presentation without starting a retry."""
+
+
 class PelletMachineEvents(StateMachineEvents):
 
     pellet_loading: Callable[[], None]  # when a load-pellet is started executing
-    pellet_sending: Callable[[], None]  # now unused
+    pellet_sending: PelletSendingEventT
     pellet_loaded: Callable[[], None]  # when a load-pellet is finished executing AND a pellet is seen on it
     pellet_sent: PelletSentEventT  # when a send-pellet is finished executing
     pellet_load_failed: PelletLoadFailedEventT
     pellet_released: PelletReleasedEventT
+    pellet_cycle_completed: PelletCycleCompletedEventT
 
 
 class PelletDeviceCommandFailed(RuntimeError):
@@ -101,6 +119,12 @@ class PelletMachine(StateMachine):
         self._prev_pellet_load_perf_c = -math.inf
         self._prev_notify_loaded_perf_c = -math.inf
         self._prev_notify_load_failed_perf_c = -math.inf
+        self._send_readiness_callback = None
+        self._send_guard_callback = None
+        self._prepared_cover_policy: Optional[str] = None
+        self._prepared_embedded_tone = None
+        self._prepared_pre_reveal_stimulus = None
+        self._command_ack_condition = threading.Condition(threading.RLock())
 
         self.machine = Machine(
             model=[self],
@@ -148,6 +172,10 @@ class PelletMachine(StateMachine):
     def _before_send_pellet(self, *, force: bool=False):
         algo = self._algorithm
 
+        guard = self._send_guard_callback
+        if guard is not None:
+            guard()
+
         # check for auto-home when load+retract counts >= threshold:
         tot_count = self._load_retract_current_count
         trigger_count = DEFAULT_LOAD_RETRACT_COUNT_FORCE_HOME
@@ -163,17 +191,30 @@ class PelletMachine(StateMachine):
 
         # apply the pellet cover or release here right before sending
         # use can_cover which checks for both cover_pellet_enabled AND pellet_delivery_enabled:
-        action, reason = self._check_cover_or_release()
+        action, reason = (
+            (None, f"prepared_{self._prepared_cover_policy}")
+            if self._prepared_cover_policy is not None
+            else self._check_cover_or_release()
+        )
         if action is not None:
             logger.debug("doing %s prior to pellet-send", reason)
             with algo.set_allow_reentrant(True):
                 action()
-        token = self._pellet_device.send_pellet()
+        token = self._pellet_device.send_pellet(
+            embedded_tone=self._prepared_embedded_tone,
+            pre_reveal_stimulus=self._prepared_pre_reveal_stimulus,
+        )
         if token is None:
             raise PelletDeviceCommandFailed
+        self._prepared_cover_policy = None
+        self._prepared_embedded_tone = None
+        self._prepared_pre_reveal_stimulus = None
         self._token_pellet_send = self._api_status_token = token
         self._send_begin_perf_c = get_perf_now()
-        self.events.pellet_sending()
+        self.events.pellet_sending(
+            perf_c=self._send_begin_perf_c,
+            context=str(token),
+        )
         self.post_event_content(ApiEventKind.pelletSendBegin, data=dict(context=token))
 
     def _before_cover_pellet(self, *, force: bool=False):
@@ -213,9 +254,96 @@ class PelletMachine(StateMachine):
         can = force or (
             self.can_use_pellet_command() and self._algorithm.can_send_pellet()
         )
+        if can and not force and self._send_readiness_callback is not None:
+            can = bool(self._send_readiness_callback())
         if can != self._prev_can_send:
             self._prev_can_send = can
         return can
+
+    def set_send_preparation_callbacks(self, *, readiness=None, guard=None):
+        """Install the application-owned protocol preparation boundary."""
+        self._send_readiness_callback = readiness
+        self._send_guard_callback = guard
+
+    def prepare_cover_policy(self, policy: str, *, timeout: float = 15.0) -> None:
+        """Acknowledge an explicit one-shot cover policy before SEND."""
+        policy = str(policy)
+        if policy not in {"keep_current", "cover", "reveal"}:
+            raise ValueError(f"Unknown pellet cover policy: {policy}")
+        if policy == "keep_current":
+            self._prepared_cover_policy = policy
+            return
+        expected = policy == "cover"
+        if self._covered_state is expected:
+            self._prepared_cover_policy = policy
+            return
+        trigger = self.cover_pellet if expected else self.release_pellet
+        if not trigger(force=True):
+            raise PelletDeviceCommandFailed(
+                f"Could not queue protocol cover policy {policy}"
+            )
+        token_attr = "_token_cover_pellet" if expected else "_token_release_pellet"
+        deadline = time.monotonic() + float(timeout)
+        with self._command_ack_condition:
+            while getattr(self, token_attr) is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Timed out waiting for protocol cover policy {policy}"
+                    )
+                self._command_ack_condition.wait(remaining)
+        self._prepared_cover_policy = policy
+
+    def cancel_prepared_cover_policy(self) -> None:
+        self._prepared_cover_policy = None
+        self._prepared_embedded_tone = None
+        self._prepared_pre_reveal_stimulus = None
+
+    def prepare_embedded_tone(self, frequency_hz: int, duration_ms: int) -> None:
+        frequency_hz, duration_ms = int(frequency_hz), int(duration_ms)
+        if frequency_hz <= 0 or duration_ms <= 0:
+            raise ValueError("Embedded tone frequency and duration must be positive")
+        self._prepared_embedded_tone = (frequency_hz, duration_ms)
+
+    def prepare_pre_reveal_stimulus(
+        self,
+        delay_ms: int,
+        pulse_duration_us: int,
+        stim_line: int = 3,
+    ) -> None:
+        """Bind a board-timed STIM pulse/reveal action to the next SEND.
+
+        The pellet board pulses ``stim_line`` - the trial laser's own board
+        STIM line, STIM2 or STIM3 - waits the requested interval, reveals the
+        pellet, and only then continues the configured SEND sequence.  Keeping
+        all three actions in the compound board command avoids a host timer.
+
+        The line defaults to STIM3, the only line this pulsed before it was
+        carried. Refused here as well as on the CAN device, because a refusal
+        there comes after SEND and stops the CAN command handler.
+        """
+        delay_ms = int(delay_ms)
+        pulse_duration_us = int(pulse_duration_us)
+        stim_line = int(stim_line)
+        # STIM0 and STIM1 carry the tone confirmations (the device package's
+        # BOARD_STIM_LINE_OUTPUTS; this package does not depend on it).
+        if stim_line not in (2, 3):
+            raise ValueError(
+                f"Board STIM{stim_line} cannot carry a stimulus pulse; use "
+                "board STIM2 or STIM3"
+            )
+        if not 1 <= delay_ms <= 60_000:
+            raise ValueError("Pre-reveal delay must be within 1..60000 ms")
+        if not 100 <= pulse_duration_us <= 5_000_000:
+            raise ValueError(
+                f"STIM{stim_line} pulse duration must be within 100 us..5 s"
+            )
+        self._prepared_cover_policy = "reveal"
+        self._prepared_pre_reveal_stimulus = (
+            delay_ms,
+            pulse_duration_us,
+            stim_line,
+        )
 
     def can_cover_pellet(self, *, force: bool=False):
         can = force or (
@@ -274,7 +402,7 @@ class PelletMachine(StateMachine):
             self._send_end_perf_c = perf_now
             self._token_pellet_send = None
             api_evt = ApiEventKind.pelletSendEnd
-            self.events.pellet_sent(perf_c=perf_now)
+            self.events.pellet_sent(perf_c=perf_now, context=str(token))
 
         elif token == self._token_pellet_load:
             self._token_pellet_load = None
@@ -307,6 +435,9 @@ class PelletMachine(StateMachine):
 
         if api_evt is not None:
             self.post_event_content(api_evt, data=dict(context=token))
+
+        with self._command_ack_condition:
+            self._command_ack_condition.notify_all()
 
         # nb: in live we could bypass this call : it's anyway called with live-inference pellet-seen callback..
         self.environment_changed(
@@ -479,6 +610,10 @@ class PelletMachine(StateMachine):
         elif cur_state == PelletState.monitoring:
             if not can_use_command:
                 return
+            if algo.would_load_pellet(pellet_state=cur_state):
+                self.events.pellet_cycle_completed(perf_c=perf_now)
+                if algo.pellet_automation_stop_requested:
+                    return
             if self.can_load_pellet():
                 reason = "can_load_pellet_when_monitoring"
                 action = partial(self.load_pellet, reason=reason)
@@ -625,3 +760,11 @@ class PelletMachine(StateMachine):
             ),
         ]
     )
+
+
+class PelletAutomationController(PelletMachine):
+    """ReachAQ pellet-cycle controller built on the proven state machine.
+
+    The subclass gives production code an explicit controller boundary while
+    preserving PelletMachine for lower-level reuse and existing integrations.
+    """

@@ -2,31 +2,34 @@ import csv
 import ctypes
 import dataclasses
 import enum
+import functools
+import hashlib
 import json
 import logging
 import math
 import os
 import pickle
 import queue
+import re
 import shlex
+import shutil
 import subprocess
 import threading
 import sys
 import time
+import uuid
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Callable, Any, Union, ClassVar, Protocol, Tuple
 
-import pandas
+import numpy as np
 import yaml
-from autotrainer.core.analysis.alarm_detector import AlarmDetector
 
-from autotrainer.api import ApiSystemStatus, ApiDetectorKind, ApiProjectStatus, \
-    ApiAlarmStatus, ApiDetectorStatus, ApiTunnelDeviceStatus, ApiPelletDeviceStatus, ApiTrainingMode, \
+from autotrainer.api import ApiDetectorKind, ApiTrainingMode, \
     ApiSystemConfiguration, ApiApplicationMode, ApiCommand, ApiCommandRequestErrorKind
-from autotrainer.api.api_system_status import ApiBehaviorStatus, ApiReachStatus
 
 from autotrainer.core import (
     ObservableObject,
@@ -34,28 +37,46 @@ from autotrainer.core import (
     SystemMessageHandler,
     SystemConfiguration,
     CameraId,
+    CameraConfiguration,
     PersistenceConfiguration,
     HardwareConfiguration,
+    LaserSystemConfiguration,
+    NidaqPortConfiguration,
+    NidaqSignalStreamConfiguration,
     Notification,
     NotificationCenter,
     TriggerNotification,
+    SystemCommandKind,
     SystemStatusMessageKind,
-    SensorAnalysis,
     Offset3DTuple,
     get_perf_now,
 )
-from autotrainer.core import AnimalSubject, FixedArrayMultiQueue
-from autotrainer.core.configuration.behavior_configuration import CageCleaningConfig
+from autotrainer.core import (
+    AnimalSubject,
+    ExternalAnimalRecord,
+    ExternalIdentity,
+    FixedArrayMultiQueue,
+)
 from autotrainer.core.configuration.json_compat import SystemConfigurationJSONEncoder
 from autotrainer.core.interfaces import RecordingEndingReason, CaptureAnalysisResult
 from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
 from autotrainer.core.configuration import SystemConfigurationDumper, DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.multiproc import no_op_timer
-from autotrainer.core.logging import get_verbose_logger, set_log_location
-from autotrainer.core.multiproc import get_mp_ctx, make_daemon_timer, DaemonTimer
+from autotrainer.core.logging import (
+    get_verbose_logger,
+    log_hardware_initialization,
+    register_fatal_exception_callback,
+    set_log_location,
+    unregister_fatal_exception_callback,
+)
+from autotrainer.core.analysis import ReachAnalysis
+from autotrainer.device.device_interface import tone_confirmation_frequency
+from autotrainer.core.multiproc import (
+    get_mp_ctx, get_nidaq_mp_ctx, make_daemon_timer, DaemonTimer,
+)
 from autotrainer.core.pose_elements import SceneElement
 from autotrainer.core.project.project_info import DATE_TIME_FORMAT
-from autotrainer.core.video_detection import PresenceDetectionAttrs
+from autotrainer.video import VideoRecordMode
 
 from autotrainer.inference import (
     PoseAlgorithm,
@@ -64,6 +85,13 @@ from autotrainer.inference import (
     calibration_FLIR,
     DlcPoseModel,
 )
+from autotrainer.inference.backend_selection import (
+    available_backends,
+    confidence_threshold,
+    pre_validate_model,
+    selected_backend,
+    trained_model_name,
+)
 from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.config import load_calib_stereo_params
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
@@ -71,8 +99,19 @@ from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSE
 from autotrainer.core.capture import CaptureProcessStatus
 
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoProps, BehaviorAlgoStatus
-from autotrainer.behavior import IntersessionState, BehaviorAlgorithm, TrainingMode, InferenceProtocol, SystemMachine, \
-    IntersessionMachine
+from autotrainer.behavior import (
+    AttemptAssignmentPolicy,
+    BehaviorAlgorithm,
+    InferenceProtocol,
+    IntersessionMachine,
+    IntersessionState,
+    PelletTrialLedger,
+    RetrySettingsPolicy,
+    SystemMachine,
+    TrialAccountingConfiguration,
+    TrialCountBasis,
+    TrialOutcome,
+)
 
 from autotrainer.training import TrainingPlan, TrainingPhase, PlanRepository, PlanInfo, LoadProgressResult
 
@@ -84,19 +123,443 @@ from autotrainer.api import (
     ApiEventKind,
 )
 
-from tools.acquisition.model.app_model_status import AppModelStatus
+from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
+from tools.acquisition.model.api_status import ReachAQSystemStatus
+from tools.acquisition.model.session_api_publisher import SessionApiPublisher
+from tools.acquisition.model.pellet_cycle_controller import (
+    PelletCycleController,
+    offset_record,
+)
+from tools.acquisition.model.recording_session_controller import (
+    RecordingSessionController,
+    SessionGeneration,
+)
+from tools.acquisition.model.camera_recording_validation import (
+    ClosedVideoValidation,
+    closed_video_timeout_seconds,
+    validate_closed_video,
+)
+from tools.acquisition.model.capture_binning import (
+    apply_capture_binning,
+    capture_binning_available,
+    common_capture_binning,
+)
+from tools.acquisition.model.camera_timing_alignment import (
+    CameraTimestampInput,
+    align_camera_timestamp_files,
+)
+from tools.acquisition.model.acquisition_controller import AcquisitionController
+from tools.acquisition.model.intertrial_send_gate import InterTrialSendGate
+from tools.acquisition.model.send_block_reasons import SendBlockReasons
+
+
+# The name intertrial analysis holds the pellet send under. Inter-trial timing
+# holds under its own name, so neither releases the other.
+INTERTRIAL_ANALYSIS_BLOCK_NAME = "intertrial_analysis"
+from tools.acquisition.model.coordinate_model import CoordinateModel
 from tools.autotrainer_version import __version__ as app_version
-from tools.acquisition.model.helpers import get_config_location
+from tools.acquisition.model.helpers import first_line, get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.inference_model import InferenceModel
+from tools.acquisition.model.laser_model import LaserModel, wait_until_cancelled_ends
+from autotrainer.device import (
+    CanFailure,
+    CanTransportConfiguration,
+    LaserCalibrationRamp,
+    LaserControllerStillClosing,
+)
+from tools.acquisition.model.hardware_scan import HardwareScanEntry, scan_can_adapters, scan_gpus
+from tools.acquisition.model.nidaq_discovery import device_name_from_channel, discover_nidaq_devices
+from tools.acquisition.model.nidaq_channel_plan import build_nidaq_acquisition_configuration
+from tools.acquisition.model.nidaq_validation import (
+    chassis_identification_note,
+    require_valid_nidaq_configuration,
+    refused_plan_clock_source,
+)
+from tools.acquisition.model.nidaq_wiring_verification import (
+    WiringVerification,
+    summarize as summarize_nidaq_wiring,
+)
+from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
+from tools.acquisition.model.nidaq_stream_autostart import NidaqStreamAutoStart
+from tools.acquisition.model.nidaq_timing import (
+    remap_nidaq_physical_channel,
+    resolve_nidaq_device_aliases,
+)
+from tools.acquisition.model.rfid_resolution import (
+    RfidResolution,
+    RfidResolutionKind,
+)
+from tools.acquisition.model.animal_metadata_sync import AnimalMetadataSyncService
+from tools.acquisition.model.animal_reconciliation import (
+    AnimalReconciliationChoices,
+    reconcile_animals,
+)
+from tools.acquisition.model.animal_registry import AnimalRegistry
+from tools.acquisition.model.rfid_metadata_controller import RfidMetadataController
+from tools.acquisition.model.softmouse_spreadsheet_source import (
+    SoftMouseMappingProfile,
+    SoftMouseSpreadsheetSource,
+)
+from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+from tools.acquisition.model.session_telemetry import (
+    SessionTelemetry,
+    describe_latency_status,
+    exact_session_capture,
+)
+from tools.acquisition.model.stim_latency_budget import StimLatencyBudget
+from tools.acquisition.model.atomic_session_io import (
+    atomic_publish_file,
+    atomic_write_json,
+    file_manifest_entry,
+)
+from tools.acquisition.model.session_boundary import SessionBoundary
+from tools.acquisition.model.protocol_readiness import (
+    STIM_CAMERA_REQUIRED,
+    ProtocolRigConfiguration,
+    ReadinessFinding,
+    ReadinessLiveState,
+    check_protocol_readiness,
+    protocol_blocker_lines,
+)
+from tools.acquisition.model.trial_protocol_repository import (
+    TrialProtocolRepository,
+)
+from tools.acquisition.model.trial_protocol_set_repository import (
+    ExperimentCompositionRepository,
+    TrialProtocolSetRepository,
+)
+from tools.acquisition.model.experiment_compiler import compile_experiment
+from tools.acquisition.model.trial_protocol_set import (
+    ExperimentComposition,
+    document_from_set,
+    set_from_document,
+)
+from tools.acquisition.model.stim_bench_test import (
+    BenchRecipe,
+    StimTestResult,
+    bench_wait_seconds,
+    refuse_reason,
+)
+from tools.acquisition.model.stimulus_profile_repository import (
+    StimulusProfileRepository,
+    StimulusProfileLibrary,
+)
+from tools.acquisition.model.session_validation_controller import (
+    SessionValidationController,
+)
+from tools.acquisition.model.trial_protocol_schedule import (
+    StimulusAssignment,
+    StimulusTrigger,
+    TrialOverride,
+    TrialProtocolDocument,
+    ProtocolPatch,
+    ProtocolScope,
+    LaserTriggerRoute,
+    TrialProtocolSchedule,
+)
+from tools.acquisition.model.trial_action import (
+    LaserPulseProfile,
+    PreparedState,
+    ToneProfile,
+    TrialActionCompiler,
+    TrialActionExecutor,
+    TrialCompileContext,
+)
+from tools.acquisition.model.laser_firing import amplitude_refusal, resolve_laser_firing
+from tools.acquisition.model.automatic_pellet_shift import (
+    AutomaticPelletShiftController,
+    AutomaticShiftPolicy,
+    ReachPositionObservation,
+)
+from tools.acquisition.model.session_stop_policy import (
+    SessionStopConfiguration,
+    SessionStopDecision,
+    SessionStopEvaluation,
+    SessionStopPolicy,
+    SessionStopReason,
+)
+from tools.acquisition.model.output_storage_monitor import (
+    RecordingStorageMonitor,
+    StorageSnapshot,
+    preflight_storage,
+)
+from tools.acquisition.model.intertrial_analysis import (
+    AnalysisProgressionMode,
+    IntertrialAnalysisCoordinator,
+    IntertrialAnalysisRequest,
+    IntertrialAnalysisResult,
+    PelletPresence,
+    analyze_tracking_window,
+    classify_pellet_state,
+)
+from tools.acquisition.model.reach_state_source import (
+    LiveTrackingReachProvider,
+    ReachStateConfiguration,
+    ReachStateResolver,
+)
+from tools.acquisition.model.live_tracking_buffer import (
+    FrameTimelineAnchor,
+    LiveTrackingBuffer,
+    LiveTrackingSample,
+)
+from tools.acquisition.model.subsystem_status import (
+    SubsystemId,
+    SubsystemState,
+    SubsystemStatus,
+)
+from tools.acquisition.model.trial_protocol_runner import TrialProtocolRunner
 from tools.acquisition.model.behavior_model import BehaviorModel
 from tools.acquisition.model.user_preferences import UserPreferences, get_default_animals_location
-from tools.acquisition.model.video_capture_model import VideoCaptureModel
+from tools.acquisition.model.video_capture_model import (
+    VideoCaptureModel,
+    camera_source_binding_key,
+    create_camera_list,
+)
 
 logger = get_verbose_logger(__name__)
 
+
+#: Holders of the NI-DAQ input stream while the plan it acquires is replaced.
+_CONFIGURATION_LOAD = "configuration load"
+_DAQ_PORTS_UPDATE = "DAQ ports update"
+#: Holder of the NI-DAQ input stream while a laser calibration ramp runs.
+_LASER_CALIBRATION = "laser calibration"
+_LASER_CALIBRATION_REASON = "a laser calibration ramp is running"
+#: How long Record waits for a protocol check another thread is running. A
+#: check of 5000 rows took 0.45 s on christielab10's E-cores; the default
+#: protocol has 15.
+_PROTOCOL_CHECK_RECORD_WAIT_S = 2.0
+#: How much longer than the ramp's own timeout closing waits for it.
+_LASER_CALIBRATION_CLOSE_MARGIN_S = 5.0
+#: How long closing then waits, after a forced close that failed, hung or
+#: found the ramp's own thread closing, for the ramp to end: a ramp its
+#: driver lets go tries to write the command back to its minimum itself.
+_LASER_CALIBRATION_RAMP_END_WAIT_S = 2.0
+#: How long any laser controller close is waited for: Stop's, a failed Run
+#: start's and closing's of System Mode's controller, and the ramp's own and
+#: closing's forced close of the ramp's. The ramp's close aborts its tasks,
+#: waits up to 5 s for the ramp to let go of them, then tries to reset the
+#: laser; the reset is refused, and the close raises, while the ramp still
+#: holds the output.
+_LASER_CONTROLLER_CLOSE_S = 15.0
+#: Why laser work is refused while a controller close given up on is still
+#: inside the driver.
+_LASER_CLOSE_PENDING_REFUSAL = (
+    "the laser controller is still closing after a driver hang; make the "
+    "laser safe by hand, and restart reachAQ if this does not clear"
+)
+#: The same, for the calibration ramp's own controller.
+_LASER_CALIBRATION_CLOSE_PENDING_REFUSAL = (
+    "the laser calibration controller is still closing after a driver hang; "
+    "make the laser safe by hand, and restart reachAQ if this does not clear"
+)
+#: Why laser work is refused while a controller close is still within its
+#: bound.
+_LASER_CLOSING_REFUSAL = "the laser controller is closing; wait for it to finish"
+#: Why laser work is refused while what a finished close gave up on still
+#: runs: `what` is "a laser operation", "the calibration ramp" or both.
+_LASER_WORK_LEFT_REFUSAL = (
+    "{what} the close gave up on is still running in the driver; make the "
+    "laser safe by hand, and restart reachAQ if this does not clear"
+)
+#: Where the GUI's operator fixes a refused NI-DAQ plan.
+_GUI_NIDAQ_PLAN_REMEDY = "fix it in Edit → Edit DAQ Ports"
+
+
+class _BoundedClose:
+    """A laser controller close, on a thread of its own, waited for with a bound.
+
+    A close that hangs inside DAQmx does not make the laser safer, since its
+    output stays driven either way, and waited for without a bound it held
+    Stop, or reachAQ's exit, for as long as the driver did (controller ruling,
+    2026-09-25). Daemon, so that a close that never returns does not hold
+    the process open. One given up on keeps running, and says so when it
+    ends (`on_late_finish`).
+    """
+
+    def __init__(self, close: Callable[[], object], name: str, *,
+                 on_late_finish: Optional[Callable[["_BoundedClose"], None]] = None,
+                 refusal: str = _LASER_CLOSE_PENDING_REFUSAL,
+                 is_watch: bool = False):
+        self.name = name
+        #: Why laser work is refused while this one, given up on, has not ended.
+        self.refusal = refusal
+        #: Watching work a close left in the driver, not a close: it refuses
+        #: laser work from the moment it is listed, and nothing waits for it
+        #: as a close under way (_close_laser_within_bound).
+        self.is_watch = is_watch
+        self.result = None
+        self.error: Optional[BaseException] = None
+        self.done = threading.Event()
+        self._close = close
+        self._on_late_finish = on_late_finish
+        self._lock = threading.Lock()
+        self._given_up = False
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+
+    @property
+    def given_up(self) -> bool:
+        """Whether run() stopped waiting for it before it ended."""
+        with self._lock:
+            return self._given_up
+
+    def run(self, timeout: float) -> bool:
+        """Start the close and wait up to `timeout`; whether it finished."""
+        self._thread.start()
+        if self.done.wait(timeout):
+            return True
+        with self._lock:
+            if self.done.is_set():
+                return True
+            self._given_up = True
+        return False
+
+    def _run(self) -> None:
+        try:
+            self.result = self._close()
+        except BaseException as error:
+            # A BaseException too, as the pulse path stores one (N2): this is
+            # the close's own daemon thread, nothing above it can act on one,
+            # and the close's outcome must still be reported as a failure.
+            self.error = error
+            logger.exception("Failed to close the %s", self.name)
+        finally:
+            with self._lock:
+                self.done.set()
+                late = self._given_up
+            if late and self._on_late_finish is not None:
+                self._on_late_finish(self)
+
+    def failure(self, timeout: float, finished: bool) -> str:
+        """What went wrong, completing "The <name> ...", or empty if nothing.
+
+        `finished` is what run() returned. Read from `done` afterwards, a
+        close that ended just past the bound read as a clean one: nothing was
+        reported, while its late finish said it had been given up on.
+        """
+        if not finished:
+            return f"did not close within {timeout:.1f} s"
+        if self.error is not None:
+            return "failed to close ({})".format(
+                first_line(self.error) or self.error.__class__.__name__)
+        return ""
+
+
+def _serialized_session_configuration(method):
+    """Serialize configuration changes against Record/Stop/Abort commands."""
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._session_lifecycle_command_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
+def _metadata_without_nonfinite_numbers(value):
+    """Replace NaN/Infinity recursively so JSON and YAML stay portable."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {
+            key: _metadata_without_nonfinite_numbers(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _metadata_without_nonfinite_numbers(item)
+            for item in value
+        ]
+    return value
+
+
+def _camera_configured_metadata(camera) -> Dict[str, Any]:
+    """What a session records about one camera's capture.
+
+    Pose files are in the pixels of the frames inference receives
+    (``inferenceShape``); the video is in the captured frame's pixels
+    (``captureShape``). With a capture-binning preset the two differ by a
+    whole factor, and these fields are how a reader maps one onto the other.
+    """
+    return {
+        "previewEnabled": camera.is_enabled,
+        "recordEnabled": camera.is_recording_enabled,
+        "captureShape": list(camera.capture_shape),
+        "inferenceShape": list(camera.shape),
+        "captureBinning": camera.effective_capture_binning,
+        "videoEncoder": camera.video_encoder if camera.is_recording_enabled else None,
+    }
+
+
+def _camera_exposure_seconds(cameras) -> Dict[str, Optional[float]]:
+    """Each camera's exposure in seconds, for the session recorder's frame anchor.
+
+    The capture URL's ``exposure`` query value is the Spinnaker ExposureTime in
+    microseconds (system_configuration.yaml cameras[].params.exposure, or a
+    profile's ordinary_exposure). A camera without it, or one whose
+    configuration cannot be read, is None; the anchor then assumes zero.
+    """
+    result = {}
+    for camera in cameras:
+        name = getattr(camera, "name", "")
+        value = None
+        try:
+            exposure = camera.save_configuration(runtime_mode=True).params.get("exposure")
+            # alignment.json is written with allow_nan=False, so a NaN here would
+            # cost the session its finalization; it counts as unknown instead. So
+            # does a negative one: no exposure is, and the anchor would move its
+            # expected edge and lag gate together by it.
+            if exposure is not None and math.isfinite(float(exposure)) and float(exposure) >= 0:
+                value = float(exposure) * 1e-6
+        except Exception:
+            logger.warning("camera %s exposure is unknown to the session recorder", name,
+                           exc_info=True)
+        result[name] = value
+    return result
+
+
+def _compact_subsystem_snapshot(snapshot):
+    """Remove fields repeated by the subsystem key and empty defaults."""
+    compact = {}
+    for subsystem_id, status in (snapshot or {}).items():
+        values = {}
+        for key, value in status.items():
+            if key == "subsystem_id":
+                continue
+            if key != "state" and value in (None, "", False, 0):
+                continue
+            values[key] = value
+        compact[subsystem_id] = values
+    return compact
+
+
+def _subsystem_snapshot_changes(at_record, at_finalize):
+    baseline = _compact_subsystem_snapshot(at_record)
+    final = _compact_subsystem_snapshot(at_finalize)
+    return {
+        subsystem_id: status
+        for subsystem_id, status in final.items()
+        if baseline.get(subsystem_id) != status
+    }
+
+
+def _metadata_reference(path: Path, *, relative_to: Path):
+    if not path.is_file():
+        return None
+    relative_path = Path(os.path.relpath(path, start=relative_to)).as_posix()
+    return {
+        "$ref": relative_path,
+        "targetSha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
 # allow be patched from tests
 _daily_timer = make_daemon_timer
+
+_RANDOM_CAMERA_DEFAULT_PARAMS = {
+    "width": 300,
+    "height": 200,
+    "fps": 30,
+}
 
 
 def _failed_camera_template(name: str, error: str):
@@ -121,55 +584,42 @@ def app_status_to_behavior_algo_status(self: AppModelStatus) -> Optional[Behavio
 
 _app_model_status_2_api_app_mode = {
     AppModelStatus.IDLE: ApiApplicationMode.IDLE,
-    AppModelStatus.ACQUIRING: ApiApplicationMode.RUNNING,
+    AppModelStatus.RUNNING: ApiApplicationMode.RUNNING,
     AppModelStatus.CALIBRATION_3D: ApiApplicationMode.CALIBRATION_3D,
     AppModelStatus.CALIBRATION_DCS: ApiApplicationMode.CALIBRATION_DCS,
-    AppModelStatus.ANIMAL_IN_DEVICE: ApiApplicationMode.IN_DEVICE,
-    AppModelStatus.ANIMAL_IN_TRAINING: ApiApplicationMode.IN_TRAINING,
 }
 
 _app_model_status_valid_targets = {
     AppModelStatus.IDLE: {
-        AppModelStatus.ACQUIRING,
+        AppModelStatus.RUNNING,
         AppModelStatus.CALIBRATION_3D,
-        AppModelStatus.ANIMAL_IN_DEVICE,
-        AppModelStatus.ANIMAL_IN_TRAINING,
     },
-    AppModelStatus.ACQUIRING: {
+    AppModelStatus.RUNNING: {
         AppModelStatus.IDLE,
         AppModelStatus.CALIBRATION_DCS,
-        AppModelStatus.ANIMAL_IN_DEVICE,
-        AppModelStatus.ANIMAL_IN_TRAINING,
-    },
-    AppModelStatus.ANIMAL_IN_DEVICE: {
-        AppModelStatus.IDLE,
-        AppModelStatus.ACQUIRING,
-        AppModelStatus.ANIMAL_IN_TRAINING,
-    },
-    AppModelStatus.ANIMAL_IN_TRAINING: {
-        AppModelStatus.ANIMAL_IN_DEVICE,
-        AppModelStatus.ACQUIRING,
-        AppModelStatus.IDLE,
     },
     AppModelStatus.CALIBRATION_3D: {AppModelStatus.IDLE},
-    AppModelStatus.CALIBRATION_DCS: {AppModelStatus.ACQUIRING, AppModelStatus.IDLE},
+    AppModelStatus.CALIBRATION_DCS: {AppModelStatus.RUNNING, AppModelStatus.IDLE},
 }
 
 _to_behavior_algo_status = {
     AppModelStatus.IDLE: BehaviorAlgoStatus.IDLE,
-    AppModelStatus.ACQUIRING: BehaviorAlgoStatus.ACQUIRING,
-    AppModelStatus.ANIMAL_IN_DEVICE: BehaviorAlgoStatus.ANIMAL_IN_DEVICE,
-    AppModelStatus.ANIMAL_IN_TRAINING: BehaviorAlgoStatus.ANIMAL_IN_TRAINING,
+    AppModelStatus.RUNNING: BehaviorAlgoStatus.RUNNING,
 }
 
 
-def training_mode_to_api_training_mode(mode: TrainingMode) -> ApiTrainingMode:
-    try:
-        member = getattr(ApiTrainingMode, mode.name)
-        assert isinstance(member, ApiTrainingMode)
-        return member
-    except AttributeError:
-        return ApiTrainingMode.UNDEFINED
+def protocol_state_to_api_training_mode(
+    plan: Optional[TrainingPlan],
+    *,
+    automatic_advance: bool,
+) -> ApiTrainingMode:
+    """Translate the simplified protocol state for the legacy status API."""
+    name = (
+        "MANUAL"
+        if plan is None
+        else "AUTOMATIC" if automatic_advance else "MANUAL_WITH_PROTOCOL"
+    )
+    return getattr(ApiTrainingMode, name, ApiTrainingMode.UNDEFINED)
 
 
 class TrainingPlanDeserializedEvent(Protocol):
@@ -216,12 +666,24 @@ class AppModel(ObservableObject):
         OUTPUT_LOCATION = "output_location"
         ANIMAL_NAME = "animal_name"
         NOTES = "notes"
-        TRAINING_MODE = 'training_mode'
         TRAINING_PLAN = "training_plan"
         TRAINING_PLANS = 'training_plans'
         TRAINING_PHASE = "training_plan.current_phase"
         TRAINING_PLAN_PROP = 'training_plan_prop'
         TRAINING_PHASE_PROP = 'training_phase_prop'
+        HARDWARE_SCAN_RESULTS = "hardware_scan_results"
+        SESSION_RECORDING_STATUS = "session_recording_status"
+        SUBSYSTEM_STATUSES = "subsystem_statuses"
+        LASER_CALIBRATION_ACTIVE = "laser_calibration_active"
+        RECORDING_BLOCKERS = "recording_blockers"
+        ANIMAL_METADATA_STATUS = "animal_metadata_status"
+        RFID_READER_STATUS = "rfid_reader_status"
+        RFID_SCAN_RESULT = "rfid_scan_result"
+        ANIMAL_METADATA_PREVIEW = "animal_metadata_preview"
+        ANIMAL_METADATA_REFRESH_BUSY = "animal_metadata_refresh_busy"
+        INTERNAL_ERROR_DIAGNOSTIC = "internal_error_diagnostic"
+        TRIAL_PROTOCOL_STATE = "trial_protocol_state"
+        SESSION_VALIDATION_STATE = "session_validation_state"
 
     def __init__(
             self,
@@ -229,7 +691,7 @@ class AppModel(ObservableObject):
             *,
             config_file: Optional[Path] = None,
             calib_dir: Optional[Path] = None,
-            sensor_analysis: Optional[SensorAnalysis] = None,
+            analysis: Optional[ReachAnalysis] = None,
             inference_model: Optional[InferenceProtocol] = None,
             system_message_handler: Optional[SystemMessageHandler] = None,
             system_machine: Optional[SystemMachine] = None,
@@ -260,12 +722,87 @@ class AppModel(ObservableObject):
         self._preferences = preferences
         self._loaded_configuration: Optional[SystemConfiguration] = None
         self._loaded_config_dir_path = Path()
+        self._loaded_configuration_path: Optional[Path] = None
+        self._loaded_configuration_has_runtime_override = False
+        # True from the start of load_configuration until it completes. A load
+        # that raises part-way leaves this set, and save_configuration refuses.
+        self._configuration_load_incomplete = False
+        self._runtime_live_inference_override: Optional[bool] = None
+        self._nidaq_ports = NidaqPortConfiguration()
+        self._hardware_scan_results: Dict[str, HardwareScanEntry] = {}
+        self._acquisition = AcquisitionController()
 
         self._output_location = PersistenceConfiguration.get_default_output_path().as_posix()
         self._project_info: Optional[ProjectInfo] = None
         self._animal_name = ""
         self._notes = ""
-        self._left_camera = self._right_camera = None
+        self._editable_notes_project: Optional[ProjectInfo] = None
+        self._last_stopped_session_path: Optional[Path] = None
+        # One gate for every write to a stopped session's published files
+        # (metadata json/yaml, manifest.json) and for the start of a
+        # validation that reads them. Order: this lock, then the validation
+        # controller's lock; never the reverse.
+        self._session_publication_lock = threading.RLock()
+        # Set when a notes save waited for a running validation; the
+        # validation's end state replays the save once.
+        self._notes_save_pending = False
+        # Edits to a stopped session's notes, and the edit the last session
+        # metadata save wrote; they differ while typed notes are unsaved.
+        self._notes_revision = 0
+        self._notes_saved_revision = 0
+        self._session_validation = SessionValidationController(
+            self._on_session_validation_state
+        )
+        self._pending_metadata_project: Optional[ProjectInfo] = None
+        self._trial_protocol_lock = threading.RLock()
+        self._trial_protocol_repository = TrialProtocolRepository(
+            Path(preferences.configuration_location).expanduser()
+            / "trial_protocols"
+        )
+        self._trial_protocol_repository.reload()
+        self._trial_protocol_set_repository = TrialProtocolSetRepository(
+            Path(preferences.configuration_location).expanduser()
+            / "trial_protocol_sets"
+        )
+        self._trial_protocol_set_repository.reload()
+        self._experiment_repository = ExperimentCompositionRepository(
+            Path(preferences.configuration_location).expanduser()
+            / "trial_experiments"
+        )
+        self._experiment_repository.reload()
+        self._stimulus_profile_repository = StimulusProfileRepository(
+            Path(preferences.configuration_location).expanduser()
+            / "stimulus_profiles.json"
+        )
+        self._stimulus_profile_repository.load()
+        self._selected_ordered_protocol: Optional[TrialProtocolDocument] = None
+        self._trial_protocol_schedule = TrialProtocolSchedule.with_placeholder_rows()
+        # The selected protocol's check for the next recording
+        # (protocol_readiness.py), rerun when what it reads changes, and the
+        # snapshot it was computed from. Off until __init__ has made all that
+        # it reads (_refresh_protocol_readiness).
+        self._protocol_readiness_lock = threading.Lock()
+        #: Notified as the computing caller finishes; Record waits on it.
+        self._protocol_readiness_idle = threading.Condition(self._protocol_readiness_lock)
+        self._protocol_readiness_requests = 0
+        self._protocol_readiness_busy = False
+        #: Each fault in the check already logged: logged once, not on every
+        #: refresh that runs into it again.
+        self._protocol_check_faults = set()
+        #: The timing plan _start_laser_domain last opened the laser with,
+        #: which its pulses run on until it closes. The check reads it rather
+        #: than the stream's plan: Refresh Hardware can restart the stream
+        #: alone, with a plan the open laser does not have.
+        self._laser_timing_plan = None
+        self._protocol_readiness_enabled = False
+        self._protocol_readiness_inputs = None
+        self._protocol_readiness: Tuple[ReadinessFinding, ...] = ()
+        self._protocol_blocker_lines: Tuple[str, ...] = ()
+        #: The profile picked on each laser's Laser Control tab, which the
+        #: check reads (note_laser_tab_profile).
+        self._laser_tab_profiles: Dict[int, Optional[str]] = {}
+        self._left_camera = self._right_camera = self._stim_camera = None
+        self._reach_cameras: Tuple[VideoCaptureModel, ...] = ()
 
         self._timer_daily: DaemonTimer = _daily_timer(0, self._on_daily_timer)
         self._current_day: Optional[date] = None
@@ -274,92 +811,186 @@ class AppModel(ObservableObject):
         self.set_log_location()
 
         self._plan_repo = PlanRepository()
-        self._training_mode = TrainingMode.MANUAL
         self._training_plan: Optional[TrainingPlan] = None
         self._training_plan_animal: Optional[AnimalSubject] = None
-        self._acquisition_starting = False
-        self._acquisition_started = False
-        self._acquisition_stopping = False
+        self._recording_session = RecordingSessionController()
+        self._session_lifecycle_command_lock = threading.RLock()
+        self._session_stop_policy: Optional[SessionStopPolicy] = None
+        self._session_stop_evaluation: Optional[SessionStopEvaluation] = None
+        self._recording_ending_reason = RecordingEndingReason.NA
+        self._automatic_stop_timer = no_op_timer
+        self._stop_drain_timer = no_op_timer
+        self._aborting_project: Optional[ProjectInfo] = None
+        self._aborted_session_ids = set()
+        self._abort_had_recording_started = False
+        # Why live inference stopped during the current recording, if it did:
+        # its live pose files then end there, closed by the inference stop.
+        self._live_inference_failed_reason: Optional[str] = None
+        self._abort_cleanup_timer = no_op_timer
+        self._record_start_timer = no_op_timer
+        self._writer_close_timer = no_op_timer
+        self._storage_monitor = RecordingStorageMonitor()
+        self._storage_preflight = None
+        self._internal_error_diagnostic = None
+        self._session_invariant_unknown = False
+        self._intertrial_resolution_request = None
+        self._intertrial_resolution_reason = ""
+        self._intertrial_waiting_operations = set()
+        self._closing_event = threading.Event()
         self._reload_plans_needed = False
-        self._prev_diamond_coord: Offset3DTuple = Offset3DTuple(math.nan, math.nan, math.nan)
-        self._prev_raw_diamond_coord: Offset3DTuple = Offset3DTuple(math.nan, math.nan, math.nan)
-        self._prev_valid_diamond_perf_c: float = -math.inf
-        self._check_diamond_coord_enabled = True
-        self._trigger_emergency_on_bad_diamond_coord = False
-        self._warned_bad_diamond_coord = False
-        self._triggered_bad_diamond_coord = False
+        self._coordinates = CoordinateModel()
         self._p_start_capture = -math.inf
         self._p_inference_live_begin = -math.inf
 
         self._event_manager = EventManager.default()
+        self._session_api = SessionApiPublisher(self._event_manager)
 
         # not sure this should better be in SystemMachine or BehaviorAlgo or BehaviorModel or eventually HardwareModel ?
         # although here it's also working, so keeping for now.
         proc_msg_queue = self._multiproc_msg_queue = mp_ctx.Queue()
+        self._stim_direct_trigger_queue = mp_ctx.Queue(maxsize=16)
+        self._stim_latency_budget = StimLatencyBudget()
+        # The panel's and the metadata's stim p99 is per session; the budget
+        # above rolls over triggers from every session since launch.
+        self._session_stim_latency_budget = StimLatencyBudget()
         self._handle_proc_msg_thread = threading.Thread(
             target=self._handle_proc_msg_queue, name="handle_proc_msg_queue", daemon=True)
         self._handle_proc_msg_thread.start()
         # end not sure
 
-        # this is used to sync the start record frame of both cameras:
+        # this is used to sync the start record frame of all reach cameras:
         self._cams_record_enabled = mp_ctx.Value(ctypes.c_bool, False)
         self._cams_synced_frame_index = mp_ctx.Value(ctypes.c_int64, -1)
+        self._cams_record_start_perf = mp_ctx.Value(ctypes.c_double, math.nan)
+        self._record_generation_value = mp_ctx.Value(ctypes.c_uint64, 0)
 
         self._record_stop_sema = mp_ctx.Semaphore(0)
-        # and this is used to notify the end of recording from the 2 camera video_record threads to the offline one,
+        # and this is used to notify the end of recording from the reach-camera video_record threads to the offline one,
         # so that the later doesn't try to open the video files, before they are finished written to and closed.
-        # Preventing the opencv lib to emit warning on stderr.
 
-        self._left_camera = VideoCaptureModel(
-            "left", self._preferences, 0,
-            msg_queue=proc_msg_queue, cam_id=CameraId.Left,
-            synced_cam_frame_index=self._cams_synced_frame_index,
-            synced_cam_recording=self._cams_record_enabled,
-            record_stop_sema=self._record_stop_sema,
+        self._reach_cameras = tuple(
+            self._make_reach_camera_model(camera_id, camera_index)
+            for camera_index, camera_id in enumerate((CameraId.Left, CameraId.Right))
         )
+        self._left_camera = self._reach_cameras[0]
+        self._right_camera = self._reach_cameras[1]
 
-        self._right_camera = VideoCaptureModel(
-            "right",
-            self._preferences,
-            1,
-            msg_queue=proc_msg_queue,
-            cam_id=CameraId.Right,
-            synced_cam_frame_index=self._cams_synced_frame_index,
-            synced_cam_recording=self._cams_record_enabled,
-            record_stop_sema=self._record_stop_sema,
-        )
-
-        self._top_camera_presence_detection = PresenceDetectionAttrs()
-        self._top_camera = VideoCaptureModel("web", self._preferences, -1,
-                                             presence_detection=self._top_camera_presence_detection,
-                                             msg_queue=None,  # not interested to webcam status for now.
-                                             cam_id=CameraId.Web)
-
-        self._cameras = [  # must respect camera_idx/inference_index order
-            self._left_camera,
-            self._right_camera,
-            self._top_camera,
-        ]
+        self._cameras = list(self._reach_cameras)
+        self._camera_by_id = {
+            camera.camera_id: camera
+            for camera in self._cameras
+        }
+        for camera in self._cameras:
+            self._acquisition.subsystems.ensure(
+                SubsystemId.camera(camera.name),
+                state=SubsystemState.DISABLED,
+                reason="camera disabled",
+            )
+        for subsystem_id in SubsystemId:
+            self._acquisition.subsystems.ensure(
+                subsystem_id,
+                state=SubsystemState.DISABLED,
+            )
 
         self._system_message_queue = queue.Queue()  # only dedicated to CAN bus messages reading/handling
 
-        if sensor_analysis is None:
-            sensor_analysis = SensorAnalysis(
-                topcam_presence=self._top_camera_presence_detection
-            )
-        analysis = self._analysis = sensor_analysis
-        del sensor_analysis  # using "analysis" instead
+        if analysis is None:
+            analysis = ReachAnalysis()
+        self._analysis = analysis
         #
         if system_message_handler is None:
-            system_message_handler = SystemMessageHandler(self._system_message_queue, sensor_analysis=analysis)
+            system_message_handler = SystemMessageHandler(self._system_message_queue)
         self._system_message_handler = system_message_handler
-        assert self._system_message_handler.analysis is analysis, \
-            "something very wrong: sensor_analysis different in system_message_handler"
         self._system_message_handler.start()
 
-        self._hardware = HardwareModel(self._system_message_handler, sensor_analysis=analysis)
+        # Before anything loads NI-DAQmx. The NI-DAQ worker context is a
+        # forkserver, and bringing that server up is itself an exec - the
+        # operation that fails once the NI-DAQmx runtime is resident in this
+        # process, which it is as soon as the laser loads. Started here it
+        # serves for the life of the process; started later it dies with a
+        # broken pipe and the signal stream never runs.
+        #
+        # Constructing the monitor below already warmed it as a side effect,
+        # so this line changes nothing today. It is here because that was
+        # luck: it held only while the monitor happened to be built before
+        # the laser, and the fault it avoids reports itself three layers
+        # away as "preflight exited with code 255 without a result".
+        get_nidaq_mp_ctx()
+
+        self._hardware = HardwareModel(self._system_message_handler)
+        self._laser = LaserModel()
+        # A display change restarts the stream only while idle: in System
+        # Mode a restart is a gap and a new timing anchor in the recording.
+        self._nidaq_signal_monitor = NidaqSignalMonitorModel(
+            restart_allowed=self._nidaq_stream_idle,
+        )
+        #: Starts the input stream by itself while idle; see _request_nidaq_stream.
+        self._nidaq_stream_autostart = NidaqStreamAutoStart(
+            self._nidaq_signal_monitor,
+            may_start=self._nidaq_stream_may_start,
+            # A released hold says "stopped"; with a refused plan held, the
+            # laser tabs and Analysis then lost the reason (A8), and so with
+            # a laser close given up on.
+            on_released=self._on_nidaq_stream_released,
+        )
+        #: Whether _start_nidaq_domain is running, and whether the stream's
+        #: latest start came while it was; see _on_nidaq_monitor_property_changed.
+        self._nidaq_domain_start_active = False
+        self._nidaq_stream_started_by_domain = False
+        #: Why the loaded configuration's NI-DAQ plan was refused, or empty.
+        #: While set, the stream has no channels and reads BLOCKED with it,
+        #: until Edit DAQ Ports saves a plan that builds.
+        self._nidaq_plan_error = ""
+        #: What the operator is told to do about a refused plan; see
+        #: nidaq_plan_remedy.
+        self._nidaq_plan_remedy = _GUI_NIDAQ_PLAN_REMEDY
+        #: Set while run_laser_calibration_ramp holds the NI-DAQ lines and a
+        #: laser controller of its own; Run, the DAQ Monitor, a configuration
+        #: load and a DAQ ports save refuse while it is.
+        self._laser_calibration_active = False
+        self._laser_calibration_lock = threading.Lock()
+        #: Clear while a ramp runs; on_close waits on it, for up to
+        #: _laser_calibration_close_wait_s, before closing the ramp's
+        #: controller itself.
+        self._laser_calibration_done = threading.Event()
+        self._laser_calibration_done.set()
+        self._laser_calibration_close_wait_s = 0.0
+        self._laser_calibration_controller = None
+        #: The ramp running, for what closing says when it cannot close it.
+        self._laser_calibration_ramp: Optional[LaserCalibrationRamp] = None
+        #: Whether the running ramp has opened its controller, and whether it
+        #: has been given it to run: from then on its output may hold a ramp
+        #: command. Before either, closing must not say it may.
+        self._laser_calibration_opened = False
+        self._laser_calibration_commanded = False
+        #: System Mode laser controller closes given up on at their bound and
+        #: still inside the driver; laser work is refused while there is one.
+        self._pending_laser_closes: List[_BoundedClose] = []
+        self._pending_laser_closes_lock = threading.Lock()
+        #: Held while LASER's status is decided and set from whether a close
+        #: is pending, so that no writer lands over another out of order; not
+        #: while it is announced (_set_laser_status_after_close).
+        self._laser_close_status_lock = threading.RLock()
+        #: Written by tools/hardware/verify_nidaq_wiring.py, read here.
+        #: It sits beside the configuration it describes rather than in
+        #: it, so it can be regenerated without touching a hand-edited
+        #: file, and so a missing one plainly means "never checked".
+        self._wiring_record_path = (
+            self.get_config_location().parent
+            / "nidaq_wiring_verification.json")
+        self._session_data_recorder = SessionDataRecorder(
+            self._nidaq_signal_monitor,
+            self._laser,
+            system_message_handler=self._system_message_handler,
+            hardware_model=self._hardware,
+            event_manager=self._event_manager,
+            nidaq_tone_edge_callback=self._on_intertrial_nidaq_tone_edge,
+        )
+        # The last finalized session's latency status, for its metadata.
+        self._latency_status: dict = {}
 
         self._inference_queue = None
+        self._inference_cameras: Tuple[VideoCaptureModel, ...] = ()
 
         self._pose_algorithm: PoseAlgorithm = None
         self._inference: InferenceModel = None  # noqa. needed before reload_calib
@@ -373,6 +1004,10 @@ class AppModel(ObservableObject):
                 record_stop_sema=self._record_stop_sema,
             )
         inference = self._inference =  inference_model
+        # Live counters for the operator panel and the session metadata. Owned
+        # here because it is the only place that sees both the capture messages
+        # and the inference model.
+        self._session_telemetry = SessionTelemetry()
         #
 
         self._training_plans: List[PlanInfo] = []
@@ -381,33 +1016,134 @@ class AppModel(ObservableObject):
 
         behavior_model = self._behavior = BehaviorModel(
             self._system_message_handler, self._analysis, self._hardware, self._inference,
-            topcam_presence=self._top_camera_presence_detection,
             system_machine=system_machine,
         )
         system_machine = behavior_model.system_machine  # ensure same
+        system_machine.use_live_intertrial_analysis = True
 
         self._models: List[ProjectDependentProtocol] = [
-            self._left_camera,
-            self._right_camera,
-            self._top_camera,
+            *self._reach_cameras,
             self._inference,
             self._behavior,
+            self._nidaq_signal_monitor,
         ]
 
         self._animals: List[AnimalSubject] = []
         self._animal_by_id: Dict[str, AnimalSubject] = {}
+        self._animal_by_external_key: Dict[Tuple[str, str, str], AnimalSubject] = {}
+        self._external_link_conflicts = set()
+        self._animal_registry = None
+        self._animal_metadata_sync = None
+        self._rfid_metadata_controller = None
+        self._animal_metadata_status = "Not configured"
+        self._animal_metadata_preview = None
+        self._rfid_reader_status = None
+        self._rfid_scan_result = None
+        self._animal_metadata_refresh_thread = None
+        self._animal_metadata_refresh_lock = threading.Lock()
+        self._animal_metadata_refresh_busy = False
+        self._animal_metadata_refresh_deferred = False
+        self._animal_metadata_refresh_reason = ""
 
         self._selected_animal: Optional[AnimalSubject] = None
         self._attached_plan: Optional[TrainingPlan] = None
         self._attached_phase: Optional[TrainingPhase] = None
         self._attached_animal: Optional[AnimalSubject] = None
+        self._protocol_runner = TrialProtocolRunner(
+            on_protocol_complete=self._on_trial_protocol_complete,
+        )
+        self._pellet_cycles = PelletCycleController(
+            self._session_api,
+            self._protocol_runner,
+            self._session_data_recorder,
+        )
+        self._protocol_action_lock = threading.RLock()
+        self._protocol_action_thread = None
+        self._protocol_positioning_active = False
+        self._protocol_session_seed = 0
+        self._automatic_protocol_shifts = {}
+        profile_library = self._stimulus_profile_repository.library
+        self._tone_profiles = {
+            profile.profile_id: profile for profile in profile_library.tone_profiles
+        }
+        self._cue_interval_profiles = {
+            profile.profile_id: profile
+            for profile in profile_library.cue_interval_profiles
+        }
+        self._stimulus_trigger_profiles = {
+            profile.profile_id: profile
+            for profile in profile_library.stimulus_trigger_profiles
+        }
+        self._laser_profiles = {
+            profile.profile_id: profile for profile in profile_library.laser_profiles
+        }
+        self._automatic_shift_policies = {
+            profile.policy_id: profile
+            for profile in profile_library.automatic_shift_profiles
+        }
+        self._live_tracking = LiveTrackingBuffer()
+        # Tone 2's reach gate, answered from live pose. The resolver has always
+        # taken this provider and nothing supplied one, so selecting
+        # live_tracking as the source reported "unknown" forever. The buffer is
+        # built first because the executor reads reach state through it.
+        self._reach_state_resolver = ReachStateResolver(
+            ReachStateConfiguration.from_environment(),
+            live_tracking_provider=LiveTrackingReachProvider(
+                self._live_tracking,
+                on_observe=self._session_data_recorder.latency_events.record_gate_observation,
+            ),
+        )
+        self._trial_action_executor = TrialActionExecutor(
+            move_absolute=self._move_protocol_motor_target,
+            configure_cover=self._configure_protocol_cover,
+            play_tone=self._play_protocol_tone,
+            prepare_laser=self._prepare_protocol_laser,
+            cancel_laser=self._cancel_protocol_laser,
+            release_laser=self._laser.release_prepared_profile,
+            prepare_detector=self._prepare_protocol_stim_detector,
+            activate_detector=self._arm_protocol_stim_detector,
+            cancel_detector=self._cancel_protocol_stim_detector,
+            trigger_hardware_stimulus=self._trigger_protocol_stim3,
+            reach_state_resolver=self._reach_state_resolver,
+        )
+        # One holder, several holders-of-holds. intertrial analysis and
+        # inter-trial timing both block the send, and BehaviorAlgorithm reads
+        # a single string, so releasing one must not release the other.
+        self._send_block_reasons = SendBlockReasons(
+            publish=self._publish_pellet_send_block_reason,
+        )
+        self._intertrial_send_gate = InterTrialSendGate(
+            block_reasons=self._send_block_reasons,
+            observe=self._on_intertrial_timing_evaluated,
+        )
+        self._intertrial_analysis = IntertrialAnalysisCoordinator(
+            self._on_intertrial_analysis_result,
+            failure_callback=self._on_intertrial_callback_failed,
+        )
+        self._intertrial_finalize_thread = None
+        self._trial_window_start = None
+        self._tone2_active = False
+        self._tone2_status_active = False
+        self._intertrial_lock = threading.RLock()
 
         self._rpc_service: Optional[RpcService] = None
 
         self._hardware.property_changed += self._on_hardware_property_changed
+        self._hardware.command_failed += self._on_hardware_command_failed
+        self._nidaq_signal_monitor.property_changed += (
+            self._on_nidaq_monitor_property_changed
+        )
+        self._laser.property_changed += self._on_laser_runtime_property_changed
+        # After the handlers above, which write the subsystems' statuses.
+        self._nidaq_signal_monitor.property_changed += (
+            self._on_protocol_readiness_input_changed
+        )
+        self._laser.property_changed += self._on_protocol_readiness_input_changed
+        self._system_message_handler.decoded_message_received += (
+            self._on_intertrial_device_message
+        )
         inference.property_changed += self._on_inference_property_changed
         inference.pose_response_ready += self._on_pose_response_ready
-        inference.detection_result_ready += self._on_detection_result_ready
 
         preferences.property_changed += self._on_preferences_property_changed
 
@@ -415,34 +1151,201 @@ class AppModel(ObservableObject):
         algo.property_changed += self._on_behavior_algo_property_changed
         algo.session_starting_before_record_start += self._on_session_starting_before_record_start
         algo.session_capture_ending += self._on_session_capture_ended
-        # algo.session_ending += self._on_session_ending
-
-        behavior_model.emergency_stopped += self._on_emergency_stopped
-        behavior_model.emergency_resumed += self._on_emergency_resumed
+        algo.session_ending += self._on_session_ending
 
         intersession = system_machine.intersession
         intersession.events.property_changed += self._on_intersession_property_changed
 
         pellet_m = system_machine.pellet
-        pellet_m.events.pellet_loaded += self._on_pellet_loaded
+        pellet_m.events.pellet_loading += self._on_pellet_loading_for_trial
+        pellet_m.events.pellet_cycle_completed += self._on_pellet_cycle_completed
+        pellet_m.events.pellet_sending += self._on_pellet_sending
         pellet_m.events.pellet_sent += self._on_pellet_sent
+        pellet_m.set_send_preparation_callbacks(
+            readiness=self._protocol_send_readiness,
+            guard=self._guard_protocol_send,
+        )
 
-        analysis.emergency_alarm_monitor.property_changed += self._on_alarm_monitor_property_changed
-        analysis.system_maintenance_alarm.property_changed += self._on_system_maint_prop_changed
         analysis.watchdog_monitor.property_changed += self._on_watchdog_property_changed
-        analysis.autoclamp_evasion_detector.property_changed += self._on_autoclamp_evasion_property_changed
+
+        # Establish the default project before publishing startup status. This
+        # gives the event-file plugin a valid destination and also prevents a
+        # configuration using the default output root from reopening the log.
+        self.project = self.make_project_info()
 
         self._timer_one_minute_repeat = no_op_timer
 
         def one_minute_timer_handle_and_reschedule():
+            if self._closing_event.is_set():
+                return
             self._update_led_color()
             self._send_api_system_status()
+            if self._closing_event.is_set():
+                return
             delay = 60
             timer = self._timer_one_minute_repeat = make_daemon_timer(delay, one_minute_timer_handle_and_reschedule)
             timer.start()
             logger.verbose("Scheduled send_system_status in %.1f seconds", delay)
 
         one_minute_timer_handle_and_reschedule()
+        register_fatal_exception_callback(self._on_fatal_exception)
+        self._protocol_readiness_enabled = True
+        self._refresh_protocol_readiness()
+
+    def _make_reach_camera_model(self, camera_id: CameraId, camera_index: int) -> VideoCaptureModel:
+        return VideoCaptureModel(
+            str(camera_id),
+            self._preferences,
+            camera_index,
+            msg_queue=self._multiproc_msg_queue,
+            cam_id=camera_id,
+            synced_cam_frame_index=self._cams_synced_frame_index,
+            synced_cam_recording=self._cams_record_enabled,
+            record_start_perf=self._cams_record_start_perf,
+            record_generation=self._record_generation_value,
+            record_stop_sema=self._record_stop_sema,
+            stim_trigger_queue=self._stim_direct_trigger_queue,
+        )
+
+    @staticmethod
+    def _configured_reach_camera_ids(configuration: SystemConfiguration) -> Tuple[CameraId, ...]:
+        reach_camera_ids = set(CameraId.reach_camera_ids())
+        configured_ids: List[CameraId] = []
+        for camera_config in configuration.cameras:
+            camera_id = camera_config.id
+            if camera_id in reach_camera_ids and camera_id not in configured_ids:
+                configured_ids.append(camera_id)
+        return tuple(configured_ids)
+
+    def _refresh_camera_collections(self) -> None:
+        self._left_camera = next(
+            (camera for camera in self._reach_cameras if camera.camera_id == CameraId.Left),
+            None,
+        )
+        self._right_camera = next(
+            (camera for camera in self._reach_cameras if camera.camera_id == CameraId.Right),
+            None,
+        )
+        self._stim_camera = next(
+            (camera for camera in self._reach_cameras if camera.camera_id == CameraId.Camera3),
+            None,
+        )
+        self._cameras = list(self._reach_cameras)
+        self._camera_by_id = {
+            camera.camera_id: camera
+            for camera in self._cameras
+        }
+        self._models = [
+            *self._reach_cameras,
+            self._inference,
+            self._behavior,
+            self._nidaq_signal_monitor,
+        ]
+        if self._project_info is not None:
+            for camera in self._reach_cameras:
+                camera.project = self._project_info
+
+    def _sync_reach_cameras_to_configuration(self, configuration: SystemConfiguration) -> None:
+        configured_camera_ids = self._configured_reach_camera_ids(configuration)
+        current_by_id = {
+            camera.camera_id: camera
+            for camera in self._reach_cameras
+        }
+        next_cameras: List[VideoCaptureModel] = []
+        for camera_index, camera_id in enumerate(configured_camera_ids):
+            camera = current_by_id.pop(camera_id, None)
+            if camera is None or camera.camera_index != camera_index:
+                if camera is not None:
+                    camera.on_close()
+                camera = self._make_reach_camera_model(camera_id, camera_index)
+            next_cameras.append(camera)
+
+        for removed_camera in current_by_id.values():
+            removed_camera.on_close()
+
+        self._reach_cameras = tuple(next_cameras)
+        self._refresh_camera_collections()
+
+    @staticmethod
+    def _ensure_optional_stim_camera(configuration: SystemConfiguration) -> None:
+        """Add the standard third camera without enabling or probing it."""
+        configured_stim_camera = configuration.get_camera(CameraId.Camera3)
+        if configured_stim_camera is not None:
+            configured_stim_camera.name = "stimCam"
+            return
+        configuration.cameras.append(
+            CameraConfiguration(
+                id=CameraId.Camera3,
+                name="stimCam",
+                is_enabled=False,
+                is_record_enabled=False,
+                record_prebuffer_duration=0,
+                scheme="random",
+                params={**_RANDOM_CAMERA_DEFAULT_PARAMS, "primary": "no"},
+            )
+        )
+        configuration._camera_map = {}
+
+    @staticmethod
+    def _make_random_camera_config(camera_id: CameraId) -> CameraConfiguration:
+        camera_config = CameraConfiguration(
+            id=camera_id,
+            name=str(camera_id),
+            is_enabled=True,
+            is_record_enabled=False,
+            record_prebuffer_duration=0,
+            scheme="random",
+            params=dict(_RANDOM_CAMERA_DEFAULT_PARAMS),
+        )
+        camera_config.params["primary"] = "yes" if camera_id == CameraId.Left else "no"
+        return camera_config
+
+    @classmethod
+    def _configure_camera_as_random(cls, camera_config: CameraConfiguration) -> None:
+        camera_config.scheme = "random"
+        camera_config.host = ""
+        camera_config.port = 0
+        camera_config.path = ""
+
+        params = dict(camera_config.params)
+        for key, value in _RANDOM_CAMERA_DEFAULT_PARAMS.items():
+            params.setdefault(key, value)
+        if camera_config.id == CameraId.Left:
+            params["primary"] = "yes"
+        elif camera_config.id in CameraId.reach_camera_ids():
+            params.setdefault("primary", "no")
+        camera_config.params = params
+
+    @classmethod
+    def _apply_random_camera_override(cls, configuration: SystemConfiguration) -> None:
+        reach_ids = set(CameraId.reach_camera_ids())
+        reach_configs_by_id = {
+            camera_config.id: camera_config
+            for camera_config in configuration.cameras
+            if camera_config.id in reach_ids
+        }
+
+        if len(reach_configs_by_id) == 0:
+            for camera_id in (CameraId.Left, CameraId.Right):
+                camera_config = cls._make_random_camera_config(camera_id)
+                configuration.cameras.append(camera_config)
+                reach_configs_by_id[camera_id] = camera_config
+
+        should_enable_default_reach_cameras = not any(
+            config.is_enabled for config in reach_configs_by_id.values()
+        )
+        for camera_id in (CameraId.Left, CameraId.Right):
+            camera_config = reach_configs_by_id.get(camera_id)
+            if camera_config is None:
+                continue
+            if should_enable_default_reach_cameras:
+                camera_config.is_enabled = True
+
+        for camera_config in configuration.cameras:
+            if camera_config.id in reach_ids:
+                cls._configure_camera_as_random(camera_config)
+
+        configuration._camera_map = {}
 
     @BehaviorAlgorithm.relay_func(wait=False)
     def _on_daily_timer(self):
@@ -473,30 +1376,806 @@ class AppModel(ObservableObject):
         timer.start()
         logger.verbose("Created new daily timer in %.1f seconds ; today=%s", delay, new_day)
         self.current_day_changed(new_day)
-
-    def check_max_pellet_loaded(self):
-        mon = self._analysis.system_maintenance_alarm
-        mon.update_pellet_loaded(self._preferences.pellet_load_count_total)
+        if (
+            getattr(self._preferences, "softmouse_nightly_refresh", False)
+            and self._animal_metadata_sync is not None
+        ):
+            self._request_animal_metadata_catchup()
 
     @property
     def app_lock(self) -> threading.RLock:
         return self._behavior.algorithm.thread_lock
 
     @property
+    def _trial_ledger(self) -> Optional[PelletTrialLedger]:
+        """Compatibility view; PelletCycleController owns the ledger."""
+        return self._pellet_cycles.ledger
+
+    @_trial_ledger.setter
+    def _trial_ledger(self, value: Optional[PelletTrialLedger]) -> None:
+        self._pellet_cycles.ledger = value
+
+    @property
     def acquisition_started(self):
-        return self._acquisition_started
+        return self._acquisition.started
+
+    @property
+    def session_recording_status(self) -> SessionRecordingStatus:
+        return self._recording_session.status
+
+    def _publish_session_recording_transition(
+        self,
+        previous: SessionRecordingStatus,
+        status: SessionRecordingStatus,
+    ) -> None:
+        if status == previous:
+            return
+        logger.info("session recording status: %s -> %s", previous.value, status.value)
+        self.property_changed(self.Props.SESSION_RECORDING_STATUS, status, previous)
+        self.property_changed(
+            self.Props.RECORDING_BLOCKERS,
+            self.recording_blockers,
+            None,
+        )
+        if status is SessionRecordingStatus.READY:
+            with self._animal_metadata_refresh_lock:
+                deferred = self._animal_metadata_refresh_deferred
+            if deferred:
+                self.request_animal_metadata_refresh("deferred after session")
+
+    def _set_session_recording_status(
+        self,
+        status: SessionRecordingStatus,
+        *,
+        expected: Optional[Tuple[SessionRecordingStatus, ...]] = None,
+        token: Optional[SessionGeneration] = None,
+    ) -> bool:
+        previous = self._recording_session.transition(
+            status,
+            expected=expected,
+            token=token,
+        )
+        if previous is None:
+            logger.warning(
+                "ignored stale/invalid session transition to %s: expected=%s token=%s",
+                status.value,
+                expected,
+                token,
+            )
+            return False
+        self._publish_session_recording_transition(previous, status)
+        return True
+
+    def start_recording(self) -> bool:
+        with self._session_lifecycle_command_lock:
+            return self._start_recording_locked()
+
+    def _start_recording_locked(self) -> bool:
+        if not self._acquisition.started or self._status == AppModelStatus.IDLE:
+            self.on_error("Recording unavailable", "Set System Mode to Running before recording.")
+            return False
+        if self._selected_animal is None:
+            logger.warning("start_recording refused because no subject is selected")
+            self.on_error(
+                "Recording unavailable",
+                "Scan an RFID tag or select a subject before recording.",
+            )
+            return False
+        recording_reach_cams = tuple(
+            camera
+            for camera in self._get_monitored_cams()
+            if camera.is_recording_enabled
+        )
+        if not recording_reach_cams:
+            self.on_error(
+                "Recording unavailable",
+                "Enable recording for at least one reach camera.",
+            )
+            return False
+        if self._recording_session.status != SessionRecordingStatus.READY:
+            logger.warning("start_recording refused while %s", self._recording_session.status.value)
+            return False
+        if (
+            self._session_data_recorder.has_pending_finalization
+            or self._pending_metadata_project is not None
+        ):
+            pending_session = (
+                self._session_data_recorder.pending_finalization_session_id
+                or (
+                    None
+                    if self._pending_metadata_project is None
+                    else self._pending_metadata_project.short_id
+                )
+                or "previous session"
+            )
+            pending_project = (
+                self._session_data_recorder.pending_finalization_project
+                or self._pending_metadata_project
+            )
+            try:
+                retained_result = None
+                if self._session_data_recorder.has_pending_finalization:
+                    retained_result = (
+                        self._session_data_recorder.retry_pending_finalization()
+                    )
+                if retained_result is not None:
+                    self._recording_session.set_stream_result(retained_result)
+                    self._latency_status = dict(retained_result.get("latency") or {})
+                if pending_project is not None:
+                    self._pending_metadata_project = pending_project
+                    self._save_project_metadata(
+                        pending_project,
+                        caller="retained_finalization_retry",
+                    )
+                    self._pending_metadata_project = None
+            except Exception as error:
+                logger.exception(
+                    "Retained finalization retry failed for %s",
+                    pending_session,
+                )
+                self.on_error(
+                    "Recording unavailable",
+                    f"Finish saving {pending_session} before recording: {error}",
+                )
+                return False
+        # Checked again as Record is taken, against the state as it is now:
+        # the button follows the check as it last ran. A check already
+        # running elsewhere is waited for, as it runs this request too.
+        self._refresh_protocol_readiness(wait_s=_PROTOCOL_CHECK_RECORD_WAIT_S)
+        blockers = tuple(
+            blocker
+            for blocker in self.recording_blockers
+            if blocker != "System Mode is not running"
+        )
+        if blockers:
+            self.on_error(
+                "Recording unavailable",
+                "Required session streams are not ready:\n"
+                + "\n".join(f"- {blocker}" for blocker in blockers),
+            )
+            return False
+        project = self._project_info
+        if project is None:
+            return False
+        session_config = self._behavior.algorithm.active_config.session_control
+        estimated_rate = self._estimate_session_bytes_per_second()
+        # Prove the output filesystem before allocating a session directory.
+        # Using the day directory avoids mutating the previous session while
+        # retaining an equivalent durability and free-space check.
+        preflight_path = Path(project.get_day_path(skip_ensure=True)[0])
+        try:
+            storage_preflight = preflight_storage(
+                preflight_path,
+                estimated_bytes_per_second=estimated_rate,
+                configured_duration_seconds=session_config.duration_limit_seconds,
+            )
+        except Exception as error:
+            logger.exception("Session output write/fsync preflight failed")
+            self.on_error("Recording unavailable", f"Storage preflight failed: {error}")
+            return False
+        try:
+            # Reserve the filesystem session before creating the lifecycle
+            # token. Writers and callbacks must observe this immutable ID for
+            # the entire generation.
+            project.calculate_next_session_index()
+        except Exception as error:
+            logger.exception("Session directory allocation failed")
+            self.on_error("Recording unavailable", f"Session allocation failed: {error}")
+            return False
+        session_path = Path(project.get_session_path(skip_ensure=True).location)
+        storage_preflight = dataclasses.replace(
+            storage_preflight,
+            target_directory=str(session_path.resolve()),
+        )
+        self._storage_preflight = storage_preflight
+        logger.info(
+            "Session storage preflight: target=%s free_bytes=%d "
+            "estimated_bytes_per_second=%.1f projected_maximum_minutes=%s",
+            storage_preflight.target_directory,
+            storage_preflight.free_bytes,
+            storage_preflight.estimated_bytes_per_second,
+            storage_preflight.projected_maximum_minutes,
+        )
+        if not storage_preflight.duration_fits_projection:
+            message = (
+                f"Configured duration {storage_preflight.configured_duration_seconds / 60:.1f} "
+                "minutes exceeds the projected storage capacity of "
+                f"{storage_preflight.projected_maximum_minutes:.1f} minutes."
+            )
+            logger.warning(message)
+            self.on_error("Storage capacity warning", message)
+        self._flush_stopped_session_notes_now()
+        # Cleared under the publication lock, so a notes save replaying from a
+        # validation's end state finishes with the project it already read.
+        with self._session_publication_lock:
+            self._editable_notes_project = None
+            self.notes = ""
+        reservation = self._recording_session.begin_record(
+            project.short_id,
+            self._acquisition.subsystems.snapshot(),
+            animal_snapshot=(
+                None
+                if self._selected_animal is None
+                else self._selected_animal.session_snapshot()
+            ),
+        )
+        if reservation is None:
+            logger.warning(
+                "start_recording lost session reservation while %s",
+                self._recording_session.status.value,
+            )
+            return False
+        previous_status, session_token = reservation
+        self._protocol_session_seed = int.from_bytes(
+            hashlib.sha256(
+                f"{session_token.session_id}:{session_token.generation}".encode("utf-8")
+            ).digest()[:8],
+            "big",
+        )
+        self._automatic_protocol_shifts.clear()
+        self._publish_session_recording_transition(
+            previous_status,
+            SessionRecordingStatus.ARMING,
+        )
+        self._record_generation_value.value = session_token.generation
+        project.session_generation = session_token.generation
+        self._recording_session.set_storage_telemetry({
+            "preflight": {
+                "targetDirectory": storage_preflight.target_directory,
+                "freeBytes": storage_preflight.free_bytes,
+                "estimatedBytesPerSecond": (
+                    storage_preflight.estimated_bytes_per_second
+                ),
+                "projectedMaximumMinutes": (
+                    storage_preflight.projected_maximum_minutes
+                ),
+                "configuredDurationSeconds": (
+                    storage_preflight.configured_duration_seconds
+                ),
+                "durationFitsProjection": storage_preflight.duration_fits_projection,
+            }
+        })
+        self._set_subsystem_status(
+            SubsystemId.INTERTRIAL_ANALYSIS,
+            SubsystemState.DISABLED,
+            reason="no completed pellet trial pending",
+        )
+        self._abort_had_recording_started = False
+        self._live_inference_failed_reason = None
+        try:
+            self._session_data_recorder.arm(
+                project,
+                source_manifest=self._build_session_source_manifest(),
+                metadata_generation_id=(
+                    self._recording_session.metadata_generation_id
+                ),
+                camera_exposure_seconds=_camera_exposure_seconds(self._cameras),
+            )
+            started = self._behavior.algorithm.start_session(
+                reason="manual_record",
+                allocate_project_session=False,
+            )
+        except Exception as err:
+            logger.exception("manual recording start failed: %s", err)
+            self.abort_recording(token=session_token)
+            self.on_error("Recording failed", str(err))
+            return False
+        if not started:
+            self.abort_recording(token=session_token)
+            return False
+        self._aborted_session_ids.discard(project.short_id)
+        if self._recording_session.status == SessionRecordingStatus.ARMING:
+            self._record_start_timer.cancel()
+            self._record_start_timer = make_daemon_timer(
+                10.0,
+                lambda token=session_token: self._record_start_timed_out(token),
+            )
+            self._record_start_timer.start()
+        notice = self.protocol_check_notice
+        if notice:
+            # Warnings do not hold Record back; this, and Behavior's status
+            # bar line, are where they are said as the session starts.
+            logger.warning(notice)
+        return True
+
+    def _estimate_session_bytes_per_second(self) -> float:
+        """Conservative configuration-only estimate used until writes are observed."""
+
+        total = 16 * 1024.0  # decoded events, timestamps, pose, laser, and logs
+        for camera in self._get_recording_cams():
+            params = camera.active_config.params
+            # The captured size: with a capture-binning preset the recorded
+            # frames are larger than the saved width/height.
+            rows, cols = camera.capture_shape
+            width = float(cols) if cols > 0 else float(params.get("width", 2048))
+            height = float(rows) if rows > 0 else float(params.get("height", 1536))
+            fps = float(params.get("fps", 150))
+            explicit_mbps = params.get("estimated_recording_mbps")
+            if explicit_mbps is not None:
+                total += max(0.0, float(explicit_mbps)) * 1_000_000 / 8.0
+            else:
+                # MP4V is content dependent. One quarter byte per source pixel is
+                # deliberately conservative and observed throughput supersedes it.
+                total += max(0.0, width * height * fps * 0.25)
+            total += max(0.0, fps * 64.0)  # frame timestamp rows
+        monitor = self._nidaq_signal_monitor
+        if monitor.hardware_enabled and monitor.configuration.is_enabled:
+            configuration = monitor.configuration
+            bytes_per_sample = 24 + 4 * len(configuration.channels)
+            total += configuration.sample_rate_hz * bytes_per_sample
+        return total
+
+    def _start_storage_monitor(self, token: SessionGeneration) -> None:
+        project = self._project_info
+        if project is None or not self._recording_session.is_current(
+            token, statuses=(SessionRecordingStatus.RECORDING,)
+        ):
+            return
+        target = Path(project.get_session_path(skip_ensure=True).location)
+        self._storage_monitor.start(
+            target,
+            estimated_bytes_per_second=self._estimate_session_bytes_per_second(),
+            callback=lambda snapshot, threshold, token=token: (
+                self._on_storage_sample(token, snapshot, threshold)
+            ),
+        )
+
+    def _on_storage_sample(
+        self,
+        token: SessionGeneration,
+        snapshot: StorageSnapshot,
+        threshold: Optional[int],
+    ) -> None:
+        if not self._recording_session.is_current(
+            token, statuses=(SessionRecordingStatus.RECORDING,)
+        ):
+            return
+        if threshold is None:
+            return
+        remaining = snapshot.projected_remaining_minutes
+        message = (
+            f"Projected recording capacity is {remaining:.2f} minutes "
+            f"({snapshot.free_bytes} bytes free)."
+        )
+        if threshold == 1:
+            logger.error("Storage critical; requesting normal Stop: %s", message)
+            self.on_error("Storage critical — recording will stop", message)
+            self._stop_recording(RecordingEndingReason.STORAGE_LIMIT, token=token)
+        else:
+            logger.warning("Storage capacity crossed %d minutes: %s", threshold, message)
+            self.on_error(f"Storage below {threshold} minutes", message)
+
+    def _build_session_source_manifest(self) -> Tuple[dict, ...]:
+        def runtime_state(subsystem_id) -> str:
+            status = self._acquisition.subsystems.get(subsystem_id)
+            return "unknown" if status is None else status.state.value
+
+        sources = [
+            {
+                "id": f"camera.{camera.name}",
+                "kind": "camera",
+                "binding": (
+                    ""
+                    if camera.camera_source is None
+                    else camera.camera_source.url
+                ),
+                "path": f"video/{camera.name}",
+                "runtimeState": runtime_state(SubsystemId.camera(camera.name)),
+            }
+            for camera in self._get_recording_cams()
+        ]
+        if self._inference.is_enabled:
+            sources.append({
+                "id": "pose",
+                "kind": "pose",
+                "path": "pose",
+                "runtimeState": runtime_state(SubsystemId.LIVE_INFERENCE),
+            })
+        if (
+            self._nidaq_signal_monitor.hardware_enabled
+            and self._nidaq_signal_monitor.configuration.is_enabled
+        ):
+            sources.extend(
+                {
+                    "id": f"nidaq.{channel.name}",
+                    "kind": f"nidaq_{channel.kind}",
+                    "binding": channel.physical_channel,
+                    "path": "streams/nidaq.h5",
+                    "runtimeState": runtime_state(SubsystemId.NIDAQ_STREAM),
+                }
+                for channel in self._nidaq_signal_monitor.configuration.channels
+            )
+        if self._hardware.requires_connection:
+            sources.append({
+                "id": "device",
+                "kind": "decoded_can_and_device_events",
+                "path": "streams/device.csv",
+                "runtimeState": runtime_state(SubsystemId.CAN_PELLET),
+            })
+        if (
+            self._stim_camera is not None
+            and self._stim_camera._stim_detection_configuration is not None
+        ):
+            sources.append({
+                "id": "stim_camera_evidence",
+                "kind": "stim_camera_detection_evidence",
+                "path": "streams/stim_camera_evidence.h5",
+                "runtimeState": runtime_state(
+                    SubsystemId.camera(self._stim_camera.name)
+                ),
+            })
+        if self._laser.configuration.backend != "disabled":
+            sources.append({
+                "id": "laser_outputs",
+                "kind": "laser_commands_and_states",
+                "path": "streams/laser.csv",
+                "runtimeState": runtime_state(SubsystemId.LASER),
+            })
+        sources.append({
+            "id": "session_logs",
+            "kind": "logs",
+            "path": "logs/session.log",
+            "runtimeState": runtime_state(SubsystemId.SESSION_LOGS),
+        })
+        sources.append({
+            "id": "trials",
+            "kind": "pellet_trial_ledger",
+            "path": "streams/trials.jsonl",
+            "runtimeState": "ready",
+        })
+        return tuple(sources)
+
+    def _record_start_timed_out(
+        self,
+        token: Optional[SessionGeneration] = None,
+    ) -> None:
+        if token is not None and not self._recording_session.is_current(
+            token,
+            statuses=(SessionRecordingStatus.ARMING,),
+        ):
+            logger.info("ignoring stale record-start timeout: %s", token)
+            return
+        if self._recording_session.status != SessionRecordingStatus.ARMING:
+            return
+        logger.error("Timed out waiting for the primary camera to begin recording")
+        self.on_error(
+            "Recording failed",
+            "The primary camera did not begin recording within 10 seconds. "
+            "The partial session will be aborted.",
+        )
+        if token is None:
+            self.abort_recording()
+        else:
+            self.abort_recording(token=token)
+
+    def _start_automatic_stop_policy(
+        self,
+        start_perf_time: float,
+        token: Optional[SessionGeneration] = None,
+    ) -> None:
+        policy = self._session_stop_policy
+        if policy is None:
+            return
+        policy.start(start_perf_time)
+        duration = policy.configuration.duration_seconds
+        if duration is not None:
+            self._automatic_stop_timer.cancel()
+            self._automatic_stop_timer = make_daemon_timer(
+                duration,
+                lambda token=token: self._evaluate_automatic_stop_policy(
+                    token=token
+                ),
+            )
+            self._automatic_stop_timer.start()
+
+    def _cancel_automatic_stop_timers(self) -> None:
+        for timer in (self._automatic_stop_timer, self._stop_drain_timer):
+            if not timer.finished.is_set():
+                timer.cancel()
+        self._automatic_stop_timer = no_op_timer
+        self._stop_drain_timer = no_op_timer
+
+    def _evaluate_automatic_stop_policy(
+        self,
+        *,
+        protocol_complete: bool = False,
+        token: Optional[SessionGeneration] = None,
+    ) -> Optional[SessionStopEvaluation]:
+        if token is not None and not self._recording_session.is_current(
+            token,
+            statuses=(SessionRecordingStatus.RECORDING,),
+        ):
+            logger.info("ignoring stale automatic-stop callback: %s", token)
+            return None
+        policy = self._session_stop_policy
+        if (
+            policy is None
+            or not policy.is_started
+            or self._recording_session.status is not SessionRecordingStatus.RECORDING
+        ):
+            return None
+        evaluation = policy.evaluate(
+            get_perf_now(),
+            trial_count=self._pellet_cycles.count(),
+            protocol_complete=protocol_complete,
+            trial_active=self._pellet_cycles.active_attempt is not None,
+        )
+        self._session_stop_evaluation = evaluation
+        if evaluation.decision is SessionStopDecision.NONE:
+            return evaluation
+        if evaluation.decision is SessionStopDecision.FINISH_ACTIVE_TRIAL:
+            self._behavior.algorithm.pellet_automation_stop_requested = True
+            if self._stop_drain_timer is no_op_timer:
+                self._stop_drain_timer = make_daemon_timer(
+                    policy.configuration.drain_timeout_seconds,
+                    lambda token=token: self._evaluate_automatic_stop_policy(
+                        token=token
+                    ),
+                )
+                self._stop_drain_timer.start()
+            logger.info(
+                "automatic session stop requested; finishing active trial: %s",
+                evaluation.reason,
+            )
+            return evaluation
+        if evaluation.decision is SessionStopDecision.TIMEOUT_ERROR:
+            now_perf = get_perf_now()
+            if self._pellet_cycles.active_attempt is not None:
+                self._pellet_cycles.finalize_active_incomplete(
+                    now_perf,
+                    time.time(),
+                    error=(
+                        "active trial did not finish within the configured "
+                        "stop drain timeout"
+                    ),
+                )
+            message = (
+                "Active pellet trial did not finish within "
+                f"{policy.configuration.drain_timeout_seconds:g} seconds"
+            )
+            logger.error(message)
+            self.on_error("Automatic recording stop timeout", message)
+        if token is None:
+            self._stop_recording_with_reason(
+                evaluation.reason,
+                evaluation.decision,
+            )
+        else:
+            self._stop_recording_with_reason(
+                evaluation.reason,
+                evaluation.decision,
+                token=token,
+            )
+        return evaluation
+
+    def _stop_recording_with_reason(
+        self,
+        reason: Optional[SessionStopReason],
+        decision: SessionStopDecision = SessionStopDecision.STOP,
+        *,
+        token: Optional[SessionGeneration] = None,
+    ) -> bool:
+        ending_reason = {
+            SessionStopReason.DURATION_LIMIT: RecordingEndingReason.DURATION_LIMIT,
+            SessionStopReason.TRIAL_LIMIT: RecordingEndingReason.TRIAL_LIMIT,
+            SessionStopReason.PROTOCOL_COMPLETE: RecordingEndingReason.PROTOCOL_COMPLETE,
+        }.get(reason, RecordingEndingReason.STOP_DRAIN_TIMEOUT)
+        if decision is SessionStopDecision.TIMEOUT_ERROR:
+            ending_reason = RecordingEndingReason.STOP_DRAIN_TIMEOUT
+        return self._stop_recording(ending_reason, token=token)
+
+    def _stop_recording(
+        self,
+        reason: RecordingEndingReason,
+        *,
+        token: Optional[SessionGeneration] = None,
+    ) -> bool:
+        with self._session_lifecycle_command_lock:
+            return self._stop_recording_locked(reason, token=token)
+
+    def _stop_recording_locked(
+        self,
+        reason: RecordingEndingReason,
+        *,
+        token: Optional[SessionGeneration] = None,
+    ) -> bool:
+        token = token or self._recording_session.token()
+        if token is not None and not self._recording_session.is_current(
+            token, statuses=(SessionRecordingStatus.RECORDING,)
+        ):
+            logger.warning(
+                "stop_recording refused while %s",
+                self._recording_session.status.value,
+            )
+            return False
+        self._cancel_automatic_stop_timers()
+        self._recording_session.mark_analysis_pending()
+        if not self._set_session_recording_status(
+            SessionRecordingStatus.STOPPING,
+            expected=(SessionRecordingStatus.RECORDING,),
+            token=token,
+        ):
+            return False
+        self._cancel_protocol_operation(token, "recording stopped")
+        stopped = self._behavior.algorithm.end_capture_session(reason=reason)
+        if not stopped:
+            self._set_session_recording_status(
+                SessionRecordingStatus.RECORDING,
+                expected=(SessionRecordingStatus.STOPPING,),
+                token=token,
+            )
+        elif token is not None and self._recording_session.is_current(
+            token,
+            statuses=(SessionRecordingStatus.STOPPING,),
+        ):
+            self._writer_close_timer.cancel()
+            self._writer_close_timer = make_daemon_timer(
+                30.0,
+                lambda token=token: self._writer_close_timed_out(token),
+            )
+            self._writer_close_timer.start()
+        return bool(stopped)
+
+    def _writer_close_timed_out(self, token: SessionGeneration) -> None:
+        if not self._recording_session.is_current(
+            token,
+            statuses=(SessionRecordingStatus.STOPPING,),
+        ):
+            return
+        message = (
+            "Camera writers did not all report closure within 30 seconds. "
+            "The session remains preserved and will finish if the late writer "
+            "acknowledgement arrives; Abort remains available."
+        )
+        logger.error(message)
+        self._recording_session.add_data_error(message)
+        self._mark_session_invariant_unknown(message)
+        self.on_error("Camera writer close timeout", message)
+
+    def stop_recording(self) -> bool:
+        return self._stop_recording(RecordingEndingReason.MANUAL_STOP)
+
+    def abort_recording(
+        self,
+        *,
+        token: Optional[SessionGeneration] = None,
+    ) -> bool:
+        with self._session_lifecycle_command_lock:
+            return self._abort_recording_locked(token=token)
+
+    def _abort_recording_locked(
+        self,
+        *,
+        token: Optional[SessionGeneration] = None,
+    ) -> bool:
+        token = token or self._recording_session.token()
+        previous_status = self._recording_session.status
+        if previous_status not in {
+            SessionRecordingStatus.ARMING,
+            SessionRecordingStatus.RECORDING,
+            SessionRecordingStatus.STOPPING,
+            SessionRecordingStatus.ANALYZING,
+        }:
+            logger.warning("abort_recording refused while %s", self._recording_session.status.value)
+            return False
+        if token is not None and not self._recording_session.is_current(
+            token,
+            statuses=(
+                SessionRecordingStatus.ARMING,
+                SessionRecordingStatus.RECORDING,
+                SessionRecordingStatus.STOPPING,
+                SessionRecordingStatus.ANALYZING,
+            ),
+        ):
+            logger.warning("abort_recording refused for stale session: %s", token)
+            return False
+        project = self._project_info
+        if project is None:
+            return False
+        self._aborting_project = project.to_local_value()
+        if not self._set_session_recording_status(
+            SessionRecordingStatus.ABORTING,
+            expected=(previous_status,),
+            token=token,
+        ):
+            self._aborting_project = None
+            return False
+        self._aborted_session_ids.add(self._aborting_project.short_id)
+        self._cancel_protocol_operation(token, "recording aborted")
+        self._intertrial_analysis.cancel_session()
+        self._live_tracking.clear()
+        self._trial_window_start = None
+        self._tone2_active = False
+        self._tone2_status_active = False
+        self._intertrial_resolution_request = None
+        self._intertrial_resolution_reason = ""
+        self._intertrial_waiting_operations.clear()
+        self._send_block_reasons.clear_all()
+        self._session_data_recorder.request_abort()
+        self._cancel_automatic_stop_timers()
+        if token is not None:
+            self._recording_session.take_pending_end(token)
+        self._record_start_timer.cancel()
+        self._record_start_timer = no_op_timer
+        self._writer_close_timer.cancel()
+        self._writer_close_timer = no_op_timer
+        if previous_status is SessionRecordingStatus.ANALYZING:
+            logger.notice(
+                "Cancelling pending pellet-trial analysis before deleting %s",
+                self._aborting_project.short_id,
+            )
+            self._finish_abort_recording(token=token)
+            return True
+        if previous_status is SessionRecordingStatus.STOPPING:
+            logger.notice(
+                "Abort requested while camera writers are closing for %s",
+                self._aborting_project.short_id,
+            )
+            return True
+        stopped = self._behavior.algorithm.end_capture_session(
+            reason=RecordingEndingReason.MANUAL_ABORT,
+        )
+        if not stopped:
+            if previous_status is SessionRecordingStatus.ARMING:
+                # A failed/declined start has no active behavior session to
+                # stop. Keep Abort ownership and verify that no camera writer
+                # appeared before deleting the reserved session.
+                self._abort_cleanup_timer.cancel()
+                self._abort_cleanup_timer = make_daemon_timer(
+                    1.0,
+                    lambda token=token: self._finish_abort_if_never_started(token),
+                )
+                self._abort_cleanup_timer.start()
+                return True
+            self._set_session_recording_status(
+                previous_status,
+                expected=(SessionRecordingStatus.ABORTING,),
+                token=token,
+            )
+            self._aborting_project = None
+            return False
+        if previous_status == SessionRecordingStatus.ARMING:
+            self._abort_cleanup_timer.cancel()
+            self._abort_cleanup_timer = make_daemon_timer(
+                1.0,
+                lambda token=token: self._finish_abort_if_never_started(token),
+            )
+            self._abort_cleanup_timer.start()
+        return True
+
+    def _finish_abort_if_never_started(
+        self,
+        token: Optional[SessionGeneration] = None,
+    ) -> None:
+        if token is not None and not self._recording_session.is_current(
+            token,
+            statuses=(SessionRecordingStatus.ABORTING,),
+        ):
+            logger.info("ignoring stale abort-cleanup callback: %s", token)
+            return
+        if (
+            self._recording_session.status == SessionRecordingStatus.ABORTING
+            and not self._abort_had_recording_started
+            and all(
+                camera.video_status != CaptureProcessStatus.RECORDING
+                for camera in self._get_recording_cams()
+            )
+        ):
+            self._finish_abort_recording(token=token)
 
     def check_target_status_valid(self, target: AppModelStatus):
         current_status = self._status
+        if (
+            target != current_status
+            and self._recording_session.status != SessionRecordingStatus.READY
+        ):
+            raise InvalidTargetAppModelStatus(
+                "System Mode cannot change while a recording is being captured or analyzed"
+            )
         if target != current_status:
             valid = app_status_is_target_status_valid(current_status, target)
             if not valid:
                 raise InvalidTargetAppModelStatus(f"New status {target} not valid for current status {current_status}")
-        if target == AppModelStatus.ANIMAL_IN_TRAINING:
-            dcs_cfg = self._behavior.algorithm.diamond_triangle_config
-            valid_dcs = dcs_cfg is not None and dcs_cfg.fully_valid
-            if not valid_dcs:
-                raise InvalidTargetAppModelStatus("Cannot change to ANIMAL_IN_TRAINING without valid DCS")
 
     def is_target_status_valid(self, target: AppModelStatus) -> bool:
         try:
@@ -520,10 +2199,8 @@ class AppModel(ObservableObject):
         if algo_status is not None:
             self._behavior.algorithm.status = algo_status
         self.property_changed(self.Props.STATUS, status, prev)
-        is_from_start = status in {AppModelStatus.ACQUIRING, AppModelStatus.IDLE}
+        is_from_start = status in {AppModelStatus.RUNNING, AppModelStatus.IDLE}
         for cam in self._cameras:
-            if status == AppModelStatus.ANIMAL_IN_DEVICE:
-                is_from_start = cam != self._top_camera
             # NB: using is_triggered=None to ensure same state is kept in process side,
             # see: VideoRecord._disable_record()
             cam.on_trigger_recording(False, is_triggered=None, is_from_start=is_from_start)
@@ -535,14 +2212,6 @@ class AppModel(ObservableObject):
             self._analysis.restart()
         # reload training plans:
         self.reload_training_plans()
-        if status == AppModelStatus.ANIMAL_IN_TRAINING:
-            # NB: need to be after set of algo_status
-            # self._behavior.system_machine.pellet.send_pellet()
-            # send_pellet most likely not needed anymore. since pellet_machine takes care of it.
-            self._hardware.open_tunnel_gate()
-        else:
-            self._hardware.close_tunnel_gate()
-        #
         status_file_path = self.status_file_path.expanduser()
         status_file_path.parent.mkdir(parents=True, exist_ok=True)
         if status == AppModelStatus.IDLE:
@@ -577,119 +2246,167 @@ class AppModel(ObservableObject):
             cam_offsets = None
             logger.warning("calib_src_dir=%r does not exist", calib_src_dir.as_posix())
 
+        inference = self._inference
+        model_location = inference.model_location if inference is not None else None
         pose_algo = PoseAlgorithm(
             stereo_params=stereo_params,
             calib_metadata=calib_metadata,
             cam_names=cam_names,
             square_size=square_size,
             cam_offsets=cam_offsets,
+            # Per backend, then per model. The TensorFlow engine saturates
+            # its likelihood at 1.0 while the PyTorch engine reports a real
+            # distribution, so a single constant cannot gate both - and the
+            # PyTorch scale differs by backbone too: a cspnext_s never
+            # scores above 0.33, so the backend default of 0.6 would hold
+            # rh_grab_seen permanently False. An unmeasured backbone, or a
+            # project this cannot read, falls back to the backend default.
+            # The model location has to reach both calls. Without it
+            # selected_backend() answers from what is installed, which on a box
+            # with both engines is TensorFlow, and a YOLO model was then gated
+            # at TensorFlow's 0.9 - above the confidence it ever reaches, so
+            # the pellet never once appeared on the overlay.
+            confidence_threshold=confidence_threshold(
+                selected_backend(model_path=model_location),
+                model_name=trained_model_name(model_location),
+                model_path=model_location,
+            ),
         )
-        inference = self._inference
         if inference is not None:
             pose_algo.initialize(inference.pose_parts)
             inference.pose_algorithm = pose_algo
         self._pose_algorithm = pose_algo
 
     def _identify_primary_main_cam_idx(self):
-        for idx, cam in enumerate(self._cameras):
-            if cam.is_primary:
-                logger.debug("using primary cam_idx=%s", idx)
-                return idx
+        ordered_cameras = self._ordered_reach_cameras(enabled_only=True) or self._ordered_reach_cameras()
+        if len(ordered_cameras) > 0:
+            primary = ordered_cameras[0]
+            logger.debug("using primary cam_idx=%s", primary.camera_index)
+            return primary.camera_index
         logger.verbose(
             "No primary camera defined, using camera-0 as main one: %s",
             self._cameras[0],
         )
         return 0
 
+    def _identify_session_reference_cam_idx(self):
+        for camera in self._ordered_reach_cameras(enabled_only=True):
+            if camera.is_recording_enabled:
+                return camera.camera_index
+        return self._identify_primary_main_cam_idx()
+
+    def _ordered_reach_cameras(self, *, enabled_only: bool = False) -> Tuple[VideoCaptureModel, ...]:
+        cameras = [
+            camera for camera in self._reach_cameras
+            if not enabled_only or camera.is_enabled
+        ]
+        if len(cameras) == 0:
+            return ()
+        primary = next((camera for camera in cameras if camera.is_primary), cameras[0])
+        return (primary, *(camera for camera in cameras if camera is not primary))
+
+    def _ensure_reach_primary_camera(self) -> None:
+        enabled_cameras = [
+            camera for camera in self._reach_cameras
+            if camera.is_enabled
+        ]
+        if len(enabled_cameras) == 1:
+            enabled_cameras[0].set_runtime_primary(True)
+            return
+        for camera in enabled_cameras:
+            camera.set_runtime_primary(camera.configured_is_primary)
+
+    @staticmethod
+    def _camera_timing_field_name(camera: VideoCaptureModel) -> str:
+        name = re.sub(r"[^0-9A-Za-z]+", "_", camera.name).strip("_").lower()
+        return name or f"camera_{camera.camera_index}"
+
     def _merge_camera_timestamp_files(self, project: ProjectInfo, cams: Tuple[VideoCaptureModel]):
-        # assert len(cams) == 2
+        if len(cams) == 0:
+            logger.warning("_merge_camera_timestamp_files called without cameras")
+            return None
         timing_path = project.get_frame_timing_path()
-        data = []
         prim_cam = cams[0]  # primary
         main_fps = prim_cam.active_config.params.get('fps', math.nan)
-        logger.info("Merging camera timestamps files for trial%03d into %s (fps=%s)",
+        logger.info("Merging camera timestamp files for session%03d into %s (fps=%s)",
                     project.session, timing_path, main_fps)
-        txt_files = []
         if not isinstance(main_fps, (int, float)) or main_fps == 0 or not math.isfinite(main_fps):
-            logger.error("skipping invalid camera config fps=%s. cam=%s", main_fps, prim_cam.name)
-            return
-        frame_duration = 1 / main_fps
-        utc_when = None
-        ts_file_fields = ("frame_time", "fps", "frame_when", "frame_perf", "frame_id")
+            raise ValueError(
+                f"invalid camera config fps={main_fps}; camera={prim_cam.name}"
+            )
+        boundary = self._recording_session.boundary
+        if boundary is None or boundary.session_id != project.short_id:
+            raise RuntimeError(
+                f"Missing canonical recording boundary for {project.short_id}"
+            )
+        sources = []
+        used_camera_field_names = set()
         for cam in cams:
-            _, ts_filename, *_ = project.get_video_path(cam.name, allow_overwrite=True)
-            ts_filename = Path(ts_filename)
-            df = pandas.read_csv(ts_filename, names=ts_file_fields, sep=",", skipinitialspace=True)
-            data.append(df)
-            txt_files.append(ts_filename)
-            logger.debug("cam%s: df=%s", cam.camera_index, df)
-        #
-        df_main_cam = data[0]
-        if len(df_main_cam) == 0:
-            logger.warning("_merge_camera_timestamp_files: empty df for main cam")
-            return
-        main_cam_first_frame_id = df_main_cam["frame_id"][0]
-        for idx_df, df in enumerate(data[1:], start=1):
-            df: pandas.DataFrame
-            if len(df) == 0:
-                logger.warning("_merge_camera_timestamp_files: empty df for cam-%s", cams[idx_df].name)
-                df = df_main_cam.copy()
-                df["frame_when"] = df["frame_perf"] = df["frame_time"] = math.nan
-            else:
-                # align on same first frame_id than primary cam:
-                cur_first_frame_id = df["frame_id"][0]
-                if cur_first_frame_id < main_cam_first_frame_id:
-                    df = df.tail(-(main_cam_first_frame_id - cur_first_frame_id)).reset_index(drop=True)
-            data[idx_df] = df
-        #
-        df_second_cam = data[1]
-        r0 = df_main_cam[:1]
-        start_frame_id = r0['frame_id'][0]
-        first_frame_utc_when = r0['frame_time'][0]
-        logger.debug("start_frame_id=%s (utc_when=%s)", start_frame_id, first_frame_utc_when)
-        timing_csv_fields = [
-            'frame_id',
-            'frame_when',
-            'frame_present_primary',
-            'frame_present_secondary',
-            'utc_when',
-        ]
-        with timing_path.open("w") as fh:
-            dw = csv.DictWriter(fh, timing_csv_fields)
-            dw.writeheader()
-            # nb: only using main_cam as reference:
-            for idx, frame_id in enumerate(range(start_frame_id, start_frame_id + len(df_main_cam))):
-                # expected_frame_id = start_frame_id + idx
-                utc_when = first_frame_utc_when + idx * frame_duration
-                frame_when = df_main_cam['frame_when'][idx]
-                # protect in case of secondary camera recorded less frames:
-                if idx >= len(df_second_cam):
-                    second_frame_when = math.nan
-                else:
-                    second_frame_when = df_second_cam['frame_when'][idx]
-                d = dict(
-                    frame_id=frame_id,
-                    frame_when=frame_when if math.isfinite(frame_when) else "",  # could keep the math.nan otherwise
-                    frame_present_primary=1 if math.isfinite(frame_when) else 0,
-                    frame_present_secondary=1 if math.isfinite(second_frame_when) else 0,
-                    utc_when=utc_when,
+            base_name = self._camera_timing_field_name(cam)
+            name = base_name
+            suffix = 1
+            while name in used_camera_field_names:
+                suffix += 1
+                name = f"{base_name}_{suffix}"
+            used_camera_field_names.add(name)
+            _, timestamp_path, _ = project.get_video_path(
+                cam.name,
+                allow_overwrite=True,
+            )
+            sources.append(
+                CameraTimestampInput(
+                    name=cam.name,
+                    field_name=name,
+                    path=Path(timestamp_path),
                 )
-                dw.writerow(d)
-        logger.info("Written %s entries into %s", len(df_main_cam), timing_path)
-        self._remove_timestamps_txt_files(project)
+            )
+        session_dir = Path(project.get_session_path().location)
+        diagnostics = align_camera_timestamp_files(
+            tuple(sources),
+            output_path=timing_path,
+            diagnostics_path=session_dir / "streams" / "camera_alignment.json",
+            primary_frame_id=boundary.primary_frame_id,
+            primary_fps=float(main_fps),
+        )
+        logger.info(
+            "Written %s entries into %s; synchronization_complete=%s",
+            diagnostics["primaryFrameCount"],
+            timing_path,
+            diagnostics["synchronizationComplete"],
+        )
+        self._remove_timestamps_txt_files(project, cams)
+        return diagnostics
+
+    def _exact_session_capture(self, project: ProjectInfo) -> Optional[dict]:
+        """The session's exact frame counts, or None when its files cannot say.
+
+        Read at finalize, after the timeline merge and the pose files' close.
+        A statistic never fails a finalization, so any error is logged here.
+        """
+        try:
+            session_dir = Path(project.get_session_path(skip_ensure=True).location)
+            alignment_path = session_dir / "streams" / "camera_alignment.json"
+            if not alignment_path.is_file():
+                return None
+            alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+            posed_frame_paths = {
+                name: Path(project.get_video_path(name, allow_overwrite=True)[2])
+                for name in alignment.get("cameras", {})
+            }
+            return exact_session_capture(alignment, posed_frame_paths)
+        except Exception:
+            logger.exception("Exact session capture counts were not computed")
+            return None
 
     def _get_monitored_cams(self):
-        cams = []  # put primary first
-        monitored_cams = (self._left_camera, self._right_camera)
-        for cam in monitored_cams:
-            if cam.is_primary:
-                cams.append(cam)
-                break
-        for cam in monitored_cams:
-            if not cam.is_primary:
-                cams.append(cam)
-        monitored_cams = tuple(cams)
-        return monitored_cams
+        return self._ordered_reach_cameras(enabled_only=True)
+
+    def _get_recording_cams(self) -> Tuple[VideoCaptureModel, ...]:
+        """Return every enabled camera expected to acknowledge this session."""
+        return tuple(
+            camera for camera in self._get_monitored_cams()
+            if camera.is_recording_enabled
+        )
 
     def _handle_proc_msg_queue(self):
         proc_msg_q = self._multiproc_msg_queue
@@ -703,6 +2420,11 @@ class AppModel(ObservableObject):
                 self._handle_proc_msg(raw, cams_closed_finished=cams_closed_finished)
             except Exception as err:
                 logger.exception("Error handling message %s: %s ; continuing", raw, err)
+                if self._recording_session.status is not SessionRecordingStatus.READY:
+                    self._mark_session_invariant_unknown(
+                        "process message "
+                        f"{raw[0] if isinstance(raw, tuple) and raw else raw}: {err}"
+                    )
         # end while True
         logger.info("handle_proc_msg_queue exiting")
 
@@ -728,19 +2450,155 @@ class AppModel(ObservableObject):
         extra_info = (args, kwargs) if logger.isEnabledFor(logging.DEBUG) else "NA"
         logger.verbose("Handling %s ; data=%s", cmd, extra_info)
         algo = self._behavior.algorithm
+        if cmd == SystemStatusMessageKind.CAMERA_FRAME_STATS:
+            cam_idx, frames_received, frames_missed = args
+            self._session_telemetry.record_capture(
+                cam_idx, acquired=frames_received, dropped=frames_missed)
+            return
         if cmd == SystemStatusMessageKind.CAMERA_STATUS_CHANGE:
             cam_idx, new_status, *r_args = args
-            if cam_idx == self._identify_primary_main_cam_idx():
+            reference_cam_idx = (
+                self._identify_session_reference_cam_idx()
+                if self._recording_session.status
+                is not SessionRecordingStatus.READY
+                else self._identify_primary_main_cam_idx()
+            )
+            if cam_idx == reference_cam_idx:
                 if new_status == CaptureProcessStatus.RECORDING:
                     first_frame_perf, first_frame_when, first_frame_time, *r_args = r_args
+                    first_frame_id = (
+                        int(r_args[0])
+                        if r_args
+                        else int(self._cams_synced_frame_index.value)
+                    )
+                    message_generation = int(r_args[1]) if len(r_args) > 1 else None
+                    session_token = self._recording_session.token()
+                    if (
+                        session_token is not None
+                        and message_generation != session_token.generation
+                    ):
+                        logger.warning(
+                            "ignoring stale camera RECORDING callback: camera=%s "
+                            "message_generation=%s active=%s",
+                            cam_idx,
+                            message_generation,
+                            session_token,
+                        )
+                        return
                     p_now = first_frame_perf
                     project = self._project_info
+                    if (
+                        session_token is not None
+                        and (
+                            project is None
+                            or project.short_id != session_token.session_id
+                        )
+                    ):
+                        logger.warning(
+                            "ignoring camera RECORDING callback for wrong project: "
+                            "project=%s active=%s",
+                            None if project is None else project.short_id,
+                            session_token,
+                        )
+                        return
                     if project is not None:
                         project.start_record_timestamp = first_frame_time
-                    logger.info("received RECORDING: frame-0: time=%.3f perf_c=%.3f now=%.3f")
+                        primary = next(
+                            camera
+                            for camera in self._cameras
+                            if camera.camera_index == cam_idx
+                        )
+                        boundary = SessionBoundary(
+                            session_id=project.short_id,
+                            primary_camera=primary.name,
+                            primary_frame_id=first_frame_id,
+                            start_perf_time=float(first_frame_perf),
+                            start_wall_time=float(first_frame_time),
+                            camera_when=float(first_frame_when),
+                        )
+                        if session_token is None:
+                            logger.warning(
+                                "camera recording boundary arrived without an active token"
+                            )
+                            return
+                        elif not self._recording_session.set_boundary(
+                            boundary,
+                            session_token,
+                        ):
+                            logger.warning(
+                                "ignoring stale camera recording boundary: %s",
+                                session_token,
+                            )
+                            return
+                    self._session_data_recorder.commit_start(
+                        first_frame_perf,
+                        first_frame_time,
+                        boundary=self._recording_session.boundary,
+                    )
+                    # Counters are per session, and the session starts at the
+                    # first recorded frame rather than at arm time, so elapsed
+                    # matches the recording rather than the operator's clicking.
+                    self._begin_session_telemetry(first_frame_perf)
+                    self._latency_status = {}
+                    self._record_start_timer.cancel()
+                    self._record_start_timer = no_op_timer
+                    self._abort_had_recording_started = True
+                    if project is not None:
+                        self._session_api.session_started(project.short_id)
+                    logger.info(
+                        "received RECORDING: frame-0 time=%.3f perf_c=%.3f now=%.3f",
+                        first_frame_time,
+                        first_frame_perf,
+                        get_perf_now(),
+                    )
+                    if self._recording_session.status == SessionRecordingStatus.ARMING:
+                        if self._set_session_recording_status(
+                            SessionRecordingStatus.RECORDING,
+                            expected=(SessionRecordingStatus.ARMING,),
+                            token=session_token,
+                        ):
+                            if session_token is not None:
+                                self._start_storage_monitor(session_token)
+                            self._start_automatic_stop_policy(
+                                first_frame_perf,
+                                session_token,
+                            )
                 else:
                     p_now = get_perf_now()
                 algo.set_capture_status(new_status, perf_now=p_now)
+                if new_status == CaptureProcessStatus.RUNNING:
+                    message_generation = (
+                        int(r_args[2]) if len(r_args) > 2 else None
+                    )
+                    session_token = self._recording_session.token()
+                    if (
+                        session_token is not None
+                        and message_generation != session_token.generation
+                    ):
+                        logger.warning(
+                            "ignoring stale camera RUNNING callback: camera=%s "
+                            "message_generation=%s active=%s",
+                            cam_idx,
+                            message_generation,
+                            session_token,
+                        )
+                        return
+                    if self._recording_session.status == SessionRecordingStatus.STOPPING:
+                        end_perf = r_args[0] if r_args else get_perf_now()
+                        if session_token is None:
+                            logger.warning(
+                                "camera recording end arrived without an active token"
+                            )
+                        else:
+                            self._recording_session.set_pending_end(
+                                end_perf,
+                                session_token,
+                            )
+                    elif (
+                        self._recording_session.status == SessionRecordingStatus.ABORTING
+                        and not self._abort_had_recording_started
+                    ):
+                        self._finish_abort_recording(token=session_token)
             else:
                 logger.verbose("not handling non-primary camera status, cam_idx=%s status=%s",
                                cam_idx, new_status)
@@ -748,14 +2606,268 @@ class AppModel(ObservableObject):
             cam_idx, frames_written, project, *r_args = args
             if project is None:
                 return
-            monitored_cams = self._get_monitored_cams()
-            monitored_cam_indices = tuple(cam.camera_index for cam in monitored_cams)
-            if cam_idx in monitored_cam_indices:
-                cams_closed_finished[cam_idx] = (project, frames_written)
-                if all(cam.camera_index in cams_closed_finished for cam in monitored_cams):
-                    project = cams_closed_finished[0][0]  # always take the primary cam passed project as ref.
-                    self._merge_camera_timestamp_files(project, monitored_cams)
-                    cams_closed_finished.clear()  # now clear
+            message_generation = int(r_args[0]) if r_args else None
+            writer_diagnostics = (
+                dict(r_args[1]) if len(r_args) > 1 and r_args[1] else {}
+            )
+            session_token = self._recording_session.token()
+            closing_statuses = {
+                SessionRecordingStatus.STOPPING,
+                SessionRecordingStatus.ABORTING,
+            }
+            if (
+                session_token is None
+                or self._recording_session.status not in closing_statuses
+                or project.short_id != session_token.session_id
+                or message_generation != session_token.generation
+            ):
+                logger.warning(
+                    "ignoring stale camera-close callback: camera=%s project=%s "
+                    "message_generation=%s active=%s",
+                    cam_idx,
+                    project.short_id,
+                    message_generation,
+                    session_token,
+                )
+                return
+            recording_cams = self._get_recording_cams()
+            recording_cam_indices = tuple(cam.camera_index for cam in recording_cams)
+            if cam_idx in recording_cam_indices:
+                callback_key = (
+                    session_token.generation,
+                    session_token.session_id,
+                    cam_idx,
+                )
+                cams_closed_finished[callback_key] = (
+                    project,
+                    frames_written,
+                    message_generation,
+                    writer_diagnostics,
+                )
+                session_keys = tuple(
+                    (
+                        session_token.generation,
+                        session_token.session_id,
+                        camera.camera_index,
+                    )
+                    for camera in recording_cams
+                )
+                if all(key in cams_closed_finished for key in session_keys):
+                    self._writer_close_timer.cancel()
+                    self._writer_close_timer = no_op_timer
+                    project = cams_closed_finished[session_keys[0]][0]
+                    session_dir = Path(project.get_session_path().location)
+                    validation_inputs = []
+                    for camera, camera_key in zip(recording_cams, session_keys):
+                        (
+                            camera_project,
+                            camera_frames,
+                            _camera_generation,
+                            camera_writer_diagnostics,
+                        ) = (
+                            cams_closed_finished[camera_key]
+                        )
+                        video_path, timestamp_path, _ = camera_project.get_video_path(
+                            camera.name,
+                            allow_overwrite=True,
+                        )
+                        validation_inputs.append((
+                            camera,
+                            Path(video_path),
+                            Path(timestamp_path),
+                            camera_frames,
+                            camera_writer_diagnostics,
+                        ))
+                    with ThreadPoolExecutor(
+                        max_workers=max(1, len(validation_inputs)),
+                        thread_name_prefix="ValidateClosedVideo",
+                    ) as executor:
+                        validations = {
+                            camera.name: executor.submit(
+                                validate_closed_video,
+                                video_path,
+                                timestamp_path,
+                                writer_frame_count=camera_frames,
+                                writer_diagnostics=writer_diagnostics,
+                                ffprobe_timeout_seconds=closed_video_timeout_seconds(camera_frames),
+                            )
+                            for (
+                                camera,
+                                video_path,
+                                timestamp_path,
+                                camera_frames,
+                                writer_diagnostics,
+                            ) in validation_inputs
+                        }
+                    for (
+                        camera,
+                        video_path,
+                        timestamp_path,
+                        camera_frames,
+                        camera_writer_diagnostics,
+                    ) in validation_inputs:
+                        try:
+                            validation = validations[camera.name].result()
+                        except Exception as error:
+                            logger.exception(
+                                "Closed-video validation crashed: camera=%s",
+                                camera.name,
+                            )
+                            validation = ClosedVideoValidation(
+                                video_path=video_path.as_posix(),
+                                timestamp_path=timestamp_path.as_posix(),
+                                decoded_frame_count=0,
+                                writer_frame_count=int(camera_frames),
+                                timestamp_row_count=0,
+                                writer_error_count=int(
+                                    camera_writer_diagnostics.get("errorCount", 0)
+                                    or 0
+                                ),
+                                writer_first_error=(
+                                    camera_writer_diagnostics.get("firstError")
+                                    or None
+                                ),
+                                counter_backend="validation_error",
+                                warnings=(),
+                                failure=(
+                                    "closed-video validation failed: "
+                                    f"{error.__class__.__name__}: {error}"
+                                ),
+                            )
+                        if validation.warnings:
+                            logger.warning(
+                                "Camera recording validation warning: camera=%s %s",
+                                camera.name,
+                                "; ".join(validation.warnings),
+                            )
+                        if validation.failure:
+                            logger.error(
+                                "Camera recording validation failed: camera=%s %s",
+                                camera.name,
+                                validation.failure,
+                            )
+                            self.on_error(
+                                "Camera recording incomplete",
+                                f"{camera.name}: {validation.failure}",
+                            )
+                        self._session_data_recorder.set_source_result(
+                            f"camera.{camera.name}",
+                            sample_count=validation.decoded_frame_count,
+                            path=Path(video_path).relative_to(
+                                session_dir
+                            ).as_posix(),
+                            failure=validation.failure,
+                            warnings=validation.warnings,
+                            diagnostics=validation.diagnostics(),
+                        )
+                    monitored_cams = tuple(
+                        camera for camera in recording_cams
+                        if camera in self._reach_cameras
+                    )
+                    try:
+                        alignment_diagnostics = self._merge_camera_timestamp_files(
+                            project,
+                            monitored_cams,
+                        )
+                    except Exception as err:
+                        logger.exception("Failed to merge camera timestamps: %s", err)
+                        self.on_error("Camera timestamp merge failed", str(err))
+                        for camera in monitored_cams:
+                            self._session_data_recorder.set_source_result(
+                                f"camera.{camera.name}",
+                                failure=f"camera timestamp alignment failed: {err}",
+                            )
+                    else:
+                        if (
+                            alignment_diagnostics is not None
+                            and not alignment_diagnostics["synchronizationComplete"]
+                        ):
+                            message = (
+                                "Camera frame synchronization is incomplete; "
+                                "see streams/camera_alignment.json"
+                            )
+                            logger.warning(message)
+                            self.on_error("Camera synchronization incomplete", message)
+                            for camera in monitored_cams:
+                                camera_diagnostics = alignment_diagnostics[
+                                    "cameras"
+                                ][camera.name]
+                                camera_incomplete = bool(
+                                    camera_diagnostics["frameIdGapCount"]
+                                    or camera_diagnostics["missingPrimaryFrameIds"]
+                                    or camera_diagnostics["extraFrameIds"]
+                                )
+                                self._session_data_recorder.set_source_result(
+                                    f"camera.{camera.name}",
+                                    failure=message if camera_incomplete else "",
+                                    warnings=(message,),
+                                    diagnostics={
+                                        "frameAlignment": camera_diagnostics,
+                                    },
+                                )
+                    for camera_key in session_keys:
+                        cams_closed_finished.pop(camera_key, None)
+                    wait_pose_closed = getattr(
+                        type(self._inference),
+                        "wait_session_pose_closed",
+                        None,
+                    )
+                    if (
+                        self._abort_had_recording_started
+                        and self._live_inference_failed_reason
+                    ):
+                        # The pose files were closed when inference stopped,
+                        # and end there; no end-of-recording marker reached
+                        # them, so waiting for one could only time out.
+                        message = (
+                            "Live pose ends early: live inference stopped during "
+                            f"the recording ({self._live_inference_failed_reason})."
+                        )
+                        logger.error(message)
+                        self._session_data_recorder.set_source_result(
+                            "pose",
+                            failure=message,
+                        )
+                    elif (
+                        wait_pose_closed is not None
+                        and self._abort_had_recording_started
+                        and not wait_pose_closed(
+                            self._inference,
+                            project,
+                            timeout=10.0,
+                        )
+                    ):
+                        message = (
+                            "Timed out waiting for live pose files to close for "
+                            f"{project.short_id}; continuing writer finalization."
+                        )
+                        logger.error(message)
+                        self.on_error("Pose writer close timeout", message)
+                        self._session_data_recorder.set_source_result(
+                            "pose",
+                            failure=message,
+                        )
+                    if self._recording_session.status == SessionRecordingStatus.ABORTING:
+                        if session_token is None:
+                            self._finish_abort_recording()
+                        else:
+                            self._finish_abort_recording(token=session_token)
+                    elif self._recording_session.status == SessionRecordingStatus.STOPPING:
+                        if session_token is None:
+                            self._complete_stopped_recording(project)
+                        else:
+                            self._complete_stopped_recording(
+                                project,
+                                token=session_token,
+                            )
+        elif cmd == SystemStatusMessageKind.STIM_CAMERA_TRIGGER:
+            cam_idx, decision = args
+            self._on_stim_camera_trigger(cam_idx, decision)
+        elif cmd == SystemStatusMessageKind.STIM_CAMERA_EVIDENCE_STATUS:
+            cam_idx, path, diagnostics, error, message_generation = args
+            self._on_stim_camera_evidence_status(
+                cam_idx, path, diagnostics, error, message_generation,
+            )
         else:
             logger.warning("unhandled command: %s raw=%s", cmd, raw)
 
@@ -795,12 +2907,79 @@ class AppModel(ObservableObject):
         return self._right_camera
 
     @property
-    def top_camera(self):
-        return self._top_camera
+    def stim_camera(self):
+        return self._stim_camera
 
     @property
-    def top_camera_presence_detection(self):
-        return self._behavior.algorithm.top_camera_presence_detection
+    def cameras(self) -> Tuple[VideoCaptureModel, ...]:
+        return tuple(self._cameras)
+
+    @property
+    def reach_cameras(self) -> Tuple[VideoCaptureModel, ...]:
+        return self._reach_cameras
+
+    def _stereo_cameras(self) -> Tuple[VideoCaptureModel, ...]:
+        # Left and right only: the calibration and live inference are theirs.
+        # stimCam keeps its own capture settings.
+        return tuple(
+            camera for camera in (self._left_camera, self._right_camera)
+            if camera is not None
+        )
+
+    @property
+    def reach_capture_binning(self) -> Optional[int]:
+        """The binning left and right capture at, or None when they differ."""
+        return common_capture_binning(self._stereo_cameras())
+
+    def reach_capture_binning_available(self, binning: int) -> bool:
+        return capture_binning_available(self._stereo_cameras(), binning)
+
+    def _warn_if_stereo_capture_binning_differs(self) -> None:
+        """Say so when left and right will record at different resolutions.
+
+        Start does not refuse it: live inference gets base-size frames from
+        both cameras either way, and only the saved videos differ.
+        """
+        cameras = self._stereo_cameras()
+        if len(cameras) < 2 or not all(camera.is_enabled for camera in cameras):
+            return
+        try:
+            binnings = {camera.effective_capture_binning for camera in cameras}
+            described = ", ".join(
+                f"{camera.name} bin {camera.effective_capture_binning}" for camera in cameras)
+        except ValueError as exc:
+            # A malformed value: the camera's own start refuses it with its message.
+            logger.warning("Left and right capture binning could not be compared: %s", exc)
+            return
+        if len(binnings) > 1:
+            logger.warning(
+                "Left and right cameras capture at different binning (%s); "
+                "their recordings will differ in resolution", described)
+
+    @_serialized_session_configuration
+    def set_reach_capture_binning(self, binning: int) -> None:
+        """Capture left and right at this binning over the same field of view, and save it.
+
+        Applies from the next Start. Live inference, the display and the
+        calibration keep the base frame size.
+        """
+        self._require_session_ready_for_configuration("Changing the camera resolution")
+        # Not only once started: capture_start prepares the cameras on a worker thread
+        # before it marks the acquisition started, and a preset changed in that window
+        # reaches left but not right. Stopping is refused for the same reason.
+        acquisition = self._acquisition
+        if acquisition.started or acquisition.starting or acquisition.stopping:
+            raise RuntimeError("Changing the camera resolution is unavailable while acquisition is running")
+        apply_capture_binning(self._stereo_cameras(), binning)
+        logger.info("Left/right capture binning set to %s", binning)
+        self.save_configuration()
+
+    @property
+    def inference_cameras(self) -> Tuple[VideoCaptureModel, ...]:
+        return self._inference_cameras
+
+    def get_camera_model(self, camera_id: CameraId) -> Optional[VideoCaptureModel]:
+        return self._camera_by_id.get(camera_id)
 
     @property
     def behavior(self) -> BehaviorModel:
@@ -819,6 +2998,571 @@ class AppModel(ObservableObject):
         return self._hardware
 
     @property
+    def laser(self) -> LaserModel:
+        return self._laser
+
+    @property
+    def nidaq_signal_monitor(self) -> NidaqSignalMonitorModel:
+        return self._nidaq_signal_monitor
+
+    @property
+    def nidaq_ports(self) -> NidaqPortConfiguration:
+        return self._nidaq_ports
+
+    @property
+    def hardware_scan_results(self) -> Dict[str, HardwareScanEntry]:
+        return dict(self._hardware_scan_results)
+
+    @property
+    def subsystem_statuses(self) -> Dict[str, SubsystemStatus]:
+        return dict(self._acquisition.subsystems.statuses)
+
+    @property
+    def recording_blockers(self) -> Tuple[str, ...]:
+        blockers = list(self._acquisition.subsystems.recording_blockers())
+        session_control = self._behavior.algorithm.active_config.session_control
+        if session_control.intertrial_analysis_enabled and not self._inference.is_enabled:
+            blockers.append(
+                "Live intertrial analysis requires live inference; enable live "
+                "inference or disable live intertrial analysis"
+            )
+        if self._protocol_runner.protocol_complete:
+            blockers.append("Selected protocol is complete")
+        if self._selected_protocol_requires_stim_camera():
+            camera = self._stim_camera
+            if camera is None or not camera.is_enabled:
+                blockers.append(STIM_CAMERA_REQUIRED)
+            elif camera._stim_detection_configuration is None:
+                blockers.append(
+                    "Selected protocol requires stimCam stimulation mode; "
+                    "restart System Mode to apply the frozen 900 Hz camera mode"
+                )
+        # The protocol check's errors, as it last ran: this property is read
+        # on every Behavior refresh, so the check runs only on a change
+        # (_refresh_protocol_readiness).
+        blockers.extend(self._protocol_blocker_lines)
+        can_status = self._acquisition.subsystems.get(SubsystemId.CAN_PELLET)
+        pellet_source_required = bool(
+            self._hardware.requires_connection
+            and can_status is not None
+            and can_status.required_for_recording
+        )
+        if pellet_source_required and not self._hardware.pellet_commands_allowed:
+            compatibility = self._hardware.firmware_compatibility
+            blockers.append(
+                "Pellet firmware is not compatible: "
+                + str(compatibility.get("reason") or "unknown compatibility state")
+            )
+        if self.animal_metadata_refresh_busy:
+            blockers.append("SoftMouse animal metadata refresh is still running")
+        if self._recording_session.status is not SessionRecordingStatus.READY:
+            blockers.append(
+                f"recording state: {self._recording_session.status.value}"
+            )
+        if not self._acquisition.started:
+            blockers.append("System Mode is not running")
+        if self._session_invariant_unknown:
+            blockers.append(
+                "An internal error left recording lifecycle ownership uncertain; "
+                "restart acquisition before recording again"
+            )
+        return tuple(blockers)
+
+    @property
+    def internal_error_diagnostic(self) -> Optional[dict]:
+        return (
+            None
+            if self._internal_error_diagnostic is None
+            else dict(self._internal_error_diagnostic)
+        )
+
+    def _mark_session_invariant_unknown(self, reason: str) -> None:
+        """Explicit lifecycle-owner hook; generic exception reporting never calls it."""
+
+        self._session_invariant_unknown = True
+        logger.error("Recording lifecycle invariant is unknown: %s", reason)
+        self.property_changed(
+            self.Props.RECORDING_BLOCKERS,
+            self.recording_blockers,
+            None,
+        )
+
+    def _set_subsystem_status(
+        self,
+        subsystem_id,
+        state: SubsystemState,
+        *,
+        reason: str = "",
+        error: str = "",
+        required_for_recording: Optional[bool] = None,
+        generation: Optional[int] = None,
+    ) -> SubsystemStatus:
+        with self._acquisition.lock:
+            previous_statuses = self._acquisition.subsystems.statuses
+            status, _ = self._acquisition.subsystems.transition(
+                subsystem_id,
+                state,
+                reason=reason,
+                error=error,
+                required_for_recording=required_for_recording,
+                generation=generation,
+            )
+            current_statuses = self._acquisition.subsystems.statuses
+        self.property_changed(
+            self.Props.SUBSYSTEM_STATUSES,
+            current_statuses,
+            previous_statuses,
+        )
+        # Published just below, with the check's lines as they are now.
+        self._refresh_protocol_readiness(publish=False)
+        self.property_changed(
+            self.Props.RECORDING_BLOCKERS,
+            self.recording_blockers,
+            None,
+        )
+        return status
+
+    def _begin_subsystem_start(
+        self,
+        subsystem_id,
+        *,
+        required_for_recording: Optional[bool] = None,
+        reason: str = "",
+    ) -> int:
+        with self._acquisition.lock:
+            previous_statuses = self._acquisition.subsystems.statuses
+            status, _ = self._acquisition.subsystems.begin_retry(
+                subsystem_id,
+                required_for_recording=required_for_recording,
+                reason=reason,
+            )
+            current_statuses = self._acquisition.subsystems.statuses
+        self.property_changed(
+            self.Props.SUBSYSTEM_STATUSES,
+            current_statuses,
+            previous_statuses,
+        )
+        return status.generation
+
+    def _configure_subsystem_intent(
+        self,
+        configuration: SystemConfiguration,
+    ) -> None:
+        stim_required = self._selected_protocol_requires_stim_camera()
+        synchronized_reach = tuple(
+            camera for camera in self._reach_cameras
+            if camera.is_enabled
+            and not (
+                camera.camera_id == CameraId.Camera3
+                and camera._stim_detection_configuration is not None
+            )
+        )
+        multi_reach = len(synchronized_reach) > 1
+        for camera in self._cameras:
+            required = bool(
+                (
+                    camera.is_recording_enabled
+                    or (camera in synchronized_reach and multi_reach)
+                    or (camera.camera_id == CameraId.Camera3 and stim_required)
+                )
+            )
+            self._set_subsystem_status(
+                SubsystemId.camera(camera.name),
+                (
+                    SubsystemState.STOPPED
+                    if camera.is_enabled
+                    else SubsystemState.DISABLED
+                ),
+                reason=(
+                    "configured; not started"
+                    if camera.is_enabled
+                    else "camera disabled"
+                ),
+                required_for_recording=required,
+            )
+        self._set_subsystem_status(
+            SubsystemId.REACH_SYNCHRONIZATION,
+            (
+                SubsystemState.STOPPED
+                if synchronized_reach
+                else SubsystemState.DISABLED
+            ),
+            reason="configured; not validated" if synchronized_reach else "no synchronized cameras",
+            required_for_recording=bool(
+                multi_reach
+                or any(camera.is_recording_enabled for camera in synchronized_reach)
+            ),
+        )
+        intent = (
+            (
+                SubsystemId.LIVE_INFERENCE,
+                configuration.inference.is_enabled,
+                configuration.inference.is_enabled,
+            ),
+            (
+                SubsystemId.CAN_PELLET,
+                self._hardware.requires_connection,
+                self._hardware.requires_connection,
+            ),
+            (
+                SubsystemId.NIDAQ_STREAM,
+                configuration.hardware.nidaq_enabled
+                and (configuration.nidaq_stream.is_enabled or bool(self._nidaq_plan_error)),
+                configuration.hardware.nidaq_enabled
+                and (configuration.nidaq_stream.is_enabled or bool(self._nidaq_plan_error)),
+            ),
+            (
+                SubsystemId.LASER,
+                configuration.laser.backend != "disabled",
+                configuration.laser.backend != "disabled",
+            ),
+        )
+        for subsystem_id, enabled, required in intent:
+            state = SubsystemState.STOPPED if enabled else SubsystemState.DISABLED
+            reason = "configured; not started" if enabled else "disabled"
+            if (
+                subsystem_id is SubsystemId.NIDAQ_STREAM
+                and enabled
+                and self._hold_nidaq_plan_blocked(required_for_recording=required)
+            ):
+                # Required as configured, and held back with the reason.
+                continue
+            if subsystem_id is SubsystemId.LASER:
+                # A settings save rewrites every intent; a close still pending
+                # keeps saying so (_on_laser_close_finished_late ends it).
+                self._set_laser_status_after_close(
+                    lambda refusal, state=state, reason=reason, required=required: (
+                        (SubsystemState.FAILED,
+                         dict(error=refusal, required_for_recording=required))
+                        if refusal
+                        else (state, dict(reason=reason, required_for_recording=required))))
+                continue
+            self._set_subsystem_status(
+                subsystem_id,
+                state,
+                reason=reason,
+                required_for_recording=required,
+            )
+        self._set_subsystem_status(
+            SubsystemId.SESSION_LOGS,
+            SubsystemState.STOPPED,
+            reason="not validated",
+            required_for_recording=True,
+        )
+        self._set_subsystem_status(
+            SubsystemId.INTERTRIAL_ANALYSIS,
+            SubsystemState.DISABLED,
+            reason="no completed pellet trial pending",
+            required_for_recording=False,
+        )
+
+    @property
+    def configured_nidaq_device_names(self) -> Tuple[str, ...]:
+        names: List[str] = []
+
+        def add_channel(channel_name: Optional[str]) -> None:
+            device_name = device_name_from_channel(channel_name)
+            if device_name and device_name not in names:
+                names.append(device_name)
+
+        if self._nidaq_ports.device_name:
+            names.append(self._nidaq_ports.device_name)
+        for field in dataclasses.fields(self._nidaq_ports):
+            if field.name != "device_name":
+                value = getattr(self._nidaq_ports, field.name)
+                if isinstance(value, str):
+                    add_channel(value)
+        for channel in self._nidaq_signal_monitor.configuration.channels:
+            add_channel(channel.physical_channel)
+        for channel in self._laser.configuration.channels:
+            for physical_channel in (
+                channel.analog_output,
+                channel.diode_input,
+                channel.shutter_output,
+                channel.command_copy_input,
+            ):
+                add_channel(physical_channel)
+        return tuple(names)
+
+    def refresh_hardware_bindings(self) -> str:
+        if self._acquisition.started or self._status != AppModelStatus.IDLE:
+            raise RuntimeError("Hardware refresh is only available while acquisition is idle")
+        close_refusal = self.laser_controller_close_refusal()
+        if close_refusal:
+            raise RuntimeError(f"Hardware refresh is unavailable: {close_refusal}")
+        # A ramp holds the NI-DAQ lines and a laser controller of its own: a
+        # refresh's request for the stream was declined by the ramp's hold,
+        # which made it harmless, but it is refused by name, as Run, a load, a
+        # DAQ ports save and the DAQ Monitor are.
+        if self._laser_calibration_active:
+            raise RuntimeError(
+                "Hardware refresh is unavailable while a laser calibration ramp "
+                "runs; wait for it to finish")
+
+        scan_started = time.perf_counter()
+        details: List[str] = []
+        warnings_list: List[str] = []
+        scan_results: Dict[str, HardwareScanEntry] = {}
+        try:
+            can_transport = CanTransportConfiguration.from_environment()
+            selected_can_interface = can_transport.channel
+            selected_can_backend = can_transport.kind.value
+        except Exception:
+            logger.exception("CAN transport selection is invalid")
+            selected_can_interface = None
+            selected_can_backend = None
+        executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="hardware-scan")
+        camera_future = executor.submit(create_camera_list, include_hardware=True)
+        nidaq_future = executor.submit(discover_nidaq_devices)
+        can_adapter_future = executor.submit(
+            scan_can_adapters,
+            selected_interface=selected_can_interface,
+            selected_backend=selected_can_backend,
+        )
+        gpu_future = executor.submit(scan_gpus)
+
+        try:
+            camera_sources = camera_future.result()
+            source_bindings = {
+                camera_source_binding_key(source.url)
+                for source in camera_sources
+            }
+            for camera in self._cameras:
+                camera.refresh_camera_list(camera_sources)
+            missing_enabled_cameras = [
+                camera.name
+                for camera in self._cameras
+                if (
+                    camera.is_enabled
+                    and camera.camera_source is not None
+                    and camera_source_binding_key(camera.camera_source.url) not in source_bindings
+                )
+            ]
+            details.append(f"cameras {len(camera_sources)} source(s)")
+            source_names = tuple(
+                source.name or source.url
+                for source in camera_sources
+                if source.name or source.url
+            )
+            physical_camera_count = sum(
+                source.url.startswith("spinnaker://")
+                for source in camera_sources
+            )
+            camera_info = (
+                f"✓ {len(camera_sources)} selectable source(s) · "
+                f"{physical_camera_count} Spinnaker camera(s)"
+            )
+            if source_names:
+                camera_info += "\n" + "\n".join(f"→ {name}" for name in source_names)
+            if missing_enabled_cameras:
+                missing_text = ", ".join(missing_enabled_cameras)
+                warnings_list.append(f"configured camera(s) not currently discovered: {missing_text}")
+                camera_info += f"\n! missing: {missing_text}"
+            elif physical_camera_count == 0:
+                camera_info += "\n! zero Spinnaker cameras found"
+            scan_results["cameras"] = HardwareScanEntry(
+                camera_info,
+                (
+                    "warning"
+                    if missing_enabled_cameras or physical_camera_count == 0
+                    else "ok"
+                ),
+            )
+        except Exception as exc:
+            logger.exception("Hardware refresh camera scan failed")
+            error_text = str(exc) or exc.__class__.__name__
+            warnings_list.append(f"camera scan failed: {error_text}")
+            scan_results["cameras"] = HardwareScanEntry(f"scan failed: {error_text}", "error")
+
+        try:
+            nidaq_devices, nidaq_error = nidaq_future.result()
+            details.append(f"NI-DAQ {len(nidaq_devices)} device(s)")
+            discovered_nidaq_names = {device.name for device in nidaq_devices}
+            nidaq_info = f"✓ {len(nidaq_devices)} NI-DAQ card(s)"
+            if nidaq_devices:
+                nidaq_info += "\n" + "\n".join(
+                    self._nidaq_device_summary(device)
+                    for device in nidaq_devices
+                )
+            nidaq_state = "ok" if nidaq_devices else "warning"
+            if nidaq_error:
+                warnings_list.append(nidaq_error)
+                nidaq_info += f"\n! {nidaq_error}"
+                nidaq_state = "error"
+            missing_nidaq_names = tuple(
+                name
+                for name in self.configured_nidaq_device_names
+                if name not in discovered_nidaq_names
+            )
+            if self._hardware.nidaq_enabled and missing_nidaq_names:
+                missing_text = ", ".join(missing_nidaq_names)
+                warnings_list.append(f"configured NI-DAQ device(s) not discovered: {missing_text}")
+                nidaq_info += f"\n! missing: {missing_text}"
+                if nidaq_state != "error":
+                    nidaq_state = "warning"
+            elif self._hardware.nidaq_enabled and not nidaq_devices:
+                warnings_list.append("no NI-DAQ devices discovered while NI-DAQ is enabled")
+            scan_results["nidaq"] = HardwareScanEntry(nidaq_info, nidaq_state)
+        except Exception as exc:
+            logger.exception("Hardware refresh NI-DAQ scan failed")
+            error_text = str(exc) or exc.__class__.__name__
+            warnings_list.append(f"NI-DAQ scan failed: {error_text}")
+            scan_results["nidaq"] = HardwareScanEntry(f"scan failed: {error_text}", "error")
+
+        try:
+            can_adapter_entry = can_adapter_future.result()
+        except Exception as exc:
+            logger.exception("Hardware refresh CAN adapter scan failed")
+            error_text = str(exc) or exc.__class__.__name__
+            can_adapter_entry = HardwareScanEntry(f"adapter scan failed: {error_text}", "error")
+            warnings_list.append(f"CAN adapter scan failed: {error_text}")
+        finally:
+            executor.shutdown(wait=True)
+        scan_results["can"] = can_adapter_entry
+        details.append(can_adapter_entry.info.splitlines()[0])
+
+        try:
+            gpu_entry = gpu_future.result()
+        except Exception as exc:
+            logger.exception("Hardware refresh GPU scan failed")
+            gpu_entry = HardwareScanEntry(f"! GPU scan failed\n→ {str(exc) or exc.__class__.__name__}", "error")
+            warnings_list.append(f"GPU scan failed: {str(exc) or exc.__class__.__name__}")
+        scan_results["gpu"] = gpu_entry
+        details.append(gpu_entry.info.splitlines()[0])
+
+        pellet_entry = self._initialize_pellet_controller_for_refresh()
+        scan_results["pellet"] = pellet_entry
+        details.append(pellet_entry.info.splitlines()[0])
+        if pellet_entry.state == "error":
+            warnings_list.append(
+                f"pellet controller initialization failed: "
+                f"{pellet_entry.info.splitlines()[-1].lstrip('→ ').strip()}"
+            )
+
+        laser_configuration = self._laser.configuration
+        if laser_configuration.backend == "disabled":
+            details.append("laser not in use")
+            scan_results["laser"] = HardwareScanEntry("not probed; backend disabled", "disabled")
+        elif self._laser.is_connected:
+            details.append(f"laser {laser_configuration.backend} connected")
+            scan_results["laser"] = HardwareScanEntry(
+                f"not probed; {laser_configuration.backend} connected",
+                "ok",
+            )
+        else:
+            details.append(f"laser {laser_configuration.backend} configured")
+            warnings_list.append(f"laser backend {laser_configuration.backend} is configured but not connected")
+            scan_results["laser"] = HardwareScanEntry(
+                f"not probed; {laser_configuration.backend} configured but not connected",
+                "warning",
+            )
+
+        # What the channel map claims, against what anyone has checked. A
+        # configuration is a set of assertions about cables and nothing here
+        # used to test them, so a wrong one recorded plausible data instead of
+        # failing. This does not probe hardware - it reports what the last
+        # verification run found, and says so when there has not been one.
+        # An unidentified chassis is not an error - explicit routing works
+        # without one - but it removes automatic cross-board routing, and
+        # meeting that as -89125 inside a task is worse than reading it here.
+        try:
+            note = chassis_identification_note(nidaq_devices)
+            if note:
+                warnings_list.append(note)
+        except Exception:
+            logger.exception("NI-DAQ chassis identification could not be read")
+
+        # This named a `configuration` that does not exist in this method, so
+        # from 2026-09-22 every refresh raised here, the except below logged it,
+        # and the wiring summary was never shown.
+        configuration = self._loaded_configuration
+        try:
+            if configuration is not None:
+                wiring = summarize_nidaq_wiring(
+                    configuration, WiringVerification.load(self._wiring_record_path))
+                details.append(wiring.detail())
+                warning = wiring.warning()
+                if warning:
+                    warnings_list.append(warning)
+                scan_results["nidaq_wiring"] = HardwareScanEntry(
+                    wiring.detail(), "ok" if wiring.is_clean else "warning")
+        except Exception:
+            logger.exception("NI-DAQ wiring verification could not be read")
+
+        previous_scan_results = self._hardware_scan_results
+        self._hardware_scan_results = scan_results
+        self._on_property_changed(
+            self.Props.HARDWARE_SCAN_RESULTS,
+            dict(scan_results),
+            previous_scan_results,
+        )
+        # A refresh is how the operator retries a stream that failed to
+        # start: nothing retries a failed start by itself. It also runs once
+        # at startup, just after the configuration loads.
+        self._request_nidaq_stream("hardware refresh")
+
+        message = (
+            f"Hardware refresh completed in {time.perf_counter() - scan_started:.2f}s: "
+            + ", ".join(details)
+        )
+        if warnings_list:
+            warning_text = "; ".join(warnings_list)
+            log_hardware_initialization(
+                logger,
+                "WARNING | hardware refresh | %s; warnings: %s",
+                message,
+                warning_text,
+                level=logging.WARNING,
+            )
+            return f"{message}; warnings: {warning_text}"
+        log_hardware_initialization(logger, "READY | hardware refresh | %s", message)
+        return message
+
+    def _ensure_pellet_controller_connected(self) -> None:
+        if self._hardware.connected:
+            return
+        self._hardware.connect(self._system_message_handler.input_queue)
+
+    def _initialize_pellet_controller_for_refresh(self) -> HardwareScanEntry:
+        hardware = self._hardware
+        if not hardware.can_enabled or not hardware.pellet_controller_enabled:
+            return HardwareScanEntry("– not in use", "disabled")
+        try:
+            self._ensure_pellet_controller_connected()
+            if not hardware.connected:
+                raise RuntimeError("controller did not report a connected session")
+        except Exception as exc:
+            error_text = str(exc) or exc.__class__.__name__
+            logger.exception("Pellet controller initialization during hardware refresh failed")
+            try:
+                hardware.safety_shutdown(
+                    f"startup hardware refresh failure: {error_text}",
+                    wait=True,
+                )
+            except Exception:
+                logger.exception("Pellet controller cleanup after refresh failure failed")
+            return HardwareScanEntry(
+                f"! controller connection failed\n→ {error_text}",
+                "error",
+            )
+
+        version = hardware.pellet_version
+        version_text = f" · firmware {version}" if version else ""
+        return HardwareScanEntry(
+            f"✓ controller session connected{version_text}",
+            "ok",
+        )
+
+    @staticmethod
+    def _nidaq_device_summary(device) -> str:
+        identity = f"→ {device.name}"
+        if device.product_type:
+            identity += f" · {device.product_type}"
+        if device.product_number is not None:
+            identity += f" · #{device.product_number}"
+        return identity
+
+    @property
     def message_handler(self) -> SystemMessageHandler:
         return self._system_message_handler
 
@@ -829,33 +3573,867 @@ class AppModel(ObservableObject):
     @animals.setter
     def animals(self, value: List[AnimalSubject]):
         prev, self._animals = self._animals, value
+        self._rebuild_animal_indexes()
         self._on_property_changed(self.Props.ANIMALS, value, prev)
 
     def get_animal_by_id(self, animal_id) -> Optional[AnimalSubject]:
-        for animal in self._animals:
-            if animal.id == animal_id:
-                return animal
-        return None
+        return self._animal_by_id.get(animal_id)
 
-    def get_days_before_cage_clean(self) -> int:
-        pref = self._preferences
-        cfg = self._behavior.algorithm.active_config.cage_cleaning
-        return (
-            cfg.clean_days_interval
-            - (date.today() - pref.cage_clean_previous_day).days
+    def get_animal_by_external_identity(
+        self, identity: ExternalIdentity
+    ) -> Optional[AnimalSubject]:
+        if identity.key in self._external_link_conflicts:
+            return None
+        return self._animal_by_external_key.get(identity.key)
+
+    @property
+    def external_link_conflicts(self):
+        return frozenset(self._external_link_conflicts)
+
+    @property
+    def animal_metadata_status(self) -> str:
+        return self._animal_metadata_status
+
+    @property
+    def animal_metadata_preview(self):
+        return self._animal_metadata_preview
+
+    @property
+    def animal_metadata_refresh_busy(self) -> bool:
+        with self._animal_metadata_refresh_lock:
+            return self._animal_metadata_refresh_busy
+
+    def _set_animal_metadata_status(self, value: str) -> None:
+        previous, self._animal_metadata_status = self._animal_metadata_status, value
+        if value != previous:
+            self._on_property_changed(
+                self.Props.ANIMAL_METADATA_STATUS, value, previous
+            )
+
+    def _configure_animal_metadata_services(self) -> None:
+        controller = self._rfid_metadata_controller
+        if controller is not None:
+            controller.stop()
+        self._animal_registry = None
+        self._animal_metadata_sync = None
+        self._rfid_metadata_controller = None
+        manifest_value = getattr(self._preferences, "softmouse_manifest_path", "")
+        hardware_configuration = (
+            None if self._loaded_configuration is None
+            else self._loaded_configuration.hardware
         )
+        reader_enabled = bool(
+            hardware_configuration is not None
+            and hardware_configuration.rfid_reader_enabled
+        )
+        logger.info(
+            "Configuring SoftMouse/RFID services: manifest_configured=%s "
+            "rfid_enabled=%s rfid_device=%s",
+            bool(manifest_value),
+            reader_enabled,
+            (
+                "not configured"
+                if hardware_configuration is None or not hardware_configuration.rfid_device
+                else hardware_configuration.rfid_device
+            ),
+        )
+        if not manifest_value and not reader_enabled:
+            self._set_animal_metadata_status("Not configured")
+            self._set_subsystem_status(
+                SubsystemId.ANIMAL_REGISTRY,
+                SubsystemState.DISABLED,
+                reason="SoftMouse/RFID not configured",
+                required_for_recording=False,
+            )
+            self._set_subsystem_status(
+                SubsystemId.RFID_READER,
+                SubsystemState.DISABLED,
+                reason="RFID reader disabled",
+                required_for_recording=False,
+            )
+            return
+        cache_directory = Path(self._preferences.configuration_location) / "softmouse"
+        try:
+            registry = self._animal_registry = AnimalRegistry(
+                cache_directory / "animal-registry.sqlite3"
+            )
+        except Exception as exc:
+            logger.exception("SoftMouse animal registry initialization failed")
+            self._set_animal_metadata_status(f"Registry unavailable: {exc}")
+            self._set_subsystem_status(
+                SubsystemId.ANIMAL_REGISTRY,
+                SubsystemState.FAILED,
+                error=str(exc),
+                required_for_recording=False,
+            )
+            self._set_subsystem_status(
+                SubsystemId.RFID_READER,
+                SubsystemState.DISABLED,
+                reason="local registry unavailable",
+                required_for_recording=False,
+            )
+            return
+        registry_reason = "local cache ready"
+        if registry.recovered_corrupt_path is not None:
+            registry_reason = (
+                "rebuilt corrupt cache; backup: "
+                f"{registry.recovered_corrupt_path.name}"
+            )
+            logger.warning(
+                "Recovered corrupt SoftMouse registry: backup=%s",
+                registry.recovered_corrupt_path,
+            )
+        self._set_subsystem_status(
+            SubsystemId.ANIMAL_REGISTRY,
+            SubsystemState.READY,
+            reason=registry_reason,
+            required_for_recording=False,
+        )
+        if manifest_value:
+            profile = SoftMouseMappingProfile(
+                new_animal_name_column=getattr(
+                    self._preferences, "softmouse_name_column", "Physical Tag"
+                )
+            )
+            self._animal_metadata_sync = AnimalMetadataSyncService(
+                manifest_path=Path(manifest_value),
+                local_staging_directory=cache_directory / "source",
+                source=SoftMouseSpreadsheetSource(profile),
+                registry=registry,
+                can_refresh=lambda: (
+                    self.session_recording_status is SessionRecordingStatus.READY
+                ),
+            )
+        if reader_enabled:
+            self._rfid_metadata_controller = RfidMetadataController(
+                app_model=self,
+                registry=registry,
+                device=hardware_configuration.rfid_device,
+            )
+            self._set_subsystem_status(
+                SubsystemId.RFID_READER,
+                SubsystemState.STOPPED,
+                reason="configured; not started",
+                required_for_recording=False,
+            )
+            logger.info(
+                "RFID metadata controller configured: device=%s",
+                hardware_configuration.rfid_device,
+            )
+        else:
+            self._set_subsystem_status(
+                SubsystemId.RFID_READER,
+                SubsystemState.DISABLED,
+                reason="RFID reader disabled",
+                required_for_recording=False,
+            )
+        previous = registry.last_complete_import()
+        if previous is None:
+            self._set_animal_metadata_status("Ready; no export imported yet")
+        else:
+            self._set_animal_metadata_status(
+                f"Cache has {previous['accepted_rows']} tagged animals; "
+                f"last refresh {previous['imported_utc']}; "
+                f"source {previous['source_file_sha256'][:12]}"
+            )
+
+    def refresh_animal_metadata(self):
+        """Compatibility entry point; refresh work is always asynchronous."""
+        return self.request_animal_metadata_refresh("manual refresh")
+
+    def request_animal_metadata_refresh(
+        self,
+        reason: str,
+        *,
+        only_if_due: bool = False,
+    ) -> bool:
+        service = self._animal_metadata_sync
+        if service is None:
+            raise RuntimeError("Configure a SoftMouse publication manifest first")
+        if self.session_recording_status is not SessionRecordingStatus.READY:
+            with self._animal_metadata_refresh_lock:
+                self._animal_metadata_refresh_deferred = True
+                self._animal_metadata_refresh_reason = str(reason)
+            self._set_animal_metadata_status("Refresh deferred until the session is Ready")
+            return False
+        with self._animal_metadata_refresh_lock:
+            if self._animal_metadata_refresh_busy:
+                self._animal_metadata_refresh_deferred = True
+                self._animal_metadata_refresh_reason = str(reason)
+                logger.info("SoftMouse refresh coalesced while another refresh is active")
+                return False
+            self._animal_metadata_refresh_busy = True
+            self._animal_metadata_refresh_deferred = False
+            self._animal_metadata_refresh_reason = str(reason)
+        self._on_property_changed(
+            self.Props.ANIMAL_METADATA_REFRESH_BUSY, True, False,
+        )
+        logger.info(
+            "SoftMouse local-cache refresh requested: manifest=%s reason=%s",
+            service.manifest_path,
+            reason,
+        )
+        self._set_animal_metadata_status("Refreshing…")
+        self._set_subsystem_status(
+            SubsystemId.ANIMAL_REGISTRY,
+            SubsystemState.STARTING,
+            reason="refreshing SoftMouse cache",
+            required_for_recording=False,
+        )
+        thread = threading.Thread(
+            target=self._run_animal_metadata_refresh,
+            args=(service, bool(only_if_due)),
+            name="softmouse-cache-refresh",
+            daemon=True,
+        )
+        self._animal_metadata_refresh_thread = thread
+        thread.start()
+        return True
+
+    def _run_animal_metadata_refresh(self, service, only_if_due: bool) -> None:
+        try:
+            if only_if_due and not service.refresh_due():
+                self._finish_animal_metadata_refresh(None, None, skipped=True)
+                return
+            result = service.refresh_now()
+        except Exception as exc:
+            self._finish_animal_metadata_refresh(None, exc)
+            return
+        self._finish_animal_metadata_refresh(result, None)
+
+    def _finish_animal_metadata_refresh(
+        self, result, error: Optional[BaseException], *, skipped: bool = False,
+    ) -> None:
+        if error is not None:
+            logger.error(
+                "SoftMouse local-cache refresh failed: %s",
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            self._set_animal_metadata_status(f"Refresh failed: {error}")
+            self._set_subsystem_status(
+                SubsystemId.ANIMAL_REGISTRY,
+                SubsystemState.FAILED,
+                error=str(error),
+                required_for_recording=False,
+            )
+        elif skipped:
+            self._set_animal_metadata_status("Already current; refresh not due")
+            self._set_subsystem_status(
+                SubsystemId.ANIMAL_REGISTRY,
+                SubsystemState.READY,
+                reason="local cache refresh not due",
+                required_for_recording=False,
+            )
+        else:
+            self._publish_animal_metadata_refresh_result(result)
+        with self._animal_metadata_refresh_lock:
+            self._animal_metadata_refresh_busy = False
+            rerun = self._animal_metadata_refresh_deferred
+            reason = self._animal_metadata_refresh_reason
+            self._animal_metadata_refresh_deferred = False
+        self._on_property_changed(
+            self.Props.ANIMAL_METADATA_REFRESH_BUSY, False, True,
+        )
+        if (
+            rerun
+            and not self._closing_event.is_set()
+            and self.session_recording_status is SessionRecordingStatus.READY
+        ):
+            self.request_animal_metadata_refresh(reason or "coalesced refresh")
+
+    def _publish_animal_metadata_refresh_result(self, result) -> None:
+        batch = result.preview.batch
+        status = (
+            f"Imported {batch.accepted_rows} tagged animals; "
+            f"ignored {batch.ignored_missing_rfid_rows} without RFID and "
+            f"{batch.ignored_ended_rows} ended"
+        )
+        if result.registry_result.unchanged:
+            status = "Already current; " + status
+        status += (
+            f"; source {batch.source_file_sha256[:12]}; "
+            f"refreshed {batch.imported_utc}"
+        )
+        self._set_animal_metadata_status(status)
+        previous_preview, self._animal_metadata_preview = (
+            self._animal_metadata_preview,
+            result.preview,
+        )
+        self._on_property_changed(
+            self.Props.ANIMAL_METADATA_PREVIEW,
+            result.preview,
+            previous_preview,
+        )
+        self._set_subsystem_status(
+            SubsystemId.ANIMAL_REGISTRY,
+            SubsystemState.READY,
+            reason=status,
+            required_for_recording=False,
+        )
+        logger.info(
+            "SoftMouse local-cache refresh complete: import_id=%s total_rows=%d "
+            "tagged_rows=%d ignored_missing_rfid=%d ignored_ended=%d unchanged=%s "
+            "source_sha256=%s",
+            batch.import_id,
+            batch.total_source_rows,
+            batch.accepted_rows,
+            batch.ignored_missing_rfid_rows,
+            batch.ignored_ended_rows,
+            result.registry_result.unchanged,
+            batch.source_file_sha256,
+        )
+
+    def _run_animal_metadata_catchup(self) -> None:
+        try:
+            self.request_animal_metadata_refresh(
+                "scheduled catch-up", only_if_due=True,
+            )
+        except Exception as exc:
+            logger.warning("Scheduled SoftMouse catch-up refresh failed: %s", exc)
+
+    def _request_animal_metadata_catchup(self) -> None:
+        self._run_animal_metadata_catchup()
+
+    def apply_animal_metadata_preferences(self) -> None:
+        if self.animal_metadata_refresh_busy:
+            raise RuntimeError("SoftMouse settings cannot change during a cache refresh")
+        self._configure_animal_metadata_services()
+        if self._rfid_metadata_controller is not None:
+            self._rfid_metadata_controller.start()
+
+    def current_external_animal_records(self):
+        if self._animal_registry is None:
+            return ()
+        return tuple(self._animal_registry.list_current_records())
+
+    def _current_registry_provenance(self):
+        ledger = (
+            None
+            if self._animal_registry is None
+            else self._animal_registry.last_complete_import()
+        )
+        return {
+            "registry_import_id": None if ledger is None else ledger["import_id"],
+            "source_file_sha256": (
+                None if ledger is None else ledger["source_file_sha256"]
+            ),
+            "imported_utc": None if ledger is None else ledger["imported_utc"],
+        }
+
+    def manually_link_animal(
+        self, animal_id: str, record: ExternalAnimalRecord
+    ) -> AnimalSubject:
+        logger.info(
+            "Manual SoftMouse link requested: animal_id=%s subject_id=%s rfid=%s",
+            animal_id,
+            record.identity.subject_id,
+            record.physical_rfid,
+        )
+        animal = self.get_animal_by_id(animal_id)
+        if animal is None:
+            raise ValueError(f"Unknown reachAQ animal UUID {animal_id!r}")
+        if animal.external_identity is not None:
+            raise ValueError("Manual linking requires an unlinked animal JSON")
+        self.link_animal_to_external_record(
+            animal,
+            record,
+            **self._current_registry_provenance(),
+        )
+        self.animals = list(self._animals)
+        self.selected_animal = animal
+        return animal
+
+    def update_animal_details(
+        self,
+        animal_id: str,
+        *,
+        name: str,
+        notes: str,
+    ) -> AnimalSubject:
+        if self.session_recording_status is not SessionRecordingStatus.READY:
+            raise RuntimeError("Animal details cannot change while a session is active")
+        animal = self.get_animal_by_id(animal_id)
+        if animal is None:
+            raise ValueError(f"Unknown reachAQ animal UUID {animal_id!r}")
+        name = str(name).strip()
+        if not name:
+            raise ValueError("Animal display name cannot be empty")
+        previous_name, previous_notes = animal.name, animal.notes
+        animal.name = name
+        animal.notes = str(notes or "").strip()
+        try:
+            self._save_animal_metadata(animal, sender="animal-details")
+        except Exception:
+            animal.name = previous_name
+            animal.notes = previous_notes
+            raise
+        self.animals = list(self._animals)
+        logger.info(
+            "Animal details saved: animal_id=%s animal_name=%s notes_present=%s",
+            animal.id,
+            animal.name,
+            bool(animal.notes),
+        )
+        return animal
+
+    def _rebuild_animal_indexes(self) -> None:
+        self._animal_by_id = {animal.id: animal for animal in self._animals}
+        self._animal_by_external_key = {}
+        self._external_link_conflicts = set()
+        for animal in self._animals:
+            identity = animal.external_identity
+            if identity is None:
+                continue
+            previous = self._animal_by_external_key.get(identity.key)
+            if previous is not None and previous.id != animal.id:
+                self._external_link_conflicts.add(identity.key)
+                self._animal_by_external_key.pop(identity.key, None)
+            elif identity.key not in self._external_link_conflicts:
+                self._animal_by_external_key[identity.key] = animal
+
+    def link_animal_to_external_record(
+        self,
+        animal: AnimalSubject,
+        record: ExternalAnimalRecord,
+        *,
+        registry_import_id: Optional[str] = None,
+        source_file_sha256: Optional[str] = None,
+        imported_utc: Optional[str] = None,
+    ) -> None:
+        logger.info(
+            "SoftMouse link requested: animal_id=%s animal_name=%s subject_id=%s "
+            "rfid=%s import_id=%s",
+            animal.id,
+            animal.name,
+            record.identity.subject_id,
+            record.physical_rfid,
+            registry_import_id,
+        )
+        if self.session_recording_status is not SessionRecordingStatus.READY:
+            raise RuntimeError("Animal links cannot change while a session is active")
+        linked = self.get_animal_by_external_identity(record.identity)
+        if linked is not None and linked.id != animal.id:
+            raise ValueError(
+                f"{record.identity.subject_id!r} is already linked to {linked.name!r}"
+            )
+        old_identity = animal.external_identity
+        old_metadata = animal.external_metadata
+        animal.external_identity = record.identity
+        animal.external_metadata = record.metadata_snapshot(
+            registry_import_id=registry_import_id,
+            source_file_sha256=source_file_sha256,
+            imported_utc=imported_utc,
+        )
+        try:
+            self._save_animal_metadata(animal, sender="external-link")
+        except Exception:
+            animal.external_identity = old_identity
+            animal.external_metadata = old_metadata
+            self._rebuild_animal_indexes()
+            logger.exception(
+                "SoftMouse link save failed and was rolled back: animal_id=%s "
+                "subject_id=%s rfid=%s",
+                animal.id,
+                record.identity.subject_id,
+                record.physical_rfid,
+            )
+            raise
+        self._rebuild_animal_indexes()
+        logger.info(
+            "SoftMouse link saved: animal_id=%s animal_name=%s subject_id=%s rfid=%s",
+            animal.id,
+            animal.name,
+            record.identity.subject_id,
+            record.physical_rfid,
+        )
+
+    def resolve_external_record(
+        self,
+        record: Optional[ExternalAnimalRecord],
+        *,
+        scanned_rfid: str,
+        registry_import_id: Optional[str] = None,
+        source_file_sha256: Optional[str] = None,
+        imported_utc: Optional[str] = None,
+        cache_stale: bool = False,
+    ) -> RfidResolution:
+        if self.session_recording_status is not SessionRecordingStatus.READY:
+            return RfidResolution(
+                RfidResolutionKind.BUSY,
+                scanned_rfid,
+                record=record,
+                message="RFID selection is disabled while a session is active",
+            )
+        if record is None:
+            return RfidResolution(
+                RfidResolutionKind.UNKNOWN_RFID,
+                scanned_rfid,
+                message=(
+                    "RFID is unknown and the local cache is stale; refresh before linking"
+                    if cache_stale
+                    else "RFID is not present in the current local cache"
+                ),
+            )
+        if record.identity.key in self._external_link_conflicts:
+            return RfidResolution(
+                RfidResolutionKind.LINK_CONFLICT,
+                scanned_rfid,
+                record=record,
+                message="Multiple local animals have this external identity",
+            )
+        animal = self.get_animal_by_external_identity(record.identity)
+        if animal is None:
+            return RfidResolution(
+                RfidResolutionKind.SETUP_REQUIRED,
+                scanned_rfid,
+                record=record,
+                message=(
+                    "Create a new animal JSON or link this RFID to an existing "
+                    "unlinked animal"
+                ),
+            )
+        self.link_animal_to_external_record(
+            animal,
+            record,
+            registry_import_id=registry_import_id,
+            source_file_sha256=source_file_sha256,
+            imported_utc=imported_utc,
+        )
+        self.selected_animal = animal
+        return RfidResolution(
+            RfidResolutionKind.SELECTED,
+            scanned_rfid,
+            record=record,
+            animal=animal,
+            message=("Selected using a stale local cache" if cache_stale else ""),
+        )
+
+    def complete_rfid_animal_setup(
+        self,
+        record: ExternalAnimalRecord,
+        *,
+        scanned_rfid: str,
+        name: str,
+        notes: str,
+        existing_animal_id: Optional[str] = None,
+    ) -> RfidResolution:
+        if self.session_recording_status is not SessionRecordingStatus.READY:
+            raise RuntimeError("RFID setup is disabled while a session is active")
+        if record.physical_rfid != scanned_rfid:
+            raise ValueError("Scanned RFID does not match the selected SoftMouse record")
+        name = str(name).strip()
+        if not name:
+            raise ValueError("Animal display name cannot be empty")
+        notes = str(notes or "").strip()
+        created = existing_animal_id is None
+        if created:
+            animal = AnimalSubject(name=name, notes=notes)
+            self._animals.append(animal)
+            self._rebuild_animal_indexes()
+            previous_name = previous_notes = None
+        else:
+            animal = self.get_animal_by_id(existing_animal_id)
+            if animal is None:
+                raise ValueError(
+                    f"Unknown reachAQ animal UUID {existing_animal_id!r}"
+                )
+            if animal.external_identity is not None:
+                raise ValueError("RFID setup can only link an unlinked animal JSON")
+            previous_name, previous_notes = animal.name, animal.notes
+            animal.name = name
+            animal.notes = notes
+        try:
+            self.link_animal_to_external_record(
+                animal,
+                record,
+                **self._current_registry_provenance(),
+            )
+        except Exception:
+            if created:
+                self._animals.remove(animal)
+                self._rebuild_animal_indexes()
+            else:
+                animal.name = previous_name
+                animal.notes = previous_notes
+            raise
+        if created:
+            self.animals = list(self._animals)
+            self._event_manager.post_event_content(
+                ApiEventKind.animalCreated, animal.to_api_status()
+            )
+        else:
+            self.animals = list(self._animals)
+        self.selected_animal = animal
+        result = RfidResolution(
+            (
+                RfidResolutionKind.CREATED_AND_SELECTED
+                if created
+                else RfidResolutionKind.LINKED_AND_SELECTED
+            ),
+            scanned_rfid,
+            record=record,
+            animal=animal,
+        )
+        self._publish_rfid_resolution(result)
+        return result
+
+    @property
+    def rfid_reader_status(self):
+        return self._rfid_reader_status
+
+    @property
+    def rfid_scan_result(self):
+        return self._rfid_scan_result
+
+    def set_rfid_reader_status(self, status) -> None:
+        previous, self._rfid_reader_status = self._rfid_reader_status, status
+        self._on_property_changed(self.Props.RFID_READER_STATUS, status, previous)
+        state_value = getattr(getattr(status, "state", None), "value", "failed")
+        logger.info(
+            "RFID reader state applied: state=%s device=%s reason=%s",
+            state_value,
+            getattr(status, "device", "unknown"),
+            getattr(status, "reason", "") or "none",
+        )
+        state = {
+            "ready": SubsystemState.READY,
+            "connecting": SubsystemState.STARTING,
+            "reconnecting": SubsystemState.STARTING,
+            "stopped": SubsystemState.STOPPED,
+            "failed": SubsystemState.FAILED,
+        }.get(state_value, SubsystemState.FAILED)
+        self._set_subsystem_status(
+            SubsystemId.RFID_READER,
+            state,
+            reason=getattr(status, "reason", "") or state_value,
+            error=(getattr(status, "reason", "") if state is SubsystemState.FAILED else ""),
+            required_for_recording=False,
+        )
+
+    def handle_rfid_scan(self, record, **kwargs) -> RfidResolution:
+        scanned_rfid = kwargs.get("scanned_rfid", "unknown")
+        logger.info(
+            "RFID scan resolution started: rfid=%s matched_softmouse=%s",
+            scanned_rfid,
+            record is not None,
+        )
+        result = self.resolve_external_record(record, **kwargs)
+        self._publish_rfid_resolution(result)
+        return result
+
+    def _publish_rfid_resolution(self, result: RfidResolution) -> None:
+        previous, self._rfid_scan_result = self._rfid_scan_result, result
+        self._on_property_changed(self.Props.RFID_SCAN_RESULT, result, previous)
+        resolution_logger = (
+            logger.info
+            if result.kind in {
+                RfidResolutionKind.SELECTED,
+                RfidResolutionKind.CREATED_AND_SELECTED,
+                RfidResolutionKind.LINKED_AND_SELECTED,
+                RfidResolutionKind.SETUP_REQUIRED,
+            }
+            else logger.warning
+        )
+        resolution_logger(
+            "RFID scan resolution complete: rfid=%s result=%s subject_id=%s "
+            "animal_id=%s animal_name=%s message=%s",
+            result.rfid,
+            result.kind.value,
+            None if result.record is None else result.record.identity.subject_id,
+            None if result.animal is None else result.animal.id,
+            None if result.animal is None else result.animal.name,
+            result.message or "none",
+        )
+
+    def condense_animal_duplicate(
+        self,
+        survivor_id: str,
+        linked_duplicate_id: str,
+    ) -> AnimalSubject:
+        survivor = self.get_animal_by_id(survivor_id)
+        duplicate = self.get_animal_by_id(linked_duplicate_id)
+        if survivor is None or duplicate is None:
+            raise ValueError("Both animal JSON records must still exist")
+        if duplicate.external_identity is None:
+            raise ValueError("The duplicate animal has no SoftMouse/RFID link")
+        if (
+            survivor.external_identity is not None
+            and survivor.external_identity.key != duplicate.external_identity.key
+        ):
+            raise ValueError(
+                "The surviving animal is already linked to a different SoftMouse animal"
+            )
+        merged = self.condense_animals(
+            survivor_id,
+            linked_duplicate_id,
+            AnimalReconciliationChoices(
+                name_from=survivor_id,
+                pellet_position_from=survivor_id,
+                training_from=survivor_id,
+                target_limit_from=survivor_id,
+                external_identity_from=linked_duplicate_id,
+            ),
+        )
+        self.selected_animal = merged
+        return merged
+
+    def condense_animals(
+        self,
+        survivor_id: str,
+        loser_id: str,
+        choices: AnimalReconciliationChoices,
+    ) -> AnimalSubject:
+        """Condense two local records with explicit field-group decisions.
+
+        Both original JSON files are preserved as backups and the losing UUID
+        receives a redirect record. Session directories are never inspected or
+        rewritten.
+        """
+        logger.info(
+            "Animal reconciliation requested: survivor_id=%s loser_id=%s choices=%s",
+            survivor_id,
+            loser_id,
+            choices.to_dict(),
+        )
+        if self.session_recording_status is not SessionRecordingStatus.READY:
+            raise RuntimeError("Animals cannot be reconciled while a session is active")
+        survivor = self.get_animal_by_id(survivor_id)
+        loser = self.get_animal_by_id(loser_id)
+        if survivor is None or loser is None:
+            raise ValueError("Both survivor and losing UUIDs must be current animals")
+        merged = reconcile_animals(survivor, loser, choices)
+        animal_directory = Path(self._preferences.animal_location)
+        animal_directory.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        survivor_path = animal_directory / f"{survivor.id}.json"
+        loser_path = animal_directory / f"{loser.id}.json"
+        if not survivor_path.is_file() or not loser_path.is_file():
+            raise FileNotFoundError(
+                "Both animal JSON files must exist before they can be condensed"
+            )
+
+        backups = {}
+        for label, path in (("survivor", survivor_path), ("loser", loser_path)):
+            backup = animal_directory / (
+                f"{path.stem}.{timestamp}.{label}.merge-backup"
+            )
+            shutil.copy2(path, backup)
+            backups[path] = backup
+
+        selected_participant = (
+            self._selected_animal
+            if self._selected_animal is not None
+            and self._selected_animal.id in {
+                survivor.id,
+                loser.id,
+            }
+            else None
+        )
+        if selected_participant is not None:
+            # Deselect before moving the losing file: the selection setter saves
+            # the outgoing animal and would otherwise recreate that file.
+            self.selected_animal = None
+
+        archived_loser = animal_directory / (
+            f"{loser.id}.{timestamp}.merged-animal-backup"
+        )
+        redirect_path = animal_directory / f"{loser.id}.merged-redirect"
+        if redirect_path.exists():
+            if selected_participant is not None:
+                self.selected_animal = selected_participant
+            raise FileExistsError(
+                f"A merge redirect already exists for losing UUID {loser.id}"
+            )
+        staged_survivor = survivor_path.with_name(
+            f".{survivor_path.name}.{timestamp}.merge-stage"
+        )
+        temporary_redirect = redirect_path.with_name(
+            f".{redirect_path.name}.{timestamp}.tmp"
+        )
+        redirect = {
+            "schemaVersion": 1,
+            "mergedUtc": timestamp,
+            "losingReachaqId": loser.id,
+            "survivingReachaqId": survivor.id,
+            "fieldSources": choices.to_dict(),
+        }
+        merged.to_file(staged_survivor)
+        temporary_redirect.write_text(
+            json.dumps(redirect, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        try:
+            os.replace(staged_survivor, survivor_path)
+            os.replace(loser_path, archived_loser)
+            os.replace(temporary_redirect, redirect_path)
+        except Exception:
+            # Restore both authoritative JSON files from the pre-merge copies.
+            # Each restore is itself staged so readers never see partial JSON.
+            for original, backup in backups.items():
+                restore_stage = original.with_name(
+                    f".{original.name}.{timestamp}.restore-stage"
+                )
+                shutil.copy2(backup, restore_stage)
+                os.replace(restore_stage, original)
+            redirect_path.unlink(missing_ok=True)
+            staged_survivor.unlink(missing_ok=True)
+            temporary_redirect.unlink(missing_ok=True)
+            if selected_participant is not None:
+                self.selected_animal = selected_participant
+            logger.exception(
+                "Animal reconciliation failed and was rolled back: survivor_id=%s "
+                "loser_id=%s",
+                survivor_id,
+                loser_id,
+            )
+            raise
+
+        self.animals = [
+            merged if animal.id == survivor.id else animal
+            for animal in self._animals
+            if animal.id != loser.id
+        ]
+        if selected_participant is not None:
+            self.selected_animal = merged
+        logger.info(
+            "Animal reconciliation complete: survivor_id=%s loser_id=%s "
+            "archived_loser=%s redirect=%s",
+            survivor_id,
+            loser_id,
+            archived_loser,
+            redirect_path,
+        )
+        return merged
 
     @property
     def selected_animal(self) -> Optional[AnimalSubject]:
         return self._selected_animal
 
     @selected_animal.setter
+    @_serialized_session_configuration
     def selected_animal(self, animal: Optional[AnimalSubject]):
+        if (
+            animal != self._selected_animal
+            and self._recording_session.status is not SessionRecordingStatus.READY
+        ):
+            raise RuntimeError(
+                "Changing the subject is unavailable while session state is "
+                f"{self._recording_session.status.value}"
+            )
         prev, self._selected_animal = self._selected_animal, animal
         if animal == prev:
             return
         self._detach_training_plan()  # always
-        logger.debug("updating animal to %s (prev=%s)", animal, prev)
+        logger.info(
+            "Animal selection changed: animal_id=%s animal_name=%s previous_id=%s "
+            "previous_name=%s",
+            None if animal is None else animal.id,
+            None if animal is None else animal.name,
+            None if prev is None else prev.id,
+            None if prev is None else prev.name,
+        )
         if prev is not None:
             self._save_animal_metadata(prev, sender="selected_animal_detach")  # in case of
         self.property_changed(self.Props.ANIMAL_NAME, *(
@@ -867,6 +4445,7 @@ class AppModel(ObservableObject):
 
         if animal is None:
             self.training_plan = None
+            self._select_ordered_protocol_internal(None, persist_animal=False)
             algo.reset_selected_animal_counts(None)
         else:
             logger.debug("animal pellet=%s is_dcs=%s",
@@ -877,53 +4456,63 @@ class AppModel(ObservableObject):
                 animal.is_pellet_dcs = False
                 animal.pellet_x = animal.pellet_y = animal.pellet_z = 0
             algo.reset_selected_animal_counts(animal)
-            if self._training_mode == TrainingMode.MANUAL:
-                # only set animal base position if manual training mode
-                self._set_animal_base_positions(animal)
-            else:
-                self.training_plan = self.get_training_plan_by_id(animal.training.current_protocol)
-        self._preferences.selected_animal = "" if animal is None else animal.name
-        analysis = self._behavior.analysis
-        analysis.autoclamp_evasion_detector.pellets_consumed = (
-            0 if animal is None
-            else animal.autoclamp_evasion_pellets_consumed
-        )
+            self._set_animal_base_positions(animal)
+            self.training_plan = self.get_training_plan_by_id(
+                animal.training.current_protocol
+            )
+            try:
+                self._select_ordered_protocol_internal(
+                    animal.training.ordered_protocol_id,
+                    persist_animal=False,
+                )
+            except KeyError:
+                logger.warning(
+                    "Animal %s preferred ordered protocol %r is unavailable; "
+                    "using No protocol",
+                    animal.id,
+                    animal.training.ordered_protocol_id,
+                )
+                self._select_ordered_protocol_internal(None, persist_animal=False)
+        self._preferences.selected_animal = "" if animal is None else animal.id
         self._on_property_changed(self.Props.SELECTED_ANIMAL, animal, prev)
         self._event_manager.post_event_content(
             ApiEventKind.animalSelected, None if animal is None else animal.to_api_status())
         logger.success("Switched to animal %s", animal)
 
     @property
-    def training_mode(self):
-        return self._training_mode
-
-    @training_mode.setter
-    def training_mode(self, mode: TrainingMode):
-        prev, self._training_mode = self._training_mode, mode
-        if prev == mode:
-            return
-        if mode == TrainingMode.MANUAL:
-            self._detach_training_plan()
-        else:
-            animal = self._selected_animal
-            if animal is None:  # animal might be not active/created yet
-                self._detach_training_plan()
-            else:
-                attached = self._attached_plan
-                if attached is not None:
-                    is_auto = mode == TrainingMode.AUTOMATIC
-                    logger.info("Updating plan is_automatic to %s", is_auto)
-                    attached.is_automatic = is_auto
-                else:
-                    # this will also attach to it (given current mode != manual):
-                    self.training_plan = self.get_training_plan_by_id(animal.training.current_protocol)
-        self._on_property_changed(self.Props.TRAINING_MODE, mode, prev)
-        self._event_manager.post_event_content(
-            ApiEventKind.trainingModeChanged, dict(training_mode=mode))
-
-    @property
     def attached_plan(self) -> Optional[TrainingPlan]:
         return self._attached_plan
+
+    def _derived_api_training_mode(self) -> ApiTrainingMode:
+        return protocol_state_to_api_training_mode(
+            self._attached_plan,
+            automatic_advance=(
+                self._behavior.algorithm.active_config.session_control
+                .automatic_protocol_advance_enabled
+            ),
+        )
+
+    @_serialized_session_configuration
+    def set_automatic_protocol_advance_enabled(self, enabled: bool) -> None:
+        """Apply protocol advancement consistently to config and live runner."""
+        self._require_session_ready_for_configuration(
+            "Changing automatic protocol advancement"
+        )
+        enabled = bool(enabled)
+        session_control = self._behavior.algorithm.active_config.session_control
+        session_control.automatic_protocol_advance_enabled = enabled
+        self._protocol_runner.automatic_advance = enabled
+        if self._attached_plan is not None:
+            self._attached_plan.is_automatic = enabled
+            self._on_property_changed(
+                self.Props.TRAINING_PLAN_PROP,
+                self._attached_plan,
+                self._attached_plan,
+            )
+        self._event_manager.post_event_content(
+            ApiEventKind.trainingModeChanged,
+            dict(training_mode=self._derived_api_training_mode()),
+        )
 
     @property
     def training_plan(self) -> Optional[TrainingPlan]:
@@ -933,7 +4522,17 @@ class AppModel(ObservableObject):
     def training_plan(self, plan: Optional[TrainingPlan]):
         self.set_training_plan(plan)
 
+    @_serialized_session_configuration
     def set_training_plan(self, plan: Optional[TrainingPlan], *, force_update: bool = False):
+        if (
+            plan != self._training_plan
+            and self._recording_session.status is not SessionRecordingStatus.READY
+        ):
+            raise RuntimeError(
+                "Changing the selected protocol is unavailable while session "
+                f"state is {self._recording_session.status.value}; edit only "
+                "future inactive trial rows instead"
+            )
         animal = self._selected_animal
         prev, self._training_plan = self._training_plan, plan
         if prev == plan and self._training_plan_animal == animal:
@@ -949,19 +4548,64 @@ class AppModel(ObservableObject):
         if plan is None:
             self._detach_training_plan()  # always
         elif animal is not None:
-            if self._training_mode != TrainingMode.MANUAL:
-                if self._attach_training_plan(plan, force_update=force_update) is False:
-                    return
+            if self._attach_training_plan(plan, force_update=force_update) is False:
+                return
         self._on_property_changed(self.Props.TRAINING_PLAN, plan, prev)
         self._event_manager.post_event_content(
             ApiEventKind.trainingPlanLoad, {'training_plan_id': None if plan is None else plan.plan_id})
+        self._event_manager.post_event_content(
+            ApiEventKind.trainingModeChanged,
+            dict(training_mode=self._derived_api_training_mode()),
+        )
 
     @property
     def output_location(self) -> str:
         return self._output_location
 
+    def _require_session_ready_for_configuration(self, action: str) -> None:
+        status = self._recording_session.status
+        if status is not SessionRecordingStatus.READY:
+            raise RuntimeError(
+                f"{action} is unavailable while session state is {status.value}"
+            )
+
+    @_serialized_session_configuration
+    def update_behavior_configuration(
+        self,
+        action: str,
+        update: Callable[[BehaviorAlgorithm], None],
+    ) -> None:
+        """Apply a Preferences mutation through the session-state boundary."""
+        self._require_session_ready_for_configuration(action)
+        update(self._behavior.algorithm)
+
+    @_serialized_session_configuration
+    def set_live_inference_enabled(self, enabled: bool) -> None:
+        self._require_session_ready_for_configuration(
+            "Changing live inference"
+        )
+        self._inference.is_enabled = bool(enabled)
+
+    @_serialized_session_configuration
+    def set_inference_model_location(self, value: str) -> None:
+        self._require_session_ready_for_configuration(
+            "Changing the inference model"
+        )
+        self._inference.model_location = str(value)
+
+    @_serialized_session_configuration
+    def update_user_preference(self, name: str, value) -> None:
+        self._require_session_ready_for_configuration(
+            f"Changing preference {name}"
+        )
+        if not hasattr(self._preferences, name):
+            raise AttributeError(f"Unknown user preference: {name}")
+        setattr(self._preferences, name, value)
+
     @output_location.setter
+    @_serialized_session_configuration
     def output_location(self, value: str):
+        self._require_session_ready_for_configuration("Changing the output location")
         if self._output_location == value and self._project_info is not None:
             return
         old_value = self._output_location
@@ -985,7 +4629,1830 @@ class AppModel(ObservableObject):
     @notes.setter
     def notes(self, value: str):
         prev, self._notes = self._notes, value
+        if self._editable_notes_project is not None and value != prev:
+            self._notes_revision += 1
         self._on_property_changed(self.Props.NOTES, value, prev)
+
+    def persist_stopped_session_notes(self) -> bool:
+        """Atomically update notes for the most recently stopped session.
+
+        While a validation reads the session the save waits: it returns False
+        and the validation's end state replays it once.
+        """
+        with self._session_publication_lock:
+            project = self._editable_notes_project
+            if project is None:
+                return False
+            validation = self._session_validation.state
+            if validation.active:
+                self._notes_save_pending = True
+                logger.info(
+                    "Session notes wait for the running %s validation",
+                    validation.profile,
+                )
+                return False
+            try:
+                self._save_project_metadata(
+                    project,
+                    caller="session_notes_updated",
+                )
+            except Exception as exc:
+                logger.exception("Failed to update stopped-session notes")
+                self.on_error("Session notes were not saved", str(exc))
+                return False
+            # Saved now, so a replay still queued would only repeat it.
+            self._notes_save_pending = False
+            return True
+
+    def _flush_stopped_session_notes_now(self) -> None:
+        """Save the stopped session's notes before Record or close drops them.
+
+        Unsaved notes cannot wait for a running validation any longer, so it
+        is cancelled; its cancelled-state callback replays the save. Notes
+        already saved leave a running validation alone.
+        """
+        with self._session_publication_lock:
+            unsaved = self._editable_notes_project is not None and (
+                self._notes_save_pending
+                or self._notes_revision != self._notes_saved_revision
+            )
+            active = self._session_validation.state.active
+            if active and unsaved:
+                self._notes_save_pending = True
+        if active:
+            if not unsaved:
+                return
+            # Cancelled with the publication lock released: its callback
+            # takes that lock to replay the save.
+            if self._session_validation.cancel():
+                logger.warning(
+                    "Cancelled the running session validation: notes were "
+                    "waiting to be saved"
+                )
+                return
+            # The validation ended on its own meanwhile: save directly.
+        self.persist_stopped_session_notes()
+
+    @property
+    def session_validation_state(self):
+        return dataclasses.asdict(self._session_validation.state)
+
+    @property
+    def last_stopped_session_path(self):
+        return self._last_stopped_session_path
+
+    def validate_last_session(self, profile="fast") -> bool:
+        if self._recording_session.status is not SessionRecordingStatus.READY:
+            raise RuntimeError("Session validation is unavailable during recording/finalization")
+        path = self._last_stopped_session_path
+        if path is None or not path.is_dir():
+            raise RuntimeError("No successfully stopped session is available")
+        with self._session_publication_lock:
+            self._session_validation.start(path, profile, automatic=False)
+        return True
+
+    def cancel_session_validation(self) -> bool:
+        return self._session_validation.cancel()
+
+    def _on_session_validation_state(self, state) -> None:
+        self.property_changed(
+            self.Props.SESSION_VALIDATION_STATE,
+            dataclasses.asdict(state),
+            None,
+        )
+        if state.active:
+            return
+        # Delivered with the controller's lock released, so taking the
+        # publication lock here keeps the order: publication, then controller.
+        with self._session_publication_lock:
+            pending, self._notes_save_pending = self._notes_save_pending, False
+            if pending:
+                self.persist_stopped_session_notes()
+
+    @property
+    def trial_protocol_rows(self) -> Tuple[dict, ...]:
+        return self._trial_protocol_schedule.to_records()
+
+    @property
+    def selected_ordered_protocol(self) -> Optional[TrialProtocolDocument]:
+        return self._selected_ordered_protocol
+
+    def save_tone_profile(
+        self, profile_id: str, frequency_hz: int, duration_ms: int,
+    ) -> ToneProfile:
+        self._require_session_ready_for_configuration("Editing tone profiles")
+        profile_id = str(profile_id).strip()
+        previous = self._tone_profiles.get(profile_id)
+        profile = ToneProfile(
+            profile_id,
+            1 if previous is None else previous.revision + 1,
+            int(frequency_hz),
+            int(duration_ms),
+        )
+        tones = {**self._tone_profiles, profile_id: profile}
+        self._save_stimulus_profiles(tones, self._laser_profiles)
+        return profile
+
+    def laser_profile(self, profile_id: str) -> Optional[LaserPulseProfile]:
+        """The saved laser profile with this identifier, or None.
+
+        The protocol state only carries each profile's name and a summary
+        line, which is enough to list them but not to rebuild the pulse train
+        they describe.
+        """
+        return self._laser_profiles.get(str(profile_id))
+
+    def save_laser_profile(self, **values) -> LaserPulseProfile:
+        self._require_session_ready_for_configuration("Editing laser profiles")
+        profile_id = str(values.pop("profile_id")).strip()
+        previous = self._laser_profiles.get(profile_id)
+        profile = LaserPulseProfile(
+            profile_id=profile_id,
+            revision=1 if previous is None else previous.revision + 1,
+            **values,
+        )
+        lasers = {**self._laser_profiles, profile_id: profile}
+        self._save_stimulus_profiles(self._tone_profiles, lasers)
+        return profile
+
+    def save_automatic_shift_policy(self, **values) -> AutomaticShiftPolicy:
+        self._require_session_ready_for_configuration(
+            "Editing automatic shift policies"
+        )
+        policy_id = str(values.pop("policy_id")).strip()
+        previous = self._automatic_shift_policies.get(policy_id)
+        profile = AutomaticShiftPolicy(
+            policy_id=policy_id,
+            revision=1 if previous is None else previous.revision + 1,
+            **values,
+        )
+        policies = {**self._automatic_shift_policies, policy_id: profile}
+        self._save_stimulus_profiles(
+            self._tone_profiles,
+            self._laser_profiles,
+            policies,
+        )
+        return profile
+
+    def delete_stimulus_profile(self, kind: str, profile_id: str) -> None:
+        self._require_session_ready_for_configuration("Deleting stimulus profiles")
+        kind, profile_id = str(kind), str(profile_id)
+        if kind not in {"tone", "laser", "automatic_shift"}:
+            raise ValueError(
+                "Profile kind must be tone, laser, or automatic_shift"
+            )
+        field = {
+            "tone": "tone_profile_id",
+            "laser": "laser_profile_id",
+            "automatic_shift": "automatic_shift_policy_id",
+        }[kind]
+        if kind == "automatic_shift" and profile_id == "default":
+            raise ValueError("The default automatic shift policy cannot be deleted")
+        referenced = []
+        for document in self._trial_protocol_repository.documents:
+            if any(getattr(item.row, field) == profile_id for item in document.resolve()):
+                referenced.append(document.name)
+        if referenced:
+            raise RuntimeError(
+                f"Profile {profile_id!r} is used by: {', '.join(referenced)}"
+            )
+        tones, lasers = dict(self._tone_profiles), dict(self._laser_profiles)
+        automatic_shifts = dict(self._automatic_shift_policies)
+        target = {
+            "tone": tones,
+            "laser": lasers,
+            "automatic_shift": automatic_shifts,
+        }[kind]
+        if target.pop(profile_id, None) is None:
+            raise KeyError(f"Unknown {kind} profile {profile_id!r}")
+        self._save_stimulus_profiles(tones, lasers, automatic_shifts)
+
+    def _save_stimulus_profiles(self, tones, lasers, automatic_shifts=None) -> None:
+        library = self._stimulus_profile_repository.library
+        automatic_shifts = (
+            self._automatic_shift_policies
+            if automatic_shifts is None
+            else automatic_shifts
+        )
+        saved = self._stimulus_profile_repository.save(
+            StimulusProfileLibrary(
+                revision=library.revision,
+                tone_profiles=tuple(tones[key] for key in sorted(tones)),
+                cue_interval_profiles=tuple(
+                    self._cue_interval_profiles[key]
+                    for key in sorted(self._cue_interval_profiles)
+                ),
+                stimulus_trigger_profiles=tuple(
+                    self._stimulus_trigger_profiles[key]
+                    for key in sorted(self._stimulus_trigger_profiles)
+                ),
+                laser_profiles=tuple(lasers[key] for key in sorted(lasers)),
+                automatic_shift_profiles=tuple(
+                    automatic_shifts[key] for key in sorted(automatic_shifts)
+                ),
+            ),
+            expected_revision=library.revision,
+        )
+        self._tone_profiles = {item.profile_id: item for item in saved.tone_profiles}
+        self._cue_interval_profiles = {
+            item.profile_id: item for item in saved.cue_interval_profiles
+        }
+        self._stimulus_trigger_profiles = {
+            item.profile_id: item for item in saved.stimulus_trigger_profiles
+        }
+        self._laser_profiles = {item.profile_id: item for item in saved.laser_profiles}
+        self._automatic_shift_policies = {
+            item.policy_id: item for item in saved.automatic_shift_profiles
+        }
+        self._notify_trial_protocol_state()
+
+    def _selected_protocol_requires_stim_camera(self) -> bool:
+        if self._selected_ordered_protocol is None:
+            return False
+        return any(
+            row.enabled
+            and row.stimulus_assignment is not StimulusAssignment.DISABLED
+            and row.stimulus_trigger is StimulusTrigger.FIRST_REACH
+            for row in self._trial_protocol_schedule.rows
+        )
+
+    def _configure_stim_camera_for_selected_protocol(self) -> None:
+        camera = self._stim_camera
+        if camera is None or not camera.is_enabled:
+            return
+        camera.configure_stim_session_mode(
+            self._selected_protocol_requires_stim_camera()
+        )
+
+    @property
+    def protocol_readiness(self) -> Tuple[ReadinessFinding, ...]:
+        """The selected protocol's check, as the next recording runs it.
+
+        A recording starts at trial 1, so every enabled row is still to run:
+        the rows the last session completed are checked too.
+        """
+        return self._protocol_readiness
+
+    @property
+    def protocol_check_notice(self) -> str:
+        """'Protocol check: N warnings (see Check protocol)', or empty."""
+        count = sum(1 for item in self._protocol_readiness if item.severity == "warning")
+        if not count:
+            return ""
+        return "Protocol check: {} warning{} (see Check protocol)".format(
+            count, "" if count == 1 else "s")
+
+    def check_selected_protocol(self) -> Tuple[ReadinessFinding, ...]:
+        """The check as Check protocol shows it: run now, on the rows still to run.
+
+        During a session those are the rows it has not completed; otherwise
+        every row, as protocol_readiness has them.
+        """
+        completed = ()
+        if self._recording_session.status is not SessionRecordingStatus.READY:
+            completed = tuple(self.trial_protocol_state["completed_trial_ids"])
+        try:
+            inputs = self._protocol_readiness_snapshot(completed)
+            return () if inputs is None else check_protocol_readiness(*inputs)
+        except Exception as error:
+            return self._protocol_check_fault(error)[1]
+
+    def note_laser_tab_profile(self, channel_id, profile_id) -> None:
+        """The profile now picked on a laser's Laser Control tab, for the check.
+
+        Run Pulse and Test stim fire it. A protocol row fires its own, and the
+        check says so for a laser the protocol fires with none picked: on
+        2026-10-02 laser 2's empty tab read as the reason it did not fire.
+        """
+        number, profile_id = int(channel_id), profile_id or None
+        if number in self._laser_tab_profiles and self._laser_tab_profiles[number] == profile_id:
+            return
+        self._laser_tab_profiles[number] = profile_id
+        self._refresh_protocol_readiness()
+
+    def _on_protocol_readiness_input_changed(self, name, _value, _old_value) -> None:
+        # Only what the check reads: the laser's feedback samples and the
+        # stream's status text change often and tell it nothing.
+        if name in {
+            LaserModel.CONFIGURATION,
+            LaserModel.IS_CONNECTED,
+            NidaqSignalMonitorModel.CONFIGURATION,
+            NidaqSignalMonitorModel.HARDWARE_ENABLED,
+            NidaqSignalMonitorModel.IS_STARTING,
+            NidaqSignalMonitorModel.IS_RUNNING,
+            NidaqSignalMonitorModel.ERROR_MESSAGE,
+            NidaqSignalMonitorModel.TIMING_PLAN,
+        }:
+            self._refresh_protocol_readiness()
+
+    def _protocol_readiness_snapshot(self, completed_trial_ids=()):
+        """What the check reads, taken at once; None with no protocol selected."""
+        with self._trial_protocol_lock:
+            if self._selected_ordered_protocol is None:
+                return None
+            # The schedule, not the document: its rows are the ones
+            # _compile_protocol_trial compiles.
+            schedule = self._trial_protocol_schedule
+            library = StimulusProfileLibrary(
+                tone_profiles=tuple(self._tone_profiles.values()),
+                cue_interval_profiles=tuple(self._cue_interval_profiles.values()),
+                stimulus_trigger_profiles=tuple(self._stimulus_trigger_profiles.values()),
+                laser_profiles=tuple(self._laser_profiles.values()),
+                automatic_shift_profiles=tuple(self._automatic_shift_policies.values()),
+            )
+        monitor = self._nidaq_signal_monitor
+        camera = self._stim_camera
+        return (
+            schedule,
+            ProtocolRigConfiguration(
+                laser=self._laser.configuration,
+                nidaq_stream=monitor.configuration,
+            ),
+            library,
+            ReadinessLiveState(
+                laser_connected=self._laser.is_connected,
+                laser_close_refusal=self.laser_controller_close_refusal(),
+                nidaq_stream_state=monitor.stream_state,
+                timing_plan=monitor.timing_plan,
+                laser_timing_plan=(
+                    self._laser_timing_plan if self._laser.is_connected else None
+                ),
+                device_aliases=monitor.runtime_device_aliases,
+                stim_camera_enabled=camera is not None and camera.is_enabled,
+                laser_tab_profiles=dict(self._laser_tab_profiles),
+                completed_trial_ids=tuple(completed_trial_ids),
+            ),
+        )
+
+    def _protocol_check_fault(self, error):
+        """A fault in the check itself, as a snapshot and its findings.
+
+        An error, which holds Record back rather than letting the protocol run
+        unchecked. Logged, with its traceback, the first time it is met: the
+        snapshot equals nothing, so every refresh runs the check again, and
+        each one logged it and put it on the status bar.
+        """
+        message = f"the protocol check could not run: {error}"
+        with self._protocol_readiness_lock:
+            first = message not in self._protocol_check_faults
+            self._protocol_check_faults.add(message)
+        if first:
+            logger.exception("The protocol check could not run")
+        return object(), (ReadinessFinding("error", None, message),)
+
+    def _refresh_protocol_readiness(
+        self, *, publish: bool = True, wait_s: float = 0.0,
+    ) -> None:
+        """Run the protocol check again if what it reads has changed.
+
+        Called where that changes: the selected protocol, its revision and the
+        profile library (_notify_trial_protocol_state); the laser and the
+        stream (_on_protocol_readiness_input_changed); a subsystem's status; a
+        configuration load; a laser tab's pick; and Record. One caller runs it
+        at a time, holding no other lock, and a change asked about meanwhile
+        is run by that caller's loop: what is kept is never older than the
+        last state asked about. RECORDING_BLOCKERS is published when Record's
+        lines change.
+
+        A caller that finds another computing returns at once, unless it gives
+        `wait_s`: then it waits that long for that caller's loop, which runs
+        its request too, to end. Record does, so that it reads the check of
+        the state as it is when it is taken.
+        """
+        with self._protocol_readiness_lock:
+            if not self._protocol_readiness_enabled:
+                return
+            self._protocol_readiness_requests += 1
+            if self._protocol_readiness_busy:
+                if wait_s > 0 and not self._protocol_readiness_idle.wait_for(
+                        lambda: not self._protocol_readiness_busy, wait_s):
+                    logger.warning(
+                        "The protocol check was still running %.1f s later; "
+                        "Record reads it as it last ran", wait_s)
+                return
+            self._protocol_readiness_busy = True
+        changed = False
+        try:
+            while True:
+                with self._protocol_readiness_lock:
+                    request = self._protocol_readiness_requests
+                findings = None
+                try:
+                    inputs = self._protocol_readiness_snapshot()
+                    if inputs != self._protocol_readiness_inputs:
+                        findings = () if inputs is None else check_protocol_readiness(*inputs)
+                except Exception as error:
+                    inputs, findings = self._protocol_check_fault(error)
+                if findings is not None:
+                    lines = protocol_blocker_lines(findings)
+                    changed = changed or lines != self._protocol_blocker_lines
+                    self._protocol_readiness_inputs = inputs
+                    self._protocol_readiness = findings
+                    self._protocol_blocker_lines = lines
+                with self._protocol_readiness_lock:
+                    if request == self._protocol_readiness_requests:
+                        self._protocol_readiness_busy = False
+                        self._protocol_readiness_idle.notify_all()
+                        break
+        except BaseException:
+            with self._protocol_readiness_lock:
+                self._protocol_readiness_busy = False
+                self._protocol_readiness_idle.notify_all()
+            raise
+        if changed and publish:
+            self.property_changed(
+                self.Props.RECORDING_BLOCKERS,
+                self.recording_blockers,
+                None,
+            )
+
+    @property
+    def ordered_protocols(self) -> Tuple[TrialProtocolDocument, ...]:
+        return self._trial_protocol_repository.documents
+
+    @property
+    def trial_protocol_sets(self):
+        with self._trial_protocol_lock:
+            return self._trial_protocol_set_repository.documents
+
+    @property
+    def experiment_compositions(self):
+        with self._trial_protocol_lock:
+            return self._experiment_repository.documents
+
+    def create_experiment(self, experiment_id: str, name: str):
+        """Start an empty experiment for the builder to fill."""
+        with self._trial_protocol_lock:
+            if self._experiment_repository.get(experiment_id) is not None:
+                raise ValueError(
+                    "Experiment {!r} already exists".format(experiment_id)
+                )
+            return self._experiment_repository.save(
+                ExperimentComposition(experiment_id=experiment_id, name=name)
+            )
+
+    def save_experiment_entries(self, experiment_id: str, entries):
+        """Replace an experiment's ordered set list.
+
+        Entries are not checked against the set library here: an experiment is
+        a draft until it is compiled, and compile_experiment is where a missing
+        set or a stale revision pin is reported against the offending entry.
+        """
+        with self._trial_protocol_lock:
+            composition = self._experiment_repository.get(experiment_id)
+            if composition is None:
+                raise ValueError("Unknown experiment {!r}".format(experiment_id))
+            return self._experiment_repository.save(
+                composition.with_entries(tuple(entries))
+            )
+
+    def compile_and_save_experiment(self, experiment_id: str):
+        """Compile an experiment and publish it as a selectable protocol."""
+        with self._trial_protocol_lock:
+            composition = self._experiment_repository.get(experiment_id)
+            if composition is None:
+                raise ValueError("Unknown experiment {!r}".format(experiment_id))
+            compiled = compile_experiment(
+                composition, self._trial_protocol_set_repository.library()
+            )
+            # Persist any seed the compiler drew before publishing the protocol
+            # it produced, so the compile can always be reproduced.
+            self._experiment_repository.save(compiled.composition)
+            return self._trial_protocol_repository.save(compiled.document)
+
+    def save_protocol_as_set(self, protocol_id: str, set_id: str, name: str):
+        """Capture a protocol you have built in the editor as a reusable set."""
+        with self._trial_protocol_lock:
+            document = self._trial_protocol_repository.get(protocol_id)
+            if document is None:
+                raise ValueError("Unknown protocol {!r}".format(protocol_id))
+            return self._trial_protocol_set_repository.save(
+                set_from_document(document, set_id=set_id, name=name)
+            )
+
+    def open_set_as_protocol(self, set_id: str, protocol_id: str, name: str):
+        """Publish a set as an editable protocol, to revise and capture again."""
+        with self._trial_protocol_lock:
+            protocol_set = self._trial_protocol_set_repository.get(set_id)
+            if protocol_set is None:
+                raise ValueError("Unknown set {!r}".format(set_id))
+            return self._trial_protocol_repository.save(
+                document_from_set(protocol_set, protocol_id=protocol_id, name=name)
+            )
+
+    @property
+    def trial_protocol_state(self) -> dict:
+        ledger = self._trial_ledger
+        attempts = () if ledger is None else ledger.attempts
+        active = None if ledger is None else ledger.active_attempt
+        active_trial_id = None if active is None else active.trial_id
+        prepared_operation = self._trial_action_executor.operation
+        if (
+            active_trial_id is None
+            and prepared_operation is not None
+            and prepared_operation.state not in prepared_operation.TERMINAL
+        ):
+            active_trial_id = prepared_operation.recipe.logical_trial_id
+        session_control = self._behavior.algorithm.active_config.session_control
+        estimate = self._intertrial_analysis.timing_estimate(1.0)
+        if active is not None and active_trial_id is None and active.protocol_context:
+            active_trial_id = (
+                active.protocol_context.get("trial_row") or {}
+            ).get("trial_id")
+        return {
+            "rows": self.trial_protocol_rows,
+            "selected_protocol": (
+                None
+                if self._selected_ordered_protocol is None
+                else {
+                    "protocol_id": self._selected_ordered_protocol.protocol_id,
+                    "name": self._selected_ordered_protocol.name,
+                    "revision": self._selected_ordered_protocol.revision,
+                }
+            ),
+            "protocols": tuple(
+                {
+                    "protocol_id": document.protocol_id,
+                    "name": document.name,
+                    "revision": document.revision,
+                    "trial_count": document.trial_count,
+                }
+                for document in self.ordered_protocols
+            ),
+            "repository_errors": dict(self._trial_protocol_repository.errors),
+            "tone_profiles": tuple(
+                {
+                    "profile_id": profile.profile_id,
+                    "revision": profile.revision,
+                    "summary": f"{profile.frequency_hz} Hz, {profile.duration_ms} ms",
+                }
+                for profile in self._tone_profiles.values()
+            ),
+            "laser_profiles": tuple(
+                {
+                    "profile_id": profile.profile_id,
+                    "revision": profile.revision,
+                    "summary": profile.summary(),
+                }
+                for profile in self._laser_profiles.values()
+            ),
+            "automatic_shift_profiles": tuple(
+                {
+                    "profile_id": profile.policy_id,
+                    "policy_id": profile.policy_id,
+                    "revision": profile.revision,
+                    "summary": (
+                        f"{profile.reduction_method.value}, "
+                        f"{','.join(sorted(profile.eligible_outcomes))}, "
+                        f"max update {profile.maximum_update_mm} mm"
+                    ),
+                }
+                for profile in self._automatic_shift_policies.values()
+            ),
+            "cue_interval_profiles": tuple(
+                {
+                    "profile_id": profile.profile_id,
+                    "revision": profile.revision,
+                    "summary": (
+                        f"{profile.preset}, "
+                        f"{len(profile.distribution().values)} intervals"
+                    ),
+                }
+                for profile in self._cue_interval_profiles.values()
+            ),
+            "stimulus_trigger_profiles": tuple(
+                {
+                    "profile_id": profile.profile_id,
+                    "revision": profile.revision,
+                    "summary": (
+                        f"{len([c for c in profile.categories if c.enabled])} "
+                        f"of {len(profile.categories)} triggers enabled"
+                    ),
+                }
+                for profile in self._stimulus_trigger_profiles.values()
+            ),
+            "active_trial_id": active_trial_id,
+            "completed_trial_ids": tuple(sorted({
+                attempt.trial_id
+                for attempt in attempts
+                if attempt.trial_id is not None and attempt.logical_trial_complete
+            })),
+            "analysis": {
+                "enabled": session_control.intertrial_analysis_enabled,
+                "progression_mode": session_control.intertrial_progression_mode,
+                "pending_attempts": (
+                    0
+                    if ledger is None
+                    else ledger.summary().get("pending_analysis_attempts", 0)
+                ),
+                "send_block_reason": self._behavior.algorithm.pellet_send_block_reason,
+                "resolution_required": self._intertrial_resolution_request is not None,
+                "resolution_reason": self._intertrial_resolution_reason,
+                "seconds_per_tracking_second": estimate.mean_realtime_factor,
+                "estimate": estimate.display_text,
+            },
+        }
+
+    @_serialized_session_configuration
+    def update_trial_protocol_row(self, trial_id: int, field: str, value) -> bool:
+        result = self.apply_ordered_protocol_values(
+            (trial_id,),
+            {field: value},
+            scope_kind="trials",
+        )
+        return bool(result["changed_trial_ids"])
+
+    @_serialized_session_configuration
+    def apply_ordered_protocol_values(
+        self,
+        trial_ids,
+        values,
+        *,
+        scope_kind: str = "trials",
+        scope_name: str = "",
+        parent_epoch: str = "",
+    ) -> dict:
+        """Atomically apply a typed patch at one authoring hierarchy level."""
+        with self._trial_protocol_lock:
+            state = self.trial_protocol_state
+            document = self._selected_ordered_protocol
+            if document is None:
+                return {
+                    "changed_trial_ids": (),
+                    "skipped_trial_ids": (),
+                    "reason": "No ordered protocol is selected",
+                }
+            requested = tuple(sorted({int(value) for value in trial_ids}))
+            valid_range = set(range(1, document.trial_count + 1))
+            if not set(requested) <= valid_range:
+                raise ValueError("Protocol edit contains out-of-range trial IDs")
+            locked = set(state["completed_trial_ids"])
+            if state["active_trial_id"] is not None:
+                locked.add(int(state["active_trial_id"]))
+            changed = tuple(value for value in requested if value not in locked)
+            skipped = tuple(value for value in requested if value in locked)
+            if scope_kind == "protocol":
+                if locked:
+                    return {
+                        "changed_trial_ids": (),
+                        "skipped_trial_ids": tuple(sorted(locked)),
+                        "reason": (
+                            "Protocol defaults cannot change after a trial is "
+                            "active or completed; edit future trials instead"
+                        ),
+                    }
+                changed = tuple(range(1, document.trial_count + 1))
+            if not changed:
+                return {
+                    "changed_trial_ids": (),
+                    "skipped_trial_ids": skipped,
+                    "reason": "Every selected trial is locked",
+                }
+
+            patch = ProtocolPatch.from_mapping(values)
+            overrides = {
+                item.trial_id: item.patch.to_mapping()
+                for item in document.trial_overrides
+            }
+            epochs = document.epochs
+            blocks = document.blocks
+            bulk = document.bulk_overrides
+            defaults = document.defaults
+            if scope_kind == "trials":
+                for trial_id in changed:
+                    merged = overrides.setdefault(trial_id, {})
+                    merged.update(patch.to_mapping())
+            elif scope_kind == "bulk":
+                bulk = (*bulk, ProtocolScope.create(
+                    scope_name or f"bulk-{document.revision + 1}",
+                    changed,
+                    patch.to_mapping(),
+                ))
+            elif scope_kind == "epoch":
+                if skipped:
+                    raise ValueError("An epoch cannot include locked trials")
+                epochs = tuple(item for item in epochs if item.name != scope_name)
+                epochs = (*epochs, ProtocolScope.create(
+                    scope_name,
+                    changed,
+                    patch.to_mapping(),
+                ))
+            elif scope_kind == "block":
+                if skipped:
+                    raise ValueError("A block cannot include locked trials")
+                blocks = tuple(item for item in blocks if item.name != scope_name)
+                blocks = (*blocks, ProtocolScope.create(
+                    scope_name,
+                    changed,
+                    patch.to_mapping(),
+                    parent_epoch=parent_epoch,
+                ))
+            elif scope_kind == "protocol":
+                merged = defaults.to_mapping()
+                merged.update(patch.to_mapping())
+                defaults = ProtocolPatch.from_mapping(merged)
+            else:
+                raise ValueError(f"Unknown protocol edit scope: {scope_kind}")
+
+            updated = dataclasses.replace(document,
+                defaults=defaults,
+                epochs=epochs,
+                blocks=blocks,
+                bulk_overrides=bulk,
+                trial_overrides=tuple(
+                    TrialOverride.create(key, overrides[key])
+                    for key in sorted(overrides)
+                ),
+            )
+            saved = self._trial_protocol_repository.save(
+                updated,
+                expected_revision=document.revision,
+            )
+            self._selected_ordered_protocol = saved
+            self._trial_protocol_schedule = TrialProtocolSchedule.from_document(saved)
+        self._notify_trial_protocol_state()
+        return {
+            "changed_trial_ids": changed,
+            "skipped_trial_ids": skipped,
+            "reason": "",
+            "revision": saved.revision,
+        }
+
+    @_serialized_session_configuration
+    def apply_ordered_protocol_row_patches(self, row_patches) -> dict:
+        """Apply differing per-row values in one protocol revision."""
+        with self._trial_protocol_lock:
+            document = self._selected_ordered_protocol
+            if document is None:
+                return {
+                    "changed_trial_ids": (),
+                    "skipped_trial_ids": (),
+                    "reason": "No ordered protocol is selected",
+                }
+            state = self.trial_protocol_state
+            locked = set(state["completed_trial_ids"])
+            if state["active_trial_id"] is not None:
+                locked.add(int(state["active_trial_id"]))
+            patches = {int(key): value for key, value in row_patches.items()}
+            valid = set(range(1, document.trial_count + 1))
+            if not set(patches) <= valid:
+                raise ValueError("Protocol edit contains out-of-range trial IDs")
+            changed = tuple(sorted(set(patches) - locked))
+            skipped = tuple(sorted(set(patches) & locked))
+            if not changed:
+                return {
+                    "changed_trial_ids": (),
+                    "skipped_trial_ids": skipped,
+                    "reason": "Every selected trial is locked",
+                }
+            overrides = {
+                item.trial_id: item.patch.to_mapping()
+                for item in document.trial_overrides
+            }
+            for trial_id in changed:
+                patch = ProtocolPatch.from_mapping(patches[trial_id])
+                overrides.setdefault(trial_id, {}).update(patch.to_mapping())
+            updated = dataclasses.replace(
+                document,
+                trial_overrides=tuple(
+                    TrialOverride.create(key, overrides[key])
+                    for key in sorted(overrides)
+                ),
+            )
+            saved = self._trial_protocol_repository.save(
+                updated,
+                expected_revision=document.revision,
+            )
+            self._selected_ordered_protocol = saved
+            self._trial_protocol_schedule = TrialProtocolSchedule.from_document(saved)
+        self._notify_trial_protocol_state()
+        return {
+            "changed_trial_ids": changed,
+            "skipped_trial_ids": skipped,
+            "reason": "",
+            "revision": saved.revision,
+        }
+
+    @_serialized_session_configuration
+    def select_ordered_protocol(self, protocol_id: Optional[str]) -> bool:
+        self._require_session_ready_for_configuration(
+            "Changing the ordered trial protocol"
+        )
+        self._select_ordered_protocol_internal(protocol_id, persist_animal=True)
+        return True
+
+    def _select_ordered_protocol_internal(
+        self,
+        protocol_id: Optional[str],
+        *,
+        persist_animal: bool,
+    ) -> None:
+        with self._trial_protocol_lock:
+            if protocol_id in {None, "", "none"}:
+                document = None
+                schedule = TrialProtocolSchedule.with_placeholder_rows()
+            else:
+                document = self._trial_protocol_repository.get(str(protocol_id))
+                if document is None:
+                    raise KeyError(f"Unknown ordered protocol {protocol_id!r}")
+                schedule = TrialProtocolSchedule.from_document(document)
+            self._selected_ordered_protocol = document
+            self._trial_protocol_schedule = schedule
+            animal = self._selected_animal
+            if persist_animal and animal is not None:
+                animal.training.ordered_protocol_id = (
+                    None if document is None else document.protocol_id
+                )
+                self._save_animal_metadata(
+                    animal,
+                    sender="ordered_protocol_selection",
+                )
+        self._notify_trial_protocol_state()
+
+    @_serialized_session_configuration
+    def save_ordered_protocol(
+        self,
+        document: TrialProtocolDocument,
+        *,
+        expected_revision: Optional[int] = None,
+        select: bool = True,
+    ) -> TrialProtocolDocument:
+        self._require_session_ready_for_configuration("Saving an ordered protocol")
+        saved = self._trial_protocol_repository.save(
+            document,
+            expected_revision=expected_revision,
+        )
+        if select:
+            self._select_ordered_protocol_internal(
+                saved.protocol_id,
+                persist_animal=True,
+            )
+        else:
+            self._notify_trial_protocol_state()
+        return saved
+
+    @_serialized_session_configuration
+    def restore_ordered_protocol_document(
+        self,
+        document: TrialProtocolDocument,
+    ) -> TrialProtocolDocument:
+        """Publish a historical editor snapshot as a new auditable revision."""
+        current = self._selected_ordered_protocol
+        if current is None or current.protocol_id != document.protocol_id:
+            raise RuntimeError("Undo/redo snapshot does not match the selected protocol")
+        restored = dataclasses.replace(document, revision=current.revision)
+        return self.save_ordered_protocol(
+            restored,
+            expected_revision=current.revision,
+            select=True,
+        )
+
+    @_serialized_session_configuration
+    def create_ordered_protocol(
+        self,
+        protocol_id: str,
+        name: str,
+        *,
+        trial_count: int = 15,
+    ) -> TrialProtocolDocument:
+        document = TrialProtocolDocument(
+            protocol_id=protocol_id,
+            name=name,
+            trial_count=int(trial_count),
+            description="New disabled protocol; validate rows before use.",
+        )
+        return self.save_ordered_protocol(document, select=True)
+
+    @_serialized_session_configuration
+    def duplicate_ordered_protocol(
+        self,
+        source_id: str,
+        *,
+        protocol_id: str,
+        name: str,
+    ) -> TrialProtocolDocument:
+        self._require_session_ready_for_configuration(
+            "Duplicating an ordered protocol"
+        )
+        saved = self._trial_protocol_repository.duplicate(
+            source_id,
+            protocol_id=protocol_id,
+            name=name,
+        )
+        self._select_ordered_protocol_internal(
+            saved.protocol_id,
+            persist_animal=True,
+        )
+        return saved
+
+    @_serialized_session_configuration
+    def rename_ordered_protocol(
+        self,
+        source_id: str,
+        *,
+        protocol_id: str,
+        name: str,
+    ) -> TrialProtocolDocument:
+        self._require_session_ready_for_configuration("Renaming an ordered protocol")
+        source = self._trial_protocol_repository.get(source_id)
+        if source is None:
+            raise KeyError(source_id)
+        saved = self._trial_protocol_repository.rename(
+            source_id,
+            protocol_id=protocol_id,
+            name=name,
+            expected_revision=source.revision,
+        )
+        self._select_ordered_protocol_internal(
+            saved.protocol_id,
+            persist_animal=True,
+        )
+        return saved
+
+    @_serialized_session_configuration
+    def import_ordered_protocol(self, path: Path) -> TrialProtocolDocument:
+        self._require_session_ready_for_configuration("Importing an ordered protocol")
+        saved = self._trial_protocol_repository.import_file(path)
+        self._select_ordered_protocol_internal(
+            saved.protocol_id,
+            persist_animal=True,
+        )
+        return saved
+
+    def export_ordered_protocol(self, protocol_id: str, path: Path) -> Path:
+        return self._trial_protocol_repository.export_file(protocol_id, path)
+
+    @_serialized_session_configuration
+    def reload_ordered_protocols(self) -> bool:
+        self._require_session_ready_for_configuration("Reloading ordered protocols")
+        selected_id = (
+            None
+            if self._selected_ordered_protocol is None
+            else self._selected_ordered_protocol.protocol_id
+        )
+        self._trial_protocol_repository.reload()
+        if selected_id is not None and self._trial_protocol_repository.get(selected_id):
+            self._select_ordered_protocol_internal(
+                selected_id,
+                persist_animal=False,
+            )
+        else:
+            self._select_ordered_protocol_internal(None, persist_animal=False)
+        return True
+
+    def request_pellet_send(
+        self,
+        *,
+        force: bool = True,
+        automatic: bool = False,
+    ) -> bool:
+        """Prepare a selected row off the Qt thread, then dispatch SEND."""
+        pellet = self._behavior.system_machine.pellet
+        if (
+            self._selected_ordered_protocol is None
+            or not self._behavior.algorithm.is_in_session
+        ):
+            return bool(pellet.send_pellet(force=force))
+        token = self._recording_session.token()
+        if token is None or self._recording_session.status is not SessionRecordingStatus.RECORDING:
+            self.on_error(
+                "Pellet trial unavailable",
+                "A selected ordered protocol can send pellets only while recording.",
+            )
+            return False
+        trial_id = self._pellet_cycles.planned_trial_id
+        try:
+            row = self._trial_protocol_schedule.row(trial_id)
+        except KeyError:
+            self.on_error("Protocol complete", "No future pellet-trial row is available.")
+            return False
+        if automatic and row.pellet_behavior.value == "manual_trial":
+            return False
+        with self._protocol_action_lock:
+            operation = self._trial_action_executor.operation
+            if (
+                operation is not None
+                and operation.state is PreparedState.PREPARED
+                and operation.recipe.session_generation == token.generation
+                and operation.recipe.logical_trial_id == trial_id
+            ):
+                return bool(pellet.send_pellet(force=force))
+            if self._protocol_action_thread is not None and self._protocol_action_thread.is_alive():
+                return False
+            thread = threading.Thread(
+                target=self._prepare_and_dispatch_protocol_send,
+                args=(token, trial_id, force),
+                name=f"PreparePelletTrial-{trial_id}",
+                daemon=True,
+            )
+            self._protocol_action_thread = thread
+            thread.start()
+        self._notify_trial_protocol_state()
+        return True
+
+    def _prepare_and_dispatch_protocol_send(
+        self,
+        token: SessionGeneration,
+        trial_id: int,
+        force: bool,
+    ) -> None:
+        try:
+            recipe = self._compile_protocol_trial(token, trial_id)
+            operation = self._trial_action_executor.prepare(recipe)
+            if not self._recording_session.is_current(
+                token,
+                statuses=(SessionRecordingStatus.RECORDING,),
+            ):
+                self._trial_action_executor.cancel(
+                    generation=token.generation,
+                    reason="session generation ended during preparation",
+                )
+                return
+            # The latency record's first CAN stage: the trial asks for SEND.
+            self._session_data_recorder.latency_events.record_can(
+                "trial_send", {"kind": "SEND_PELLET", "perf": time.perf_counter()})
+            # The pellet machine's triggers are relayed to the behaviour
+            # algorithm's thread without waiting, and the relay returns
+            # nothing. Wait for this one, so the state below says whether
+            # the SEND was taken: unwaited, every protocol Send was failed
+            # here before that thread ran it (christielab10, 2026-10-02).
+            with BehaviorAlgorithm.set_put_func_call_mode(True):
+                self._behavior.system_machine.pellet.send_pellet(force=force)
+            if operation.state is PreparedState.PREPARED:
+                self._trial_action_executor.fail(
+                    RuntimeError("pellet state machine did not accept SEND")
+                )
+                raise RuntimeError("Pellet SEND was not accepted after preparation")
+        except Exception as error:
+            # Preparation may have reserved one-shot cover/tone/STIM actions
+            # before a later motor or laser step failed. Never let those
+            # actions leak into the next manual or protocol SEND.
+            self._behavior.system_machine.pellet.cancel_prepared_cover_policy()
+            logger.exception("Pellet-trial preparation failed")
+            self.on_error(
+                "Pellet trial was not sent",
+                f"Preparation failed without consuming a trial: {error}",
+            )
+        finally:
+            with self._protocol_action_lock:
+                if self._protocol_action_thread is threading.current_thread():
+                    self._protocol_action_thread = None
+            self._notify_trial_protocol_state()
+
+    def _compile_protocol_trial(
+        self,
+        token: SessionGeneration,
+        trial_id: int,
+    ):
+        document = self._selected_ordered_protocol
+        animal = self._selected_animal
+        if document is None or animal is None:
+            raise RuntimeError("A selected protocol and subject are required")
+        row = self._trial_protocol_schedule.row(trial_id)
+        attempts = () if self._trial_ledger is None else self._trial_ledger.attempts
+        attempt_id = 1 + max(
+            (item.attempt_id for item in attempts if item.trial_id == trial_id),
+            default=0,
+        )
+        diamond = self._behavior.algorithm.diamond_triangle_config
+
+        def dcs_to_motor(values):
+            offset = Offset3DTuple(*values)
+            converted = offset if diamond is None else diamond.diamond_to_motor(offset)
+            return tuple(converted)
+
+        delivery = self._behavior.algorithm.active_config.pellet_delivery
+        lane_offsets = {
+            "center": (0.0, 0.0, 0.0),
+            "left": tuple(delivery.lane_left_offset_dcs),
+            "right": tuple(delivery.lane_right_offset_dcs),
+        }
+        automatic = None
+        if row.position_mode.value == "reach_derived_automatic":
+            controller = self._automatic_shift_controller(row)
+            automatic = controller.latest
+            if automatic is not None and automatic.apply_automatically:
+                controller.accept(automatic.generation)
+        context = TrialCompileContext(
+            session_id=token.session_id,
+            session_generation=token.generation,
+            protocol_id=document.protocol_id,
+            protocol_revision=document.revision,
+            logical_trial_id=trial_id,
+            attempt_id=attempt_id,
+            session_seed=self._protocol_session_seed,
+            animal_base_dcs=(animal.pellet_x, animal.pellet_y, animal.pellet_z),
+            lane_offsets_dcs=lane_offsets,
+            automatic_target_dcs=(
+                None
+                if automatic is None or not automatic.apply_automatically
+                else automatic.resolved_target_dcs
+            ),
+            automatic_generation=(
+                None if automatic is None else automatic.generation
+            ),
+            automatic_reach_ids=(
+                () if automatic is None else automatic.reach_ids
+            ),
+            automatic_policy=(
+                None
+                if row.position_mode.value != "reach_derived_automatic"
+                else controller.policy.to_record()
+            ),
+            automatic_recommendation=(
+                None if automatic is None else automatic.to_record()
+            ),
+        )
+        if (
+            row.position_lane.value != "center"
+            and lane_offsets[row.position_lane.value] == (0.0, 0.0, 0.0)
+        ):
+            raise RuntimeError(
+                f"{row.position_lane.label} pellet lane has no calibrated DCS offset"
+            )
+        compiler = TrialActionCompiler(
+            tone_profiles=self._tone_profiles,
+            laser_profiles=self._laser_profiles,
+            cue_interval_profiles=self._cue_interval_profiles,
+            stimulus_trigger_profiles=self._stimulus_trigger_profiles,
+            laser_configuration=self._laser.configuration,
+            dcs_to_motor=dcs_to_motor,
+        )
+        return compiler.compile(row, context)
+
+    def _automatic_shift_controller(self, row):
+        base_policy = self._automatic_shift_policies.get(
+            row.automatic_shift_policy_id
+        )
+        if base_policy is None:
+            raise RuntimeError(
+                "Unknown automatic shift policy: "
+                f"{row.automatic_shift_policy_id}"
+            )
+        key = (
+            row.automatic_shift_policy_id,
+            base_policy.revision,
+            row.automatic_window_method.value,
+            row.automatic_window_size,
+        )
+        controller = self._automatic_protocol_shifts.get(key)
+        if controller is None:
+            controller = AutomaticPelletShiftController(dataclasses.replace(
+                base_policy,
+                window_method=row.automatic_window_method.value,
+                window_size=row.automatic_window_size,
+                minimum_y_dcs=(
+                    None
+                    if self._selected_animal is None
+                    else self._selected_animal.target_y_limit
+                ),
+            ))
+            self._automatic_protocol_shifts[key] = controller
+        return controller
+
+    def _move_protocol_motor_target(self, target) -> None:
+        self._protocol_positioning_active = True
+        try:
+            for axis, value in zip("xyz", target):
+                command = getattr(self._hardware, f"set_{axis}")
+                token = command(value, absolute=True, sender="ordered_protocol")
+                if token is None:
+                    raise RuntimeError(f"Pellet {axis.upper()} target was not queued")
+                self._hardware.wait_pending_command_acked(token, timeout=15.0)
+        finally:
+            self._protocol_positioning_active = False
+
+    def _configure_protocol_cover(self, policy: str, recipe) -> None:
+        row = recipe.requested_row
+        if recipe.stimulus_selected and row["stimulus_trigger"] == "pre_reveal":
+            firing = recipe.laser_firing
+            if firing is None or not firing.is_board_trigger:
+                raise RuntimeError(
+                    "Pre-reveal stimulation requires a board STIM laser row"
+                )
+            if policy != "reveal":
+                raise RuntimeError(
+                    "Pre-reveal stimulation requires the pellet cover policy Reveal"
+                )
+            # The laser's own board line: laser 2 on christielab10 is wired
+            # to STIM2, and a board pulse on STIM3 never triggered it.
+            self._behavior.system_machine.pellet.prepare_pre_reveal_stimulus(
+                row["pre_reveal_ms"],
+                firing.trigger_pulse_us,
+                stim_line=firing.stim_line,
+            )
+            return
+        self._behavior.system_machine.pellet.prepare_cover_policy(policy)
+
+    def _play_protocol_tone(self, profile: ToneProfile, phase: str) -> None:
+        if phase == "embedded_in_sequence":
+            self._behavior.system_machine.pellet.prepare_embedded_tone(
+                profile.frequency_hz,
+                profile.duration_ms,
+            )
+            return
+        token = self._hardware.play_tone(
+            profile.frequency_hz,
+            profile.duration_ms / 1000.0,
+        )
+        if token is None:
+            raise RuntimeError(f"Tone {profile.profile_id} was not queued at {phase}")
+        self._hardware.wait_pending_command_acked(token, timeout=5.0)
+
+    def _prepare_protocol_laser(self, profile, recipe):
+        prepare = getattr(self._laser, "prepare_pulse_profile", None)
+        if prepare is None:
+            raise RuntimeError("Asynchronous protocol laser preparation is unavailable")
+        firing = recipe.laser_firing
+        if firing.trigger_terminal:
+            firing = dataclasses.replace(
+                firing,
+                trigger_terminal=remap_nidaq_physical_channel(
+                    firing.trigger_terminal,
+                    self._nidaq_signal_monitor.runtime_device_aliases,
+                ),
+            )
+        return prepare(profile, firing, recipe)
+
+    def _prepare_protocol_stim_detector(self, recipe):
+        camera = self._stim_camera
+        if camera is None or not camera.is_enabled:
+            raise RuntimeError("First Reach requires the enabled stimCam")
+        if camera._stim_detection_configuration is None:
+            raise RuntimeError(
+                "First Reach requires stimCam stimulation mode at 900 Hz"
+            )
+        handle = {
+            "session_generation": recipe.session_generation,
+            "operation_id": recipe.operation_id,
+            "logical_trial_id": recipe.logical_trial_id,
+            "attempt_id": recipe.attempt_id,
+            "nonce": uuid.uuid4().hex,
+            "trigger_route": recipe.laser_firing.trigger_route.value,
+        }
+        return handle
+
+    def _arm_protocol_stim_detector(self, handle) -> None:
+        self._laser.bind_direct_trigger_nonce(
+            handle["operation_id"], handle["nonce"],
+        )
+        self._stim_camera.arm_stim_detector(handle)
+
+    def _cancel_protocol_stim_detector(self, handle) -> None:
+        if self._stim_camera is not None:
+            self._stim_camera.disarm_stim_detector(handle.get("operation_id"))
+
+    def _trigger_protocol_stim3(self, profile, recipe, detail) -> None:
+        firing = recipe.laser_firing
+        called = time.perf_counter()
+        token = self._hardware.pulse_stim(
+            firing.trigger_pulse_us, stim_line=firing.stim_line
+        )
+        self._session_data_recorder.latency_events.record_stim3_pulse(
+            getattr(recipe, "operation_id", ""), token, called, time.perf_counter())
+        if token is None:
+            raise RuntimeError("Firmware STIM{} pulse was not queued".format(firing.stim_line))
+        timeout = max(3.0, firing.trigger_pulse_us / 1e6 + 2.0)
+        self._hardware.wait_pending_command_acked(token, timeout=timeout)
+
+    def run_stim_bench_test(self, profile, channel_id, route) -> StimTestResult:
+        """Fire one pulse profile on one laser, the way a trial would, off any session.
+
+        Arms the analog output as a trial does, then starts it by the chosen
+        route: on hardware_stim3 the board's firmware-timed STIM pulse into the
+        trigger terminal starts the waveform; on direct_ni_software the host
+        starts it, which is the start a trial's stim-camera trigger makes.
+
+        The terminal, board line and trigger pulse come from resolve_laser_firing,
+        which reads them off this laser's own configuration - not from the
+        profile - so the same profile fires correctly on whichever laser and
+        route the caller names.
+        """
+        close_refusal = self.laser_controller_close_refusal()
+        if close_refusal:
+            raise RuntimeError(f"Test stim is unavailable: {close_refusal}")
+        if profile is None:
+            raise RuntimeError("Select a saved laser profile, or the builder draft, to test.")
+        try:
+            firing = resolve_laser_firing(self._laser.configuration, channel_id, route)
+            refusal = amplitude_refusal(
+                profile, self._laser.configuration.get_channel(firing.channel_id))
+        except ValueError as error:
+            raise RuntimeError(str(error)) from None
+        refusal = refusal or refuse_reason(
+            profile=profile,
+            firing=firing,
+            recording_status_value=self.session_recording_status.value,
+            trial_operation_active=(
+                self._trial_action_executor.operation is not None
+            ),
+            laser_backend=self._laser.configuration.backend,
+            firmware_capabilities=self._hardware.firmware_compatibility.get(
+                "reported_capabilities", ()
+            ),
+        )
+        if refusal:
+            raise RuntimeError(refusal)
+
+        finished = threading.Event()
+        prepared = self._laser.prepare_pulse_profile(profile, firing, BenchRecipe())
+        add_terminal_callback = getattr(prepared, "add_terminal_callback", None)
+        if add_terminal_callback is not None:
+            add_terminal_callback(lambda _operation: finished.set())
+        software_start = not firing.is_board_trigger
+        started = time.perf_counter()
+        try:
+            if software_start:
+                prepared.trigger()
+            else:
+                token = self._hardware.pulse_stim(
+                    int(firing.trigger_pulse_us), stim_line=firing.stim_line
+                )
+                if token is None:
+                    raise RuntimeError(
+                        "Firmware STIM{} pulse was not queued".format(firing.stim_line)
+                    )
+                timeout = max(3.0, firing.trigger_pulse_us / 1e6 + 2.0)
+                self._hardware.wait_pending_command_acked(token, timeout=timeout)
+            completed = finished.wait(bench_wait_seconds(profile, firing))
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+        except Exception:
+            # Never leave an armed analog output behind on a failed test.
+            cancel = getattr(prepared, "cancel", None)
+            if cancel is not None:
+                cancel()
+            raise
+        finally:
+            self._laser.release_prepared_profile(prepared)
+
+        return StimTestResult(
+            profile_id=profile.profile_id,
+            channel_id=firing.channel_id,
+            trigger_terminal=firing.trigger_terminal,
+            trigger_pulse_us=int(firing.trigger_pulse_us),
+            arm_to_terminal_ms=elapsed_ms if completed else None,
+            stim_line=firing.stim_line,
+            detail=(
+                "completed"
+                if completed
+                else "started, but the waveform did not report terminal"
+                if software_start
+                else "board acknowledged but the waveform did not report terminal"
+            ),
+            trigger_route=firing.trigger_route.value,
+        )
+
+    def _on_stim_camera_trigger(self, camera_index, decision) -> None:
+        """Accept only the detector decision owned by the current attempt."""
+        received = time.perf_counter()
+        if decision.get("trigger_route") == "hardware_stim3":
+            # The direct route is recorded where its NI start returns; this
+            # message is the only GUI hop the STIM3 route has.
+            try:
+                self._session_data_recorder.latency_events.record_stim_dispatch(
+                    decision, gui_recv_perf=received)
+            except Exception:
+                logger.exception("STIM3 dispatch latency row was not recorded")
+        camera = self._stim_camera
+        token = self._recording_session.token()
+        operation = self._trial_action_executor.operation
+        if (
+            camera is None
+            or int(camera_index) != camera.camera_index
+            or token is None
+            or self._recording_session.status is not SessionRecordingStatus.RECORDING
+            or operation is None
+        ):
+            logger.warning("Ignoring unowned stim-camera trigger: %s", decision)
+            return
+        try:
+            operation_id = str(decision["operation_id"])
+            generation = int(decision["session_generation"])
+            if generation != token.generation:
+                raise RuntimeError("stim trigger belongs to a stale session generation")
+            if operation.recipe.operation_id != operation_id:
+                raise RuntimeError("stim trigger belongs to a stale trial operation")
+            if operation.state is not PreparedState.ACTIVE:
+                raise RuntimeError(
+                    "stim trigger requires active pellet attempt, found "
+                    f"{operation.state.value}"
+                )
+            payload = dict(decision)
+            captured = self._session_data_recorder.capture_external_event(
+                "stimCameraFirstReach",
+                payload,
+                perf_time=float(payload["frame_perf_time"]),
+                event_index=int(payload["stim_frame_id"]),
+                timestamp_method="stim_camera_acquired_frame_perf_time",
+            )
+            if not captured:
+                raise RuntimeError("stim trigger could not enter the session event ledger")
+            if (
+                operation.recipe.laser_firing.trigger_route
+                is LaserTriggerRoute.HARDWARE_STIM3
+            ):
+                self._trial_action_executor.trigger_stimulus(
+                    operation_id,
+                    generation,
+                    detail=f"stim-camera frame {payload['stim_frame_id']}",
+                )
+            self._persist_protocol_operation()
+        except Exception as error:
+            logger.exception("Stim-camera trigger rejected: %s", error)
+            try:
+                self._trial_action_executor.fail(error)
+                self._persist_protocol_operation()
+            except Exception:
+                logger.exception("Could not fail the rejected stim operation")
+
+    @property
+    def stim_latency_budget(self) -> StimLatencyBudget:
+        """Rolling Tier 1 stim-loop latency view, aggregated from trigger records."""
+        return self._stim_latency_budget
+
+    #: Whether this session's p99 feed has already reported a failure. A feed
+    #: that fails does so on every trigger, and one line per trigger would bury
+    #: the log; class-level so a bare instance has the default.
+    _stim_p99_failure_logged = False
+
+    def _begin_session_telemetry(self, started_perf=None) -> None:
+        """Start the session counters and the stim p99 that goes with them over.
+
+        Together because the p99 is read from a budget that has to be cleared at
+        the same moments the counters are: any begin() that left the budget
+        alone would show an earlier session's triggers in this one's figure.
+        """
+        self._session_telemetry.begin(started_perf)
+        self._session_stim_latency_budget.reset()
+        self._stim_p99_failure_logged = False
+
+    def _log_stim_latency_budget(self) -> None:
+        """Emit the Tier 1 breakdown once per capture stop, when triggers occurred."""
+        try:
+            summary = self._stim_latency_budget.summary()
+            if summary.accepted == 0 and summary.rejected == 0:
+                return
+            report = self._stim_latency_budget.format_report()
+            if summary.total is not None and not summary.meets_budget:
+                logger.warning("Stim loop exceeded its p99 budget\n%s", report)
+            else:
+                logger.notice("%s", report)
+        except Exception:
+            logger.exception("Failed to report the stim latency budget")
+
+    def _on_direct_stim_trigger_result(self, result) -> None:
+        payload = dict(result)
+        # Aggregate before anything that can raise, so a recorder or capture
+        # failure does not also lose the latency sample.
+        self._stim_latency_budget.observe(payload)
+        try:
+            self._session_data_recorder.latency_events.record_stim_dispatch(payload)
+        except Exception:
+            logger.exception("Direct stim dispatch latency row was not recorded")
+        # Its own try, so a failure here is not reported as a lost latency row
+        # and cannot stop the trigger's event record below.
+        try:
+            session_budget = self._session_stim_latency_budget
+            session_budget.observe(payload)
+            total = session_budget.summary().total
+            if total is not None and math.isfinite(total.p99):
+                self._session_telemetry.record_stim_p99(total.p99 * 1000.0)
+        except Exception:
+            if not self._stim_p99_failure_logged:
+                self._stim_p99_failure_logged = True
+                logger.exception("Live stim p99 was not updated")
+        perf_time = float(
+            payload.get("daqmx_start_entry_perf_time")
+            or payload.get("ipc_receive_perf_time")
+            or time.perf_counter()
+        )
+        captured = self._session_data_recorder.capture_external_event(
+            "stimCameraDirectNiStart",
+            payload,
+            perf_time=perf_time,
+            event_index=int(payload.get("stim_frame_id", -1)),
+            timestamp_method="stim_camera_direct_ni_ipc",
+        )
+        if not payload.get("accepted"):
+            logger.error("Direct stim-to-NI trigger failed: %s", payload.get("error"))
+        elif not captured:
+            logger.warning("Direct stim-to-NI trigger occurred outside event capture")
+
+    def _on_stim_camera_evidence_status(
+        self,
+        camera_index,
+        path,
+        diagnostics,
+        error,
+        message_generation,
+    ) -> None:
+        camera = self._stim_camera
+        token = self._recording_session.token()
+        if (
+            camera is None
+            or int(camera_index) != camera.camera_index
+            or token is None
+            or message_generation != token.generation
+        ):
+            logger.warning(
+                "Ignoring stale stim evidence status: camera=%s generation=%s active=%s",
+                camera_index, message_generation, token,
+            )
+            return
+        session_dir = Path(self._project_info.get_session_path().location)
+        evidence_path = Path(path)
+        try:
+            relative_path = evidence_path.relative_to(session_dir).as_posix()
+        except ValueError:
+            relative_path = "streams/stim_camera_evidence.h5"
+            error = str(error or f"evidence path escaped session directory: {path}")
+        self._session_data_recorder.set_source_result(
+            "stim_camera_evidence",
+            sample_count=int(diagnostics.get("rows_written", 0)),
+            path=relative_path,
+            failure=str(error or ""),
+            diagnostics=dict(diagnostics),
+        )
+
+    @staticmethod
+    def _cancel_protocol_laser(handle) -> None:
+        cancel = getattr(handle, "cancel", None)
+        if cancel is not None:
+            cancel()
+            # Ended before the trial goes on: the next trial's pulse is armed
+            # straight after, and is refused while the board is still held by
+            # this one's cleanup. The abort ends it in milliseconds.
+            wait_until_cancelled_ends(handle)
+
+    def _protocol_send_readiness(self) -> bool:
+        if (
+            self._selected_ordered_protocol is None
+            or not self._behavior.algorithm.is_in_session
+        ):
+            return True
+        token = self._recording_session.token()
+        operation = self._trial_action_executor.operation
+        if token is not None and operation is not None:
+            try:
+                operation.require_generation(token.generation)
+            except RuntimeError:
+                return False
+            if (
+                operation.state is PreparedState.PREPARED
+                and operation.recipe.logical_trial_id == self._pellet_cycles.planned_trial_id
+            ):
+                return True
+        self.request_pellet_send(force=False, automatic=True)
+        return False
+
+    def _guard_protocol_send(self) -> None:
+        if (
+            self._selected_ordered_protocol is None
+            or not self._behavior.algorithm.is_in_session
+        ):
+            return
+        token = self._recording_session.token()
+        operation = self._trial_action_executor.operation
+        if token is None or operation is None:
+            raise RuntimeError("Ordered protocol SEND has not been prepared")
+        self._trial_action_executor.require_send_permission(
+            operation.recipe.operation_id,
+            token.generation,
+        )
+
+    def _cancel_protocol_operation(
+        self,
+        token: Optional[SessionGeneration],
+        reason: str,
+    ) -> None:
+        operation = self._trial_action_executor.operation
+        if operation is None:
+            return
+        try:
+            self._trial_action_executor.cancel(
+                generation=(None if token is None else token.generation),
+                reason=reason,
+            )
+        except RuntimeError:
+            logger.info("Ignored stale protocol-operation cancellation: %s", reason)
+        self._behavior.system_machine.pellet.cancel_prepared_cover_policy()
+        self._persist_protocol_operation()
+
+    def _persist_protocol_operation(self) -> None:
+        operation = self._trial_action_executor.operation
+        attempt = self._pellet_cycles.active_attempt
+        if operation is None or attempt is None or self._project_info is None:
+            return
+        if not self._trial_action_executor.matches_send_context(attempt.operation_id):
+            return
+        try:
+            self._pellet_cycles.annotate_protocol_operation(
+                self._project_info,
+                attempt.operation_id,
+                self._trial_action_executor.operation_record(),
+            )
+        except (KeyError, RuntimeError):
+            logger.exception("Could not persist prepared protocol-operation evidence")
+
+    @_serialized_session_configuration
+    def set_intertrial_analysis_enabled(self, enabled: bool) -> None:
+        self._require_session_ready_for_configuration(
+            "Changing intertrial analysis"
+        )
+        control = self._behavior.algorithm.active_config.session_control
+        control.intertrial_analysis_enabled = bool(enabled)
+        if not enabled:
+            control.behavioral_retry_outcomes = tuple(
+                outcome
+                for outcome in control.behavioral_retry_outcomes
+                if outcome == TrialOutcome.PELLET_MISSING.value
+            )
+            if control.trial_count_basis == TrialCountBasis.SCORED.value:
+                control.trial_count_basis = TrialCountBasis.COMPLETED.value
+        self._notify_trial_protocol_state()
+        return True
+
+    @_serialized_session_configuration
+    def update_session_control_option(self, field: str, value) -> bool:
+        """Validate and apply one operator session-policy option while Ready."""
+        self._require_session_ready_for_configuration(
+            "Changing recording-session configuration"
+        )
+        control = self._behavior.algorithm.active_config.session_control
+        if field not in {item.name for item in dataclasses.fields(control)}:
+            raise ValueError(f"Unknown session-control option: {field}")
+        candidate = dataclasses.replace(control, **{str(field): value})
+        setattr(control, str(field), getattr(candidate, str(field)))
+        self._notify_trial_protocol_state()
+        return True
+
+    def retry_pending_intertrial_analysis(self) -> bool:
+        request = self._intertrial_resolution_request
+        if (
+            request is None
+            or self._recording_session.status is not SessionRecordingStatus.RECORDING
+        ):
+            return False
+        token = self._recording_session.token()
+        if (
+            token is None
+            or request.generation != token.generation
+            or request.session_id != token.session_id
+            or not self._intertrial_analysis.submit(request)
+        ):
+            return False
+        self._intertrial_resolution_request = None
+        self._intertrial_resolution_reason = ""
+        self._intertrial_waiting_operations.add(request.operation_id)
+        estimate = self._intertrial_analysis.timing_estimate(
+            request.window.end_perf - request.window.start_perf
+        )
+        self._send_block_reasons.set(
+            INTERTRIAL_ANALYSIS_BLOCK_NAME,
+            "waiting for retried pellet trial analysis; " + estimate.display_text,
+        )
+        self._notify_trial_protocol_state()
+        return True
+
+    def continue_without_pending_intertrial_result(self) -> bool:
+        request = self._intertrial_resolution_request
+        if (
+            request is None
+            or self._recording_session.status is not SessionRecordingStatus.RECORDING
+        ):
+            return False
+        ledger = self._trial_ledger
+        attempt = next(
+            (
+                item
+                for item in (() if ledger is None else ledger.attempts)
+                if item.trial_id == request.trial_id
+                and item.attempt_id == request.attempt_id
+                and item.operation_id == request.operation_id
+            ),
+            None,
+        )
+        if attempt is None or attempt.outcome is not TrialOutcome.PENDING_ANALYSIS:
+            return False
+        tone_references, laser_references = (
+            self._session_data_recorder.trial_stream_references(
+                request.window.start_perf,
+                request.window.end_perf,
+            )
+        )
+        self._pellet_cycles.finalize_intertrial_unavailable(
+            self._project_info,
+            attempt,
+            perf_time=request.window.end_perf,
+            wall_time=attempt.capture_end_wall_time or time.time(),
+            reason=(
+                "operator continued without an analysis result; behavioral retry "
+                "decision was skipped"
+            ),
+            pellet_presence=request.pellet_state.presence.value,
+            pellet_misplacement=request.pellet_state.misplacement.value,
+            window=request.window,
+            tone_references=tone_references,
+            laser_references=laser_references,
+        )
+        self._intertrial_resolution_request = None
+        self._intertrial_resolution_reason = ""
+        self._intertrial_waiting_operations.discard(request.operation_id)
+        self._refresh_intertrial_send_block()
+        self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
+        self._notify_trial_protocol_state()
+        self._evaluate_automatic_stop_policy(
+            protocol_complete=self._protocol_runner.protocol_complete,
+        )
+        return True
+
+    def _hold_intertrial_resolution(
+        self,
+        request: IntertrialAnalysisRequest,
+        reason: str,
+    ) -> None:
+        self._intertrial_resolution_request = request
+        self._intertrial_resolution_reason = str(reason)
+        self._send_block_reasons.set(
+            INTERTRIAL_ANALYSIS_BLOCK_NAME,
+            "pellet trial analysis needs operator action",
+        )
+        logger.error("%s", reason)
+        self._notify_trial_protocol_state()
+
+    def _publish_pellet_send_block_reason(self, rendered: str) -> None:
+        """Publish the combined holds to the single string BehaviorAlgorithm reads."""
+        self._behavior.algorithm.pellet_send_block_reason = rendered
+
+    def _on_intertrial_timing_evaluated(self, evaluation) -> None:
+        """Record how the inter-trial interval actually came out.
+
+        Lateness is evidence, not a correction: the policy releases a late
+        trial immediately rather than padding it further.
+        """
+        if evaluation.lateness_seconds:
+            logger.notice(
+                "inter-trial target missed by %.3f s", evaluation.lateness_seconds,
+            )
+        self._notify_trial_protocol_state()
+
+    def _refresh_intertrial_send_block(self) -> None:
+        if self._intertrial_resolution_request is not None:
+            self._send_block_reasons.set(
+                INTERTRIAL_ANALYSIS_BLOCK_NAME,
+                "pellet trial analysis needs operator action",
+            )
+        elif self._intertrial_waiting_operations:
+            self._send_block_reasons.set(
+                INTERTRIAL_ANALYSIS_BLOCK_NAME,
+                "waiting for pellet trial analysis",
+            )
+        else:
+            self._send_block_reasons.clear(INTERTRIAL_ANALYSIS_BLOCK_NAME)
+
+    def _on_intertrial_callback_failed(
+        self,
+        request: IntertrialAnalysisRequest,
+        error: Exception,
+    ) -> None:
+        """Turn an asynchronous callback failure into an explicit resolution."""
+        token = self._recording_session.token()
+        if (
+            token is None
+            or token.generation != request.generation
+            or token.session_id != request.session_id
+        ):
+            return
+        self._intertrial_waiting_operations.discard(request.operation_id)
+        ledger = self._trial_ledger
+        attempt = next((
+            item
+            for item in (() if ledger is None else ledger.attempts)
+            if item.operation_id == request.operation_id
+        ), None)
+        if attempt is not None and attempt.outcome is TrialOutcome.PENDING_ANALYSIS:
+            self._hold_intertrial_resolution(
+                request,
+                f"Applying analysis for {request.attempt_label} failed: {error}",
+            )
+        else:
+            # The authoritative result was already committed and only a
+            # downstream optional action failed. Do not deadlock the next SEND.
+            self._recording_session.add_data_error(
+                f"post-analysis action failed for {request.attempt_label}: {error}"
+            )
+            self._refresh_intertrial_send_block()
+            self._notify_trial_protocol_state()
+
+    def _notify_trial_protocol_state(self) -> None:
+        # First, so that what follows the state reads the check of it. A
+        # trial's progress changes nothing the check reads, and reruns nothing.
+        self._refresh_protocol_readiness()
+        self.property_changed(
+            self.Props.TRIAL_PROTOCOL_STATE,
+            self.trial_protocol_state,
+            None,
+        )
 
     @property
     def rpc_service(self) -> Optional[RpcService]:
@@ -1024,11 +6491,11 @@ class AppModel(ObservableObject):
 
     @property
     def check_diamond_coord_enabled(self):
-        return self._check_diamond_coord_enabled
+        return self._coordinates.enabled
 
     @check_diamond_coord_enabled.setter
     def check_diamond_coord_enabled(self, value):
-        self._check_diamond_coord_enabled = value
+        self._coordinates.enabled = bool(value)
 
     def get_training_plan_by_id(self, plan_id: Optional[str]) -> Optional[TrainingPlan]:
         if plan_id is None:
@@ -1061,12 +6528,14 @@ class AppModel(ObservableObject):
             if load_result != LoadProgressResult.OK:
                 return False
 
-        is_auto = self._training_mode == TrainingMode.AUTOMATIC
+        session_control = algo.active_config.session_control
+        is_auto = session_control.automatic_protocol_advance_enabled
         logger.success("Animal %s: attaching auto=%s to plan %s (%s) ..",
                        animal.name, is_auto, plan.plan_id, hex(id(plan)))
         plan.is_automatic = is_auto
-        pellet_dev = tunnel_dev = self._hardware
-        plan.attach(algo, pellet_dev, tunnel_dev)
+        pellet_dev = self._hardware
+        self._protocol_runner.automatic_advance = is_auto
+        self._protocol_runner.attach(plan, algo, pellet_dev)
         self._attached_plan = plan
         self._attached_animal = animal
         plan.property_changed += self._on_training_plan_property_changed  # first, to be sure get everything
@@ -1092,7 +6561,10 @@ class AppModel(ObservableObject):
         animal = self._attached_animal
         assert isinstance(animal, AnimalSubject)
         logger.notice("%s: detaching from plan %s (%s)", animal.name, plan.plan_id, hex(id(plan)))
-        plan.detach()
+        if self._protocol_runner.plan is plan:
+            self._protocol_runner.detach()
+        else:
+            plan.detach()
         self._attached_plan = None
         self._attached_animal = None
         prog = plan.serialize_progress()
@@ -1138,14 +6610,16 @@ class AppModel(ObservableObject):
         return animal
 
     def make_project_info(self) -> ProjectInfo:
-        left = None if self._left_camera is None else self._left_camera.name
-        right = None if self._right_camera is None else self._right_camera.name
+        camera_names = tuple(
+            camera.name
+            for camera in self._reach_cameras
+            if camera.is_enabled and camera.is_recording_enabled
+        )
         return ProjectInfo(
             root=self._output_location,
             device_id=self._preferences.serial_number,
             ensure_exists=True,
-            camera_1=left,
-            camera_2=right,
+            camera_names=camera_names,
             mp_manager=self._mp_manager,  # required,
             # so to have shared values that can be put to multiprocess queue.
             # The active ProjectInfo must effectively be shared across all processes/threads.
@@ -1165,13 +6639,1790 @@ class AppModel(ObservableObject):
                       PendingDeprecationWarning, stacklevel=2)
         return self.capture_stop(**kwargs)
 
+    def _prepare_camera_domain(
+        self,
+        camera: VideoCaptureModel,
+        inference_queue,
+        inference_index: Optional[int],
+    ) -> bool:
+        subsystem_id = SubsystemId.camera(camera.name)
+        generation = self._begin_subsystem_start(
+            subsystem_id,
+            reason="starting camera process",
+        )
+        started = time.perf_counter()
+        try:
+            did_start = camera.on_prepare_capture(
+                inference_queue,
+                inference_index=inference_index,
+            )
+            if not did_start:
+                raise RuntimeError(camera.last_error or "camera process did not start")
+            if (
+                not camera.wait_for_capture_status(
+                    (CaptureProcessStatus.RUNNING, CaptureProcessStatus.FAILED),
+                    timeout=5,
+                )
+                or camera.video_status != CaptureProcessStatus.RUNNING
+            ):
+                raise RuntimeError(camera.last_error or "camera process did not become ready")
+        except Exception as exc:
+            try:
+                camera.on_capture_stop()
+            except Exception:
+                logger.exception("Failed to clean up camera %s", camera.name)
+            self._set_subsystem_status(
+                subsystem_id,
+                SubsystemState.FAILED,
+                error=str(exc) or exc.__class__.__name__,
+                generation=generation,
+            )
+            logger.exception("Camera %s initialization failed", camera.name)
+            return False
+        log_hardware_initialization(
+            logger,
+            "READY | camera process | name=%s status=%s elapsed=%.3fs",
+            camera.name,
+            camera.video_status.name,
+            time.perf_counter() - started,
+        )
+        return True
+
+    def _enable_camera_capture_domain(
+        self,
+        camera: VideoCaptureModel,
+        generation: int,
+        *,
+        wait_for_first_frame: bool = True,
+    ) -> bool:
+        subsystem_id = SubsystemId.camera(camera.name)
+        try:
+            camera.on_capture_start()
+            if not wait_for_first_frame:
+                return True
+        except Exception as exc:
+            try:
+                camera.on_capture_stop()
+            except Exception:
+                logger.exception("Failed to stop camera %s after capture failure", camera.name)
+            self._set_subsystem_status(
+                subsystem_id,
+                SubsystemState.FAILED,
+                error=str(exc) or exc.__class__.__name__,
+                generation=generation,
+            )
+            logger.exception("Camera %s capture failed", camera.name)
+            return False
+        return self._wait_camera_first_frame_domain(camera, generation)
+
+    def _wait_camera_first_frame_domain(
+        self,
+        camera: VideoCaptureModel,
+        generation: int,
+    ) -> bool:
+        subsystem_id = SubsystemId.camera(camera.name)
+        try:
+            if not camera.wait_for_first_frame(timeout=5):
+                raise RuntimeError(camera.last_error or "camera delivered no frame")
+        except Exception as exc:
+            try:
+                camera.on_capture_stop()
+            except Exception:
+                logger.exception("Failed to stop camera %s after capture failure", camera.name)
+            self._set_subsystem_status(
+                subsystem_id,
+                SubsystemState.FAILED,
+                error=str(exc) or exc.__class__.__name__,
+                generation=generation,
+            )
+            logger.exception("Camera %s first-frame validation failed", camera.name)
+            return False
+        self._set_subsystem_status(
+            subsystem_id,
+            SubsystemState.READY,
+            reason=f"first frame {camera.last_captured_frame_index}",
+            generation=generation,
+        )
+        return True
+
+    def _start_reach_camera_domains(
+        self,
+        inference_camera_indices,
+    ) -> bool:
+        all_cameras = self._ordered_reach_cameras(enabled_only=True)
+        independent_stim = next((
+            camera for camera in all_cameras
+            if camera.camera_id == CameraId.Camera3
+            and camera._stim_detection_configuration is not None
+        ), None)
+        cameras = tuple(
+            camera for camera in all_cameras if camera is not independent_stim
+        )
+        if independent_stim is not None:
+            stim_status = self._acquisition.subsystems.get(
+                SubsystemId.camera(independent_stim.name)
+            )
+            if stim_status is None or not stim_status.is_ready:
+                stim_index = inference_camera_indices.get(independent_stim)
+                if self._prepare_camera_domain(
+                    independent_stim,
+                    self._inference_queue if stim_index is not None else None,
+                    stim_index,
+                ):
+                    stim_generation = self._acquisition.subsystems.get(
+                        SubsystemId.camera(independent_stim.name)
+                    ).generation
+                    self._enable_camera_capture_domain(
+                        independent_stim,
+                        stim_generation,
+                        wait_for_first_frame=True,
+                    )
+        if not cameras:
+            self._set_subsystem_status(
+                SubsystemId.REACH_SYNCHRONIZATION,
+                SubsystemState.DISABLED,
+                reason="no enabled synchronized behavioral cameras",
+            )
+            return False
+        configured_primaries = tuple(
+            camera for camera in cameras if camera.is_primary
+        )
+        topology_error = (
+            None
+            if len(cameras) == 1 or len(configured_primaries) == 1
+            else (
+                "multiple enabled reach cameras require exactly one primary; "
+                f"found {len(configured_primaries)}"
+            )
+        )
+        primary = cameras[0]
+        prepared = {}
+        generation = self._begin_subsystem_start(
+            SubsystemId.REACH_SYNCHRONIZATION,
+            reason="validating reach camera topology",
+        )
+        primary_index = inference_camera_indices.get(primary)
+        primary_ready = self._prepare_camera_domain(
+            primary,
+            self._inference_queue if primary_index is not None else None,
+            primary_index,
+        )
+        if not primary_ready:
+            for secondary in cameras[1:]:
+                self._set_subsystem_status(
+                    SubsystemId.camera(secondary.name),
+                    SubsystemState.BLOCKED,
+                    reason="primary trigger unavailable",
+                )
+            self._set_subsystem_status(
+                SubsystemId.REACH_SYNCHRONIZATION,
+                SubsystemState.FAILED,
+                error=f"primary camera {primary.name} unavailable",
+                generation=generation,
+            )
+            return False
+        prepared[primary] = self._acquisition.subsystems.get(
+            SubsystemId.camera(primary.name)
+        ).generation
+
+        for secondary in cameras[1:]:
+            time.sleep(0.5)
+            inference_index = inference_camera_indices.get(secondary)
+            if self._prepare_camera_domain(
+                secondary,
+                self._inference_queue if inference_index is not None else None,
+                inference_index,
+            ):
+                prepared[secondary] = self._acquisition.subsystems.get(
+                    SubsystemId.camera(secondary.name)
+                ).generation
+
+        # Triggered secondaries must be armed before the primary emits edges.
+        for secondary in cameras[1:]:
+            if secondary in prepared and not self._enable_camera_capture_domain(
+                    secondary,
+                    prepared[secondary],
+                    wait_for_first_frame=False,
+            ):
+                prepared.pop(secondary)
+        primary_capture_started = self._enable_camera_capture_domain(
+            primary,
+            prepared[primary],
+            wait_for_first_frame=False,
+        )
+        primary_capture_ready = (
+            primary_capture_started
+            and self._wait_camera_first_frame_domain(primary, prepared[primary])
+        )
+        for secondary in cameras[1:]:
+            if secondary in prepared:
+                self._wait_camera_first_frame_domain(
+                    secondary,
+                    prepared[secondary],
+                )
+        all_ready = topology_error is None and primary_capture_ready and all(
+            (
+                status := self._acquisition.subsystems.get(
+                    SubsystemId.camera(camera.name)
+                )
+            ) is not None
+            and status.is_ready
+            for camera in cameras
+        )
+        self._set_subsystem_status(
+            SubsystemId.REACH_SYNCHRONIZATION,
+            SubsystemState.READY if all_ready else SubsystemState.FAILED,
+            reason=(
+                "standalone camera ready"
+                if all_ready and len(cameras) == 1
+                else "all enabled reach cameras synchronized"
+                if all_ready
+                else topology_error or "one or more enabled reach cameras unavailable"
+            ),
+            error="" if all_ready else topology_error or "reach synchronization incomplete",
+            generation=generation,
+        )
+        return all_ready
+
+    def _start_can_domain(self, *, wait_connected: bool) -> bool:
+        hard = self._hardware
+        if not hard.requires_connection:
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.DISABLED,
+                reason="CAN/pellet controller disabled",
+            )
+            return False
+        generation = self._begin_subsystem_start(
+            SubsystemId.CAN_PELLET,
+            reason="connecting CAN/pellet controller",
+        )
+        started = time.perf_counter()
+        try:
+            self._ensure_pellet_controller_connected()
+            if wait_connected:
+                deadline = time.perf_counter() + 3.0
+                for token in tuple(hard.pending_tokens):
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        raise TimeoutError("timed out waiting for pending CAN command")
+                    hard.wait_pending_command_acked(token, timeout=remaining)
+                while not hard.connected:
+                    if time.perf_counter() >= deadline:
+                        raise TimeoutError("timed out waiting for CAN hardware connection")
+                    time.sleep(0.05)
+        except Exception as exc:
+            error = str(exc) or exc.__class__.__name__
+            logger.exception("CAN/pellet initialization failed")
+            try:
+                hard.safety_shutdown(
+                    f"CAN/pellet initialization failure: {error}",
+                    wait=True,
+                )
+            except Exception:
+                logger.exception("CAN safety shutdown failed")
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.FAILED,
+                error=error,
+                generation=generation,
+            )
+            return False
+        self._set_subsystem_status(
+            SubsystemId.CAN_PELLET,
+            SubsystemState.READY,
+            reason="CAN/pellet controller connected",
+            generation=generation,
+        )
+        log_hardware_initialization(
+            logger,
+            "READY | CAN/pellet controller | connected=%s elapsed=%.3fs",
+            hard.connected,
+            time.perf_counter() - started,
+        )
+        return True
+
+    def _nidaq_stream_idle(self) -> bool:
+        """Whether the stream is the application's rather than System Mode's."""
+        acquisition = self._acquisition
+        return not (
+            acquisition.started or acquisition.starting or acquisition.stopping
+        )
+
+    def _nidaq_stream_may_start(self) -> bool:
+        """Whether the input stream may start by itself now.
+
+        Only while idle with a whole configuration loaded. While System Mode
+        starts, runs or stops, _start_nidaq_domain owns the stream, and a
+        failure there is retried from the Hardware panel, not from here.
+        """
+        return (
+            self._nidaq_stream_idle()
+            and not self._closing_event.is_set()
+            and self._loaded_configuration is not None
+            and not self._configuration_load_incomplete
+            # A refused plan: there is nothing valid to start until Edit DAQ
+            # Ports saves one.
+            and not self._nidaq_plan_error
+            # Nor while a laser close given up on is still inside the driver:
+            # a controller still closing can hold inputs on the stream's
+            # lines, as a ramp's does. The ramp let go of its hold on the
+            # stream as it ended, and the stream restarted over that close
+            # (final re-review, affb7491). The close's late finish asks for
+            # the stream again.
+            and not self._given_up_close_refusal()
+        )
+
+    def _show_nidaq_stream_held_for_laser_close(self) -> None:
+        """Say why the idle input stream stays stopped: a close given up on.
+
+        _nidaq_stream_may_start refuses while one is listed, and the stream
+        read only "stopped". Taken back once none is, for a stream that has
+        not started since. Not for a stream disabled, which is never held
+        back; not in System Mode, whose stream state is the acquisition's to
+        tell; nor over a refused plan's, which is held.
+        """
+        monitor = self._nidaq_signal_monitor
+        if not (monitor.hardware_enabled and monitor.configuration.is_enabled
+                and self._nidaq_stream_idle() and not self._nidaq_plan_error):
+            return
+        monitor.show_held_back(self._given_up_close_refusal())
+
+    def _on_nidaq_stream_released(self) -> None:
+        """The last hold on the stream is let go: say what still holds it back."""
+        if not self._hold_nidaq_plan_blocked():
+            self._show_nidaq_stream_held_for_laser_close()
+
+    @property
+    def nidaq_plan_error(self) -> str:
+        """Why the loaded NI-DAQ plan was refused, or an empty string."""
+        return self._nidaq_plan_error
+
+    @property
+    def nidaq_plan_remedy(self) -> str:
+        """What to do about a refused plan, as the refusal's log line says it.
+
+        "fix it in Edit → Edit DAQ Ports" by default. Headless has no such
+        dialog and names the configuration file instead; each refusal names
+        its own field.
+        """
+        return self._nidaq_plan_remedy
+
+    @nidaq_plan_remedy.setter
+    def nidaq_plan_remedy(self, value: str) -> None:
+        self._nidaq_plan_remedy = str(value)
+
+    def _nidaq_plan_blocked_reason(self) -> str:
+        # The remedy first: the status bar cuts an error at 320 characters,
+        # which two or three refusals run past.
+        return (
+            f"NI-DAQ plan refused; {self._nidaq_plan_remedy}: "
+            f"{self._nidaq_plan_error}"
+        )
+
+    def _hold_nidaq_plan_blocked(
+        self, *, required_for_recording: Optional[bool] = None,
+    ) -> bool:
+        """Hold the NI-DAQ stream BLOCKED on a refused plan, and say why.
+
+        The one writer of the stream's state while a plan is refused. The
+        stream then has no channels, which every other writer reads as
+        "disabled", and the reason an operator can act on was lost: after a
+        Run and Stop, and in the monitor's own status message, which the
+        laser tabs and Analysis show. Returns whether a refusal is held.
+        """
+        monitor = self._nidaq_signal_monitor
+        if not (self._nidaq_plan_error and monitor.hardware_enabled):
+            return False
+        reason = self._nidaq_plan_blocked_reason()
+        monitor.show_blocked(reason)
+        self._set_subsystem_status(
+            SubsystemId.NIDAQ_STREAM,
+            SubsystemState.BLOCKED,
+            reason=reason,
+            required_for_recording=required_for_recording,
+        )
+        return True
+
+    def _request_nidaq_stream(self, reason: str) -> None:
+        """Start the shared NI-DAQ input stream if it should be running.
+
+        It runs whenever NI-DAQ is enabled and has something to acquire, in
+        Idle as well as in System Mode, so no view has a Start button for it.
+        Returns at once; the start happens on the rule's own thread.
+        """
+        logger.debug("NI-DAQ input stream requested: %s", reason)
+        monitor = self._nidaq_signal_monitor
+        if monitor.is_running and self._nidaq_stream_may_start():
+            # _configure_subsystem_intent marks the domain "not started"
+            # whatever the stream is doing; a stream that kept running
+            # through a settings change is still ready.
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                SubsystemState.READY,
+                reason="NI-DAQ tasks running",
+            )
+        self._show_nidaq_stream_held_for_laser_close()
+        self._nidaq_stream_autostart.request()
+
+    def pause_nidaq_stream(self, holder, reason: str) -> None:
+        """Stop the input stream until `holder` resumes it.
+
+        For whatever needs the NI-DAQ lines to itself, such as the DAQ
+        Monitor, which opens its own tasks on them. `reason` completes
+        "NI-DAQ signal stream paused: ..." where the stream state is shown.
+
+        Refused unless idle with the recording session ready. In System Mode
+        the stream is the acquisition's: stopping it for the monitor marked
+        it stopped rather than failed, so a recording carried on without its
+        NI data, and nothing restarted it when the monitor closed. Each
+        refusal names its own reason; an operator already in Idle was told
+        to set System Mode to Idle while a recording session finished.
+        """
+        if not self._nidaq_stream_idle():
+            raise RuntimeError(
+                "the NI-DAQ input stream belongs to System Mode while it runs; "
+                "set System Mode to Idle first"
+            )
+        recording_status = self._recording_session.status
+        if recording_status is not SessionRecordingStatus.READY:
+            raise RuntimeError(
+                f"the recording session is still {recording_status.value}; "
+                "try again once it is ready"
+            )
+        self._hold_nidaq_stream_unless_calibrating(
+            holder,
+            reason,
+            "a laser calibration ramp holds the NI-DAQ lines; wait for it to finish",
+        )
+
+    def resume_nidaq_stream(self, holder) -> None:
+        self._nidaq_stream_autostart.resume(holder)
+
+    def _hold_nidaq_stream_unless_calibrating(self, holder, reason: str, refusal: str) -> None:
+        """Take the stream for `holder`, or refuse with `refusal` while a ramp holds it.
+
+        The DAQ Monitor, a configuration load and a DAQ ports save all come
+        through here: each opens tasks on the ramp's lines or closes the
+        controller under it. Checked again once the hold is taken, because a
+        ramp sets its flag and then checks for other holders, so of two that
+        start together at least one sees the other and backs out.
+        """
+        if self._laser_calibration_active:
+            raise RuntimeError(refusal)
+        self._nidaq_stream_autostart.pause(holder, reason)
+        if self._laser_calibration_active:
+            self._nidaq_stream_autostart.resume(holder)
+            raise RuntimeError(refusal)
+
+    def laser_calibration_refusal(self) -> str:
+        """Why a laser calibration ramp cannot start now, or an empty string.
+
+        Idle only (Ben, 2026-09-25). In System Mode the stream is the
+        acquisition's, and the laser controller System Mode opens is fed by
+        it, which makes the controller refuse a ramp. In Idle the ramp takes
+        the stream through the same hold as the DAQ Monitor and opens a
+        controller of its own; see run_laser_calibration_ramp.
+        """
+        if self._laser_calibration_active:
+            return "a laser calibration ramp is already running"
+        return self._laser_calibration_conditions_refusal()
+
+    @property
+    def laser_calibration_active(self) -> bool:
+        return self._laser_calibration_active
+
+    def _announce_laser_calibration(self, active: bool) -> None:
+        # For the menus, which disable what a ramp would refuse. Not under
+        # _laser_calibration_lock: a handler on this thread runs at once.
+        self.property_changed(self.Props.LASER_CALIBRATION_ACTIVE, active, not active)
+
+    def _laser_calibration_conditions_refusal(self) -> str:
+        if self._closing_event.is_set():
+            # Not while closing: nothing would wait for it, and the process
+            # could end with the laser driven.
+            return "reachAQ is closing"
+        close_refusal = self.laser_controller_close_refusal()
+        if close_refusal:
+            return close_refusal
+        recording_status = self._recording_session.status
+        if recording_status is not SessionRecordingStatus.READY:
+            return (
+                f"a session is {recording_status.value}; calibrate in Idle "
+                "once it has finished"
+            )
+        acquisition = self._acquisition
+        if acquisition.starting:
+            return "System Mode is starting; the ramp runs only in Idle"
+        if acquisition.stopping:
+            return "System Mode is stopping; wait for Idle"
+        if acquisition.started or self._status is not AppModelStatus.IDLE:
+            return "System Mode is running; set it to Idle to calibrate"
+        if self._loaded_configuration is None or self._configuration_load_incomplete:
+            return "the system configuration has not finished loading"
+        laser = self._laser.configuration
+        if laser.backend == "disabled":
+            return "the laser is disabled in the system configuration"
+        if laser.backend == "nidaq":
+            # The NI-DAQ controller's own conditions for a ramp: it clocks the
+            # diode input from the command's sample clock.
+            missing = [
+                name
+                for name, present in (
+                    ("hardwareTimed: true", laser.hardware_timed),
+                    ("sampleRateHz", laser.sample_rate_hz is not None),
+                )
+                if not present
+            ]
+            if missing:
+                return (
+                    "the laser configuration needs " + " and ".join(missing)
+                    + " for a calibration ramp"
+                )
+        holders = self._nidaq_stream_autostart.pause_reasons
+        if holders:
+            return f"the NI-DAQ lines are in use: {holders[-1]}"
+        return ""
+
+    def run_laser_calibration_ramp(self, ramp: LaserCalibrationRamp):
+        """Run one calibration ramp in Idle, on a laser controller of its own.
+
+        The ramp reads the diode on its own finite task, so the shared input
+        stream is held stopped for it, through the same holder mechanism as
+        the DAQ Monitor, and the auto-start cannot restart it mid-ramp. It
+        stopped the stream directly before, which nothing prevented from
+        being started again over its tasks. The controller is opened without
+        the stream feeding it and is never given to the laser model; both
+        are handed back in finally, whatever the ramp does.
+        """
+        with self._laser_calibration_lock:
+            if self._laser_calibration_active:
+                raise RuntimeError(
+                    "Laser calibration is unavailable: a laser calibration ramp "
+                    "is already running")
+            # on_close waits on this, for as long as the ramp may take.
+            self._laser_calibration_done.clear()
+            self._laser_calibration_close_wait_s = self._laser_calibration_wait_seconds(ramp)
+            self._laser_calibration_active = True
+            self._laser_calibration_ramp = ramp
+            self._laser_calibration_opened = False
+            self._laser_calibration_commanded = False
+        try:
+            self._announce_laser_calibration(True)
+            # After the flag is set: Run and every other holder set theirs
+            # first and check this one after, and so does closing.
+            refusal = self._laser_calibration_conditions_refusal()
+            if refusal:
+                raise RuntimeError(f"Laser calibration is unavailable: {refusal}")
+            configuration = self._laser.configuration
+            try:
+                # Inside the try that lets go: the hold is registered before
+                # the stream is stopped, and a stop that raised left it held.
+                self._nidaq_stream_autostart.pause(
+                    _LASER_CALIBRATION, _LASER_CALIBRATION_REASON)
+                try:
+                    controller = self._laser.open_controller(
+                        self._runtime_laser_configuration(configuration),
+                        timing_plan=(
+                            self._nidaq_signal_monitor.timing_plan
+                            if configuration.hardware_timed
+                            else None
+                        ),
+                        analog_terminal_config=self._laser_analog_terminal_config(),
+                    )
+                except Exception as error:
+                    # Its partial close may go on past the ramp's end, which
+                    # clears the ramp's own refusal.
+                    self._watch_failed_open_close(error, "The ramp stops")
+                    raise
+                with self._laser_calibration_lock:
+                    self._laser_calibration_controller = controller
+                    self._laser_calibration_opened = True
+                ramp_error = None
+                try:
+                    if self._closing_event.is_set():
+                        # Closing began while the controller opened; the
+                        # close path may already have stopped waiting.
+                        raise RuntimeError("Laser calibration is unavailable: reachAQ is closing")
+                    # Set before the ramp is given the controller, so that
+                    # closing never says a ramp that may have driven the
+                    # output has not.
+                    with self._laser_calibration_lock:
+                        self._laser_calibration_commanded = True
+                    return self._laser.run_calibration_ramp(ramp, controller=controller)
+                except BaseException as error:
+                    ramp_error = error
+                    raise
+                finally:
+                    # close() drives the command to its minimum and closes the
+                    # shutters. Unless the close path already closed it.
+                    self._close_laser_calibration_controller_within_bound(
+                        ramp, keep_error=ramp_error is not None)
+            finally:
+                self._nidaq_stream_autostart.resume(_LASER_CALIBRATION)
+        finally:
+            with self._laser_calibration_lock:
+                self._laser_calibration_active = False
+                self._laser_calibration_ramp = None
+                self._laser_calibration_done.set()
+            self._announce_laser_calibration(False)
+
+    @staticmethod
+    def _laser_calibration_timeout_seconds(ramp: LaserCalibrationRamp, configuration) -> float:
+        """How long the controller lets the ramp's own waits take."""
+        if ramp.timeout_seconds is not None:
+            return float(ramp.timeout_seconds)
+        rate = configuration.sample_rate_hz or 1.0
+        return ramp.steps * ramp.samples_per_step / rate + 5.0
+
+    def _laser_calibration_wait_seconds(self, ramp: LaserCalibrationRamp) -> float:
+        return (
+            self._laser_calibration_timeout_seconds(ramp, self._laser.configuration)
+            + _LASER_CALIBRATION_CLOSE_MARGIN_S
+        )
+
+    def _close_laser_calibration_controller_within_bound(
+        self, ramp: LaserCalibrationRamp, *, keep_error: bool,
+    ) -> None:
+        """The ramp's own close of its controller, bounded as every laser close is.
+
+        Unbounded, a driver hung in it held the ramp's thread in its finally:
+        the calibration stayed active, the panel stuck, and nothing was said
+        until reachAQ closed. Past the bound it is watched as a close given
+        up on, so laser work is refused by name until it ends, LASER says so
+        meanwhile, and the ramp ends without it. The input stream stays
+        stopped meanwhile too (_nidaq_stream_may_start). A close that raised
+        is raised here, as before.
+        """
+        closing = _BoundedClose(
+            lambda: self._close_laser_calibration_controller(keep_error=keep_error),
+            "laser calibration controller")
+        finished = closing.run(_LASER_CONTROLLER_CLOSE_S)
+        if not finished and self._watch_given_up_laser_close(
+                closing.done.wait, "laser calibration controller",
+                ended="The laser calibration controller finished closing",
+                late=("the laser calibration controller finished closing, late, "
+                      "after a driver hang"),
+                refusal=_LASER_CALIBRATION_CLOSE_PENDING_REFUSAL):
+            logger.critical(
+                "The calibration controller for laser %s did not close within "
+                "%.1f s. %s The ramp ends without it.",
+                int(ramp.channel_id), _LASER_CONTROLLER_CLOSE_S,
+                self._laser_calibration_output_note(ramp))
+            # As a failed open's close still in the driver writes it
+            # (_watch_failed_open_close): the refusal showed only once laser
+            # work was tried. The close's late finish sets it back.
+            self._set_laser_status_after_close(
+                lambda refusal: (SubsystemState.FAILED, dict(error=refusal)) if refusal else None)
+            return
+        if closing.error is not None:
+            raise closing.error
+
+    def _laser_calibration_output_note(self, ramp: Optional[LaserCalibrationRamp]) -> str:
+        """What a ramp's output may hold, as far as the application knows.
+
+        A ramp that never opened its controller, or never started on it,
+        wrote no command. One that did may hold up to its highest command,
+        whichever end that is: stopped part-way, its output holds a level
+        between the two, and a falling ramp's stop, named alone, said 0 V.
+        """
+        with self._laser_calibration_lock:
+            opened = self._laser_calibration_opened
+            commanded = self._laser_calibration_commanded
+        if commanded:
+            return (
+                "Its analog output may still hold up to %g V, the ramp's highest "
+                "command (a %g V to %g V ramp), and its shutter may be open: "
+                "make the laser safe by hand." % (
+                    float("nan") if ramp is None else max(ramp.start_volts, ramp.stop_volts),
+                    float("nan") if ramp is None else ramp.start_volts,
+                    float("nan") if ramp is None else ramp.stop_volts,
+                ))
+        if opened:
+            return "The ramp had not started, so it wrote no command."
+        return ("The ramp never wrote a command, so it has not driven the "
+                "laser's output.")
+
+    def _close_laser_calibration_controller(self, *, keep_error: bool) -> bool:
+        """Close the ramp's controller once, whichever thread gets here first.
+
+        Returns whether this call had a controller to close; False when the
+        other thread took it first.
+        """
+        with self._laser_calibration_lock:
+            controller, self._laser_calibration_controller = (
+                self._laser_calibration_controller, None)
+        if controller is None:
+            return False
+        try:
+            controller.close()
+        except Exception:
+            if not keep_error:
+                raise
+            # The ramp's own error is the one to report.
+            logger.exception("Laser calibration controller did not close cleanly")
+        return True
+
+    def _finish_laser_calibration_for_close(self) -> None:
+        """Wait for a ramp in progress; past its own timeout, close its controller.
+
+        The ramp's controller is never the laser model's, so the laser close
+        below never reached it, and nothing waited for the ramp: the process
+        could end before its finally, with the 6713 holding its last sample
+        and the shutter line high. The controller's close aborts the ramp's
+        tasks first, which is safe while the ramp thread is inside DAQmx
+        (NidaqLaserController._abort_calibration_ramp).
+        """
+        wait_seconds = self._laser_calibration_close_wait_s
+        if self._laser_calibration_done.wait(wait_seconds):
+            return
+        with self._laser_calibration_lock:
+            has_controller = self._laser_calibration_controller is not None
+            opened = self._laser_calibration_opened
+        # Not "which puts the command to its minimum": that reset can be
+        # refused, and the forced close can fail or hang. Nor "closing its
+        # laser controller" when there is none here to close: the ramp has not
+        # opened it yet, or its own thread has taken it to close.
+        if has_controller:
+            action = (
+                "closing its laser controller, which aborts the ramp and tries "
+                "to put the command to its minimum and close the shutters")
+        elif opened:
+            action = "its own thread is closing its laser controller"
+        else:
+            action = "it had not opened its laser controller, so there is none to close"
+        logger.error(
+            "A laser calibration ramp was still running %.1f s after reachAQ "
+            "began closing; %s",
+            wait_seconds,
+            action,
+        )
+        ramp = self._laser_calibration_ramp
+        # Bounded, as every laser controller close is (_BoundedClose). Past
+        # the bound the operator is told what may still be driven, and closing
+        # goes on.
+        closing = _BoundedClose(
+            lambda: self._close_laser_calibration_controller(keep_error=False),
+            "laser calibration controller")
+        finished = closing.run(_LASER_CONTROLLER_CLOSE_S)
+        failure = closing.failure(_LASER_CONTROLLER_CLOSE_S, finished)
+        if not failure and closing.result:
+            return  # Closed cleanly: the laser was reset.
+        with self._laser_calibration_lock:
+            opened = self._laser_calibration_opened
+        if not failure:
+            # Nothing here to close: the ramp's own thread took the controller
+            # first, and closes it, or the ramp had not opened one yet.
+            failure = (
+                "is being closed by the ramp's own thread" if opened
+                else "had not finished opening")
+        output = self._laser_calibration_output_note(ramp)
+        # Before the wait below, whatever it finds: with a raise as with a
+        # hang reachAQ exits next, and nothing else will reset the laser.
+        logger.critical(
+            "The calibration controller for laser %s %s. %s reachAQ is closing "
+            "without it.",
+            "?" if ramp is None else int(ramp.channel_id),
+            failure,
+            output,
+        )
+        # A ramp let go by its driver after the forced close tries to write
+        # the command back itself, on its closed branch; the process must not
+        # end before it can. Bounded, as everything on this path. What that
+        # reset did is the ramp's own to log, not this path's to assume.
+        if self._laser_calibration_done.wait(_LASER_CALIBRATION_RAMP_END_WAIT_S):
+            logger.warning(
+                "The laser calibration ramp ended; see above for any error "
+                "from its own reset")
+        else:
+            logger.error(
+                "The laser calibration ramp had not ended %.1f s later; "
+                "reachAQ closes with it still running",
+                _LASER_CALIBRATION_RAMP_END_WAIT_S)
+
+    def laser_controller_close_refusal(self) -> str:
+        """Why laser work is refused, or an empty string.
+
+        While a System Mode controller close is still running: the laser
+        model still holds that controller, and Run, Run Pulse, Test stim, a
+        ramp, a refresh, a configuration load or a DAQ ports save would call
+        into its driver, or open a second controller over the same lines.
+        Past its bound, in a driver that hung, that close stays pending until
+        it ends, and so do a partial close of a controller that failed to
+        open and a pulse train or ramp a close stopped waiting for (each
+        watched as a close given up on). Clears by itself when they end.
+        """
+        refusal = self._given_up_close_refusal()
+        if refusal:
+            return refusal
+        with self._pending_laser_closes_lock:
+            closing = bool(self._pending_laser_closes)
+        return _LASER_CLOSING_REFUSAL if closing else ""
+
+    def _given_up_close_refusal(self) -> str:
+        """The refusal of a close given up on, or of a watch, still listed.
+
+        Not a close still within its bound, whose owner sets LASER's status
+        when it ends. Listed, not unfinished: an entry is taken off only as
+        whatever follows it is listed (_watch_laser_work_left_running), so
+        laser work never reads free while a pulse it gave up on still runs.
+        """
+        with self._pending_laser_closes_lock:
+            held = [pending for pending in self._pending_laser_closes
+                    if pending.given_up or pending.is_watch]
+        return held[0].refusal if held else ""
+
+    def _laser_status_generation(self) -> int:
+        with self._acquisition.lock:
+            status = self._acquisition.subsystems.get(SubsystemId.LASER)
+        return 0 if status is None else status.generation
+
+    def _set_laser_status_after_close(self, decide) -> str:
+        """Set LASER from whether a laser close is pending, in order; the refusal.
+
+        `decide(refusal)` gives the status to set, as (state, fields for the
+        registry's transition), or None to leave it. Decided and set under
+        _laser_close_status_lock, so that a Stop, a failed start, a settings
+        save and a close's late finish land in the order they decided in.
+        Announced after the lock, with the statuses as they are then: the
+        announcement runs every property-change handler there and then, and
+        none of them runs under this lock.
+        """
+        with self._laser_close_status_lock:
+            refusal = self.laser_controller_close_refusal()
+            change = decide(refusal)
+            if change is None:
+                return refusal
+            state, fields = change
+            with self._acquisition.lock:
+                previous = self._acquisition.subsystems.statuses
+                self._acquisition.subsystems.transition(SubsystemId.LASER, state, **fields)
+        with self._acquisition.lock:
+            current = self._acquisition.subsystems.statuses
+        self.property_changed(self.Props.SUBSYSTEM_STATUSES, current, previous)
+        # A laser close's refusal changes with this status; the check reads it.
+        self._refresh_protocol_readiness(publish=False)
+        self.property_changed(self.Props.RECORDING_BLOCKERS, self.recording_blockers, None)
+        return refusal
+
+    def _watch_given_up_laser_close(
+        self, wait: Callable[[], object], name: str, *, ended: str, late: str,
+        refusal: str = _LASER_CLOSE_PENDING_REFUSAL,
+        replacing: Optional["_BoundedClose"] = None,
+    ) -> bool:
+        """Hold laser work off until `wait` returns; whether it had not yet.
+
+        For what goes on inside the driver after the close that started it
+        has returned: listed as a close given up on, so every refusal and the
+        LASER status follow it, and taken off, and said, when it ends.
+        `ended` is what the log says then; `late` what LASER says. Listed in
+        the same hold of the lock that takes `replacing`, the close it
+        follows, off.
+        """
+        generation = self._laser_status_generation()
+        watch = _BoundedClose(
+            wait, name,
+            on_late_finish=lambda closing: self._on_laser_close_finished_late(
+                closing, generation, ended, late),
+            refusal=refusal, is_watch=True)
+        with self._pending_laser_closes_lock:
+            self._pending_laser_closes.append(watch)
+            if replacing in self._pending_laser_closes:
+                self._pending_laser_closes.remove(replacing)
+        if watch.run(0.0):
+            with self._pending_laser_closes_lock:
+                if watch in self._pending_laser_closes:
+                    self._pending_laser_closes.remove(watch)
+            return False
+        return True
+
+    @staticmethod
+    def _still_closing_after_failed_open(error: BaseException) -> Optional[threading.Event]:
+        """The event a failed open's close sets when it ends, however `error` wraps it."""
+        seen = set()
+        while error is not None and id(error) not in seen:
+            if isinstance(error, LaserControllerStillClosing):
+                return error.still_closing
+            seen.add(id(error))
+            error = error.__cause__ or error.__context__
+        return None
+
+    def _watch_failed_open_close(
+        self, error: BaseException, going_on: str, *, write_status: bool = True,
+    ) -> None:
+        """Hold laser work off while a controller that failed to open closes.
+
+        NidaqLaserController closes what it had opened when opening fails,
+        bounded; past the bound that close goes on inside the driver, and it
+        raises LaserControllerStillClosing, with an event set when it ends.
+        Found on the error's chain, so a wrapped one still holds laser work
+        off. LASER says so while it lasts, in Idle as in System Mode.
+        """
+        still_closing = self._still_closing_after_failed_open(error)
+        if still_closing is None:
+            return
+        if not self._watch_given_up_laser_close(
+                still_closing.wait, "laser controller that failed to open",
+                ended="The laser controller that failed to open finished closing",
+                late=("the laser controller that failed to open finished "
+                      "closing, late, after a driver hang")):
+            return
+        logger.critical(
+            "The laser controller that failed to open is still closing what "
+            "it had opened, inside the driver. Its outputs may still hold a "
+            "command, and its shutters may be open: make the laser safe by "
+            "hand. %s without it.", going_on)
+        if write_status:
+            # A failed Run start writes its own, once, with the open's error.
+            self._set_laser_status_after_close(
+                lambda refusal: (SubsystemState.FAILED, dict(error=refusal)) if refusal else None)
+
+    def _close_laser_within_bound(self, going_on: str) -> None:
+        """Close System Mode's laser controller, waiting for it with a bound.
+
+        Every path that closes it comes here: Stop, a Run start that failed,
+        and closing. It waited without a bound, and a driver hung in the close
+        hung Stop, or exit, with nothing said. `going_on` completes the
+        CRITICAL's "... without it", such as "System Mode stops".
+        """
+        deadline = time.monotonic() + _LASER_CONTROLLER_CLOSE_S
+        closing = None
+        while True:
+            # Looked for and listed in one hold of the lock: a Stop and closing
+            # that both looked before either listed its close ran two on one
+            # controller at once. A watch is no close: nothing waits for one.
+            with self._pending_laser_closes_lock:
+                closes = [pending for pending in self._pending_laser_closes
+                          if not pending.done.is_set() and not pending.is_watch]
+                hung = [pending for pending in closes if pending.given_up]
+                under_way = [pending for pending in closes if not pending.given_up]
+                if hung:
+                    break
+                if not under_way:
+                    if self._laser.is_connected:
+                        channels = self._laser.configuration.channels
+                        commands = self._laser.last_command_volts
+                        # The generation as the close is listed, the one its
+                        # late finish writes with.
+                        generation = self._laser_status_generation()
+                        closing = _BoundedClose(
+                            self._laser.close, "laser controller",
+                            on_late_finish=lambda ended: self._on_laser_close_finished_late(
+                                ended, generation, "The laser controller finished closing",
+                                "laser controller closed, late, after a driver hang"))
+                        # Listed before it runs, so that one ending just past
+                        # its bound is still found and taken off by
+                        # _on_laser_close_finished_late.
+                        self._pending_laser_closes.append(closing)
+                    break
+            # One already running is this one: waited for, for as long as it
+            # is bounded, not run a second time beside it.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            under_way[0].done.wait(remaining)
+        if hung:
+            # Not started again over one still in the driver, which would
+            # hang the same way; that one's CRITICAL has been logged.
+            logger.error(
+                "The laser controller is still closing after a driver hang; "
+                "%s without closing it again", going_on)
+            return
+        if under_way:
+            logger.error(
+                "A laser controller close on another path had not ended within "
+                "%.1f s; %s without closing the laser again",
+                _LASER_CONTROLLER_CLOSE_S, going_on)
+            return
+        if closing is None:
+            # Nothing connected, or a close that came first has just closed
+            # it: nothing to close. The model's close would be a no-op.
+            return
+        finished = closing.run(_LASER_CONTROLLER_CLOSE_S)
+        if finished:
+            # Taken off as what it left running is listed, in one hold.
+            self._watch_laser_work_left_running(replacing=closing)
+        failure = closing.failure(_LASER_CONTROLLER_CLOSE_S, finished)
+        if not failure:
+            return
+        lasers = ", ".join(
+            "laser {} {:g} V".format(
+                int(channel.channel_id),
+                commands.get(int(channel.channel_id), channel.minimum_command_volts))
+            for channel in channels)
+        # With a raise as with a hang: the close is what resets the laser.
+        logger.critical(
+            "The laser controller %s. Each output may still hold its last "
+            "command (%s), and the shutters may be open: make the laser safe "
+            "by hand. %s without it.",
+            failure,
+            lasers or "no laser configured",
+            going_on,
+        )
+
+    def _watch_laser_work_left_running(
+        self, replacing: Optional["_BoundedClose"] = None,
+    ) -> None:
+        """Hold laser work off until what a close stopped waiting for ends.
+
+        The controller's close waits a bounded time for each pulse train it
+        cancels, and for a ramp to let go; past that it goes on, and that
+        work can still act on the lines, releasing a route or writing a line,
+        after a new controller has opened on them. The close itself has
+        finished, so the refusal says what is still running, not "closing".
+        `replacing`, the close that has just ended, is taken off here: in the
+        hold that lists the watch, or at once when nothing is left running.
+        """
+        try:
+            left = self._laser.work_left_running_after_close()
+        except Exception:
+            # The finished close is taken off all the same: left listed, it
+            # refused laser work until reachAQ restarted.
+            logger.exception(
+                "Could not tell what the laser controller's close left "
+                "running; laser work is not held off for it")
+            left = ()
+        if not left:
+            if replacing is not None:
+                with self._pending_laser_closes_lock:
+                    if replacing in self._pending_laser_closes:
+                        self._pending_laser_closes.remove(replacing)
+            return
+        operations = any(item.startswith("laser operation") for item in left)
+        ramp = "the calibration ramp" in left
+        what = (
+            "a laser operation or the calibration ramp" if operations and ramp
+            else "the calibration ramp" if ramp else "a laser operation")
+        if self._watch_given_up_laser_close(
+                self._laser.wait_for_work_left_running_after_close,
+                "laser work its close left running",
+                ended="What the laser controller's close left running ended",
+                late=f"{what} the close gave up on has ended",
+                refusal=_LASER_WORK_LEFT_REFUSAL.format(what=what),
+                replacing=replacing):
+            logger.error(
+                "The laser controller closed without %s, which had not ended; "
+                "laser work is refused until it does", ", ".join(left))
+
+    def _on_laser_close_finished_late(
+        self, closing: "_BoundedClose", generation: int, ended: str, late: str,
+    ) -> None:
+        """A close given up on has ended: laser work may start again.
+
+        LASER's status is set with the generation the close began in, so that
+        a start made since keeps its own, and only once nothing else is
+        pending. Not "stopped" while System Mode is on: that close was a
+        failed start's, and the laser stays failed until Refresh Hardware
+        opens it again.
+        """
+        # Taken off as what it left running, if anything, is listed: in one
+        # hold, so laser work never reads free in between.
+        self._watch_laser_work_left_running(replacing=closing)
+        logger.warning(
+            "%s after it was given up on%s", ended,
+            "" if closing.error is None
+            else f", with an error ({closing.failure(0.0, True)}); see above")
+        acquisition = self._acquisition
+        disabled = self._laser.configuration.backend == "disabled"
+
+        def decide(refusal):
+            held = self._given_up_close_refusal()
+            if held:
+                # Another close given up on, or work this one left running:
+                # laser work is refused, and LASER says why.
+                return SubsystemState.FAILED, dict(error=held, generation=generation)
+            if refusal:
+                # A close still within its bound; its owner sets the status.
+                return None
+            with acquisition.lock:
+                system_mode_on = (
+                    (acquisition.starting or acquisition.started)
+                    and not acquisition.stopping)
+            if system_mode_on:
+                return SubsystemState.FAILED, dict(
+                    error=f"{late}; Refresh Hardware can open it again",
+                    generation=generation)
+            # Tells the laser panel and the menus, which follow the statuses.
+            return (
+                SubsystemState.DISABLED if disabled else SubsystemState.STOPPED,
+                dict(reason=late, generation=generation))
+
+        self._set_laser_status_after_close(decide)
+        # The idle stream was held back while it lasted (_nidaq_stream_may_start),
+        # and nothing else asks for it: it starts, or says what still holds it.
+        self._request_nidaq_stream("a laser close given up on has ended")
+
+    def _start_nidaq_domain(self, *, timeout: float = 12.0, restart: bool = False) -> bool:
+        """Start the NI-DAQ domain; `restart` replaces a stream already running.
+
+        System Mode passes restart=True. NI sample times are the worker's
+        task-start anchor plus sample index over rate, anchored once, and are
+        compared with host perf_counter times (the tone-2 trial window, for
+        one); the two clocks drift apart. A stream started in Idle, carried
+        into System Mode, would bring its whole age of drift into a recording.
+        A retry keeps whatever is running.
+        """
+        monitor = self._nidaq_signal_monitor
+        if self._hold_nidaq_plan_blocked():
+            # The stream has no channels, which read as "disabled" below; it
+            # is held back, with the refusal an operator can fix.
+            return False
+        if not (monitor.hardware_enabled and monitor.configuration.is_enabled):
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                SubsystemState.DISABLED,
+                reason="NI-DAQ stream disabled",
+            )
+            return False
+        pause_reasons = self._nidaq_stream_autostart.pause_reasons
+        if pause_reasons:
+            # The DAQ Monitor holds tasks on the same lines. Starting over it
+            # fails inside DAQmx at a reservation error that names neither.
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                SubsystemState.BLOCKED,
+                reason=f"NI-DAQ stream is paused: {pause_reasons[-1]}",
+            )
+            return False
+        # The stream reports its own starts and stops as this status too
+        # (_on_nidaq_monitor_property_changed), and the start made below
+        # used to begin an attempt newer than this one. The registry then
+        # dropped this start's verdict as stale: independent device clocks
+        # read READY, so Record stayed allowed, and a start that timed out
+        # read "starting" after it had been stopped. While this runs, the
+        # verdict is its own.
+        self._nidaq_domain_start_active = True
+        try:
+            generation = self._begin_subsystem_start(
+                SubsystemId.NIDAQ_STREAM,
+                reason="starting synchronized NI-DAQ tasks",
+            )
+            return self._finish_nidaq_domain_start(
+                generation, timeout=timeout, restart=restart)
+        finally:
+            self._nidaq_domain_start_active = False
+
+    def _finish_nidaq_domain_start(
+        self, generation: int, *, timeout: float, restart: bool,
+    ) -> bool:
+        """Start the stream for _start_nidaq_domain and write its verdict."""
+        monitor = self._nidaq_signal_monitor
+        try:
+            # Refuse a channel map the boards cannot honour, before any task
+            # is built from it. The alternative is what this replaces: a
+            # DAQmx status code from inside a running task, naming neither the
+            # configuration line responsible nor the remedy.
+            self._require_valid_nidaq_configuration()
+            # An automatic start that decided to run just before System Mode
+            # began can still be in discovery or the preflight here, holding
+            # the monitor without yet saying it is starting. Decided now, the
+            # stop below was skipped and start() handed System Mode that Idle
+            # worker once it launched. Let it finish first, within the same
+            # bound as the start; past that, carry on rather than hang Run.
+            if restart and not self._nidaq_stream_autostart.wait(timeout):
+                logger.warning(
+                    "An automatic NI-DAQ input stream start was still running "
+                    "after %g seconds; System Mode may keep its worker instead "
+                    "of a fresh one",
+                    timeout,
+                )
+            if restart and (monitor.is_running or monitor.is_starting):
+                logger.info(
+                    "Restarting the NI-DAQ input stream so System Mode's "
+                    "samples are timed from a fresh task-start anchor"
+                )
+                monitor.stop()
+            if not monitor.start():
+                raise RuntimeError(
+                    monitor.error_message or "NI-DAQ stream did not start"
+                )
+            deadline = time.perf_counter() + timeout
+            while monitor.is_starting and time.perf_counter() < deadline:
+                time.sleep(0.02)
+            if not monitor.is_running:
+                raise RuntimeError(
+                    monitor.error_message
+                    or f"NI-DAQ stream was not ready within {timeout:g} seconds"
+                )
+        except Exception as exc:
+            error = str(exc) or exc.__class__.__name__
+            logger.exception("NI-DAQ initialization failed")
+            monitor.stop()
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                SubsystemState.FAILED,
+                error=error,
+                generation=generation,
+            )
+            return False
+        timing_plan = monitor.timing_plan
+        if (
+            timing_plan is not None
+            and timing_plan.resolved_mode == "independent"
+            and len(timing_plan.task_start_order) > 1
+        ):
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                SubsystemState.BLOCKED,
+                reason=(
+                    "NI-DAQ diagnostic preview is running with independent device "
+                    "clocks; deterministic session recording is unavailable"
+                ),
+                generation=generation,
+            )
+            self._fail_nidaq_domain_if_stream_lost(generation)
+            return False
+        self._set_subsystem_status(
+            SubsystemId.NIDAQ_STREAM,
+            SubsystemState.READY,
+            reason="synchronized NI-DAQ tasks running",
+            generation=generation,
+        )
+        return not self._fail_nidaq_domain_if_stream_lost(generation)
+
+    def _fail_nidaq_domain_if_stream_lost(self, generation: int) -> bool:
+        """Write FAILED if the stream failed while its verdict was written.
+
+        The verdict follows a check that the stream runs. A worker that died
+        after that check was written FAILED at the same generation, and the
+        verdict then replaced it: a required subsystem read ready on a dead
+        stream. Checked after the write, a failure either came first and is
+        seen here, or comes later and stands.
+        """
+        monitor = self._nidaq_signal_monitor
+        # Running first. A dying worker sets its error before it clears
+        # running (NidaqSignalMonitorModel._run, then _finalize_worker), so
+        # read the other way round a crash between the two reads showed a
+        # stopped stream with no error, written as the generic FAILED below.
+        running = monitor.is_running
+        error = monitor.error_message
+        if running and not error:
+            return False
+        self._set_subsystem_status(
+            SubsystemId.NIDAQ_STREAM,
+            SubsystemState.FAILED,
+            error=error or "NI-DAQ stream stopped as System Mode started it",
+            generation=generation,
+        )
+        return True
+
+    def _require_valid_nidaq_configuration(self) -> None:
+        """Check the configuration against the installed boards, or refuse.
+
+        Discovery is reused when the stream has already resolved device
+        aliases, so this costs nothing on the usual path. An empty probe means
+        the hardware could not be asked, which is unknown rather than invalid
+        and is left to the domain start to report.
+        """
+        configuration = self._loaded_configuration
+        if configuration is None:
+            return
+        devices, discovery_error = discover_nidaq_devices()
+        if discovery_error or not devices:
+            return
+        # A plan a refused start left has no clock, and the laser's route
+        # check reads the clock's board off the plan: it went unasked beside
+        # the refusal. Only then is a clock put in: the one the refused plan's
+        # own master would have given. With no plan yet, and with a valid one
+        # that shares no clock (one board, or independent boards), the check
+        # is skipped, as it always was. Independent boards run the laser on
+        # its own clock: a clock guessed for them made Run check, and refuse,
+        # a route that mode never uses.
+        plan = self._nidaq_signal_monitor.timing_plan
+        require_valid_nidaq_configuration(
+            devices,
+            stream=configuration.nidaq_stream,
+            ports=configuration.nidaq_ports,
+            laser=configuration.laser,
+            timing_plan=plan,
+            clock_source=refused_plan_clock_source(
+                plan, configuration.nidaq_ports.timing),
+        )
+
+    def _start_laser_domain(self) -> bool:
+        configuration = self._laser.configuration
+        if configuration.backend == "disabled":
+            self._set_subsystem_status(
+                SubsystemId.LASER,
+                SubsystemState.DISABLED,
+                reason="laser disabled",
+            )
+            return False
+        # Not over a close still running, for a Run as for a retry: opening
+        # builds a second controller on the same lines, and then closes the
+        # laser model's, the one whose close is still in the driver, calling
+        # into it again (LaserModel.configure_nidaq, then set_controller).
+        # Before the generation moves on, so that the close's late finish
+        # still sets the status (_on_laser_close_finished_late).
+        if self._set_laser_status_after_close(
+                lambda refusal: (SubsystemState.FAILED, dict(
+                    error=f"laser controller not opened: {refusal}"))
+                if refusal else None):
+            return False
+        generation = self._begin_subsystem_start(
+            SubsystemId.LASER,
+            reason="opening laser controller",
+        )
+        try:
+            runtime_configuration = self._runtime_laser_configuration(configuration)
+            feedback_reader = (
+                self._read_nidaq_feedback_channel
+                if (
+                    configuration.backend == "nidaq"
+                    and self._nidaq_signal_monitor.is_running
+                )
+                else None
+            )
+            timing_plan = (
+                self._nidaq_signal_monitor.timing_plan
+                if configuration.hardware_timed
+                else None
+            )
+            # Before the open, which announces the connection the protocol
+            # check then reads this beside.
+            self._laser_timing_plan = timing_plan
+            self._laser.load_configuration(
+                runtime_configuration,
+                feedback_reader=feedback_reader,
+                persisted_configuration=configuration,
+                timing_plan=timing_plan,
+                analog_terminal_config=self._laser_analog_terminal_config(),
+            )
+            self._laser.start_direct_trigger_receiver(
+                self._stim_direct_trigger_queue,
+                self._on_direct_stim_trigger_result,
+            )
+        except Exception as exc:
+            error = str(exc) or exc.__class__.__name__
+            logger.exception("Laser initialization failed")
+            self._close_laser_within_bound("System Mode goes on")
+            self._watch_failed_open_close(exc, "System Mode goes on", write_status=False)
+            self._set_laser_status_after_close(
+                lambda refusal: (SubsystemState.FAILED, dict(
+                    error=f"{error}; {refusal}" if refusal else error,
+                    generation=generation)))
+            return False
+        self._set_subsystem_status(
+            SubsystemId.LASER,
+            SubsystemState.READY,
+            reason="laser controller connected",
+            generation=generation,
+        )
+        return True
+
+    def _laser_analog_terminal_config(self):
+        """The stream's analogTerminalConfig, which the laser's own inputs use.
+
+        One source: the stream's configuration, as the stream reads it, or,
+        with a refused plan, as the operator stored it. None leaves the
+        laser's inputs to DAQmx's default.
+        """
+        stream = (
+            self._loaded_configuration.nidaq_stream
+            if self._nidaq_plan_error and self._loaded_configuration is not None
+            else self._nidaq_signal_monitor.configuration
+        )
+        return getattr(stream, "analog_terminal_config", "") or None
+
+    def _runtime_laser_configuration(self, configuration):
+        """The laser configuration under the device names NI-DAQmx uses now.
+
+        Shared by System Mode's laser domain and the Idle calibration ramp.
+        """
+        if not (
+            configuration.backend == "nidaq"
+            and self._nidaq_ports.device_identities
+        ):
+            return configuration
+        aliases = self._nidaq_signal_monitor.runtime_device_aliases
+        if not aliases:
+            devices, discovery_error = discover_nidaq_devices()
+            if discovery_error:
+                raise RuntimeError(discovery_error)
+            aliases = resolve_nidaq_device_aliases(
+                self._nidaq_ports.device_identities,
+                devices,
+            )
+        return self._remap_laser_configuration(configuration, aliases)
+
+    @staticmethod
+    def _remap_laser_configuration(configuration, aliases):
+        def remap(value):
+            return (
+                None
+                if value is None
+                else remap_nidaq_physical_channel(value, aliases)
+            )
+
+        return dataclasses.replace(
+            configuration,
+            channels=tuple(
+                dataclasses.replace(
+                    channel,
+                    analog_output=remap(channel.analog_output),
+                    diode_input=remap(channel.diode_input),
+                    shutter_output=remap(channel.shutter_output),
+                    auxiliary_output=remap(channel.auxiliary_output),
+                    command_copy_input=remap(channel.command_copy_input),
+                    trigger_source=remap(channel.trigger_source),
+                    trigger_output=remap(channel.trigger_output),
+                    timing_trigger_output=remap(
+                        channel.timing_trigger_output
+                    ),
+                )
+                for channel in configuration.channels
+            ),
+            pmt_shutter_output=remap(configuration.pmt_shutter_output),
+            trigger_listener_inputs=tuple(
+                remap(value)
+                for value in configuration.trigger_listener_inputs
+            ),
+        )
+
+    def _read_nidaq_feedback_channel(self, physical_channel: str) -> float:
+        monitor = self._nidaq_signal_monitor
+        if not monitor.is_running:
+            raise RuntimeError("shared NI-DAQ input stream is not running")
+        configuration = monitor.configuration
+        channel_index = next(
+            (
+                index
+                for index, channel in enumerate(configuration.channels)
+                if remap_nidaq_physical_channel(
+                    channel.physical_channel,
+                    monitor.runtime_device_aliases,
+                ) == physical_channel
+            ),
+            None,
+        )
+        if channel_index is None:
+            raise KeyError(
+                f"NI-DAQ input channel is not in the acquisition plan: {physical_channel}"
+            )
+        ring = monitor.sample_ring
+        scratch = np.empty(
+            (max(1, len(ring.channel_names)), 1),
+            dtype=np.float32,
+        )
+        for _ in range(5):
+            end_sample_index = ring.current_end_sample_index()
+            if end_sample_index <= 0:
+                break
+            read = ring.copy_since(end_sample_index - 1, scratch)
+            if read is not None and read.sample_count == 1:
+                return float(scratch[channel_index, 0])
+        raise RuntimeError(
+            f"No current NI-DAQ feedback sample is available for {physical_channel}"
+        )
+
+    def _start_inference_domain(
+        self,
+        *,
+        reach_synchronization_ready: bool,
+        preflight_error: Optional[str],
+    ) -> bool:
+        if not self._inference.is_enabled:
+            self._set_subsystem_status(
+                SubsystemId.LIVE_INFERENCE,
+                SubsystemState.DISABLED,
+                reason="live inference disabled",
+            )
+            return False
+        if preflight_error:
+            return False
+        if not reach_synchronization_ready:
+            self._set_subsystem_status(
+                SubsystemId.LIVE_INFERENCE,
+                SubsystemState.BLOCKED,
+                reason="enabled reach camera synchronization is not ready",
+            )
+            return False
+        generation = self._begin_subsystem_start(
+            SubsystemId.LIVE_INFERENCE,
+            reason="starting live inference",
+        )
+        try:
+            if not self._inference.start(self._inference_queue):
+                raise RuntimeError("live inference process did not start")
+        except Exception as exc:
+            error = str(exc) or exc.__class__.__name__
+            logger.exception("Live inference initialization failed")
+            try:
+                self._inference.stop()
+            except Exception:
+                logger.exception("Live inference cleanup failed")
+            self._set_subsystem_status(
+                SubsystemId.LIVE_INFERENCE,
+                SubsystemState.FAILED,
+                error=error,
+                generation=generation,
+            )
+            return False
+        self._set_subsystem_status(
+            SubsystemId.LIVE_INFERENCE,
+            SubsystemState.READY,
+            reason="live inference running",
+            generation=generation,
+        )
+        return True
+
+    def _validate_session_logs_domain(self) -> bool:
+        generation = self._begin_subsystem_start(
+            SubsystemId.SESSION_LOGS,
+            reason="validating session output location",
+        )
+        try:
+            output_location = Path(self._output_location).expanduser()
+            session_config = self._behavior.algorithm.active_config.session_control
+            preflight = preflight_storage(
+                output_location,
+                estimated_bytes_per_second=self._estimate_session_bytes_per_second(),
+                configured_duration_seconds=session_config.duration_limit_seconds,
+            )
+        except Exception as exc:
+            error = str(exc) or exc.__class__.__name__
+            logger.exception("Session output validation failed")
+            self._set_subsystem_status(
+                SubsystemId.SESSION_LOGS,
+                SubsystemState.FAILED,
+                error=error,
+                generation=generation,
+            )
+            return False
+        self._set_subsystem_status(
+            SubsystemId.SESSION_LOGS,
+            SubsystemState.READY,
+            reason=(
+                f"session output durable-write test passed: {output_location}; "
+                f"free={preflight.free_bytes} bytes; projected maximum="
+                f"{preflight.projected_maximum_minutes:.1f} minutes"
+            ),
+            generation=generation,
+        )
+        return True
+
+    def _log_acquisition_startup_summary(self) -> None:
+        statuses = self._acquisition.subsystems.statuses
+        for subsystem_id, status in statuses.items():
+            detail = status.error or status.reason or "no detail"
+            log_hardware_initialization(
+                logger,
+                "SUMMARY | %s | state=%s detail=%s",
+                subsystem_id,
+                status.state.value,
+                detail,
+            )
+
+        failed_cameras = tuple(
+            subsystem_id
+            for subsystem_id, status in statuses.items()
+            if subsystem_id.startswith("camera.")
+            and status.state in {SubsystemState.FAILED, SubsystemState.BLOCKED}
+        )
+        nidaq_status = statuses.get(SubsystemId.NIDAQ_STREAM.value)
+        if (
+            failed_cameras
+            and nidaq_status is not None
+            and nidaq_status.state in {SubsystemState.FAILED, SubsystemState.BLOCKED}
+        ):
+            log_hardware_initialization(
+                logger,
+                "CORRELATION | camera failure(s)=%s and NI-DAQ=%s occurred "
+                "during the same startup. They may share a physical power, "
+                "timing, trigger, or ground dependency; NI-DAQ software "
+                "initialization does not trigger the cameras.",
+                ",".join(failed_cameras),
+                nidaq_status.state.value,
+                level=logging.WARNING,
+            )
+
+    def retry_failed_subsystems(self) -> str:
+        """Retry failed acquisition domains without disturbing healthy domains."""
+        if not self._acquisition.started:
+            raise RuntimeError("Subsystem retry requires System Mode to be running")
+        if self._recording_session.status is not SessionRecordingStatus.READY:
+            raise RuntimeError("Subsystem retry is unavailable during recording or analysis")
+
+        failed = {
+            subsystem_id
+            for subsystem_id, status in self._acquisition.subsystems.statuses.items()
+            if status.state in {SubsystemState.FAILED, SubsystemState.BLOCKED}
+        }
+        retried = []
+        reach_failed = any(
+            subsystem_id == SubsystemId.REACH_SYNCHRONIZATION.value
+            or subsystem_id.startswith("camera.")
+            and any(
+                subsystem_id == SubsystemId.camera(camera.name)
+                for camera in self._reach_cameras
+            )
+            for subsystem_id in failed
+        )
+        if reach_failed:
+            if self._retry_reach_camera_domains():
+                retried.append("reach cameras")
+        if SubsystemId.CAN_PELLET.value in failed:
+            if self._start_can_domain(wait_connected=True):
+                retried.append("CAN/pellet")
+        if SubsystemId.NIDAQ_STREAM.value in failed:
+            if self._start_nidaq_domain():
+                retried.append("NI-DAQ")
+        if SubsystemId.LASER.value in failed:
+            if self._start_laser_domain():
+                retried.append("laser")
+        if SubsystemId.SESSION_LOGS.value in failed:
+            if self._validate_session_logs_domain():
+                retried.append("session output")
+
+        synchronization = self._acquisition.subsystems.get(
+            SubsystemId.REACH_SYNCHRONIZATION
+        )
+        inference = self._acquisition.subsystems.get(SubsystemId.LIVE_INFERENCE)
+        if (
+            self._inference.is_enabled
+            and synchronization is not None
+            and synchronization.is_ready
+            and (inference is None or not inference.is_ready)
+            and self._start_inference_domain(
+                reach_synchronization_ready=True,
+                preflight_error=None,
+            )
+        ):
+            retried.append("live inference")
+        remaining = self._acquisition.subsystems.recording_blockers()
+        if remaining:
+            return (
+                f"Retried {', '.join(retried) if retried else 'failed subsystems'}; "
+                f"Record remains blocked: {'; '.join(remaining)}"
+            )
+        return (
+            f"Ready after retry: {', '.join(retried)}"
+            if retried
+            else "All required subsystems are already ready"
+        )
+
+    def _retry_reach_camera_domains(self) -> bool:
+        all_cameras = self._ordered_reach_cameras(enabled_only=True)
+        independent_stim = next((
+            camera for camera in all_cameras
+            if camera.camera_id == CameraId.Camera3
+            and camera._stim_detection_configuration is not None
+        ), None)
+        cameras = tuple(
+            camera for camera in all_cameras if camera is not independent_stim
+        )
+        stim_ready = independent_stim is None
+        if independent_stim is not None:
+            status = self._acquisition.subsystems.get(
+                SubsystemId.camera(independent_stim.name)
+            )
+            if status is not None and status.is_ready:
+                stim_ready = True
+            else:
+                independent_stim.on_capture_stop()
+                inference_indices = {
+                    camera: index
+                    for index, camera in enumerate(self._inference_cameras)
+                }
+                inference_index = inference_indices.get(independent_stim)
+                if self._prepare_camera_domain(
+                    independent_stim,
+                    self._inference_queue if inference_index is not None else None,
+                    inference_index,
+                ):
+                    camera_generation = self._acquisition.subsystems.get(
+                        SubsystemId.camera(independent_stim.name)
+                    ).generation
+                    stim_ready = self._enable_camera_capture_domain(
+                        independent_stim,
+                        camera_generation,
+                    )
+        if not cameras:
+            return stim_ready
+        primary = cameras[0]
+        primary_status = self._acquisition.subsystems.get(
+            SubsystemId.camera(primary.name)
+        )
+        inference_indices = {
+            camera: index
+            for index, camera in enumerate(self._inference_cameras)
+        }
+        if primary_status is None or not primary_status.is_ready:
+            # Secondaries depend on the primary trigger, so this is the one retry
+            # case where the complete reach-camera synchronization domain restarts.
+            for camera in cameras:
+                try:
+                    camera.on_capture_stop()
+                except Exception:
+                    logger.exception("Failed to reset reach camera %s", camera.name)
+            sync_ready = self._start_reach_camera_domains(inference_indices)
+            return sync_ready and stim_ready
+
+        generation = self._begin_subsystem_start(
+            SubsystemId.REACH_SYNCHRONIZATION,
+            reason="retrying unavailable secondary cameras",
+        )
+        for secondary in cameras[1:]:
+            status = self._acquisition.subsystems.get(
+                SubsystemId.camera(secondary.name)
+            )
+            if status is not None and status.is_ready:
+                continue
+            inference_index = inference_indices.get(secondary)
+            if not self._prepare_camera_domain(
+                secondary,
+                self._inference_queue if inference_index is not None else None,
+                inference_index,
+            ):
+                continue
+            camera_generation = self._acquisition.subsystems.get(
+                SubsystemId.camera(secondary.name)
+            ).generation
+            if self._enable_camera_capture_domain(
+                secondary,
+                camera_generation,
+                wait_for_first_frame=False,
+            ):
+                self._wait_camera_first_frame_domain(
+                    secondary,
+                    camera_generation,
+                )
+        all_ready = all(
+            (
+                status := self._acquisition.subsystems.get(
+                    SubsystemId.camera(camera.name)
+                )
+            ) is not None
+            and status.is_ready
+            for camera in cameras
+        )
+        self._set_subsystem_status(
+            SubsystemId.REACH_SYNCHRONIZATION,
+            SubsystemState.READY if all_ready else SubsystemState.FAILED,
+            reason=(
+                "all enabled reach cameras synchronized"
+                if all_ready
+                else "one or more enabled reach cameras unavailable"
+            ),
+            error="" if all_ready else "reach synchronization incomplete",
+            generation=generation,
+        )
+        return all_ready and stim_ready
+
     def capture_start(
         self,
         *,
-        target_status: AppModelStatus = AppModelStatus.ACQUIRING,
+        target_status: AppModelStatus = AppModelStatus.RUNNING,
         wait_connected: bool = True,
     ) -> bool:
         """Request to start the acquisition"""
+        hardware_init_started = time.perf_counter()
+        log_hardware_initialization(
+            logger,
+            "START | acquisition hardware | target_status=%s wait_connected=%s",
+            target_status.value,
+            wait_connected,
+        )
         if target_status == AppModelStatus.IDLE:
             raise ValueError("AppModelStatus.IDLE not accepted as target for capture_start")
         with self.app_lock:
@@ -1179,19 +8430,86 @@ class AppModel(ObservableObject):
             if target_status == before_status:
                 logger.verbose("AppModelStatus already %s", before_status)
                 return True
-            if self._acquisition_started:
+            if self._acquisition.started:
                 if self.is_target_status_valid(target_status):
                     self.status = target_status
                     return True
                 self.on_error("AppModelStatus change error",
                               f"Target status {target_status} not valid for source status {before_status}")
                 return False
-            if self._acquisition_starting:
+            if not self._acquisition.begin_start():
                 logger.warning("Acquisition already starting")
                 return False
-            self._acquisition_starting = True
+            # After begin_start, which a ramp checks for once its own flag is
+            # set, so of the two only one goes ahead. A ramp holds the NI-DAQ
+            # lines and a laser controller of its own: a Run would restart the
+            # stream over its tasks and open a second controller on the same
+            # lines. Nothing but the start flag has been changed yet.
+            if self._laser_calibration_active:
+                self._acquisition.mark_stopped()
+                self.on_error(
+                    "Run unavailable",
+                    "System Mode cannot start while a laser calibration ramp "
+                    "runs; wait for it to finish",
+                )
+                return False
+            # The laser model still holds a controller whose close hung in the
+            # driver; a Run would call into it, or open a second one over it.
+            close_refusal = self.laser_controller_close_refusal()
+            if close_refusal:
+                self._acquisition.mark_stopped()
+                self.on_error("Run unavailable", f"System Mode cannot start: {close_refusal}")
+                return False
+            previous_internal_error = self._internal_error_diagnostic
+            self._internal_error_diagnostic = None
+            self._session_invariant_unknown = False
             self._start_count += 1
             is_first_start = self._start_count == 1
+        if previous_internal_error is not None:
+            self._on_property_changed(
+                self.Props.INTERNAL_ERROR_DIAGNOSTIC,
+                None,
+                previous_internal_error,
+            )
+            self._set_subsystem_status(
+                SubsystemId.RUNTIME_DIAGNOSTICS,
+                SubsystemState.READY,
+                reason="internal-error diagnostic cleared by acquisition restart",
+                required_for_recording=False,
+            )
+
+        # Freeze the third camera's mutually exclusive session contract before
+        # declaring subsystem intent. Intent must be established before any
+        # preflight publishes a terminal failure, otherwise the intent reset
+        # would erase that first diagnostic.
+        self._configure_stim_camera_for_selected_protocol()
+        self._configure_subsystem_intent(self._loaded_configuration)
+
+        inference_preflight_error = None
+        if self._inference.is_enabled:
+            runtime_check = getattr(self._inference, "check_live_inference_runtime", None)
+            if callable(runtime_check):
+                gpu_status = runtime_check()
+                if not gpu_status.is_available:
+                    # Name the engine that was actually probed. This said
+                    # "TensorFlow" whatever the probe ran, so a torch-only rig
+                    # was told to fix a TensorFlow runtime it never installed.
+                    probed = gpu_status.backend or "configured"
+                    installed = ", ".join(available_backends()) or "none"
+                    inference_preflight_error = (
+                        f"Live inference cannot start because a compatible {probed} GPU "
+                        f"runtime was not found (engines installed: {installed}). "
+                        "Cameras and independent hardware will continue without live inference. "
+                        "Disable Live inference in Preferences or launch with --no-live-inference "
+                        "to suppress this failure.\n\n"
+                        f"{gpu_status.error}"
+                    )
+                    logger.error(inference_preflight_error)
+                    self._set_subsystem_status(
+                        SubsystemId.LIVE_INFERENCE,
+                        SubsystemState.FAILED,
+                        error=inference_preflight_error,
+                    )
 
         algo = self._behavior.algorithm
         analysis = self._analysis
@@ -1208,156 +8526,113 @@ class AppModel(ObservableObject):
 
         self._behavior.on_prepare_capture()  # might be better at the end...
 
+        self._ensure_reach_primary_camera()
+        self._warn_if_stereo_capture_binning_differs()
         self._inference_queue = None
+        self._inference_cameras = ()
+        inference_camera_indices = {}
 
-        if self._inference.is_enabled:
-            shape_1 = self._left_camera.shape
-            shape_2 = self._right_camera.shape
-            if shape_1 == shape_2:
+        if self._inference.is_enabled and inference_preflight_error is None:
+            inference_cameras = self._ordered_reach_cameras(enabled_only=True)
+            inference_error = None
+            if len(inference_cameras) < 2:
+                inference_error = (
+                    "Live inference requires at least two enabled reach cameras; "
+                    f"found {len(inference_cameras)}."
+                )
+            else:
+                shape = inference_cameras[0].shape
+                mismatched_cameras = [
+                    camera.name
+                    for camera in inference_cameras
+                    if camera.shape != shape
+                ]
+                if len(mismatched_cameras) > 0:
+                    inference_error = (
+                        "Live inference requires all enabled reach cameras to use the same frame size; "
+                        f"mismatched cameras: {', '.join(mismatched_cameras)}."
+                    )
+            if inference_error is None:
                 self._inference_queue = FixedArrayMultiQueue(
-                    # live queue does not need/require a lot of "depth" == total nbr of batches that can sit
-                    # in the ring-buffer-queue at the same time.
-                    # Now only using a "depth" of 1 frame batches,
-                    # this should makes less delay / be more reactive in live inference results,
-                    1,
+                    # Depth 2, with PoseProcess draining to the newest batch.
+                    #
+                    # Depth 1 looked like the low-latency choice and is not.
+                    # get_output frees the slot as soon as it has copied the
+                    # frame out, at the start of predict, so the producer
+                    # refills it immediately and then has nowhere to put
+                    # anything else; the batch waiting at the next call is
+                    # already a predict-period old. Measured on the rig at
+                    # 150 fps, cspnext_m went 17.637 ms p50 / 22.185 p99 at
+                    # depth 1 to 13.854 / 17.611 at depth 2, and the share of
+                    # batches the capture loop could not hand over at all fell
+                    # from 35.2% to 0.7%. cspnext_s, which is faster than the
+                    # frame period and so never backs up, is unchanged:
+                    # 7.000 / 7.486 against 6.981 / 7.521.
+                    #
+                    # Not deeper than 2: at depth 4 the drain pays a full
+                    # frame copy and RGB expansion for each batch it skips,
+                    # and cspnext_s regressed to 10.167 / 13.330.
+                    #
+                    # None of this touches acquisition. The capture loop puts
+                    # with block=False and records on a separate queue, so a
+                    # slow pose process can never stall capture or cost a
+                    # recorded frame; what is skipped here is inference work.
                     2,
-                    3,
-                    shape=shape_1,
+                    len(inference_cameras),
+                    # One frame per camera: the batch is released as soon as a frame
+                    # arrives instead of accumulating three, which removes two frame
+                    # periods of staleness. PoseProcess pads up to the model batch
+                    # size, so the DeepLabCut graph and the offline path are unchanged.
+                    1,
+                    shape=shape,
+                    primary=0,
                     name="inference_q",
                     mp_ctx=get_mp_ctx(),
                 )
+                inference_camera_indices = {
+                    camera: camera_index
+                    for camera_index, camera in enumerate(inference_cameras)
+                }
+                self._inference_cameras = inference_cameras
             else:
-                logger.warning("inference disabled: left and right camera frame sizes do not match")
+                logger.error(inference_error)
+                self.on_error("Inference configuration error", inference_error)
+                self._set_subsystem_status(
+                    SubsystemId.LIVE_INFERENCE,
+                    SubsystemState.FAILED,
+                    error=inference_error,
+                )
+                inference_preflight_error = inference_error
         else:
             self._inference_queue = None
 
-        #
-        synced_cameras = (self._left_camera, self._right_camera)  # normally/usually left cam is primary
-        did_start = True
+        reach_synchronization_ready = self._start_reach_camera_domains(
+            inference_camera_indices,
+        )
+        # Each hardware domain starts and fails independently. Readiness is
+        # aggregated only when Record is requested.
+        can_ready = self._start_can_domain(wait_connected=wait_connected)
+        # A fresh worker, not the one started in Idle: see _start_nidaq_domain.
+        self._start_nidaq_domain(restart=True)
+        self._start_laser_domain()
+        self._validate_session_logs_domain()
 
-        # 1) prepare synced primary camera(s)
-        if did_start:
-            for camera in synced_cameras:
-                if camera.is_primary and camera.is_enabled:
-                    logger.info("Preparing capture on %s", camera.name)
-                    did_start = camera.on_prepare_capture(self._inference_queue)
-                    if not did_start:
-                        self.on_error("Camera Process Failed",
-                                      _failed_camera_template(camera.name, camera.last_error))
-                        break
-                    # 1.1) wait it's running or failed
-                    if (
-                        not camera.wait_for_capture_status((CaptureProcessStatus.RUNNING, CaptureProcessStatus.FAILED), timeout=5)
-                    ) or camera.video_status != CaptureProcessStatus.RUNNING:
-                        did_start = False
-                        self.on_error("Camera start failed", _failed_camera_template(camera.name, camera.last_error))
-                        break
-
-        # 2) prepare synced non-primary camera(s)
-        if did_start:
-            time.sleep(0.5)
-            for camera in synced_cameras:
-                if not camera.is_primary and camera.is_enabled:
-                    logger.info("Preparing capture on %s", camera.name)
-                    did_start = camera.on_prepare_capture(self._inference_queue)
-                    if not did_start:
-                        self.on_error("Camera Process Failed",
-                                      _failed_camera_template(camera.name, camera.last_error))
-                        break
-
-        # 3) wait all synced cameras are running
-        if did_start:
-            p_before = time.perf_counter()
-            p_timeout = p_before + 10
-            for camera in synced_cameras:
-                p_now = time.perf_counter()
-                if not camera.is_primary and camera.is_enabled:
-                    if (not camera.wait_for_capture_status((CaptureProcessStatus.RUNNING, CaptureProcessStatus.FAILED), timeout=p_timeout - p_now)
-                        or camera.video_status != CaptureProcessStatus.RUNNING):
-                        did_start = False
-                        self.on_error("Camera start failed", _failed_camera_template(camera.name, camera.last_error))
-                        break
-                    logger.verbose("%s now running", camera.name)
-
-        # 4) trigger enable capture on synced cameras
-        if did_start:
-            # 4.1) first on non-primary
-            for camera in synced_cameras:
-                if not camera.is_primary and camera.is_enabled:
-                    logger.info("Starting capture on %s", camera.name)
-                    camera.on_capture_start()
-            # small delay to ensure not-primary cam(s) are waiting on primary:
-            time.sleep(0.5)
-            # 4.2) then on primary
-            for camera in synced_cameras:
-                if camera.is_primary and camera.is_enabled:
-                    logger.info("Starting capture on %s", camera.name)
-                    camera.on_capture_start()
-
-        # sleep, relatively a bit, to give more time to synced cameras to start together
-        time.sleep(1.5)
-
-        # 5) remaining non-synced camera(s)
-        camera = self._top_camera
-        if did_start and camera.is_enabled:
-            logger.info("Preparing capture on %s", camera.name)
-            did_start = camera.on_prepare_capture()
-            if not did_start:
-                self.on_error("Camera Process Failed",
-                              _failed_camera_template(camera.name, camera.last_error))
-            else:
-                if (
-                    not camera.wait_for_capture_status((CaptureProcessStatus.RUNNING, CaptureProcessStatus.FAILED), timeout=5)
-                    or camera.video_status != CaptureProcessStatus.RUNNING
-                ):
-                    did_start = False
-                    self.on_error("Camera start failed", _failed_camera_template(camera.name, camera.last_error))
-                else:
-                    camera.on_capture_start()
-
-        if not did_start:
-            logger.error("failed to start all subprocesses")
-            self.capture_stop(force=True)
-            return False
-
-        # Connect "hardware" (motors/steppers/etc..) after cameras are setup/running,
-        # so that any movement pre-applied should be visible on camera(s).
-        logger.debug("connecting hardware ...")
-        hard = self._hardware
-        hard.connect(self._system_message_handler.input_queue)
-        # hard.set_auto_correct_motor_drift(algo.auto_correct_motors_drift)  # disabled
-        if wait_connected:
-            timeout = 3
-            # full establishement of connection to/from device should be very fast actually, but not immediate,
-            # so this timeout.
-            p_end = time.perf_counter() + timeout
-            while True:
-                for tok in hard.pending_tokens:
-                    p0 = time.perf_counter()
-                    try:
-                        hard.wait_pending_command_acked(tok, timeout=timeout)
-                    except Exception as err:
-                        logger.error("pending token %s not acked: %s", tok, err)
-                        self.capture_stop(force=True)
-                        return False
-                    timeout -= time.perf_counter() - p0
-                break
-            while True:
-                if hard.connected:
-                    break
-                if time.perf_counter() > p_end:
-                    logger.error("timeout waiting hardware connected")
-                    self.capture_stop(force=True)
-                    return False
-                time.sleep(0.05)
-        logger.info("finished connecting hardware")
-        #
         watchdog_mon_register = self._analysis.watchdog_monitor.register_watchdog
-        watchdog_mon_register(WatchdogItems.DEVICE_READER, lambda: self._hardware.watchdog_reader_perf_c)
-        watchdog_mon_register(WatchdogItems.DEVICE_WRITER, lambda: self._hardware.watchdog_writer_perf_c)
+        if can_ready:
+            watchdog_mon_register(
+                WatchdogItems.DEVICE_READER,
+                lambda: self._hardware.watchdog_reader_perf_c,
+            )
+            watchdog_mon_register(
+                WatchdogItems.DEVICE_WRITER,
+                lambda: self._hardware.watchdog_writer_perf_c,
+            )
 
         for cam in self._cameras:
-            if cam.is_enabled:
+            status = self._acquisition.subsystems.get(
+                SubsystemId.camera(cam.name)
+            )
+            if status is not None and status.is_ready:
                 watchdog_mon_register(f"camera.{cam.name}", lambda cam=cam: cam.watchdog_capture_perf_c)
 
         if __debug__ and os.getenv("_AUTOTRAINER_TEST_WATCHDOG") == "1":
@@ -1365,16 +8640,14 @@ class AppModel(ObservableObject):
                 return t_end
             watchdog_mon_register("test-watchdog", lambda t=time.perf_counter() + 180: fake_watchdog(t))
 
-        # we always be/go at home on acquisition start, so:
-        self._behavior.system_machine.pellet.move_home(force=True)
-
         # once cameras successfully started:
         self._save_project_metadata(project_info, when=datetime.now(), session=None, caller="capture_start")
         #
-        # Start inference & hardware AFTER cameras started, so we can see the initial eventual motor move.
-        if self._inference.is_enabled:
-            logger.info("Starting inference ..")
-            self._inference.start(self._inference_queue)
+        # Start inference only after the required reach camera topology is ready.
+        if self._start_inference_domain(
+            reach_synchronization_ready=reach_synchronization_ready,
+            preflight_error=inference_preflight_error,
+        ):
             watchdog_mon_register(WatchdogItems.POSE_DATA_MONITOR_PROC,
                                   lambda: self._inference.watchdog_monitor_data_proc_perf_c)
 
@@ -1386,17 +8659,19 @@ class AppModel(ObservableObject):
             None if (animal is None or animal.training.current_protocol is None)
             else self.get_training_plan_by_id(animal.training.current_protocol)
         )
-        if self._training_mode == TrainingMode.MANUAL or animal is None:
-            # logger.notice("training mode is MANUAL or animal is none")
-            # forcing manual so:
-            self.training_mode = TrainingMode.MANUAL
-        else:
-            self.training_plan = plan
+        self.training_plan = plan if animal is not None else None
 
         if animal is not None:
             self._set_animal_base_positions(animal)
 
-        self._acquisition_started = True
+        self._acquisition.mark_started()
+        # Start counting as soon as the system is acquiring, not only when
+        # a recording starts. Demo playback and plain preview run frames
+        # through the same pipeline, and the operator has no way to see the
+        # inference rate or percentage there - the panel simply showed a
+        # dash. A recording re-baselines this at its first recorded frame,
+        # so session figures stay session-relative.
+        self._begin_session_telemetry()
         self.status = target_status
         self.property_changed(self.Props.ACQUISITION_RUNNING, True, False)
         self._event_manager.post_event_content(
@@ -1404,21 +8679,31 @@ class AppModel(ObservableObject):
             dict(mode=app_status_to_api_app_mode(target_status))
         )
 
-        self.check_max_pellet_loaded()
+        self._log_acquisition_startup_summary()
+        log_hardware_initialization(
+            logger,
+            "READY | acquisition hardware | status=%s elapsed=%.3fs",
+            target_status.value,
+            time.perf_counter() - hardware_init_started,
+        )
 
         return True
 
     def capture_stop(self, force: bool = False):
         logger.debug("AppModel.capture_stop")
         with self.app_lock:
-            if not self._acquisition_started and not force:
-                logger.verbose("acquisition not running")
+            if not self._acquisition.begin_stop(force=force):
+                logger.verbose("acquisition not running or already stopping")
                 return
-            if self._acquisition_stopping:
-                logger.verbose("acquisition already stopping")
-                return
-            self._acquisition_stopping = True
             before_status = self._status
+            recording_status = self._recording_session.status
+            session_token = self._recording_session.token()
+        if recording_status in {
+            SessionRecordingStatus.ARMING,
+            SessionRecordingStatus.RECORDING,
+        }:
+            logger.warning("Acquisition stop requested during recording; aborting the session")
+            self.abort_recording(token=session_token)
         # always remove status-file on stop:
         status_file_path = self.status_file_path.expanduser()
         status_file_path.unlink(missing_ok=True)
@@ -1426,10 +8711,17 @@ class AppModel(ObservableObject):
             self._capture_stop()
         finally:
             # always:
+            self._nidaq_signal_monitor.stop()
             # must be set before try reload training plans, given checked in it
-            self._acquisition_started = False
-            self._acquisition_stopping = False
-            self._acquisition_starting = False
+            self._acquisition.mark_stopped()
+            if self._recording_session.status == SessionRecordingStatus.ABORTING:
+                self._finish_abort_recording(token=session_token)
+            elif self._recording_session.status != SessionRecordingStatus.READY:
+                self._session_data_recorder.abort()
+                self._set_session_recording_status(
+                    SessionRecordingStatus.READY,
+                    token=session_token,
+                )
             analysis = self._analysis
             analysis.project_info = None
             self.status = AppModelStatus.IDLE
@@ -1444,44 +8736,169 @@ class AppModel(ObservableObject):
                 dict(mode=app_status_to_api_app_mode(AppModelStatus.IDLE))
             )
             self.property_changed(self.Props.ACQUISITION_RUNNING, False, True)
+            # Stopped above with the rest of acquisition; back in Idle it runs
+            # again by itself. Not while the application closes: the rule
+            # refuses once closing has begun.
+            self._request_nidaq_stream("acquisition stopped")
 
     def _capture_stop(self):
-
-        tok = self._hardware.set_color_led(0, 0, 0)
-        self._hardware.wait_pending_command_acked(tok, timeout=2, raise_on_timeout=False)
-
         self._detach_training_plan()  # always
 
         watchdog_mon_unregister = self._analysis.watchdog_monitor.unregister_watchdog
         for item in WatchdogItems:
             watchdog_mon_unregister(item)
 
-        self._inference.stop()
-        self._hardware.disconnect()
+        can_status = self._acquisition.subsystems.get(SubsystemId.CAN_PELLET)
+        if can_status is not None and can_status.state is SubsystemState.READY:
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.STOPPING,
+                reason="stopping CAN/pellet controller",
+            )
+            try:
+                tok = self._hardware.set_color_led(0, 0, 0)
+                self._hardware.wait_pending_command_acked(
+                    tok,
+                    timeout=2,
+                    raise_on_timeout=False,
+                )
+            except Exception:
+                logger.exception("Failed to turn off pellet controller LED")
+
+        self._set_subsystem_status(
+            SubsystemId.LIVE_INFERENCE,
+            SubsystemState.STOPPING,
+            reason="stopping live inference",
+        )
+        try:
+            self._inference.stop()
+        except Exception:
+            logger.exception("Failed to stop live inference")
+        self._set_subsystem_status(
+            SubsystemId.LIVE_INFERENCE,
+            (
+                SubsystemState.DISABLED
+                if not self._inference.is_enabled
+                else SubsystemState.STOPPED
+            ),
+            reason="live inference stopped",
+        )
+
+        self._set_subsystem_status(
+            SubsystemId.LASER,
+            SubsystemState.STOPPING,
+            reason="closing laser controller",
+        )
+        try:
+            self._laser.stop_direct_trigger_receiver()
+        except Exception as err:
+            logger.exception("Failed to stop the direct laser trigger receiver: %s", err)
+        self._close_laser_within_bound("System Mode stops")
+        self._log_stim_latency_budget()
+        # Not "stopped" while its close is still inside the driver; the
+        # close's late finish says when it ends.
+        stopped = (
+            SubsystemState.DISABLED
+            if self._laser.configuration.backend == "disabled"
+            else SubsystemState.STOPPED
+        )
+        self._set_laser_status_after_close(
+            lambda refusal: (SubsystemState.FAILED, dict(error=refusal)) if refusal
+            else (stopped, dict(reason="laser controller stopped")))
+
+        self._set_subsystem_status(
+            SubsystemId.NIDAQ_STREAM,
+            SubsystemState.STOPPING,
+            reason="stopping NI-DAQ stream",
+        )
+        try:
+            self._nidaq_signal_monitor.stop()
+        except Exception:
+            logger.exception("Failed to stop NI-DAQ stream")
+        # A refused plan keeps its BLOCKED and reason: its empty stream reads
+        # as disabled below.
+        if not self._hold_nidaq_plan_blocked():
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                (
+                    SubsystemState.DISABLED
+                    if not (
+                        self._nidaq_signal_monitor.hardware_enabled
+                        and self._nidaq_signal_monitor.configuration.is_enabled
+                    )
+                    else SubsystemState.STOPPED
+                ),
+                reason="NI-DAQ stream stopped",
+            )
+
+        try:
+            self._hardware.disconnect()
+        except Exception:
+            logger.exception("Failed to disconnect CAN/pellet controller")
+        self._set_subsystem_status(
+            SubsystemId.CAN_PELLET,
+            (
+                SubsystemState.DISABLED
+                if not self._hardware.requires_connection
+                else SubsystemState.STOPPED
+            ),
+            reason="CAN/pellet controller stopped",
+        )
 
         for camera in self._cameras:
             watchdog_mon_unregister(f"camera.{camera.name}")
-
-            if not camera.is_primary:
+            if camera.is_enabled and not camera.is_primary:
                 logger.verbose("notifying end to %s", camera.name)
-                camera.on_capture_notify_end()
+                try:
+                    camera.on_capture_notify_end()
+                except Exception:
+                    logger.exception("Failed to notify camera %s to end", camera.name)
 
         time.sleep(0.01)
 
         for camera in self._cameras:
-            if camera.is_primary:
+            if camera.is_enabled and camera.is_primary:
                 logger.verbose("notifying end to %s", camera.name)
-                camera.on_capture_notify_end()
+                try:
+                    camera.on_capture_notify_end()
+                except Exception:
+                    logger.exception("Failed to notify camera %s to end", camera.name)
 
         for camera in self._cameras:
-            if not camera.is_primary:
+            if camera.is_enabled and not camera.is_primary:
                 logger.verbose("stopping capture to %s", camera.name)
-                camera.on_capture_stop()
+                try:
+                    camera.on_capture_stop()
+                except Exception:
+                    logger.exception("Failed to stop camera %s", camera.name)
 
         for camera in self._cameras:
-            if camera.is_primary:
+            if camera.is_enabled and camera.is_primary:
                 logger.verbose("stopping capture to %s", camera.name)
-                camera.on_capture_stop()
+                try:
+                    camera.on_capture_stop()
+                except Exception:
+                    logger.exception("Failed to stop camera %s", camera.name)
+
+        for camera in self._cameras:
+            self._set_subsystem_status(
+                SubsystemId.camera(camera.name),
+                (
+                    SubsystemState.STOPPED
+                    if camera.is_enabled
+                    else SubsystemState.DISABLED
+                ),
+                reason="camera stopped" if camera.is_enabled else "camera disabled",
+            )
+        self._set_subsystem_status(
+            SubsystemId.REACH_SYNCHRONIZATION,
+            (
+                SubsystemState.STOPPED
+                if any(camera.is_enabled for camera in self._reach_cameras)
+                else SubsystemState.DISABLED
+            ),
+            reason="reach camera synchronization stopped",
+        )
 
     def set_log_location(self, location: Optional[Path] = None):
         if location is None:
@@ -1512,18 +8929,87 @@ class AppModel(ObservableObject):
             configuration.save_file(location, as_yaml=True)
         return configuration
 
-    def load_configuration(self, location: Optional[Path] = None):
+    @_serialized_session_configuration
+    def load_configuration(self, location: Optional[Path] = None, *, random_cameras: bool = False):
+        # A load closes the laser model's controller: over a close still
+        # inside the driver it would call into the driver that hung, part-way
+        # through the load. Refused before anything is held or applied.
+        close_refusal = self.laser_controller_close_refusal()
+        if close_refusal:
+            raise RuntimeError(f"Loading a configuration is unavailable: {close_refusal}")
+        # The input stream now runs while idle, and the timing below is
+        # refused while it runs, so it is held stopped for the load and starts
+        # again from the new plan afterwards. In System Mode it belongs to the
+        # acquisition and is left as it was.
+        if not self._nidaq_stream_idle():
+            return self._load_configuration(location, random_cameras=random_cameras)
+        holder = _CONFIGURATION_LOAD
+        # Not while a calibration ramp runs: the load replaces the laser
+        # configuration and the NI-DAQ plan the ramp is running on.
+        self._hold_nidaq_stream_unless_calibrating(
+            holder,
+            "the configuration is loading",
+            "Loading a configuration is unavailable while a laser calibration "
+            "ramp runs; wait for it to finish",
+        )
+        try:
+            return self._load_configuration(location, random_cameras=random_cameras)
+        finally:
+            self._nidaq_stream_autostart.resume(holder)
+
+    def _load_configuration(self, location: Optional[Path] = None, *, random_cameras: bool = False):
+        self._require_session_ready_for_configuration("Loading configuration")
+        # Everything below reconfigures live objects one after another, and
+        # several steps can raise. A load that stops part-way leaves the cameras
+        # on the new configuration and the rest on the old, and save_configuration
+        # builds what it writes from those live objects. On 2026-09-17 exactly
+        # that wrote a demo run's playback cameras over christielab10's real
+        # ones. So nothing may be saved until this load reaches its last line.
+        self._configuration_load_incomplete = True
         if location is None:
             location = self.get_config_location()
 
+        config_started = time.perf_counter()
+        log_hardware_initialization(
+            logger,
+            "START | hardware configuration | path=%s random_cameras=%s",
+            location,
+            random_cameras,
+        )
         configuration: SystemConfiguration = self.get_config_from_location(location)
+        if random_cameras:
+            logger.notice("Using random camera override for this run")
+            self._apply_random_camera_override(configuration)
+        self._ensure_optional_stim_camera(configuration)
 
-        prebuffer_duration = 0
+        # The NI-DAQ plan first, before anything is applied. Built after the
+        # lasers, as it was, a refused line - a duplicate pin, a PFI pin, a
+        # port1 tone - left the load half done: nothing kept the configuration,
+        # so Edit DAQ Ports would not open, and the file had to be fixed by
+        # hand. A refused plan now loads everything else, and holds the NI-DAQ
+        # stream back with the reason until Edit DAQ Ports saves a valid one.
+        try:
+            nidaq_acquisition = build_nidaq_acquisition_configuration(
+                configuration.nidaq_stream,
+                configuration.nidaq_ports,
+                configuration.laser,
+            )
+            nidaq_plan_error = ""
+        except ValueError as error:
+            nidaq_acquisition = None
+            nidaq_plan_error = str(error) or error.__class__.__name__
+
+        self._sync_reach_cameras_to_configuration(configuration)
 
         frame_rate = None
-        if (left_cam_cfg := configuration.get_camera(CameraId.Left)) is not None:
-            prebuffer_duration = left_cam_cfg.record_prebuffer_duration
-            frame_rate = left_cam_cfg.params.get("fps")
+        reach_camera_configs = []
+        for camera in self._reach_cameras:
+            camera_config = configuration.get_camera(camera.camera_id)
+            if camera_config is None:
+                continue
+            reach_camera_configs.append((camera, camera_config))
+            if frame_rate is None:
+                frame_rate = camera_config.params.get("fps")
 
         pose_algo = self._pose_algorithm
         pose_algo.frame_rate = frame_rate
@@ -1532,62 +9018,188 @@ class AppModel(ObservableObject):
         # which force a sync to pose-result process.
         self._behavior.system_machine.intersession.frame_rate = frame_rate
 
-        if (right_cam_cfg := configuration.get_camera(CameraId.Right)) is not None:
-            prebuffer_duration = max(prebuffer_duration, right_cam_cfg.record_prebuffer_duration)
-            if right_cam_cfg.record_prebuffer_duration != prebuffer_duration:
-                logger.warning("left & right cameras don't have same record_prebuffer_duration: %s vs %s ; using max",
-                               right_cam_cfg.record_prebuffer_duration, prebuffer_duration)
-            right_cam_cfg.record_prebuffer_duration = prebuffer_duration
+        for camera, camera_config in reach_camera_configs:
+            if camera_config.record_mode != VideoRecordMode.TRIGGER:
+                logger.warning(
+                    "Ignoring continuous camera mode for manual recording: %s=%s",
+                    camera.name,
+                    camera_config.record_mode,
+                )
+            camera_config.record_mode = VideoRecordMode.TRIGGER
+            if camera_config.record_prebuffer_duration != 0:
+                logger.warning(
+                    "Ignoring camera prebuffer for manual recording alignment: %s=%s",
+                    camera.name,
+                    camera_config.record_prebuffer_duration,
+                )
+            camera_config.record_prebuffer_duration = 0
 
-        if left_cam_cfg is not None:
-            self._left_camera.load_configuration(left_cam_cfg)
+        for camera, camera_config in reach_camera_configs:
+            camera.load_configuration(camera_config)
+            log_hardware_initialization(
+                logger,
+                "CONFIGURED | camera | name=%s enabled=%s primary=%s source=%s shape=%s fps=%s",
+                camera.name,
+                camera_config.is_enabled,
+                camera_config.params.get("primary", "no"),
+                camera.camera_source.url,
+                camera.shape,
+                camera_config.params.get("fps"),
+            )
+        self._ensure_reach_primary_camera()
 
-        if right_cam_cfg is not None:
-            self._right_camera.load_configuration(right_cam_cfg)
+        self._behavior.algorithm.record_prebuffer_duration = 0
 
-        if (camera := configuration.get_camera(CameraId.Web)) is not None:
-            self._top_camera.load_configuration(camera)
-
-        if prebuffer_duration > 0:
-            prebuffer_scale = os.getenv("AUTOTRAINER_PREBUFFER_SCALE")
-            if prebuffer_scale is not None:
-                prebuffer_duration *= float(prebuffer_scale)
-                logger.notice("Using AUTOTRAINER_PREBUFFER_SCALE=%s ; prebuffer_duration -> %.3f",
-                              prebuffer_scale, prebuffer_duration)
-
-        logger.verbose("Will use algo record_prebuffer_duration=%.1f seconds", prebuffer_duration)
-        self._behavior.algorithm.record_prebuffer_duration = prebuffer_duration
-
+        self._hardware.load_config(configuration.hardware)
+        log_hardware_initialization(
+            logger,
+            "CONFIGURED | hardware flags | CAN=%s pellet_controller=%s NI-DAQ=%s RFID=%s",
+            configuration.hardware.can_enabled,
+            configuration.hardware.pellet_controller_enabled,
+            configuration.hardware.nidaq_enabled,
+            configuration.hardware.rfid_reader_enabled,
+        )
         self.inference.load_configuration(configuration.inference)
+        log_hardware_initialization(
+            logger,
+            "CONFIGURED | live inference | enabled=%s model=%s",
+            configuration.inference.is_enabled,
+            configuration.inference.pose_model_location,
+        )
+        # Configuration loading must remain side-effect free. The laser controller
+        # is opened as its own acquisition domain in capture_start().
+        self.laser.set_configuration_offline(configuration.laser)
+        self._nidaq_ports = configuration.nidaq_ports
+        self.nidaq_signal_monitor.set_hardware_enabled(
+            configuration.hardware.nidaq_enabled,
+            auto_start=False,
+        )
+        hardware_timed_output_devices = tuple(
+            dict.fromkeys(
+                device_name
+                for channel in configuration.laser.channels
+                for device_name in (device_name_from_channel(channel.analog_output),)
+                if configuration.laser.hardware_timed and device_name is not None
+            )
+        )
+        self.nidaq_signal_monitor.configure_timing(
+            configuration.nidaq_ports.timing,
+            hardware_timed_output_devices=hardware_timed_output_devices,
+            hardware_timed_output_channels=tuple(
+                channel.analog_output
+                for channel in configuration.laser.channels
+                if configuration.laser.hardware_timed
+            ),
+            device_identities=configuration.nidaq_ports.device_identities,
+            laser=configuration.laser,
+        )
+        self._nidaq_plan_error = nidaq_plan_error
+        if nidaq_plan_error:
+            # The stream gets no channels, and the configuration keeps the
+            # operator's own stream, ports and lasers: what Edit DAQ Ports
+            # shows marked invalid, and what a save writes back unchanged.
+            # The remedy first: the status bar shows this line cut at 320
+            # characters, which two or three refusals run past.
+            logger.error(
+                "NI-DAQ inputs are not acquired; %s. Refused: %s",
+                self._nidaq_plan_remedy,
+                nidaq_plan_error,
+            )
+            self.nidaq_signal_monitor.load_configuration(NidaqSignalStreamConfiguration())
+        else:
+            configuration.nidaq_stream = nidaq_acquisition
+            self.nidaq_signal_monitor.load_configuration(nidaq_acquisition)
         self.behavior.load_configuration(configuration.behavior)
 
         self._analysis.watchdog_monitor.config = configuration.watchdog
 
         self._loaded_configuration = configuration
         self._loaded_config_dir_path = location.parent.resolve()
+        self._loaded_configuration_path = Path(location).resolve()
+        self._loaded_configuration_has_runtime_override = random_cameras
+        self._runtime_live_inference_override = None
+
+        with self._trial_protocol_lock:
+            self._trial_protocol_repository = TrialProtocolRepository(
+                self._loaded_config_dir_path / "trial_protocols"
+            )
+            self._trial_protocol_repository.reload()
+            # A loaded configuration brings its own set and experiment
+            # libraries, the same way it brings its own protocols.
+            self._trial_protocol_set_repository = TrialProtocolSetRepository(
+                self._loaded_config_dir_path / "trial_protocol_sets"
+            )
+            self._trial_protocol_set_repository.reload()
+            self._experiment_repository = ExperimentCompositionRepository(
+                self._loaded_config_dir_path / "trial_experiments"
+            )
+            self._experiment_repository.reload()
+            self._selected_ordered_protocol = None
+            self._trial_protocol_schedule = (
+                TrialProtocolSchedule.with_placeholder_rows()
+            )
+            self._stimulus_profile_repository = StimulusProfileRepository(
+                self._loaded_config_dir_path / "stimulus_profiles.json"
+            )
+            profile_library = self._stimulus_profile_repository.load()
+            self._tone_profiles = {
+                profile.profile_id: profile
+                for profile in profile_library.tone_profiles
+            }
+            # Kept from startup before, so a configuration from another
+            # directory showed the startup directory's cue-interval and trigger
+            # profiles, and the next profile save wrote them into this one.
+            self._cue_interval_profiles = {
+                profile.profile_id: profile
+                for profile in profile_library.cue_interval_profiles
+            }
+            self._stimulus_trigger_profiles = {
+                profile.profile_id: profile
+                for profile in profile_library.stimulus_trigger_profiles
+            }
+            self._laser_profiles = {
+                profile.profile_id: profile
+                for profile in profile_library.laser_profiles
+            }
+            self._automatic_shift_policies = {
+                profile.policy_id: profile
+                for profile in profile_library.automatic_shift_profiles
+            }
+        # No protocol is selected now, and the check of the last one goes.
+        self._refresh_protocol_readiness()
+        for path, error in self._trial_protocol_repository.errors.items():
+            logger.error("Ordered protocol %s was not loaded: %s", path, error)
+        if self._stimulus_profile_repository.error:
+            logger.error(
+                "Stimulus profile library was not loaded: %s",
+                self._stimulus_profile_repository.error,
+            )
 
         # only at the end:
         self.output_location = configuration.persistence.output_location
+        self._configure_subsystem_intent(configuration)
 
         self.reload_training_plans(reraise_on_error=True)
 
         # and:
         self._load_animals()
-
-        analysis = self._analysis
-        analysis.system_fault_alarm.set_persistence_config(configuration.persistence)
-        self._refresh_cage_clean_data()
-
-        self._hardware.load_config(configuration.hardware)
+        self._configure_animal_metadata_services()
 
         self.configuration_loaded_event(configuration)
+
+        self._configuration_load_incomplete = False
+        log_hardware_initialization(
+            logger,
+            "READY | hardware configuration | elapsed=%.3fs",
+            time.perf_counter() - config_started,
+        )
 
         return True
 
     def reload_training_plans(self, *, refresh: bool = False, reraise_on_error: bool = False):
-        if self._acquisition_started or self._status != AppModelStatus.IDLE:
+        if self._acquisition.started or self._status != AppModelStatus.IDLE:
             logger.notice("delaying reload training plans given acquisition started(%s) or status not idle: %s",
-                          self._acquisition_started, self._status)
+                          self._acquisition.started, self._status)
             self._reload_plans_needed = True
             return
         try:
@@ -1607,10 +9219,216 @@ class AppModel(ObservableObject):
             # do not save if loaded_config is still None, which signify the load configuration failed,
             # so we won't overwrite the (currently) bad user config file with one having all defaults.
             return
-        loc = self._preferences.configuration_location
+        if self._loaded_configuration_has_runtime_override:
+            logger.info("Skipping configuration save because this run used runtime camera source overrides")
+            return
+        if self._configuration_load_incomplete:
+            logger.warning(
+                "Not saving configuration: the last configuration load did not complete, "
+                "so what is running is part old and part new"
+            )
+            return
+        # Back to the file it was loaded from. The preferences location is only
+        # where the application looks when no file is named; saving there meant
+        # a run started with -c on a copy overwrote the real configuration on
+        # exit, which on christielab10 wrote a test run's settings into
+        # ~/Autotrainer on 2026-09-16.
+        loc = self._loaded_configuration_path
         logger.info("Saving configuration to %s", loc)
         conf = self._create_configuration()
-        conf.save_default(loc)
+        conf.save_file(loc, as_yaml=True)
+
+    @_serialized_session_configuration
+    def set_runtime_live_inference_override(self, enabled: bool) -> None:
+        """Override configured live inference without persisting the CLI choice."""
+        self._require_session_ready_for_configuration(
+            "Changing the runtime inference override"
+        )
+        if self._loaded_configuration is None:
+            raise RuntimeError("Cannot override live inference before configuration is loaded")
+        enabled = bool(enabled)
+        self._inference.is_enabled = enabled
+        self._runtime_live_inference_override = enabled
+        logger.notice("Runtime live inference override: enabled=%s", enabled)
+
+    @_serialized_session_configuration
+    def update_daq_port_configuration(
+        self,
+        nidaq_ports: NidaqPortConfiguration,
+        laser_configuration: LaserSystemConfiguration,
+    ) -> None:
+        self._require_session_ready_for_configuration(
+            "Changing the DAQ port configuration"
+        )
+        # As for a load: saving the ports closes the laser model's controller.
+        close_refusal = self.laser_controller_close_refusal()
+        if close_refusal:
+            raise RuntimeError(
+                f"Changing the DAQ port configuration is unavailable: {close_refusal}")
+        if self._loaded_configuration is None:
+            raise RuntimeError("Cannot update DAQ port configuration before a system configuration is loaded")
+        # Held stopped while the plan changes, then started on the new one.
+        # Only while idle, as for a configuration load: in System Mode the
+        # stream is the acquisition's and is left to it.
+        if not self._nidaq_stream_idle():
+            self._apply_daq_port_configuration(nidaq_ports, laser_configuration)
+            return
+        self._hold_nidaq_stream_unless_calibrating(
+            _DAQ_PORTS_UPDATE,
+            "the DAQ ports are being saved",
+            "Saving DAQ ports is unavailable while a laser calibration ramp "
+            "runs; wait for it to finish",
+        )
+        try:
+            self._apply_daq_port_configuration(nidaq_ports, laser_configuration)
+        finally:
+            self._nidaq_stream_autostart.resume(_DAQ_PORTS_UPDATE)
+
+    def _apply_daq_port_configuration(
+        self,
+        nidaq_ports: NidaqPortConfiguration,
+        laser_configuration: LaserSystemConfiguration,
+    ) -> None:
+        # Built first, because building is what refuses two roles on one
+        # input or a trigger readback the stream cannot acquire. Built after
+        # the lasers were applied, a refused save had already changed them.
+        # After a refused plan at load the stream has no channels, so the
+        # operator's own stored stream is the one to build on.
+        acquisition = build_nidaq_acquisition_configuration(
+            (
+                self._loaded_configuration.nidaq_stream
+                if self._nidaq_plan_error
+                else self._nidaq_signal_monitor.configuration
+            ),
+            nidaq_ports,
+            laser_configuration,
+        )
+        self._nidaq_ports = nidaq_ports
+        self._laser.set_configuration_offline(laser_configuration)
+        self._loaded_configuration.nidaq_ports = nidaq_ports
+        self._loaded_configuration.laser = laser_configuration
+        if self._nidaq_plan_error:
+            # Fixed: the stream may start again, once the hold is let go. Its
+            # state and requirement are the fixed plan's, as a load would set
+            # them, not the refused one's: a fix can leave nothing to acquire.
+            self._nidaq_plan_error = ""
+            enabled = (
+                self._nidaq_signal_monitor.hardware_enabled
+                and acquisition.is_enabled
+            )
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                SubsystemState.STOPPED if enabled else SubsystemState.DISABLED,
+                reason="configured; not started" if enabled else "disabled",
+                required_for_recording=enabled,
+            )
+        self._nidaq_signal_monitor.load_configuration(acquisition)
+        hardware_timed_output_devices = tuple(
+            dict.fromkeys(
+                device_name
+                for channel in laser_configuration.channels
+                for device_name in (device_name_from_channel(channel.analog_output),)
+                if laser_configuration.hardware_timed and device_name is not None
+            )
+        )
+        self._nidaq_signal_monitor.configure_timing(
+            nidaq_ports.timing,
+            hardware_timed_output_devices=hardware_timed_output_devices,
+            hardware_timed_output_channels=tuple(
+                channel.analog_output
+                for channel in laser_configuration.channels
+                if laser_configuration.hardware_timed
+            ),
+            device_identities=nidaq_ports.device_identities,
+            laser=laser_configuration,
+        )
+        self._loaded_configuration.nidaq_stream = acquisition
+        self.configuration_loaded_event(self._loaded_configuration)
+        self.save_configuration()
+
+    def update_nidaq_signal_stream_channels(self, channels) -> None:
+        """Apply and persist plot selection without changing DAQ acquisition."""
+        if self._loaded_configuration is None:
+            raise RuntimeError("Cannot update NI-DAQ stream channels before a system configuration is loaded")
+        if self._nidaq_plan_error:
+            # The stream has no channels to select, and the stored stream is
+            # the operator's, kept for Edit DAQ Ports; neither is replaced.
+            raise RuntimeError(self._nidaq_plan_blocked_reason())
+        channel_names = tuple(
+            channel.name if hasattr(channel, "name") else str(channel)
+            for channel in channels
+        )
+        self._nidaq_signal_monitor.set_display_channels(channel_names)
+        self._loaded_configuration.nidaq_stream = self._nidaq_signal_monitor.save_configuration()
+        self.save_configuration()
+
+    def update_hardware_configuration(
+        self,
+        *,
+        can_enabled: bool,
+        pellet_controller_enabled: bool,
+        nidaq_enabled: bool,
+        rfid_reader_enabled: bool,
+        rfid_device: str,
+    ) -> str:
+        """Apply and persist rig-level hardware availability settings."""
+        if self._loaded_configuration is None:
+            raise RuntimeError("Cannot update hardware settings before configuration is loaded")
+        if self._acquisition.started or self._status != AppModelStatus.IDLE:
+            raise RuntimeError("Hardware settings can only be changed while acquisition is idle")
+
+        rfid_device = str(rfid_device).strip()
+        if rfid_reader_enabled and not rfid_device:
+            raise ValueError("RFID serial device is required when the reader is enabled")
+
+        hardware_configuration = self._loaded_configuration.hardware
+        previous_settings = {
+            "can_enabled": hardware_configuration.can_enabled,
+            "pellet_controller_enabled": hardware_configuration.pellet_controller_enabled,
+            "nidaq_enabled": hardware_configuration.nidaq_enabled,
+            "rfid_reader_enabled": hardware_configuration.rfid_reader_enabled,
+            "rfid_device": hardware_configuration.rfid_device,
+        }
+        requested_settings = {
+            "can_enabled": bool(can_enabled),
+            "pellet_controller_enabled": bool(pellet_controller_enabled),
+            "nidaq_enabled": bool(nidaq_enabled),
+            "rfid_reader_enabled": bool(rfid_reader_enabled),
+            "rfid_device": rfid_device,
+        }
+        logger.info(
+            "Hardware configuration update requested: previous=%s requested=%s",
+            previous_settings,
+            requested_settings,
+        )
+        was_can_required = self._hardware.requires_connection
+        will_require_can = bool(can_enabled and pellet_controller_enabled)
+        if was_can_required and not will_require_can and self._hardware.connected:
+            self._hardware.disconnect()
+
+        hardware_configuration.can_enabled = bool(can_enabled)
+        hardware_configuration.pellet_controller_enabled = bool(
+            pellet_controller_enabled
+        )
+        hardware_configuration.nidaq_enabled = bool(nidaq_enabled)
+        hardware_configuration.rfid_reader_enabled = bool(rfid_reader_enabled)
+        hardware_configuration.rfid_device = rfid_device
+
+        self._hardware.load_config(hardware_configuration)
+        self._nidaq_signal_monitor.set_hardware_enabled(
+            hardware_configuration.nidaq_enabled,
+            auto_start=False,
+        )
+        self._configure_subsystem_intent(self._loaded_configuration)
+        # Enabling NI-DAQ starts its stream; disabling it stopped it above.
+        self._request_nidaq_stream("hardware settings changed")
+        self._configure_animal_metadata_services()
+        if self._rfid_metadata_controller is not None:
+            self._rfid_metadata_controller.start()
+        self.save_configuration()
+        self.configuration_loaded_event(self._loaded_configuration)
+        logger.info("Hardware configuration update applied: settings=%s", requested_settings)
+        return "Hardware settings saved; refresh hardware to connect newly enabled devices"
 
     def on_activated(self):
         """Must be called at start"""
@@ -1638,27 +9456,71 @@ class AppModel(ObservableObject):
         timer.start()
         logger.notice("Created daily timer in %.1f seconds ; today=%s", delay, today)
         self._analysis.start()
+        if self._rfid_metadata_controller is not None:
+            self._rfid_metadata_controller.start()
+        if getattr(self._preferences, "softmouse_nightly_refresh", False):
+            self._request_animal_metadata_catchup()
 
-    def on_close(self):
-        logger.debug("AppModel.on_close")
-
+    def _stop_periodic_timers(self):
+        self._closing_event.set()
         for timer in (
                 self._timer_one_minute_repeat,
                 self._timer_daily,
+                self.__dict__.get("_writer_close_timer", no_op_timer),
         ):
             logger.debug("stopping timer %s", timer)
             timer.cancel()
 
+    def _prepare_application_shutdown(self) -> None:
+        self._stop_periodic_timers()
+
+    def on_close(self):
+        logger.debug("AppModel.on_close")
+        # Stop command producers first so none can race with CAN teardown or
+        # reschedule themselves after their current timer is cancelled.
+        self._prepare_application_shutdown()
+        # Closing has begun, so no ramp starts now; one running must hand the
+        # laser back before anything below can end the process.
+        self._finish_laser_calibration_for_close()
+        self._storage_monitor.abort()
+        try:
+            self._flush_stopped_session_notes_now()
+        except Exception as err:
+            logger.exception("Failed to save the stopped session's notes on close: %s", err)
+
+        if self._rfid_metadata_controller is not None:
+            self._rfid_metadata_controller.stop()
+        metadata_thread = self._animal_metadata_refresh_thread
+        if metadata_thread is not None and metadata_thread.is_alive():
+            metadata_thread.join(5)
+
+        try:
+            self._system_message_handler.decoded_message_received -= (
+                self._on_intertrial_device_message
+            )
+        except (KeyError, ValueError):
+            pass
+        if not self._intertrial_analysis.close():
+            logger.warning("Intertrial analysis worker did not stop cleanly")
+        self._session_data_recorder.close()
         self._analysis.stop()
 
         # ensure go back to IDLE mode + stop cameras & inference & analysis + hardware disconnect :
         self.capture_stop()
 
+        self._close_laser_within_bound("reachAQ is closing")
+
+        try:
+            # Closing has begun, so the rule starts nothing new; this waits
+            # briefly for a start already under way, which close() then stops.
+            self._nidaq_stream_autostart.close()
+            self._nidaq_signal_monitor.close()
+        except Exception as err:
+            logger.exception("Failed to close NI-DAQ signal monitor: %s", err)
+
         if self._inference is not None:
             # fully terminate inference, which keeps a background process alive between different stop/start
             self._inference.terminate()
-
-        self._behavior.system_machine.cancel_timers()
 
         # also fully close cameras now:
         for camera in self._cameras:
@@ -1693,6 +9555,52 @@ class AppModel(ObservableObject):
 
         self._preferences.save()
         self.save_configuration()
+        unregister_fatal_exception_callback(self._on_fatal_exception)
+
+    def _on_fatal_exception(self, source: str, exception: BaseException) -> None:
+        # Fatal callbacks are process-wide and may originate from cameras,
+        # analysis, NI-DAQ, or UI code. They must never reset or disconnect an
+        # otherwise healthy shared CAN interface.
+        previous = self._internal_error_diagnostic
+        if previous is None:
+            token = self._recording_session.token()
+            diagnostic = {
+                "source": str(source),
+                "exceptionType": exception.__class__.__name__,
+                "message": str(exception) or exception.__class__.__name__,
+                "wallTime": time.time(),
+                "sessionStatus": self._recording_session.status.value,
+                "sessionId": None if token is None else token.session_id,
+                "sessionGeneration": None if token is None else token.generation,
+                "operationChanged": False,
+            }
+            self._internal_error_diagnostic = diagnostic
+            self._on_property_changed(
+                self.Props.INTERNAL_ERROR_DIAGNOSTIC,
+                dict(diagnostic),
+                None,
+            )
+            self._set_subsystem_status(
+                SubsystemId.RUNTIME_DIAGNOSTICS,
+                SubsystemState.FAILED,
+                error=(
+                    f"{diagnostic['exceptionType']}: {diagnostic['message']} "
+                    f"({diagnostic['source']})"
+                ),
+                required_for_recording=False,
+            )
+            self.on_error(
+                "Internal software error",
+                "The error was logged without stopping recording, moving hardware, "
+                "resetting CAN, or disconnecting unrelated systems. Stop and Abort "
+                "remain available.",
+            )
+        logger.error(
+            "Fatal callback from %s left the active operation and CAN ownership "
+            "unchanged: %s",
+            source,
+            exception,
+        )
 
     def _load_animals(self):
         animals = []
@@ -1700,32 +9608,70 @@ class AppModel(ObservableObject):
 
         if animals_dir_path.is_dir():
             files = list(animals_dir_path.glob("*.json"))
-            animals: Dict[Path, AnimalSubject] = {
-                path: animal
-                for path, animal in (
-                    (path, AnimalSubject.from_file(path))
-                    for path in files
+            loaded = {}
+            skipped = []
+            for path in files:
+                try:
+                    animal = AnimalSubject.from_file(path)
+                    if animal is None:
+                        raise ValueError("unsupported or invalid animal schema")
+                except Exception as error:
+                    logger.exception("Skipping invalid animal file %s", path)
+                    skipped.append((path.name, str(error) or error.__class__.__name__))
+                    continue
+                loaded[path] = animal
+            animals: Dict[Path, AnimalSubject] = loaded
+            if skipped:
+                self.on_error(
+                    "Some animal files were skipped",
+                    "\n".join(f"{name}: {reason}" for name, reason in skipped),
                 )
-                if animal is not None
-            }
 
-            for path, animal in animals.items():
-                prev_day_date = animal.pellet_counts_day_date
-                prev_counts = animal.pellet_counts_day
-                animal.check_today_date()
-                if animal.pellet_counts_day_date != prev_day_date:
-                    logger.info("Reset animal day count to 0 given saved before today: %s ; prev counts=%s",
-                                prev_day_date, prev_counts)
-                    animal.to_file(path)
-            animals = sorted(animals.values(), key=lambda a: a.name)
+            loaded_by_path = animals
+            paths_by_id = {}
+            for source_path, animal in loaded_by_path.items():
+                previous_path = paths_by_id.get(animal.id)
+                if previous_path is not None:
+                    raise ValueError(
+                        "Duplicate reachAQ animal UUID "
+                        f"{animal.id!r} in {previous_path.name!r} and "
+                        f"{source_path.name!r}; remove or archive one copy"
+                    )
+                paths_by_id[animal.id] = source_path
+            animals = sorted(loaded_by_path.values(), key=lambda a: a.name)
+
+            # New persistence is UUID-addressed so duplicate display names are
+            # safe. Preserve a recoverable copy of every legacy name-based file.
+            for source_path, animal in loaded_by_path.items():
+                destination = animals_dir_path / f"{animal.id}.json"
+                if source_path == destination:
+                    continue
+                if destination.exists():
+                    raise ValueError(
+                        f"Cannot migrate {source_path.name!r}: canonical path "
+                        f"{destination.name!r} already exists"
+                    )
+                backup = source_path.with_suffix(source_path.suffix + ".legacy-name-backup")
+                if backup.exists():
+                    backup = source_path.with_suffix(
+                        source_path.suffix
+                        + datetime.now(timezone.utc).strftime(
+                            ".%Y%m%dT%H%M%S%fZ.legacy-name-backup"
+                        )
+                    )
+                os.replace(source_path, backup)
+                try:
+                    animal.to_file(destination)
+                except Exception:
+                    os.replace(backup, source_path)
+                    raise
 
         pref_animal = self._preferences.selected_animal
+        self.animals = animals
         for animal in animals:
-            if pref_animal == animal.name:
+            if pref_animal in {animal.id, animal.name}:
                 self.selected_animal = animal
                 break
-
-        self.animals = animals
 
     def _update_status_text_overlay(self):
         parts = []
@@ -1735,8 +9681,10 @@ class AppModel(ObservableObject):
             parts.append(f"Inference: {cur_inf_status}")
         cur_inter_state = self._behavior.system_machine.intersession.state
         if cur_inter_state != IntersessionState.idle:
-            parts.append(f"Intersession: {cur_inter_state}")
-        self._left_camera.text_overlay = None if len(parts) == 0 else "\n".join(parts)
+            parts.append(f"Post-session analysis: {cur_inter_state}")
+        text_overlay = None if len(parts) == 0 else "\n".join(parts)
+        for camera in self._reach_cameras:
+            camera.text_overlay = text_overlay
 
     def _set_animal_base_positions(self, animal: AnimalSubject):
         xyz = Offset3DTuple(animal.pellet_x, animal.pellet_y, animal.pellet_z)
@@ -1777,23 +9725,13 @@ class AppModel(ObservableObject):
             #   pellet_m.send_pellet(force=True)
             # yet, it will be done by pellet-machine automatically if/when status goes to animal-in-training
 
-    def _refresh_cage_clean_data(self):
-        self._analysis.system_maintenance_alarm.set_cage_clean_next_day(
-            self._preferences.cage_clean_previous_day
-            + timedelta(days=self._behavior.algorithm.active_config.cage_cleaning.clean_days_interval)
-        )
-
     def _on_preferences_property_changed(self, name: str, value, old_value):
         prefs = UserPreferences
         if name == prefs.SELECTED_ANIMAL:
             for animal in self._animals:
-                if animal.name == value:
+                if value in {animal.id, animal.name}:
                     self.selected_animal = animal
                     break
-        elif name == prefs.PELLET_LOAD_COUNT_TOTAL:
-            self.check_max_pellet_loaded()
-        elif name == prefs.CAGE_CLEAN_PREVIOUS_DAY:
-            self._refresh_cage_clean_data()
 
     def _update_led_color(self):
         color = self._behavior.get_led_color()
@@ -1801,60 +9739,865 @@ class AppModel(ObservableObject):
         if cur_led is None or color != (cur_led.red, cur_led.green, cur_led.blue):
             self._hardware.set_color_led(*color)
 
-    def _on_alarm_monitor_property_changed(self, name, value, _):
-        alarm_mon = self._analysis.emergency_alarm_monitor
-        if name == alarm_mon.IS_ENGAGED:
-            self._update_led_color()
-        elif name == alarm_mon.ALARM_DETECTOR_PROPERTY_CHANGED:
-            detector = value[0]
-            detector: AlarmDetector
-            sub_name = value[1]
-            if sub_name in (detector.IS_ENGAGED, detector.CONFIG):
-                self._update_led_color()
-
-    def _on_system_maint_prop_changed(self, name, value, _):
-        self.check_max_pellet_loaded()
-
     def _on_watchdog_property_changed(self, name, value, old_value):
         wd_mon = self._analysis.watchdog_monitor
         if name == wd_mon.IS_ENGAGED:
-            engaged_d = wd_mon.engaged_watchdogs
-            if value and not old_value:  # watchd.is_engaged:
-                self.on_error("Watchdog timeout",
-                              f"Fatal error: element(s) timedout:\n\n"
-                              f"{engaged_d}\n\n"
-                              f"Application shall be restarted fully.")
+            if value:
+                for watchdog_id in wd_mon.engaged_watchdogs:
+                    self._handle_watchdog_timeout(watchdog_id)
 
-    def _on_autoclamp_evasion_property_changed(self, name, value, _):
-        det = self._analysis.autoclamp_evasion_detector
-        animal = self._selected_animal
-        if name == det.PELLETS_CONSUMED:
-            if animal is not None and value != animal.autoclamp_evasion_pellets_consumed:
-                animal.autoclamp_evasion_pellets_consumed = value
-                self._save_animal_metadata(animal, sender="autoclamp_evasion_pellets_consumed")
+    def _handle_watchdog_timeout(self, watchdog_id) -> None:
+        watchdog_key = (
+            watchdog_id.value
+            if isinstance(watchdog_id, enum.Enum)
+            else str(watchdog_id)
+        )
+        error = f"watchdog timed out: {watchdog_key}"
+        if watchdog_key.startswith("camera."):
+            camera_name = watchdog_key.partition(".")[2]
+            camera = next(
+                (item for item in self._cameras if item.name == camera_name),
+                None,
+            )
+            if camera is None:
+                logger.error("Unknown camera watchdog timed out: %s", watchdog_key)
+                return
+            try:
+                camera.on_capture_stop()
+            except Exception:
+                logger.exception("Failed to stop timed-out camera %s", camera_name)
+            self._analysis.watchdog_monitor.unregister_watchdog(watchdog_key)
+            root_error = camera.last_error or error
+            self._set_subsystem_status(
+                SubsystemId.camera(camera_name),
+                SubsystemState.FAILED,
+                error=root_error,
+            )
+            if camera in self._reach_cameras:
+                if camera.is_primary:
+                    for secondary in self._reach_cameras:
+                        if not secondary.is_enabled or secondary is camera:
+                            continue
+                        try:
+                            secondary.on_capture_stop()
+                        except Exception:
+                            logger.exception(
+                                "Failed to suspend secondary camera %s",
+                                secondary.name,
+                            )
+                        self._analysis.watchdog_monitor.unregister_watchdog(
+                            f"camera.{secondary.name}"
+                        )
+                        self._set_subsystem_status(
+                            SubsystemId.camera(secondary.name),
+                            SubsystemState.BLOCKED,
+                            reason="primary trigger unavailable",
+                        )
+                self._set_subsystem_status(
+                    SubsystemId.REACH_SYNCHRONIZATION,
+                    SubsystemState.FAILED,
+                    error=(
+                        f"reach camera unavailable: {camera_name}; {root_error}"
+                    ),
+                )
+                try:
+                    self._inference.stop()
+                except Exception:
+                    logger.exception("Failed to stop inference after camera timeout")
+                self._set_subsystem_status(
+                    SubsystemId.LIVE_INFERENCE,
+                    SubsystemState.BLOCKED,
+                    reason=f"reach camera unavailable: {camera_name}",
+                )
+            else:
+                logger.error("Unknown camera watchdog failed: %s", camera_name)
+            self._handle_recording_subsystem_failure(
+                SubsystemId.camera(camera_name),
+                root_error,
+            )
+        elif watchdog_key in {
+            WatchdogItems.DEVICE_READER.value,
+            WatchdogItems.DEVICE_WRITER.value,
+        }:
+            try:
+                self._hardware.report_can_watchdog_failure(error)
+            except Exception:
+                logger.exception("Failed to start CAN recovery after watchdog timeout")
+            self._analysis.watchdog_monitor.unregister_watchdog(watchdog_id)
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.FAILED,
+                error=error,
+            )
+        elif watchdog_key in {
+            WatchdogItems.POSE_PROCESS.value,
+            WatchdogItems.POSE_DATA_MONITOR_PROC.value,
+        }:
+            try:
+                self._inference.stop()
+            except Exception:
+                logger.exception("Failed to stop inference after watchdog timeout")
+            self._analysis.watchdog_monitor.unregister_watchdog(watchdog_id)
+            self._set_subsystem_status(
+                SubsystemId.LIVE_INFERENCE,
+                SubsystemState.FAILED,
+                error=error,
+            )
+            self._handle_recording_subsystem_failure(
+                SubsystemId.LIVE_INFERENCE,
+                error,
+            )
+        else:
+            logger.error("Unowned watchdog timed out: %s", watchdog_key)
+            return
+        self.on_error(
+            "Hardware subsystem failure",
+            f"{error}. Unrelated hardware remains running; Record is blocked "
+            "until the required subsystem is ready.",
+        )
+
+    def _on_nidaq_monitor_property_changed(self, name, value, _old_value):
+        monitor = self._nidaq_signal_monitor
+        if name == monitor.IS_STARTING and value:
+            # A start during _start_nidaq_domain is that attempt, not a new
+            # one; the domain writes its READY, BLOCKED or FAILED itself.
+            # It says "starting" again, over whatever an Idle stream said
+            # since the domain began.
+            self._nidaq_stream_started_by_domain = self._nidaq_domain_start_active
+            if self._nidaq_stream_started_by_domain:
+                self._set_subsystem_status(
+                    SubsystemId.NIDAQ_STREAM,
+                    SubsystemState.STARTING,
+                    reason="starting synchronized NI-DAQ tasks",
+                )
+            else:
+                self._begin_subsystem_start(SubsystemId.NIDAQ_STREAM)
+        elif name == monitor.IS_RUNNING:
+            if value:
+                # Not while the domain runs: an Idle start that turns ready
+                # then is about to be replaced, and its READY stood through
+                # the fresh start. Nor for the domain's own start, whose
+                # READY can arrive after the verdict: the monitor settles its
+                # flags before telling anyone, and the domain polls them.
+                if not (self._nidaq_stream_started_by_domain
+                        or self._nidaq_domain_start_active):
+                    self._set_subsystem_status(
+                        SubsystemId.NIDAQ_STREAM,
+                        SubsystemState.READY,
+                        reason="NI-DAQ tasks running",
+                    )
+            elif (
+                monitor.configuration.is_enabled
+                and monitor.hardware_enabled
+                and not monitor.error_message
+                # The domain's own restart; it stays "starting" throughout.
+                and not self._nidaq_domain_start_active
+            ):
+                self._set_subsystem_status(
+                    SubsystemId.NIDAQ_STREAM,
+                    SubsystemState.STOPPED,
+                    reason="NI-DAQ stream stopped",
+                )
+        elif name == monitor.ERROR_MESSAGE and value:
+            self._set_subsystem_status(
+                SubsystemId.NIDAQ_STREAM,
+                SubsystemState.FAILED,
+                error=str(value),
+            )
+            self._handle_recording_subsystem_failure(
+                SubsystemId.NIDAQ_STREAM,
+                str(value),
+            )
+
+    def _on_laser_runtime_property_changed(self, name, value, _old_value):
+        if name != self._laser.IS_CONNECTED:
+            return
+        if value:
+            self._set_subsystem_status(
+                SubsystemId.LASER,
+                SubsystemState.READY,
+                reason="laser controller connected",
+            )
+        elif self._laser.configuration.backend != "disabled":
+            current = self._acquisition.subsystems.get(SubsystemId.LASER)
+            if (
+                self._acquisition.started
+                and not self._acquisition.stopping
+                and current is not None
+                and current.state is SubsystemState.READY
+            ):
+                reason = "laser controller disconnected unexpectedly"
+                self._set_subsystem_status(
+                    SubsystemId.LASER,
+                    SubsystemState.FAILED,
+                    error=reason,
+                )
+                self._handle_recording_subsystem_failure(
+                    SubsystemId.LASER,
+                    reason,
+                )
+            else:
+                # Not STOPPED while laser work is refused: a close that ended
+                # late disconnects here, with the work it left still running.
+                def decide(refusal):
+                    held = self._given_up_close_refusal()
+                    if held:
+                        return SubsystemState.FAILED, dict(error=held)
+                    if refusal:
+                        # In the middle of a close within its bound: closing,
+                        # until its owner writes the outcome.
+                        return SubsystemState.STOPPING, dict(reason="closing laser controller")
+                    return SubsystemState.STOPPED, dict(reason="laser controller disconnected")
+
+                self._set_laser_status_after_close(decide)
+
+    def _handle_recording_subsystem_failure(
+        self,
+        subsystem_id,
+        reason: str,
+    ) -> None:
+        status = self._acquisition.subsystems.get(subsystem_id)
+        recording_status = self._recording_session.status
+        if status is None or recording_status not in {
+            SessionRecordingStatus.ARMING,
+            SessionRecordingStatus.RECORDING,
+        }:
+            return
+        subsystem_key = status.subsystem_id
+        if subsystem_key.startswith("camera."):
+            camera_name = subsystem_key.split(".", 1)[1]
+            camera = next(
+                (item for item in self._reach_cameras if item.name == camera_name),
+                None,
+            )
+            is_session_reference = (
+                camera is not None
+                and camera.camera_index == self._identify_session_reference_cam_idx()
+            )
+            if is_session_reference:
+                if recording_status is SessionRecordingStatus.RECORDING:
+                    logger.error(
+                        "Primary camera failed during recording: %s; requesting "
+                        "normal Stop and preserving partial data",
+                        reason,
+                    )
+                    self._stop_recording(
+                        RecordingEndingReason.REQUIRED_SOURCE_FAILURE,
+                        token=self._recording_session.token(),
+                    )
+                else:
+                    logger.error(
+                        "Primary camera failed before the recording boundary: %s; "
+                        "cleaning the empty armed session",
+                        reason,
+                    )
+                    self.abort_recording(token=self._recording_session.token())
+            else:
+                logger.error(
+                    "Secondary camera failed; healthy primary recording continues: %s",
+                    reason,
+                )
+            return
+        logger.error(
+            "%s failed during recording; remaining streams and the active "
+            "operation continue: %s",
+            subsystem_key,
+            reason,
+        )
+        if subsystem_key == SubsystemId.LIVE_INFERENCE:
+            self._live_inference_failed_reason = reason
 
     def _on_intersession_property_changed(self, name, value, _):
         if name == IntersessionMachine.Properties.STATE_PROPERTY:
             self._update_status_text_overlay()
 
     def _on_session_starting_before_record_start(self):
+        session_config = self._behavior.algorithm.active_config.session_control
+        token = self._recording_session.token()
+        if token is None:
+            logger.warning(
+                "Behavior session started outside the recording controller; "
+                "intertrial results will not be applied"
+            )
+            analysis_generation = 0
+            analysis_session_id = self._project_info.short_id
+        else:
+            analysis_generation = token.generation
+            analysis_session_id = token.session_id
+        self._live_tracking.clear()
+        self._trial_window_start = None
+        self._tone2_active = False
+        self._tone2_status_active = False
+        self._intertrial_resolution_request = None
+        self._intertrial_resolution_reason = ""
+        self._intertrial_waiting_operations.clear()
+        self._send_block_reasons.clear_all()
+        self._intertrial_analysis.begin_session(
+            analysis_generation,
+            analysis_session_id,
+        )
+        self._pellet_cycles.start_session(
+            self._project_info.short_id,
+            TrialAccountingConfiguration(
+                assignment_policy=AttemptAssignmentPolicy(
+                    session_config.attempt_assignment
+                ),
+                retry_settings_policy=RetrySettingsPolicy(
+                    session_config.retry_settings
+                ),
+                count_basis=TrialCountBasis(
+                    session_config.trial_count_basis
+                ),
+                counted_outcomes=frozenset(
+                    TrialOutcome(outcome)
+                    for outcome in session_config.counted_trial_outcomes
+                ),
+            ),
+        )
+        self._notify_trial_protocol_state()
+        self._cancel_automatic_stop_timers()
+        self._session_stop_policy = SessionStopPolicy(
+            SessionStopConfiguration(
+                duration_seconds=session_config.duration_limit_seconds,
+                trial_limit=session_config.trial_limit,
+                stop_on_protocol_complete=(
+                    session_config.stop_on_protocol_complete
+                ),
+                drain_timeout_seconds=(
+                    session_config.stop_drain_timeout_seconds
+                ),
+            ),
+        )
+        self._session_stop_evaluation = None
+        self._recording_ending_reason = RecordingEndingReason.NA
+        self._cams_record_start_perf.value = math.nan
         drained = 0
         while self._record_stop_sema.acquire(block=False):
             drained += 1
         if drained:
             logger.verbose("drained record_stop_sema by %s", drained)
+        prepare_pose = getattr(
+            type(self._inference),
+            "prepare_session_recording",
+            None,
+        )
+        if prepare_pose is not None:
+            prepare_pose(self._inference, self._project_info)
 
     def _on_session_capture_ended(self, reason: RecordingEndingReason):
-        project = self._project_info
-        if project is not None:
-            self._save_project_metadata(project, caller="session_capture_ended")
-        # self._behavior.system_machine.on_session_capture_ended(reason)
-        # NB: had to keep in system_machine for many tests.
-        # is ok as long as the project isn't modified in system_machine.on_session_capture_ended()
+        self._recording_ending_reason = RecordingEndingReason(reason)
+        logger.debug("session capture trigger ended: %s", reason)
+        # Freeze the counters here rather than waiting for finalization. The
+        # pose process finishes its backlog after capture stops, and those
+        # predicts are not frames of this session getting a live pose - once
+        # the model was fast enough to keep up, letting them in took a session
+        # that ran at 99.8% of frames inferenced and reported 125%.
+        #
+        # end() is idempotent, so the later call in _complete_stopped_recording
+        # still covers any ending path that does not reach here.
+        self._session_telemetry.end()
 
-    def _remove_timestamps_txt_files(self, project: ProjectInfo):
+    def _on_session_ending(self, project: ProjectInfo, result: CaptureAnalysisResult):
+        if project.short_id in self._aborted_session_ids:
+            logger.info("ignoring session-ending callback for aborted %s", project.short_id)
+            return
+        session_token = self._recording_session.token()
+        project_generation = int(getattr(project, "session_generation", 0))
+        if session_token is not None and (
+            project.short_id != session_token.session_id
+            or project_generation not in (0, session_token.generation)
+        ):
+            logger.warning(
+                "ignoring stale session-ending callback: project=%s "
+                "generation=%s active=%s",
+                project.short_id,
+                project_generation,
+                session_token,
+            )
+            return
+        if self._recording_session.status not in {
+            SessionRecordingStatus.STOPPING,
+            SessionRecordingStatus.ANALYZING,
+        }:
+            logger.warning(
+                "ignoring session-ending callback while state is %s: project=%s",
+                self._recording_session.status.value,
+                project.short_id,
+            )
+            return
+        logger.info(
+            "capture lifecycle ended for %s (%s); waiting for closed "
+            "pellet-window analyses after writers close",
+            project.short_id,
+            result.value,
+        )
+
+    def _complete_stopped_recording(
+        self,
+        project: ProjectInfo,
+        *,
+        token: Optional[SessionGeneration] = None,
+    ) -> None:
+        token = token or self._recording_session.token()
+        if token is not None and (
+            not self._recording_session.is_current(
+                token,
+                statuses=(SessionRecordingStatus.STOPPING,),
+            )
+            or project.short_id != token.session_id
+        ):
+            logger.warning(
+                "ignoring stale stopped-recording completion: project=%s active=%s",
+                project.short_id,
+                token,
+            )
+            return
+        end_perf = (
+            self._recording_session.pending_end_perf
+            if token is None
+            else self._recording_session.take_pending_end(token)
+        )
+        if token is None:
+            logger.warning("stopped recording completion has no active token")
+        if end_perf is None:
+            end_perf = get_perf_now()
+            logger.warning("Primary camera did not report a final recorded-frame timestamp")
+        boundary = self._recording_session.boundary
+        if boundary is None or boundary.session_id != project.short_id:
+            raise RuntimeError(
+                f"Missing canonical recording boundary for {project.short_id}"
+            )
+        completed_boundary = boundary.with_end(end_perf)
+        if token is None:
+            logger.warning("cannot update stopped boundary without a session token")
+            return
+        elif not self._recording_session.set_boundary(completed_boundary, token):
+            logger.warning("stopped-recording boundary became stale: %s", token)
+            return
+        project.start_record_timestamp = self._recording_session.boundary.start_wall_time
+        storage_telemetry = self._storage_monitor.stop()
+        current_storage = dict(self._recording_session.storage_telemetry)
+        current_storage["recording"] = storage_telemetry
+        self._recording_session.set_storage_telemetry(current_storage)
+        stream_result = None
+        try:
+            self._pellet_cycles.snapshot_for_stop(
+                end_perf,
+                self._recording_session.boundary.end_wall_time,
+            )
+            self._session_telemetry.end(end_perf)
+            exact_capture = self._exact_session_capture(project)
+            self._recording_session.set_capture_telemetry({
+                **self._session_telemetry.summary(),
+                "exact": exact_capture,
+            })
+            self._session_telemetry.set_exact_capture(
+                exact_capture,
+                completed_boundary.to_metadata()["durationSeconds"],
+            )
+            stream_result = self._session_data_recorder.stop(end_perf)
+        except Exception as first_error:
+            logger.exception(
+                "Initial session auxiliary finalization failed; retrying retained data"
+            )
+            try:
+                stream_result = self._session_data_recorder.retry_pending_finalization()
+            except Exception as retry_error:
+                logger.exception("Failed to save retained session auxiliary streams")
+                self.on_error("Session stream save failed", str(retry_error))
+                self._recording_session.add_data_error(
+                    "auxiliary stream finalization remains pending: "
+                    f"{first_error}"
+                )
+        if isinstance(stream_result, dict):
+            camera_alignment = (
+                stream_result.get("cameraNidaqAlignment")
+            )
+            matched_sample_index = (
+                None
+                if camera_alignment is None
+                else camera_alignment.get("matchedSampleIndex")
+            )
+            if matched_sample_index is not None:
+                if token is None or not self._recording_session.update_boundary_nidaq_sample_index(
+                    matched_sample_index,
+                    token,
+                ):
+                    logger.warning("NI-DAQ alignment boundary update became stale")
+            self._recording_session.set_stream_result(stream_result)
+            # A status line is not worth skipping the completeness check, the
+            # end-home request or the analysis start below.
+            try:
+                self._latency_status = dict(stream_result.get("latency") or {})
+                self._session_telemetry.set_latency_status(
+                    describe_latency_status(self._latency_status))
+            except Exception:
+                logger.exception("Latency record status was not published")
+            if not self._recording_session.data_complete:
+                message = (
+                    "Session auxiliary data is incomplete: "
+                    + "; ".join(self._recording_session.data_errors)
+                )
+                logger.error(message)
+                self.on_error("Session data incomplete", message)
+        self._request_session_end_home("stop")
+        self._recording_session.set_analysis_started(time.perf_counter())
+        self._begin_subsystem_start(
+            SubsystemId.INTERTRIAL_ANALYSIS,
+            reason="finishing closed pellet-trial analyses",
+        )
+        transitioned = self._set_session_recording_status(
+            SessionRecordingStatus.ANALYZING,
+            expected=(SessionRecordingStatus.STOPPING,),
+            token=token,
+        )
+        try:
+            self._editable_notes_project = project.to_local_value()
+            self._save_project_metadata(
+                project,
+                caller="raw_writers_closed",
+            )
+        except Exception as exc:
+            self._pending_metadata_project = project.to_local_value()
+            self._recording_session.add_data_error(
+                f"metadata save failed: {exc}"
+            )
+            self._set_subsystem_status(
+                SubsystemId.INTERTRIAL_ANALYSIS,
+                SubsystemState.FAILED,
+                error=f"metadata save failed: {exc}",
+            )
+            logger.exception("Initial stopped-session metadata save failed")
+        if not transitioned:
+            return
+        if self._intertrial_analysis.is_idle():
+            self._finish_intertrial_session(project, token)
+        else:
+            thread = threading.Thread(
+                target=self._wait_and_finish_intertrial_session,
+                args=(project.to_local_value(), token),
+                name="FinishIntertrialSession",
+                daemon=True,
+            )
+            self._intertrial_finalize_thread = thread
+            thread.start()
+
+    def _wait_and_finish_intertrial_session(
+        self,
+        project: ProjectInfo,
+        token: Optional[SessionGeneration],
+    ) -> None:
+        while (
+            token is None
+            and self._recording_session.status is SessionRecordingStatus.ANALYZING
+        ) or self._recording_session.is_current(
+            token, statuses=(SessionRecordingStatus.ANALYZING,)
+        ):
+            if self._intertrial_analysis.wait_for_idle(0.25):
+                self._finish_intertrial_session(project, token)
+                return
+
+    def _finish_intertrial_session(
+        self,
+        project: ProjectInfo,
+        token: Optional[SessionGeneration],
+    ) -> None:
+        if not (
+            (
+                token is None
+                and self._recording_session.status
+                is SessionRecordingStatus.ANALYZING
+            )
+            or self._recording_session.is_current(
+                token, statuses=(SessionRecordingStatus.ANALYZING,)
+            )
+        ):
+            return
+        requests, tracking_errors = (
+            self._session_data_recorder.load_trial_tracking_requests(project)
+        )
+        for error in tracking_errors:
+            logger.warning("Stored trial tracking could not be validated: %s", error)
+        pending_identities = {
+            (attempt.trial_id, attempt.attempt_id, attempt.operation_id)
+            for attempt in (self._trial_ledger.attempts if self._trial_ledger else ())
+            if attempt.outcome is TrialOutcome.PENDING_ANALYSIS
+        }
+        for request in requests:
+            identity = (
+                request.trial_id,
+                request.attempt_id,
+                request.operation_id,
+            )
+            if identity not in pending_identities:
+                continue
+            try:
+                result = analyze_tracking_window(request)
+                self._session_data_recorder.persist_trial_tracking(
+                    project,
+                    request,
+                    result,
+                )
+                tone_references, laser_references = (
+                    self._session_data_recorder.trial_stream_references(
+                        request.window.start_perf,
+                        request.window.end_perf,
+                    )
+                )
+                self._pellet_cycles.finalize_intertrial_result(
+                    project,
+                    result,
+                    retry=False,
+                    tone_references=tone_references,
+                    laser_references=laser_references,
+                )
+                logger.warning(
+                    "Repaired pending trial %s from stored live tracking",
+                    request.attempt_label,
+                )
+            except Exception as error:
+                logger.exception(
+                    "Stored tracking repair failed for %s: %s",
+                    request.attempt_label,
+                    error,
+                )
+        self._pellet_cycles.finalize_pending_without_analysis(
+            project,
+            perf_time=get_perf_now(),
+            wall_time=time.time(),
+            reason="intertrial analysis ended without a result",
+        )
+        self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
+        self._pellet_cycles.end_session()
+        pending_api_events = self._session_api.flush_pending()
+        if pending_api_events:
+            message = (
+                f"{pending_api_events} public lifecycle event(s) remain in the "
+                "bounded retry outbox"
+            )
+            logger.warning(message)
+            self._recording_session.add_data_error(message)
+        self._intertrial_resolution_request = None
+        self._intertrial_resolution_reason = ""
+        self._intertrial_waiting_operations.clear()
+        self._send_block_reasons.clear_all()
+        self._recording_session.set_analysis_finished(time.perf_counter())
+        try:
+            # The final save, the seal against late ledger/tracking writes and
+            # the start of the quick validation that reads the files are one
+            # publication. READY is set after the lock is released: Record can
+            # begin once it is, and its notes flush takes this lock.
+            with self._session_publication_lock:
+                # Sealed before the final save, which hashes the stream
+                # manifest: a ledger or tracking write in flight finishes
+                # first, and a later one is refused. A failed save leaves the
+                # session sealed; _write_session already published its streams.
+                self._session_data_recorder.seal_session(project.short_id)
+                try:
+                    self._save_project_metadata(
+                        project,
+                        caller="intertrial_analysis_finished",
+                    )
+                except Exception as error:
+                    self._pending_metadata_project = project.to_local_value()
+                    self._recording_session.add_data_error(
+                        f"final metadata save failed: {error}"
+                    )
+                    self._set_subsystem_status(
+                        SubsystemId.INTERTRIAL_ANALYSIS,
+                        SubsystemState.FAILED,
+                        error=f"final metadata save failed: {error}",
+                    )
+                    logger.exception("Final intertrial metadata save failed")
+                else:
+                    self._pending_metadata_project = None
+                    self._last_stopped_session_path = Path(
+                        project.get_session_path(skip_ensure=True).location
+                    ).resolve()
+                    try:
+                        self._session_validation.start(
+                            self._last_stopped_session_path,
+                            "quick",
+                            automatic=True,
+                        )
+                    except Exception:
+                        logger.exception("Could not schedule automatic quick session validation")
+                    self._set_subsystem_status(
+                        SubsystemId.INTERTRIAL_ANALYSIS,
+                        (
+                            SubsystemState.READY
+                            if self._recording_session.data_complete
+                            else SubsystemState.FAILED
+                        ),
+                        reason=(
+                            "all closed pellet-trial analyses completed"
+                            if self._recording_session.data_complete
+                            else "trial analysis completed; session data is incomplete"
+                        ),
+                        error=(
+                            ""
+                            if self._recording_session.data_complete
+                            else "; ".join(self._recording_session.data_errors)
+                        ),
+                    )
+        finally:
+            self._set_session_recording_status(
+                SessionRecordingStatus.READY,
+                expected=(SessionRecordingStatus.ANALYZING,),
+                token=token,
+            )
+
+    def _request_session_end_home(self, ending: str) -> None:
+        requested_perf = get_perf_now()
+        requested_wall = time.time()
+        if not self._recording_session.reserve_end_action(
+            "pellet_home",
+            {
+                "ending": str(ending),
+                "requestedPerfTime": requested_perf,
+                "requestedWallTime": requested_wall,
+                "insideRecordedBoundary": False,
+            },
+        ):
+            return
+        status = self._acquisition.subsystems.get(SubsystemId.CAN_PELLET)
+        if status is None or not status.is_ready or not self._hardware.connected:
+            self._recording_session.finish_end_action(
+                "pellet_home",
+                status="skipped",
+                error="pellet board was not Ready at session end",
+            )
+            logger.warning("Session-end pellet home skipped: pellet board not Ready")
+            return
+        try:
+            token = self._hardware.send_home_and_wait(timeout=15.0)
+        except Exception as error:
+            message = str(error) or error.__class__.__name__
+            logger.exception("Session-end pellet home failed")
+            self._recording_session.finish_end_action(
+                "pellet_home",
+                status="failed",
+                completedPerfTime=get_perf_now(),
+                error=message,
+            )
+            self.on_error("Pellet home failed", message)
+            return
+        self._recording_session.finish_end_action(
+            "pellet_home",
+            status="completed",
+            completedPerfTime=get_perf_now(),
+            commandToken=str(token),
+            error=None,
+        )
+
+    def _finish_abort_recording(
+        self,
+        *,
+        token: Optional[SessionGeneration] = None,
+    ) -> None:
+        token = token or self._recording_session.token()
+        if token is not None and not self._recording_session.is_current(
+            token,
+            statuses=(SessionRecordingStatus.ABORTING,),
+        ):
+            logger.warning("ignoring stale abort completion: %s", token)
+            return
+        self._record_start_timer.cancel()
+        self._storage_monitor.abort()
+        self._record_start_timer = no_op_timer
+        self._abort_cleanup_timer.cancel()
+        self._abort_cleanup_timer = no_op_timer
+        project = self._aborting_project
+        if project is None:
+            logger.error("abort completed without an associated project")
+            self._set_session_recording_status(
+                SessionRecordingStatus.READY,
+                expected=(SessionRecordingStatus.ABORTING,),
+                token=token,
+            )
+            return
+        try:
+            self._session_data_recorder.abort()
+        except Exception as error:
+            message = (
+                "Session data writer has not stopped yet; abort cleanup will "
+                f"retry without deleting files: {error}"
+            )
+            logger.exception(message)
+            self.on_error("Abort cleanup waiting for writer", message)
+            self._abort_cleanup_timer = make_daemon_timer(
+                1.0,
+                lambda token=token: self._finish_abort_recording(token=token),
+            )
+            self._abort_cleanup_timer.start()
+            return
+        try:
+            day_path = Path(project.get_day_path(skip_ensure=True)[0]).resolve()
+            session_path = Path(project.get_session_path(skip_ensure=True).location).resolve()
+            try:
+                session_path.relative_to(day_path)
+            except ValueError as err:
+                raise RuntimeError(
+                    f"Resolved session path is outside the project day directory: {session_path}"
+                ) from err
+            if session_path.parent != day_path:
+                raise RuntimeError(
+                    f"Resolved session path is not a direct session directory: {session_path}"
+                )
+            if session_path.name != f"session{project.session:03}":
+                raise RuntimeError(
+                    f"Resolved session directory has an unexpected name: {session_path.name}"
+                )
+            if session_path.exists():
+                shutil.rmtree(session_path)
+                logger.notice("aborted session removed: %s", session_path)
+            current_project = self._project_info
+            if current_project is not None and current_project.session == project.session:
+                current_project.session = max(0, project.session - 1)
+        except Exception as err:
+            logger.exception("Unable to delete aborted session data: %s", err)
+            self.on_error("Abort cleanup failed", str(err))
+        finally:
+            self._request_session_end_home("abort")
+            self._pellet_cycles.abort(
+                perf_time=get_perf_now(),
+                wall_time=time.time(),
+            )
+            pending_api_events = self._session_api.flush_pending()
+            if pending_api_events:
+                logger.warning(
+                    "%s aborted-session lifecycle event(s) remain queued",
+                    pending_api_events,
+                )
+            self._behavior.algorithm.reset_session_counts()
+            self._set_subsystem_status(
+                SubsystemId.INTERTRIAL_ANALYSIS,
+                SubsystemState.DISABLED,
+                reason="aborted session analysis was cancelled",
+            )
+            self._abort_had_recording_started = False
+            self._aborting_project = None
+            self._editable_notes_project = None
+            self.notes = ""
+            previous = self._recording_session.complete_abort(token)
+            if previous is None:
+                logger.warning(
+                    "ignored stale/invalid abort completion: token=%s",
+                    token,
+                )
+            else:
+                self._publish_session_recording_transition(
+                    previous,
+                    SessionRecordingStatus.READY,
+                )
+
+    def _remove_timestamps_txt_files(
+        self,
+        project: ProjectInfo,
+        cameras: Optional[Tuple[VideoCaptureModel, ...]] = None,
+    ):
         removed = []
-        for cam in self._cameras:
+        for cam in self._cameras if cameras is None else cameras:
             _, ts_file, _ = project.get_video_path(cam.name, allow_overwrite=True)
             ts_file = Path(ts_file)
             if ts_file.exists():
@@ -1878,23 +10621,21 @@ class AppModel(ObservableObject):
                 self._event_manager.post_event_content(
                     ApiEventKind.animalUpdated, animal.to_api_status())
 
-        elif name == props.CAGE_CLEAN_CONFIG:
-            self._refresh_cage_clean_data()
-
-        elif name == props.HEAD_FIXATION_ENABLED:
-            det = self._behavior.analysis.autoclamp_evasion_detector
-            if value and not old_value:
-                det.pellets_consumed = 0
-                # we monitor the detector pellets_consumed property,
-                # and update it in selected animal.
-            det.autoclamp_enabled = value
-
     def _on_hardware_property_changed(self, name: str, value, _):
         animal = self._selected_animal
         hard = self._hardware
-        if animal is not None and name in {hard.SET_X, hard.SET_Y, hard.SET_Z}:
-            # only when manual:
-            if self._training_mode != TrainingMode.MANUAL:
+        if name == hard.CAN_CONNECTION_STATE_PROPERTY:
+            self._on_can_connection_state_changed(value)
+        elif name == hard.FIRMWARE_COMPATIBILITY_PROPERTY:
+            self.property_changed(
+                self.Props.RECORDING_BLOCKERS,
+                self.recording_blockers,
+                None,
+            )
+        elif animal is not None and name in {hard.SET_X, hard.SET_Y, hard.SET_Z}:
+            # Protocol actions temporarily move the motors without redefining
+            # the animal's manually configured base position.
+            if self._attached_plan is not None or self._protocol_positioning_active:
                 return
             coord = name[-1]
             coord_idx = "xyz".index(coord)
@@ -1932,11 +10673,123 @@ class AppModel(ObservableObject):
             if changed:
                 self._save_animal_metadata(animal, sender=f"hardware_{name}", backup_previous=pellet_dcs_changed)
 
+    def _on_can_connection_state_changed(self, value) -> None:
+        if not self._acquisition.started:
+            return
+        state = str((value or {}).get("state", "failed"))
+        error = str((value or {}).get("error", ""))
+        watchdog = self._analysis.watchdog_monitor
+        if state in {"failed", "recovering", "connecting"}:
+            watchdog.unregister_watchdog(WatchdogItems.DEVICE_READER)
+            watchdog.unregister_watchdog(WatchdogItems.DEVICE_WRITER)
+        if state == "ready":
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.READY,
+                reason="CAN/pellet controller ready",
+            )
+            watchdog.register_watchdog(
+                WatchdogItems.DEVICE_READER,
+                lambda: self._hardware.watchdog_reader_perf_c,
+            )
+            watchdog.register_watchdog(
+                WatchdogItems.DEVICE_WRITER,
+                lambda: self._hardware.watchdog_writer_perf_c,
+            )
+        elif state in {"recovering", "connecting"}:
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.STARTING,
+                reason=(
+                    "recovering CAN/pellet controller"
+                    if state == "recovering"
+                    else "connecting CAN/pellet controller"
+                ),
+                error=error,
+            )
+        elif state == "failed":
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.FAILED,
+                error=error or "CAN/pellet controller failed",
+            )
+            # Preserve all remaining recording streams. The in-flight command
+            # is explicitly failed/unknown by HardwareModel and no new pellet
+            # cycle is allowed until this subsystem returns to Ready.
+        elif state == "stopped" and not self._acquisition.stopping:
+            self._set_subsystem_status(
+                SubsystemId.CAN_PELLET,
+                SubsystemState.STOPPED,
+                reason="CAN/pellet controller stopped",
+            )
+
     def _on_inference_property_changed(self, name: str, value, _):
+        if name == InferenceModel.LIVE_POSE_STATS and value is not None:
+            # Windowed timing from the pose process, folded into the session
+            # counters the operator panel and the metadata read.
+            pose_count, mean_ms, max_ms, e2e_mean_ms, e2e_max_ms = value
+            self._session_telemetry.record_inference(
+                pose_count, mean_ms, max_ms,
+                sensor_to_result_mean_ms=e2e_mean_ms,
+                sensor_to_result_max_ms=e2e_max_ms)
+            return
         if name == InferenceModel.STATUS:
             new_is_live = value == InferenceStatus.live
             if new_is_live:
                 self._p_inference_live_begin = time.perf_counter()
+                # Acquisition starts before inference is ready - the model
+                # still has to load - so counting both from capture start
+                # charged inference for the couple of seconds it did not
+                # exist. The preview panel read 74% rising to 96% on a run
+                # that dropped nothing, and carried an 8.5 s end-to-end max
+                # from the first frame through the warming pipeline. Rebase
+                # here so the percentage measures the two running together.
+                # A recording owns the counters from its first frame until it
+                # is finalized, so this never moves a session's baseline. That
+                # includes Stopping: the pose process handles EOF_RECORDING
+                # and comes straight back to live while the session is still
+                # being saved, and rebasing there zeroed the saved figures.
+                if self._recording_session.status not in {
+                    SessionRecordingStatus.RECORDING,
+                    SessionRecordingStatus.STOPPING,
+                    SessionRecordingStatus.ANALYZING,
+                }:
+                    self._begin_session_telemetry()
+            elif value == InferenceStatus.stopped:
+                current = self._acquisition.subsystems.get(
+                    SubsystemId.LIVE_INFERENCE
+                )
+                if (
+                    self._acquisition.started
+                    and not self._acquisition.stopping
+                    and current is not None
+                    and current.state is SubsystemState.READY
+                ):
+                    reason = "live inference stopped unexpectedly"
+                    # The pose process's own reason, when it gave one. Its
+                    # traceback is in the log, but this is what the status
+                    # panel, the degraded tooltip and the Record refusal show.
+                    cause = getattr(self._inference, "pose_process_error", None)
+                    if cause:
+                        reason = f"{reason}: {cause}"
+                    self._set_subsystem_status(
+                        SubsystemId.LIVE_INFERENCE,
+                        SubsystemState.FAILED,
+                        error=reason,
+                    )
+                    self._handle_recording_subsystem_failure(
+                        SubsystemId.LIVE_INFERENCE,
+                        reason,
+                    )
+                    # As a pose watchdog timeout would. A pose process that
+                    # exits is caught within a poll of the message loop, and
+                    # stopping it unregisters that watchdog before it can fire,
+                    # so without this a crash while live raised no alert.
+                    self.on_error(
+                        "Hardware subsystem failure",
+                        f"{reason}. Unrelated hardware remains running; Record is "
+                        "blocked until the required subsystem is ready.",
+                    )
 
             if new_is_live or value == InferenceStatus.intersession:
                 self._analysis.watchdog_monitor.register_watchdog(
@@ -1944,88 +10797,359 @@ class AppModel(ObservableObject):
             else:
                 self._analysis.watchdog_monitor.unregister_watchdog(WatchdogItems.POSE_PROCESS)
 
-            left_cam = self._left_camera
-            left_cam.display_dots_detection = new_is_live
-            self._right_camera.display_dots_detection = new_is_live
+            for camera in self._reach_cameras:
+                camera.display_dots_detection = new_is_live
             self._update_status_text_overlay()
         elif name == InferenceModel.MODEL_LOCATION:
             if value:
                 try:
-                    DlcPoseModel.pre_validate(value)
+                    # Routed by backend, not pinned to DeepLabCut: this
+                    # reported every YOLO model as broken, an error dialog
+                    # on every start for a model that then ran correctly.
+                    pre_validate_model(value)
                 except Exception as err:
-                    self.on_error("DlcPoseModel pre_validate failed",
+                    self.on_error("Pose model pre-validate failed",
                                   f"\nModel at {value} failed pre-validate:\n\n{err}")
 
-    def _on_pose_response_ready(self, response: PoseResponse):
-        # TODO: move to behavior algo or analysis (as BaseDetector subclass)
-        if not self._check_diamond_coord_enabled or self._behavior.algorithm.algo_paused:
-            return
-        cfg = self._behavior.algorithm.diamond_triangle_config
-        if cfg is None:
-            # nothing we can do
-            return
-        # maybe todo: make these configurable:
-        min_check_delay = 5  # seconds ; if no valid check/measure within this delay -> error + emergency
-        delay_inference_begin = 3  # seconds ; wait inference started for that duration before consider min_check_delay
-        max_dist_diff = 5  # mm ; if distance between obtained & expected above that -> invalid measure
-        #
-        loc3d = response.locations_3d.get(SceneElement.Diamond)
-        raw3d = response.raw_loc_3d.get(SceneElement.Diamond)
-        if loc3d is None or raw3d is None:
-            return
-        self._prev_diamond_coord = loc3d
-        diff = loc3d - cfg.diamond_coord
-        raw_diff = raw3d - cfg.raw_diamond_coord
-        p_now = time.perf_counter()
-        if diff.distance > max_dist_diff or raw_diff.distance > max_dist_diff:
-            if not self._warned_bad_diamond_coord:
-                logger.warning("Diamond coordinate invalid: %s ; dist=%.2f raw=%.2f ; pose=%s",
-                               loc3d.humanize(n_digits=2), diff.distance, raw_diff.distance, response)
-                self._warned_bad_diamond_coord = True
-        else:
-            self._prev_valid_diamond_perf_c = p_now
-            self._warned_bad_diamond_coord = False
-            self._triggered_bad_diamond_coord = False
-        #
-        if (p_now - self._p_inference_live_begin > delay_inference_begin
-                and p_now - self._prev_valid_diamond_perf_c > min_check_delay
-        ):
-            if not self._triggered_bad_diamond_coord:
-                self._triggered_bad_diamond_coord = True
-                if self._trigger_emergency_on_bad_diamond_coord:
-                    self._behavior.emergency_stop(source="Diamond-Coord-Check")
-                    self.on_error("Diamond not detected or invalid position",
-                                  "Could not ensure valid diamond position for too long.\n\n"
-                                  "Please re-execute a diamond-triangle calibration via menu Tools -> Calibrate Coordinate System\n\n"
-                                  "Then click Resume to resume from the emergency."
-                                  )
-                else:
-                    logger.error("Bad diamond coord check: distance=%.2f ; %s vs %s",
-                                 diff.distance,
-                                 loc3d.humanize(), cfg.diamond_coord.humanize())
+    def _live_tracking_anchor(self, boundary: SessionBoundary) -> FrameTimelineAnchor:
+        """Place live pose frames on the session clock.
 
-    def _on_detection_result_ready(self, project: ProjectInfo, result: IntersessionResponse):
-        animal = self._selected_animal
-        if animal is None:
+        Pose responses number frames from the first recorded one (the video
+        capture's frame_idx_cat), so frame 0 is the frame whose time is
+        boundary.start_perf_time. boundary.primary_frame_id is the camera's own
+        count since acquisition began; anchoring on it put every sample earlier
+        by however long the camera ran before Record.
+
+        The rate is measured once a second of frames carries its own capture
+        times (frame_perf_c, host arrival): the rig's cameras deliver 149.9845
+        frames per host second for a configured 150, and the configured rate an
+        hour in misplaces a frame by 0.37 s.
+        """
+        primary = self._ordered_reach_cameras(enabled_only=True)[0]
+        frame_rate = float(
+            primary.active_config.params.get("fps")
+            or self._behavior.system_machine.intersession.frame_rate
+        )
+        latest = self._live_tracking.latest()
+        if latest is not None:
+            frame_id = latest.primary_frame_ids[-1]
+            elapsed = latest.primary_frame_perf_times[-1] - boundary.start_perf_time
+            if frame_id >= frame_rate and elapsed > 0:
+                frame_rate = frame_id / elapsed
+        return FrameTimelineAnchor(0, boundary.start_perf_time, frame_rate)
+
+    def _on_pose_response_ready(self, response: PoseResponse):
+        # One row per pose, on this receive thread rather than the Qt thread:
+        # the latency record's last pose stage.
+        self._session_data_recorder.latency_events.record_live_pose(response, time.perf_counter())
+        boundary = self._recording_session.boundary
+        if (
+            boundary is not None
+            and self._recording_session.status
+            in {SessionRecordingStatus.RECORDING, SessionRecordingStatus.STOPPING}
+        ):
+            try:
+                sample = LiveTrackingSample.from_pose_response(
+                    response,
+                    self._live_tracking_anchor(boundary),
+                )
+                if sample is not None:
+                    self._live_tracking.append(sample)
+            except (IndexError, TypeError, ValueError) as error:
+                logger.warning("Live tracking sample was not buffered: %s", error)
+        message = self._coordinates.validate_pose(
+            response,
+            self._behavior.algorithm.diamond_triangle_config,
+            inference_started_perf=self._p_inference_live_begin,
+            paused=self._behavior.algorithm.algo_paused,
+        )
+        if message is not None:
+            self.on_error("Diamond not detected or invalid position", message)
+
+    def _on_intertrial_device_message(
+        self,
+        kind,
+        data,
+        perf_time: float,
+        _wall_time: float,
+    ) -> None:
+        """Use immediate CAN tone state only when NI confirmation is unavailable."""
+        if kind is SystemStatusMessageKind.TONE_STATUS:
+            frequency_hz = int(getattr(data, "frequency_hz", 0))
+            active = bool(getattr(data, "time_remaining_ms", 0))
+            # The board's own mapping rather than a literal. A frequency
+            # compared against a copied constant is a comparison that
+            # stops being true the moment the devicetree changes, with
+            # nothing failing to say so.
+            tone2 = active and frequency_hz == tone_confirmation_frequency(
+                "tone2")
+            rising = tone2 and not self._tone2_status_active
+            self._tone2_status_active = tone2
+            if not rising or self._nidaq_tone_is_authoritative("tone2"):
+                return
+            source_index = getattr(data, "index", 0)
+            source_perf = (
+                float(source_index) / 1e9
+                if isinstance(source_index, int) and source_index > 0
+                else float(perf_time)
+            )
+            self._open_pellet_trial_window(source_perf, source="immediate_can_tone")
             return
-        # NB: instead of reacting to inference.detection_result_ready event,
-        # we could eventually sub-depend on system_machine._on_detection_result_ready cb handler,
-        # and simply assign from the behavior algo instance pellets counts .. to be sure to be in sync with it.
-        day_changed = animal.check_today_date()  # 1st
-        day_counts = animal.pellet_counts_day
-        total_counts = animal.pellet_counts_total
-        #
-        # NB2: presented count is handled via pellet-sent event.
-        day_counts.success_reaches += result.successful_reaches
-        total_counts.success_reaches += result.successful_reaches
-        day_counts.consumed += result.food_consumed
-        total_counts.consumed += result.food_consumed
-        day_counts.reaches += result.total_reaches
-        total_counts.reaches += result.total_reaches
-        if day_changed or result.successful_reaches or result.food_consumed or result.total_reaches:
-            self._save_animal_metadata(animal, sender="detection_result_ready")
-            self._event_manager.post_event_content(
-                ApiEventKind.animalUpdated, animal.to_api_status())
+        if kind is not SystemStatusMessageKind.STIMULUS_INPUTS:
+            return
+        if isinstance(data, dict):
+            tone2 = bool(data.get("tone2", False))
+        elif isinstance(data, (tuple, list)) and len(data) >= 2:
+            tone2 = bool(data[1])
+        else:
+            logger.warning("Cannot decode tone-2 state from stimulus input: %r", data)
+            return
+        rising = tone2 and not self._tone2_active
+        self._tone2_active = tone2
+        if not rising or self._nidaq_tone_is_authoritative("tone2"):
+            return
+        if self._tone2_status_active:
+            return
+        self._open_pellet_trial_window(
+            float(perf_time),
+            source="legacy_can_gpio",
+        )
+
+    def _nidaq_tone_is_authoritative(self, channel: str) -> bool:
+        monitor = self._nidaq_signal_monitor
+        return bool(
+            monitor.is_running
+            and any(
+                configured.name == channel
+                for configured in monitor.configuration.channels
+            )
+        )
+
+    @property
+    def session_telemetry(self) -> SessionTelemetry:
+        """Live capture and inference counters for the current session."""
+        return self._session_telemetry
+
+    def _on_intertrial_nidaq_tone_edge(
+        self,
+        *,
+        channel: str,
+        perf_time: float,
+        wall_time: float,
+        sample_index: int,
+    ) -> None:
+        del wall_time
+        if channel != "tone2":
+            return
+        self._open_pellet_trial_window(
+            float(perf_time),
+            source=f"nidaq:{channel}:sample={sample_index}",
+        )
+
+    def _open_pellet_trial_window(self, perf_time: float, *, source: str) -> None:
+        attempt = self._pellet_cycles.active_attempt
+        if (
+            attempt is None
+            or self._recording_session.status is not SessionRecordingStatus.RECORDING
+        ):
+            logger.warning(
+                "Tone-2 edge from %s received without an active recorded pellet attempt",
+                source,
+            )
+            return
+        with self._intertrial_lock:
+            if self._trial_window_start is None:
+                self._trial_window_start = (
+                    attempt.operation_id,
+                    float(perf_time),
+                )
+                logger.info(
+                    "pellet trial tracking window opened: attempt=%s perf=%.6f source=%s",
+                    attempt.attempt_label,
+                    perf_time,
+                    source,
+                )
+
+    def _on_intertrial_analysis_result(
+        self,
+        result: IntertrialAnalysisResult,
+    ) -> None:
+        request = result.request
+        token = self._recording_session.token()
+        if (
+            token is None
+            or token.generation != request.generation
+            or token.session_id != request.session_id
+            or self._recording_session.status
+            not in {
+                SessionRecordingStatus.RECORDING,
+                SessionRecordingStatus.STOPPING,
+                SessionRecordingStatus.ANALYZING,
+            }
+        ):
+            logger.warning(
+                "Ignoring stale intertrial result: %s generation=%s active=%s",
+                request.attempt_label,
+                request.generation,
+                token,
+            )
+            return
+        config = self._behavior.algorithm.active_config.session_control
+        retry = result.outcome.value in config.behavioral_retry_outcomes
+        self._session_data_recorder.persist_trial_tracking(
+            self._project_info,
+            request,
+            result,
+        )
+        if result.error and (
+            set(config.behavioral_retry_outcomes)
+            - {TrialOutcome.PELLET_MISSING.value}
+        ):
+            self._hold_intertrial_resolution(
+                request,
+                "Trial analysis failed while a behavioral retry rule requires "
+                f"the result: {result.error}",
+            )
+            return
+        tone_references, laser_references = (
+            self._session_data_recorder.trial_stream_references(
+                request.window.start_perf,
+                request.window.end_perf,
+            )
+        )
+        can_affect_next_trial = self._pellet_cycles.result_can_control_next_trial(
+            request
+        )
+        try:
+            finalized = self._pellet_cycles.finalize_intertrial_result(
+                self._project_info,
+                result,
+                retry=retry,
+                apply_protocol_outcome=can_affect_next_trial,
+                tone_references=tone_references,
+                laser_references=laser_references,
+            )
+        except (KeyError, RuntimeError) as error:
+            logger.error(
+                "Ignoring unusable intertrial result for %s: %s",
+                request.attempt_label,
+                error,
+            )
+            return
+
+        if (
+            self._intertrial_resolution_request is not None
+            and self._intertrial_resolution_request.operation_id
+            == request.operation_id
+        ):
+            self._intertrial_resolution_request = None
+            self._intertrial_resolution_reason = ""
+        self._intertrial_waiting_operations.discard(request.operation_id)
+
+        protocol_shift_handled = self._update_protocol_automatic_shift(
+            result,
+            finalized,
+        )
+        if (
+            result.reaches
+            and can_affect_next_trial
+            and not protocol_shift_handled
+            and self._behavior.algorithm.active_config.pellet_delivery
+            .is_intersession_pellet_shift_enabled
+        ):
+            response = IntersessionResponse(
+                rh_max_vp_list=[
+                    Offset3DTuple(*trajectory.closest_offset)
+                    for trajectory in result.reaches
+                    if not trajectory.consumed
+                ],
+                food_consumed=result.consumption_count,
+                successful_reaches=result.success_count,
+                pellets_presented=1,
+                total_reaches=result.reach_count,
+            )
+            self._behavior.system_machine.shift_xyz_handler.put_intersession_response(
+                self._project_info,
+                response,
+            )
+        self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
+        self._refresh_intertrial_send_block()
+        self._notify_trial_protocol_state()
+        self._evaluate_automatic_stop_policy(
+            protocol_complete=self._protocol_runner.protocol_complete,
+        )
+        logger.success(
+            "pellet trial analysis finalized: attempt=%s outcome=%s "
+            "reaches=%s analysis=%.3fs",
+            finalized.attempt_label,
+            finalized.outcome.value,
+            finalized.reach_count,
+            result.analysis_seconds,
+        )
+
+    def _update_protocol_automatic_shift(self, result, finalized) -> bool:
+        context = finalized.protocol_context or {}
+        row_record = context.get("trial_row") or {}
+        if row_record.get("position_mode") != "reach_derived_automatic":
+            return False
+        try:
+            row = self._trial_protocol_schedule.row(finalized.trial_id).from_record(
+                row_record
+            )
+            controller = self._automatic_shift_controller(row)
+            animal = self._selected_animal
+            if animal is None:
+                raise RuntimeError("Automatic shift has no selected subject")
+            delivery = self._behavior.algorithm.active_config.pellet_delivery
+            lane_offset = {
+                "center": (0.0, 0.0, 0.0),
+                "left": tuple(delivery.lane_left_offset_dcs),
+                "right": tuple(delivery.lane_right_offset_dcs),
+            }[row.position_lane.value]
+            baseline = tuple(
+                value + offset
+                for value, offset in zip(
+                    (animal.pellet_x, animal.pellet_y, animal.pellet_z),
+                    lane_offset,
+                )
+            )
+            latest = None
+            for index, trajectory in enumerate(result.reaches, start=1):
+                latest = controller.add(
+                    ReachPositionObservation(
+                        reach_id=f"{finalized.attempt_label}:reach-{index}",
+                        outcome=("success" if trajectory.consumed else "failure"),
+                        closest_offset_dcs=trajectory.closest_offset,
+                    ),
+                    baseline_dcs=baseline,
+                ) or latest
+            if latest is not None:
+                accepted = controller.accept(latest.generation)
+                logger.info(
+                    "Automatic pellet target generation %s from reaches %s: "
+                    "recommended=%s target=%s accepted=%s",
+                    latest.generation,
+                    latest.reach_ids,
+                    latest.recommended_shift_dcs,
+                    latest.resolved_target_dcs,
+                    accepted is not None,
+                )
+            return True
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            logger.exception(
+                "Could not update automatic pellet target for %s",
+                finalized.attempt_label,
+            )
+            return True
+
+    def _sync_session_counts_from_results(
+        self,
+        ledger: PelletTrialLedger,
+    ) -> None:
+        """Compatibility wrapper around the authoritative controller summary."""
+        if ledger is not self._pellet_cycles.ledger:
+            self._pellet_cycles.ledger = ledger
+        self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
 
     def _on_training_plan_property_changed(self, name, value, _):
         logger.debug("plan prop: %s -> %s", name, value)
@@ -2059,24 +11183,57 @@ class AppModel(ObservableObject):
             if prev_animal.id == animal.id:
                 prev_animals[idx] = animal
                 break
-        animal.check_today_date()  # in case of
-        dst = Path(self._preferences.animal_location).joinpath(f"{animal.name}.json")
+        dst = Path(self._preferences.animal_location).joinpath(f"{animal.id}.json")
         logger.verbose("Saving %s to %s ; sender=%s", animal, dst, sender)
         if backup_previous and dst.exists():
             now = datetime.now()
             dst.with_suffix(f'.{now.strftime(DATE_TIME_FORMAT)}.json.bak').write_bytes(dst.read_bytes())
         animal.to_file(dst)
 
-    def _create_configuration(self) -> SystemConfiguration:
-        hardware_configuration = HardwareConfiguration(tunnel_identifier="CAN", pellet_identifier="CAN")
+    def _create_configuration(
+        self,
+        *,
+        runtime_camera_modes: bool = False,
+    ) -> SystemConfiguration:
+        loaded_hardware = (
+            self._loaded_configuration.hardware
+            if self._loaded_configuration is not None
+            else HardwareConfiguration(pellet_identifier="CAN")
+        )
+        hardware_configuration = HardwareConfiguration(
+            pellet_identifier=loaded_hardware.pellet_identifier,
+            can_enabled=self._hardware.can_enabled,
+            pellet_controller_enabled=self._hardware.pellet_controller_enabled,
+            nidaq_enabled=self._hardware.nidaq_enabled,
+            rfid_reader_enabled=loaded_hardware.rfid_reader_enabled,
+            rfid_device=loaded_hardware.rfid_device,
+            min_ack_timeout=loaded_hardware.min_ack_timeout,
+            board_status_timeout=loaded_hardware.board_status_timeout,
+        )
 
         cameras = []
         for camera in self._cameras:
-            cameras.append(camera.save_configuration())
+            cameras.append(camera.save_configuration(
+                runtime_mode=runtime_camera_modes,
+            ))
 
+        inference_configuration = self._inference.save_configuration()
+        if self._runtime_live_inference_override is not None and self._loaded_configuration is not None:
+            inference_configuration.is_enabled = self._loaded_configuration.inference.is_enabled
+
+        # With a refused NI-DAQ plan the stream runs no channels; the file
+        # keeps the operator's own stream, as loaded, for Edit DAQ Ports to fix.
+        nidaq_stream = (
+            self._loaded_configuration.nidaq_stream
+            if self._nidaq_plan_error and self._loaded_configuration is not None
+            else self._nidaq_signal_monitor.save_configuration()
+        )
         configuration = SystemConfiguration(cameras=cameras,
                                             hardware=hardware_configuration,
-                                            inference=self._inference.save_configuration(),
+                                            inference=inference_configuration,
+                                            laser=self._laser.save_configuration(),
+                                            nidaq_ports=self._nidaq_ports,
+                                            nidaq_stream=nidaq_stream,
                                             behavior=self._behavior.save_configuration(),
                                             persistence=PersistenceConfiguration(output_location=self.output_location))
 
@@ -2086,44 +11243,290 @@ class AppModel(ObservableObject):
                                when: Optional[datetime] = None, session: Optional[int] = -1,
                                caller: str="NA"):
         """Save the given project_info metadata, if session is None : it's main/global metadata"""
-        when = when if when is not None else project_info.when
-        file_name = project_info.get_metadata_file(session, when)
-        logger.verbose(
-            "Saving metadata to %s ; caller=%s when=%s sess=%s prj=%s",
-            file_name, caller, when, session, project_info,
-        )
-        if session is not None and session < 0:
-            session = project_info.session  # ensure use this one
-        self._save_metadata(project_info, when, file_name, session)
+        with self._session_publication_lock:
+            # Read before _save_metadata reads the live notes: an edit made
+            # meanwhile then still counts as unsaved.
+            notes_revision = self._notes_revision
+            when = when if when is not None else project_info.when
+            file_name = project_info.get_metadata_file(session, when)
+            logger.verbose(
+                "Saving metadata to %s ; caller=%s when=%s sess=%s prj=%s",
+                file_name, caller, when, session, project_info,
+            )
+            if session is not None and session < 0:
+                session = project_info.session  # ensure use this one
+            if caller in {
+                "raw_writers_closed",
+                "session_analysis_ended",
+                "intertrial_analysis_finished",
+                "session_notes_updated",
+                "retained_finalization_retry",
+            }:
+                boundary = self._recording_session.boundary
+                if boundary is None or boundary.session_id != project_info.short_id:
+                    raise RuntimeError(
+                        f"Cannot finalize {project_info.short_id} without a canonical "
+                        "recording boundary"
+                    )
+                if not (
+                    math.isfinite(boundary.start_perf_time)
+                    and math.isfinite(boundary.start_wall_time)
+                ):
+                    raise RuntimeError(
+                        f"Cannot finalize {project_info.short_id} with a non-finite "
+                        "recording boundary"
+                    )
+                alignment_path = Path(
+                    project_info.get_session_path().location
+                ) / "streams" / "alignment.json"
+                if not alignment_path.is_file():
+                    raise RuntimeError(
+                        f"Cannot finalize {project_info.short_id}: "
+                        "streams/alignment.json is missing"
+                    )
+                with alignment_path.open(encoding="utf-8") as stream:
+                    alignment = json.load(stream)
+                alignment_boundary = alignment.get("canonicalBoundary", {})
+                if (
+                    alignment_boundary.get("startPerfTime")
+                    != boundary.start_perf_time
+                    or alignment_boundary.get("startWallTime")
+                    != boundary.start_wall_time
+                ):
+                    raise RuntimeError(
+                        f"Cannot finalize {project_info.short_id}: canonical "
+                        "boundary differs from streams/alignment.json"
+                    )
+            self._save_metadata(project_info, when, file_name, session)
+            if session is not None:
+                # Only session metadata carries the live notes.
+                self._notes_saved_revision = notes_revision
 
     def _save_metadata(self, project: ProjectInfo, when: datetime, file_name: str, session: Optional[int] = -1):
         when_as_utc = when.astimezone(timezone.utc)
-        info: Dict[str, Any] = {
-            "date": when.strftime("%Y%m%d_%H%M%S"),
-            "created": when.timestamp(),
-            "createdUtc": when_as_utc.timestamp(),  # same than created
-            "start_record_timestamp": project.start_record_timestamp,
-            "serialNumber": self._preferences.serial_number or "",
-            "appVersion": self._app_version,
-            "animalName": self.animal_name,
-            "notes": self.notes or "",
-            "session": session,
-            "t_pellet_delivered": project.t_pellet_delivered,
-            "t_pellet_presented": project.t_pellet_presented,
-            "configuration": None,
+        metadata_generation_id = (
+            f"acquisition-{when_as_utc.timestamp()}"
+            if session is None
+            else self._recording_session.metadata_generation_id
+            or f"{project.short_id}-g{getattr(project, 'session_generation', 0)}"
+        )
+        boundary = self._recording_session.boundary
+        if boundary is not None and boundary.session_id == project.short_id:
+            session_boundary = boundary.to_metadata()
+        else:
+            session_boundary = None
+        configuration = asdict(self._create_configuration(
+            runtime_camera_modes=True,
+        ))
+        hardware_configured = {
+            "canEnabled": self._hardware.can_enabled,
+            "pelletControllerEnabled": self._hardware.pellet_controller_enabled,
+            "nidaqEnabled": self._hardware.nidaq_enabled,
+            "laserBackend": self._laser.configuration.backend,
+            "liveInferenceEnabled": self._inference.is_enabled,
+            "pelletFirmwareCompatibility": self._hardware.firmware_compatibility,
+            "cameras": {
+                camera.name: _camera_configured_metadata(camera)
+                for camera in self._cameras
+            },
         }
+        runtime_final = self._acquisition.subsystems.snapshot()
 
-        configuration = self._create_configuration()
+        if session is None:
+            out = {
+                "metadataSchemaVersion": 2,
+                "metadataGenerationId": metadata_generation_id,
+                "scope": "acquisition",
+                "createdUtc": when_as_utc.timestamp(),
+                "serialNumber": self._preferences.serial_number or "",
+                "appVersion": self._app_version,
+                "hardware": {
+                    "configured": hardware_configured,
+                    "runtime": _compact_subsystem_snapshot(runtime_final),
+                },
+                "configuration": configuration,
+            }
+        else:
+            session_dir = Path(file_name).parent
+            artifacts = {
+                "alignment": _metadata_reference(
+                    session_dir / "streams" / "alignment.json",
+                    relative_to=session_dir,
+                ),
+                "trialSummary": _metadata_reference(
+                    session_dir / "streams" / "trial_summary.json",
+                    relative_to=session_dir,
+                ),
+            }
+            out = {
+                "metadataSchemaVersion": 2,
+                "metadataGenerationId": metadata_generation_id,
+                "scope": "session",
+                "sessionId": project.short_id,
+                "sessionIndex": session,
+                "createdUtc": when_as_utc.timestamp(),
+                "serialNumber": self._preferences.serial_number or "",
+                "appVersion": self._app_version,
+                "boundary": session_boundary,
+                "animal": self._recording_session.animal_snapshot,
+                "notes": self.notes or "",
+                "counts": {
+                    "presented": self._behavior.algorithm.pellets_presented,
+                    "reaches": self._behavior.algorithm.pellet_reaches,
+                    "successfulReaches": self._behavior.algorithm.successful_reaches,
+                    "consumed": self._behavior.algorithm.pellets_consumed,
+                },
+                "recording": {
+                    "status": self._recording_session.status.value,
+                    "stopReason": (
+                        None
+                        if self._recording_ending_reason is RecordingEndingReason.NA
+                        else self._recording_ending_reason.value
+                    ),
+                    "dataComplete": self._recording_session.data_complete,
+                    "dataErrors": list(self._recording_session.data_errors),
+                    "analysisDurationSeconds": (
+                        self._recording_session.analysis_duration_seconds
+                    ),
+                    "firstPelletDeliveryOffsetSeconds": (
+                        project.first_pellet_delivery_offset
+                    ),
+                    "firstPelletPresentationOffsetSeconds": (
+                        project.first_pellet_presentation_offset
+                    ),
+                    "endActions": [
+                        dict(action)
+                        for action in self._recording_session.end_actions
+                    ],
+                    "storage": dict(
+                        self._recording_session.storage_telemetry
+                    ),
+                    "internalError": self.internal_error_diagnostic,
+                },
+                "stopPolicy": (
+                    None
+                    if self._session_stop_policy is None
+                    else dataclasses.asdict(
+                        self._session_stop_policy.configuration
+                    )
+                ),
+                "protocolSchedule": list(self._trial_protocol_schedule.to_records()),
+                "stimulusProfileLibrary": (
+                    self._stimulus_profile_repository.library.to_record()
+                ),
+                "orderedProtocol": (
+                    None
+                    if self._selected_ordered_protocol is None
+                    else self._selected_ordered_protocol.to_record()
+                ),
+                "stopResult": (
+                    None
+                    if self._session_stop_evaluation is None
+                    else {
+                        "decision": self._session_stop_evaluation.decision.value,
+                        "reason": (
+                            None
+                            if self._session_stop_evaluation.reason is None
+                            else self._session_stop_evaluation.reason.value
+                        ),
+                        "triggeredReasons": [
+                            reason.value
+                            for reason in (
+                                self._session_stop_evaluation.triggered_reasons
+                            )
+                        ],
+                        "requestedPerfTime": (
+                            self._session_stop_evaluation.requested_perf_time
+                        ),
+                        "timeoutSeconds": (
+                            self._session_stop_evaluation.timeout_seconds
+                        ),
+                    }
+                ),
+                "hardware": {
+                    "configured": hardware_configured,
+                    "atRecord": _compact_subsystem_snapshot(
+                        self._recording_session.hardware_status_at_record
+                    ),
+                    "changesAtFinalize": _subsystem_snapshot_changes(
+                        self._recording_session.hardware_status_at_record,
+                        runtime_final,
+                    ),
+                },
+                "configuration": configuration,
+                "artifacts": artifacts,
+                # What the operator watched during the recording, kept so the
+                # same numbers can be read back from the session rather than
+                # only having existed on screen. Taken as the session was
+                # finalized: a notes save rewrites this file later, by when
+                # the counters may have been rebased for preview.
+                "capture": (
+                    self._session_telemetry.summary()
+                    if self._recording_session.capture_telemetry is None
+                    else self._recording_session.capture_telemetry
+                ),
+                # The latency record's status: per-loop completeness, the
+                # clock fits it used, and why anything is missing.
+                "latency": dict(self._latency_status),
+            }
+        out = _metadata_without_nonfinite_numbers(out)
+        json_path = Path(file_name + ".json")
+        yaml_path = Path(file_name + ".yaml")
+        session_dir = None if session is None else Path(file_name).parent
+        generation_id = str(
+            out.get("metadataGenerationId") or f"acquisition-{when_as_utc.timestamp()}"
+        )
+        # Serialize both representations before publishing either one. This
+        # preserves the previous pair if either encoder rejects the snapshot;
+        # the generation ID detects the narrower power-loss window between the
+        # two atomic replacements.
+        json_text = json.dumps(
+            out,
+            cls=SystemConfigurationJSONEncoder,
+            allow_nan=False,
+            sort_keys=True,
+        ) + "\n"
+        yaml_text = yaml.dump(
+            out,
+            Dumper=SystemConfigurationDumper,
+            sort_keys=False,
+        )
+        atomic_publish_file(
+            json_path,
+            lambda path: path.write_text(json_text, encoding="utf-8"),
+            session_dir=session_dir,
+            generation_id=generation_id,
+            validate=lambda path: json.loads(path.read_text(encoding="utf-8")),
+        )
 
-        out = info.copy()
-        out["configuration"] = asdict(configuration)
-        with open(file_name + ".json", "w") as file:
-            json.dump(out, file, cls=SystemConfigurationJSONEncoder)
-
-        out = info.copy()
-        out["configuration"] = configuration
-        with open(file_name + ".yaml", "w") as file:
-            yaml.dump(out, file, Dumper=SystemConfigurationDumper, sort_keys=False)
+        atomic_publish_file(
+            yaml_path,
+            lambda path: path.write_text(yaml_text, encoding="utf-8"),
+            session_dir=session_dir,
+            generation_id=generation_id,
+            validate=lambda path: yaml.safe_load(path.read_text(encoding="utf-8")),
+        )
+        if session_dir is not None:
+            stream_manifest_path = session_dir / "streams" / "stream_manifest.json"
+            manifest_files = [json_path, yaml_path, stream_manifest_path]
+            manifest = {
+                "schemaVersion": 1,
+                "metadataGenerationId": generation_id,
+                "authoritativeMetadata": json_path.relative_to(session_dir).as_posix(),
+                "files": [
+                    file_manifest_entry(path, relative_to=session_dir)
+                    for path in manifest_files
+                    if path.is_file()
+                ],
+            }
+            # This is deliberately last: its presence declares that the current
+            # auxiliary generation reached its authoritative metadata publish.
+            atomic_write_json(
+                session_dir / "manifest.json",
+                manifest,
+                session_dir=session_dir,
+                generation_id=generation_id,
+            )
 
     #
 
@@ -2220,14 +11623,6 @@ class AppModel(ObservableObject):
         elif cmd == ApiCommand.STOP_ACQUISITION:
             return self._handle_rpc_async_command(request, self.capture_stop)
 
-        elif cmd == ApiCommand.EMERGENCY_STOP:
-            self._behavior.emergency_stop(source="RpcService")
-            return dict(reason="RpcService")
-
-        elif cmd == ApiCommand.EMERGENCY_RESUME:
-            self._behavior.emergency_resume(source="RpcService")
-            return dict(reason="RpcService")
-
         elif cmd == ApiCommand.USER_DEFINED:
             logger.verbose("TODO")
 
@@ -2269,155 +11664,464 @@ class AppModel(ObservableObject):
             data=dataclasses.asdict(system_status),
         )
 
-    def _make_api_system_status_payload(self) -> ApiSystemStatus:
+    def _make_api_system_status_payload(self) -> ReachAQSystemStatus:
         hard = self._hardware
         algo = self._behavior.algorithm
-        analysis = self._behavior.analysis
-        magnet_intensity = hard.head_magnet_intensity
         project = self._project_info
         if project is None:
             project = self.make_project_info()
-        if magnet_intensity is None:
-            magnet_intensity = math.nan
-        doors_mon = analysis.external_doors_alarm
-        doors_state = doors_mon.doors_state
-        alarm_mon = analysis.emergency_alarm_monitor
-        load_cell = analysis.load_cell_monitor
-        audio_mon = analysis.animal_thrashing_alarm
-        presence_mon = analysis.global_animal_presence_alarm
-        misplaced_mon = analysis.pellet_misplaced_monitor
         animal = self._selected_animal
-
-        detectors = [
-            ApiDetectorStatus(
-                detector_id=ApiDetectorKind.frontDoor,
-                is_enabled=doors_mon.running,
-                is_active=doors_state.front.open or False,
+        plan = self._attached_plan
+        phase = None if plan is None else plan.current_phase
+        return ReachAQSystemStatus(
+            schema_version=1,
+            acquisition_state=self._status.value,
+            recording_state=self._recording_session.status.value,
+            synchronization_ready=not any(
+                "camera" in blocker.lower()
+                for blocker in self._acquisition.subsystems.recording_blockers()
             ),
-            ApiDetectorStatus(
-                detector_id=ApiDetectorKind.slidingDoor,
-                is_enabled=doors_mon.running,
-                is_active=doors_state.sliding.open or False,
-            ),
-            ApiDetectorStatus(
-                detector_id=ApiDetectorKind.loadCellThrash,
-                is_enabled=load_cell.running,
-                is_active=load_cell.thrashing_detected,
-            ),
-            ApiDetectorStatus(
-                detector_id=ApiDetectorKind.audioThrash,
-                is_enabled=audio_mon.running,
-                is_active=audio_mon.is_engaged,
-            ),
-            ApiDetectorStatus(
-                detector_id=ApiDetectorKind.pelletMisplaced,
-                is_enabled=misplaced_mon.running,
-                is_active=misplaced_mon.is_engaged,
-            ),
-            ApiDetectorStatus(
-                detector_id=ApiDetectorKind.deviceAckTimeOut,
-                is_enabled=self._acquisition_started,
-                is_active=hard.device_ack_timeout_engaged,
-            ),
-        ]
-
-        alarms = []
-        for alarm in analysis.alarms:
-            alarm_cfg = alarm.config
-            alarms.append(
-                ApiAlarmStatus(
-                    alarm_id=alarm.alarm_api_kind,
-                    is_enabled=alarm_cfg.use,
-                    is_active=alarm.is_engaged,
-                    is_stop_condition=alarm_cfg.is_emergency_condition,
-                    is_auto_resume_enabled=alarm_cfg.allow_autoresume_on_cleared,
-                )
-            )
-
-        dcs_pos_xyz = hard.last_dcs_position
-        dcs_send_xyz = hard.last_dcs_set_position
-        if dcs_pos_xyz is None or any(map(math.isnan, dcs_pos_xyz)):
-            dcs_pos_xyz = Offset3DTuple.get_nan()
-        if dcs_send_xyz is None or any(map(math.isnan, dcs_send_xyz)):
-            dcs_send_xyz = Offset3DTuple.get_nan()
-
-        if animal is None:
-            reach_status = ApiReachStatus()
-        else:
-            animal_count = animal.pellet_counts_total
-            reach_status = ApiReachStatus(
-                pellets_presented=animal_count.presented,
-                pellets_consumed=animal_count.consumed,
-                reaches=animal_count.reaches,
-                successful_reaches=animal_count.success_reaches,
-            )
-
-        system_status = ApiSystemStatus(
-            application_mode=app_status_to_api_app_mode(self._status),
-            training_mode=training_mode_to_api_training_mode(self._training_mode),
             animal=None if animal is None else animal.to_api_status(),
-            project=ApiProjectStatus(
-                day_path=project.get_day_path()[0],
-                session_index=project.session,
-            ),
-            detectors=detectors,
-            alarms=alarms,
-            pellet_device=ApiPelletDeviceStatus(
-                dcs_x=dcs_pos_xyz.x,
-                dcs_y=dcs_pos_xyz.y,
-                dcs_z=dcs_pos_xyz.z,
-                dcs_send_x=dcs_send_xyz.x,
-                dcs_send_y=dcs_send_xyz.y,
-                dcs_send_z=dcs_send_xyz.z,
-                load_arm=hard.load_arm_position,
-                barrier_arm=hard.cover_arm_position,
-            ),
-            tunnel_device=ApiTunnelDeviceStatus(
-                magnet_intensity=magnet_intensity,
-                gate_open=hard.tunnel_gate_open_status,
-            ),
-            behavior=ApiBehaviorStatus(
-                baseline_magnet_intensity=algo.baseline_intensity,
-                reaches=reach_status,
-            )
+            project={
+                "dayPath": project.get_day_path()[0],
+                "sessionIndex": project.session,
+                "sessionId": project.short_id,
+            },
+            subsystems=self._acquisition.subsystems.snapshot(),
+            pellet_device={
+                "connected": hard.connected,
+                "position": self._offset_record(hard.last_dcs_position),
+                "sendPosition": self._offset_record(hard.last_dcs_set_position),
+                "loadArm": hard.load_arm_position,
+                "coverArm": hard.cover_arm_position,
+            },
+            session_counts={
+                "reaches": algo.pellet_reaches,
+                "presented": algo.pellets_presented,
+                "success": algo.successful_reaches,
+                "consumed": algo.pellets_consumed,
+            },
+            protocol={
+                "selected": None if plan is None else plan.plan_id,
+                "phase": None if phase is None else phase.phase_id,
+                "complete": self._protocol_runner.protocol_complete,
+                "automaticAdvance": self._protocol_runner.automatic_advance,
+            },
         )
-        return system_status
 
     #
 
-    def _on_emergency_stopped(self, source: str):
-        s = "\n".join(source.split(" "))
-        self._right_camera.set_text_overlay(f"Emergency: {s}", color="red")
-        self._update_led_color()
-
-    def _on_emergency_resumed(self, source):
-        self._right_camera.set_text_overlay(None)
-        self._update_led_color()
-
     # pellet machine events
 
-    def _on_pellet_loaded(self):
-        prefs = self._preferences
-        prefs.pellet_load_count_total += 1
-        prefs.pellet_load_count_day += 1
-        prefs.save()  # always
-        #
-        self.check_max_pellet_loaded()
+    def _on_trial_protocol_complete(self) -> None:
+        logger.success("Selected pellet-trial protocol is complete")
+        self.property_changed(
+            self.Props.RECORDING_BLOCKERS,
+            self.recording_blockers,
+            None,
+        )
+        self._evaluate_automatic_stop_policy(protocol_complete=True)
 
-    def _on_pellet_sent(self, *, perf_c: Optional[float]=None):
-        selected = self._selected_animal
-        status = self._status
-        recent = self._behavior.algorithm.pellet_recently_seen
-        algo = self._behavior.algorithm
-        logger.debug("on_pellet_sent: status=%s pellet_recently_seen=%s sel=%s",
-                     status, recent, selected)
+    def _on_pellet_loading_for_trial(self):
+        if self._pellet_cycles.active_attempt is not None:
+            operation = self._trial_action_executor.operation
+            if operation is not None and operation.state not in operation.TERMINAL:
+                try:
+                    self._trial_action_executor.execute_phase("retract")
+                    self._trial_action_executor.complete("next pellet load began")
+                    self._persist_protocol_operation()
+                except RuntimeError as error:
+                    logger.exception("Could not finalize prepared pellet-trial operation")
+                    self._persist_protocol_operation()
+                    self._pellet_cycles.finalize_active_hardware_error(
+                        get_perf_now(), time.time(), error=str(error),
+                    )
+            logger.warning(
+                "Pellet loading closed an attempt without a pellet-cycle event"
+            )
+            self._complete_pellet_trial_window(
+                get_perf_now(),
+                close_reason="next pellet load began",
+            )
+
+    def _on_pellet_cycle_completed(self, *, perf_c: float):
+        # The retrieval has been dispatched, so the inter-trial interval
+        # starts here rather than when the next trial is prepared.
+        self._intertrial_send_gate.arm(perf_c)
+        operation = self._trial_action_executor.operation
         if (
-            selected is not None
-            and recent
-            and status == AppModelStatus.ANIMAL_IN_TRAINING
+            operation is not None
+            and operation.state not in operation.TERMINAL
         ):
-            algo.increase_pellets_presented(1)
-            # now recopy the values from algo:
-            selected.pellet_counts_day.presented = algo.pellets_presented_day
-            selected.pellet_counts_total.presented = algo.pellets_presented_total
-            self._save_animal_metadata(selected, sender="on_pellet_sent")  # always
+            try:
+                self._trial_action_executor.execute_phase("retract")
+                self._trial_action_executor.complete("pellet cycle completed")
+                self._persist_protocol_operation()
+            except RuntimeError as error:
+                logger.exception("Could not finalize prepared pellet-trial operation")
+                self._persist_protocol_operation()
+                self._pellet_cycles.finalize_active_hardware_error(
+                    perf_c, time.time(), error=str(error),
+                )
+        self._complete_pellet_trial_window(
+            perf_c,
+            close_reason="pellet cycle completed",
+        )
+
+    def _complete_pellet_trial_window(
+        self,
+        perf_c: float,
+        *,
+        close_reason: str,
+    ) -> None:
+        active = self._pellet_cycles.active_attempt
+        if active is None:
+            return
+        closed = self._pellet_cycles.finish_active(perf_c, time.time())
+        with self._intertrial_lock:
+            window_start = self._trial_window_start
+            self._trial_window_start = None
+        config = self._behavior.algorithm.active_config.session_control
+        tracking_window = None
+        evidence = None
+        unavailable_reason = ""
+        if window_start is None:
+            unavailable_reason = "decoded pellet-board tone-2 rising edge was not observed"
+        elif window_start[0] != closed.operation_id:
+            unavailable_reason = "tone-2 window belonged to a different pellet operation"
+        else:
+            boundary = self._recording_session.boundary
+            expected_start_frame_id = expected_end_frame_id = None
+            if boundary is not None:
+                expected_start_frame_id, expected_end_frame_id = (
+                    self._live_tracking_anchor(boundary).frame_id_bounds(
+                        window_start[1],
+                        perf_c,
+                    )
+                )
+            tracking_window = self._live_tracking.window(
+                window_start[1],
+                perf_c,
+                expected_start_frame_id=expected_start_frame_id,
+                expected_end_frame_id=expected_end_frame_id,
+            )
+            pellet_config = self._behavior.algorithm.active_config.pellet_delivery
+            evidence = classify_pellet_state(
+                tracking_window,
+                expected_triangle_pellet_distance=(
+                    pellet_config.triangle_pellet_expected_distance
+                ),
+                misplacement_threshold=(
+                    pellet_config.triangle_pellet_diff_too_far_threshold
+                ),
+            )
+
+        if not config.intertrial_analysis_enabled:
+            unavailable_reason = "live intertrial analysis is disabled"
+        elif tracking_window is not None and not tracking_window.samples:
+            unavailable_reason = "no live tracking samples covered the pellet trial"
+
+        token = self._recording_session.token()
+        request = None
+        if token is not None and tracking_window is not None and evidence is not None:
+            request = IntertrialAnalysisRequest(
+                generation=token.generation,
+                session_id=token.session_id,
+                trial_id=closed.trial_id,
+                attempt_id=closed.attempt_id,
+                operation_id=closed.operation_id,
+                window=tracking_window,
+                pellet_state=evidence,
+            )
+            self._session_data_recorder.persist_trial_tracking(
+                self._project_info,
+                request,
+            )
+            self._pellet_cycles.annotate_intertrial_capture(
+                self._project_info,
+                request,
+            )
+
+        if (
+            request is not None
+            and evidence.presence is PelletPresence.MISSING
+        ):
+            tone_references, laser_references = (
+                self._session_data_recorder.trial_stream_references(
+                    tracking_window.start_perf,
+                    tracking_window.end_perf,
+                )
+            )
+            retry = (
+                TrialOutcome.PELLET_MISSING.value
+                in config.behavioral_retry_outcomes
+            )
+            finalized = self._pellet_cycles.finalize_intertrial_unavailable(
+                self._project_info,
+                closed,
+                perf_time=perf_c,
+                wall_time=closed.capture_end_wall_time or time.time(),
+                reason="live tracking confirmed pellet absence",
+                pellet_presence=evidence.presence.value,
+                pellet_misplacement=evidence.misplacement.value,
+                window=tracking_window,
+                outcome=TrialOutcome.PELLET_MISSING,
+                retry=retry,
+                tone_references=tone_references,
+                laser_references=laser_references,
+            )
+            self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
+            self._intertrial_waiting_operations.discard(closed.operation_id)
+            self._refresh_intertrial_send_block()
+            self._notify_trial_protocol_state()
+            self._evaluate_automatic_stop_policy(
+                protocol_complete=self._protocol_runner.protocol_complete,
+            )
+            logger.info(
+                "pellet trial %s finalized synchronously as missing; retry=%s",
+                finalized.attempt_label,
+                retry,
+            )
+            return
+
+        if unavailable_reason:
+            tone_references, laser_references = (
+                ((), ())
+                if tracking_window is None
+                else self._session_data_recorder.trial_stream_references(
+                    tracking_window.start_perf,
+                    tracking_window.end_perf,
+                )
+            )
+            finalized = self._pellet_cycles.finalize_intertrial_unavailable(
+                self._project_info,
+                closed,
+                perf_time=perf_c,
+                wall_time=closed.capture_end_wall_time or time.time(),
+                reason=f"{close_reason}: {unavailable_reason}",
+                pellet_presence=(
+                    "unknown" if evidence is None else evidence.presence.value
+                ),
+                pellet_misplacement=(
+                    "unknown" if evidence is None else evidence.misplacement.value
+                ),
+                window=tracking_window,
+                outcome=(
+                    TrialOutcome.UNSCORED
+                    if not config.intertrial_analysis_enabled
+                    else TrialOutcome.INCOMPLETE
+                ),
+                tone_references=tone_references,
+                laser_references=laser_references,
+            )
+            self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
+            self._notify_trial_protocol_state()
+            self._evaluate_automatic_stop_policy(
+                protocol_complete=self._protocol_runner.protocol_complete,
+            )
+            logger.warning(
+                "pellet trial %s finalized without trajectory analysis: %s",
+                finalized.attempt_label,
+                unavailable_reason,
+            )
+            return
+
+        if request is None:
+            return
+        must_wait = (
+            config.intertrial_progression_mode
+            == AnalysisProgressionMode.WAIT.value
+            or config.automatic_protocol_advance_enabled
+            or self._behavior.algorithm.active_config.pellet_delivery
+            .is_intersession_pellet_shift_enabled
+            or bool(
+                set(config.behavioral_retry_outcomes)
+                - {TrialOutcome.PELLET_MISSING.value}
+            )
+        )
+        if must_wait:
+            self._intertrial_waiting_operations.add(request.operation_id)
+            estimate = self._intertrial_analysis.timing_estimate(
+                tracking_window.end_perf - tracking_window.start_perf
+            )
+            self._send_block_reasons.set(
+                INTERTRIAL_ANALYSIS_BLOCK_NAME,
+                "waiting for pellet trial analysis; " + estimate.display_text,
+            )
+        if not self._intertrial_analysis.submit(request):
+            self._intertrial_waiting_operations.discard(request.operation_id)
+            if must_wait:
+                self._hold_intertrial_resolution(
+                    request,
+                    "Intertrial analysis queue is full. Retry this analysis, "
+                    "continue without its result, Stop, or Abort.",
+                )
+                return
+            self._refresh_intertrial_send_block()
+            tone_references, laser_references = (
+                self._session_data_recorder.trial_stream_references(
+                    tracking_window.start_perf,
+                    tracking_window.end_perf,
+                )
+            )
+            finalized = self._pellet_cycles.finalize_intertrial_unavailable(
+                self._project_info,
+                closed,
+                perf_time=perf_c,
+                wall_time=closed.capture_end_wall_time or time.time(),
+                reason="intertrial analysis queue was full",
+                pellet_presence=evidence.presence.value,
+                pellet_misplacement=evidence.misplacement.value,
+                window=tracking_window,
+                tone_references=tone_references,
+                laser_references=laser_references,
+            )
+            self._pellet_cycles.sync_behavior_counts(self._behavior.algorithm)
+            logger.error(
+                "Intertrial analysis queue full; attempt %s was not analyzed",
+                finalized.attempt_label,
+            )
+        self._notify_trial_protocol_state()
+
+    def _on_pellet_sending(self, *, perf_c: float, context: str):
+        algo = self._behavior.algorithm
+        if self._trial_ledger is None or not algo.is_in_session:
+            return
+        wall_time = time.time()
+        with self._intertrial_lock:
+            self._trial_window_start = None
+        shift = self._behavior.system_machine.shift_xyz_handler
+        with self._trial_protocol_lock:
+            operation = self._trial_action_executor.operation
+            if self._selected_ordered_protocol is not None:
+                if operation is None:
+                    raise RuntimeError("Ordered protocol SEND has no prepared operation")
+                self._trial_action_executor.bind_send(
+                    operation.recipe.operation_id,
+                    operation.recipe.session_generation,
+                    context,
+                )
+            attempt = self._pellet_cycles.begin_send(
+                perf_c,
+                wall_time,
+                operation_id=context,
+                pellet_position=self._offset_record(
+                    self._hardware.last_dcs_set_position
+                ),
+                planned_shift=self._offset_record(shift.last_shift_xyz),
+                applied_shift=self._offset_record(shift.last_processed_shift_xyz),
+                protocol_context=self._current_trial_protocol_context(
+                    self._pellet_cycles.planned_trial_id
+                ),
+            )
+            self._persist_protocol_operation()
+        self._notify_trial_protocol_state()
+        logger.info(
+            "pellet trial attempt started: session=%s attempt=%s context=%s",
+            self._trial_ledger.session_id,
+            attempt.attempt_label,
+            context,
+        )
+
+    def _on_hardware_command_failed(self, failure: CanFailure) -> None:
+        """Finalize the matching physical pellet attempt as a hardware error."""
+        operation = self._trial_action_executor.operation
+        if (
+            operation is not None
+            and operation.state not in operation.TERMINAL
+            and self._trial_action_executor.matches_send_context(failure.context)
+        ):
+            try:
+                self._trial_action_executor.fail(RuntimeError(failure.error))
+                self._persist_protocol_operation()
+            except RuntimeError:
+                logger.exception("Could not fail prepared pellet-trial operation")
+        finalized = self._pellet_cycles.finalize_hardware_failure(
+            failure,
+            in_session=self._behavior.algorithm.is_in_session,
+        )
+        if finalized is None:
+            return
+        self._notify_trial_protocol_state()
+        self._evaluate_automatic_stop_policy(
+            protocol_complete=self._protocol_runner.protocol_complete,
+        )
+
+    def _on_pellet_sent(
+        self,
+        *,
+        perf_c: Optional[float] = None,
+        context: Optional[str] = None,
+    ):
+        algo = self._behavior.algorithm
+        logger.debug("on_pellet_sent: recording=%s in_session=%s",
+                     self._recording_session.status, algo.is_in_session)
+        if algo.is_in_session:
+            ledger = self._trial_ledger
+            if ledger is not None and self._pellet_cycles.active_attempt is not None:
+                operation = self._trial_action_executor.operation
+                if operation is not None and operation.state is PreparedState.SEND_ACCEPTED:
+                    try:
+                        self._trial_action_executor.acknowledge_presentation(context)
+                        self._persist_protocol_operation()
+                    except RuntimeError:
+                        logger.exception("Pellet acknowledgement did not bind to prepared trial")
+                attempt = self._pellet_cycles.acknowledge_presentation(
+                    get_perf_now() if perf_c is None else perf_c,
+                    time.time(),
+                    operation_id=context,
+                )
+                if attempt is None:
+                    return
+                if operation is not None:
+                    behavior = operation.recipe.requested_row["pellet_behavior"]
+                    if behavior in {"send_and_hold", "manual_trial"}:
+                        algo.pellet_automation_stop_requested = True
+                    elif behavior == "send_then_retract":
+                        self._behavior.system_machine.pellet.move_retract(force=True)
+                self._notify_trial_protocol_state()
+            if ledger is not None:
+                # Presentation is acknowledgement-derived immediately. The
+                # other three counts update together when this pellet window's
+                # live tracking result is finalized.
+                algo.pellets_presented = self._pellet_cycles.count(
+                    TrialCountBasis.PRESENTED
+                )
+            self._evaluate_automatic_stop_policy(
+                protocol_complete=self._protocol_runner.protocol_complete,
+            )
+
+    @staticmethod
+    def _offset_record(value):
+        return offset_record(value)
+
+    def _current_trial_protocol_context(self, trial_id: Optional[int] = None):
+        plan = self._attached_plan
+        phase = None if plan is None else plan.current_phase
+        ordered = self._selected_ordered_protocol
+        if trial_id is None:
+            trial_id = self._pellet_cycles.planned_trial_id
+        operation = self._trial_action_executor.operation
+        prepared = (
+            operation is not None
+            and operation.recipe.logical_trial_id == trial_id
+            and operation.state not in operation.TERMINAL
+        )
+        return {
+            "protocol_id": None if ordered is None else ordered.protocol_id,
+            "protocol_revision": None if ordered is None else ordered.revision,
+            "training_plan_id": None if plan is None else plan.plan_id,
+            "phase_id": None if phase is None else phase.phase_id,
+            "automatic_advance": self._protocol_runner.automatic_advance,
+            "trial_row": (
+                dict(operation.recipe.requested_row)
+                if prepared
+                else self._trial_protocol_schedule.row(trial_id).to_record()
+            ),
+            "compiled_recipe": (
+                operation.recipe.to_record() if prepared else None
+            ),
+            "prepared_operation": (
+                operation.to_record() if prepared else None
+            ),
+        }

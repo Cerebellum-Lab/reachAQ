@@ -40,12 +40,6 @@ class SystemStatusMessageKind(IntEnum):
     PELLET_COVER = 205
     """Pellet cover arm servo position"""
 
-    HEAD_MAGNET = 206
-    """Tunnel head magnet servo position"""
-
-    TUNNEL_GATE_SERVO = 207
-    """Tunnel gate servo position"""
-
     PELLET_X = 208
     """Pellet X motor position as a float."""
 
@@ -55,46 +49,47 @@ class SystemStatusMessageKind(IntEnum):
     PELLET_Z = 210
     """Pellet Z motor position as a float."""
 
-    FRONT_DOOR = 301
-    """Message will contain front door status as True (open) or False (closed)."""
-
-    DRAWER_DOOR = 302
-    """Message will contain drawer door status as True (open) or False (closed)."""
-
-    SPARE_DOOR = 303
-    """Message will contain spare door status as True (open) or False (closed)."""
-
-    EXT_BUTTON = 304
-    """Message will contain external button status as True (pressed) or False (released)"""
-
     STIMULUS_INPUTS = 305
     """Message will contain a list of 4 states as True/False"""
 
-    TUNNEL_FAN = 220
-    """Tunnel Fan will contain the tunnel fan status as a ServoStatusMessage"""
+    TONE_STATUS = 306
+    """Immediate pellet-board tone-generator state and requested duration."""
 
-    MEASUREMENTS = 401
-    """Message will contain a list of MeasurementMessage objects."""
+    BOARD_TIME_SYNC = 307
+    BOARD_CAPABILITIES = 308
+    DIGITAL_PULSE_STATUS = 309
 
-    AUDIO_SPECTRUM = 402
-    """Message will contain the audio spectrum data as an array list of float values."""
+    PRESSURE_READING = 310
+    """One pellet-board FSR sample as a PressureReading (raw 12-bit ADC count)."""
 
     COLOR_LED = 403
     """Message is the original ColorLed message"""
 
     MOTOR_CONFIGURATION = 501
 
-    TUNNEL_GATE_OPEN_STATUS = 600
-    """Open status: True for opened, closed otherwise"""
-
     CAMERA_STATUS_CHANGE = 1001
 
     CAMERA_RECORDING_CLOSED_FINISHED = 1002  # current associated args is (cam_idx, tot_frames_written, project_info)
     """Sent when camera recording files are closed by record thread"""
 
-    MEASUREMENT = -101
-    """This value is deprecated.  Use MEASUREMENTS if the object you are passing with this identifier conforms to the
-    MeasurementMessage protocol."""
+    STIM_CAMERA_TRIGGER = 1003
+    """One-shot high-rate stim-camera threshold decision."""
+
+    STIM_CAMERA_EVIDENCE_STATUS = 1004
+    """Stim-camera evidence writer terminal status and diagnostics."""
+
+    CAMERA_FRAME_STATS = 1005
+    """Periodic per-camera frame accounting: (cam_idx, frames_received, frames_missed).
+
+    Absolute session totals, not deltas. The capture process emits these on a
+    timer, and an absolute value corrects itself if a message is lost or
+    arrives out of order, where a delta would corrupt a running sum silently.
+
+    frames_missed counts gaps in the camera's own frame-ID sequence - frames
+    the sensor produced that never reached the host. It is not the pose path
+    skipping frames, which is by design and is not a fault.
+    """
+
 
 
 class StepperStatusMessage(Protocol):

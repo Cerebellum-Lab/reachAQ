@@ -1,0 +1,1312 @@
+from __future__ import annotations
+
+import dataclasses
+import json
+import logging
+import math
+import queue
+import threading
+import time
+import uuid
+from typing import Callable, Optional, Tuple, Union
+
+from autotrainer.core import NidaqTimingPlan, ObservableObject
+from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization
+from autotrainer.device.laser import LaserPulseCancelled, LaserPulseRefused
+from autotrainer.device.nidaq_laser import CANCELLED_OPERATION_WAIT_S
+from autotrainer.device import (
+    LaserControllerProtocol,
+    LaserCalibrationPoint,
+    LaserCalibrationRamp,
+    LaserChannelId,
+    LaserDiodePowerCurve,
+    LaserFeedbackSample,
+    LaserOperationState,
+    LaserPulseTrain,
+    LaserSynchronizedPulseTrain,
+    LaserSystemConfiguration,
+    NidaqLaserController,
+    NullLaserController,
+)
+
+
+logger = get_verbose_logger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class LaserTraceBlock:
+    channel_id: LaserChannelId
+    source: str
+    x_values: Tuple[float, ...] = tuple()
+    command_volts: Tuple[float, ...] = tuple()
+    diode_volts: Tuple[float, ...] = tuple()
+    command_copy_volts: Tuple[float, ...] = tuple()
+    output_name: str = ""
+    output_value: Optional[float] = None
+    replace: bool = False
+    event: str = "trace"
+    operation_id: str = ""
+    context_json: str = "{}"
+    timestamp_method: str = "laser_event_perf_counter"
+    timing_confidence: str = "host_timestamp"
+    origin_perf_time: Optional[float] = None
+    origin_wall_time: Optional[float] = None
+
+
+#: A manual Run Pulse's event id starts so; a protocol operation's is a bare
+#: UUID (NidaqLaserOperation), so the one is never taken for the other.
+MANUAL_PULSE_OPERATION_PREFIX = "manual-"
+#: How a manual Run Pulse's rows are timed: by perf_counter at its call.
+_MANUAL_PULSE_TIMESTAMP_METHOD = "manual_pulse_call_perf_counter"
+
+
+@dataclasses.dataclass(frozen=True)
+class _ManualPulse:
+    """A manual Run Pulse as told so far (LaserModel.run_pulse_train, ArmedManualPulse)."""
+
+    channel_id: LaserChannelId
+    operation_id: str
+    context: dict
+    perf_time: float
+    wall_time: float
+
+
+def wait_until_cancelled_ends(operation, timeout: float = CANCELLED_OPERATION_WAIT_S) -> bool:
+    """Wait, bounded, for a cancelled operation to end; whether it did.
+
+    A pulse armed next on the same board is refused until it has, as the
+    board is still held by the cancelled one's cleanup.
+    """
+    wait_until_finished = getattr(operation, "wait_until_finished", None)
+    if wait_until_finished is None or wait_until_finished(timeout):
+        return True
+    logger.warning(
+        "The cancelled laser operation %s had not ended %.1f s later; a pulse "
+        "armed next on its board is refused until it does",
+        getattr(operation, "operation_id", "?"), timeout)
+    return False
+
+
+def _controller_closed(controller) -> bool:
+    """Whether `controller` has been marked closed.
+
+    NidaqLaserController marks itself so before its close cancels anything
+    (_mark_closed), and words a waited-for train it cancelled by it; a
+    controller with no such mark, the null one, reads open.
+    """
+    return bool(getattr(controller, "_closed", False))
+
+
+class ArmedManualPulse:
+    """A manual Run Pulse armed while its button is pressed (LaserModel.arm_manual_pulse).
+
+    fire() starts it at the click, on the thread that decides, the Qt thread:
+    one DAQmx start, its edge about 0.6 ms later (christielab10, M3 A), where
+    a click that armed, wrote and started the train took 12-18 ms (session004;
+    M3 B). disarm() asks for it to be let go unfired. finish(), on the thread
+    that armed it, makes that cancel, waits for its end and tells how it
+    ended. One of fire() and disarm() decides, once: a fire after a disarm,
+    or after the pulse ended unfired, starts nothing.
+    """
+
+    def __init__(self, model, controller, operation, pulse_train, manual_context, before):
+        self.operation = operation
+        self._model = model
+        self._controller = controller
+        self._pulse_train = pulse_train
+        self._manual_context = manual_context
+        #: The command records as they were before the arm recorded its
+        #: amplitude (LaserModel._record_pulse_commands).
+        self._before = before
+        self._lock = threading.Lock()
+        #: "fired", "disarmed", or "ended" when finish() found it ended with
+        #: neither; None until one of them.
+        self._decided = None
+        #: The "requested" row's pulse, once its start was accepted.
+        self._manual = None
+        #: Set once fire() is done: its start accepted and told, or refused.
+        self._fire_done = threading.Event()
+        #: Set by disarm(), and as the operation ends: what finish() waits on
+        #: before it makes a disarm's cancel.
+        self._woken = threading.Event()
+        add_terminal_callback = getattr(operation, "add_terminal_callback", None)
+        self._woken_as_it_ends = add_terminal_callback is not None
+        if add_terminal_callback is not None:
+            add_terminal_callback(lambda _ended: self._woken.set())
+
+    def fire(self, *, clicked_at: Optional[float] = None, fallback: bool = False) -> bool:
+        """Start the armed pulse, then tell it as requested; whether it started.
+
+        The row is stamped before the start and told after it (Ben,
+        2026-10-02, decision 3), so the click's path is the start alone. The
+        trade: a recorder that fails no longer stops the pulse; that failure
+        is logged at ERROR with the pulse's id, and its end is still told.
+        False, with nothing told, once it was decided already, or is no
+        longer armed: let go by a disarm, by its start wait, or by a cancel
+        or a close.
+
+        `clicked_at` is the click's perf_counter time, and `fallback` says
+        it came before the arm was ready, so that the arming thread fires it:
+        both go in the row, which a fallback's start, later than its click,
+        would otherwise read as a click's sub-ms one (the review of task 9,
+        Minor 3).
+        """
+        perf_time, wall_time = time.perf_counter(), time.time()
+        # The claim is made inside the try, so that nothing can come between
+        # it and the finally: an exception there, a KeyboardInterrupt on the
+        # Qt thread say, left _fire_done unset and finish() waiting for it
+        # without end (the review of task 9, Minor 1; as trigger() claims).
+        claimed = False
+        try:
+            with self._lock:
+                if self._decided is not None:
+                    return False
+                claimed = True
+                self._decided = "fired"
+            # Made before the start: made after it, one that failed left a
+            # pulse that ran with nothing told of it (Minor 6).
+            manual = self._model._manual_pulse(
+                self._pulse_train, self._manual_context, perf_time, wall_time)
+            try:
+                self.operation.trigger()
+            except RuntimeError:
+                # Raised only when it is not armed: nothing was started.
+                return False
+            with self._lock:
+                self._manual = manual
+            try:
+                self._model._emit_manual_pulse_event(
+                    manual, "requested", "before_output_start",
+                    {**manual.context, "fallback": bool(fallback),
+                     "click_perf_time": clicked_at},
+                    perf_time, wall_time)
+            except Exception:
+                logger.exception(
+                    "Laser %s's Run Pulse %s started, but its requested row "
+                    "could not be told", int(self._pulse_train.channel_id),
+                    manual.operation_id)
+            return True
+        finally:
+            if claimed:
+                self._fire_done.set()
+
+    def disarm(self) -> bool:
+        """Ask for the pulse to be let go unfired, unless fire() decided first.
+
+        Whether it was. Nothing is asked of the driver here: a disarm comes
+        from the Qt thread, on a release off the button, a tab switch or a
+        close, and Ben accepted only the click's start there (the review of
+        task 9, Important 1). finish(), on the thread that armed the pulse,
+        makes the cancel: the pulse's shutter closed, then its output
+        aborted; the pulse's own thread then resets the output and lets go of
+        the board.
+        """
+        with self._lock:
+            if self._decided is not None:
+                return False
+            self._decided = "disarmed"
+        self._woken.set()
+        return True
+
+    def finish(self) -> bool:
+        """Wait for the pulse to end, and tell how; on the thread that armed it.
+
+        True once it fired and completed: told as completed, its waveform
+        from the click's time, and its output at its minimum, as a waited-for
+        Run Pulse's is. False when it never started: let go by disarm(), its
+        start wait, a cancel or a close, or a fire() that found one of those.
+        Nothing was requested then, so nothing is told, and its amplitude's
+        record is taken back, as a refused pulse's is: the output was never
+        driven, and its cleanup reset it. Raises what ended a pulse that
+        started and failed or was cancelled, told as "failed" or "cancelled",
+        keeping its amplitude, which its output may still hold.
+        """
+        # Without a bound, as a waited-for Run Pulse waited for its train:
+        # the operation bounds its start wait and its output itself.
+        if self._woken_as_it_ends:
+            self._woken.wait()
+        else:
+            while not (self._woken.is_set() or self.operation.wait_until_finished(0.05)):
+                pass
+        with self._lock:
+            disarmed = self._decided == "disarmed"
+        if disarmed:
+            # The disarm's cancel, made here, off the Qt thread. One already
+            # ended, by its start wait or a close, is left as it is.
+            self.operation.cancel()
+        self.operation.wait_until_finished()
+        with self._lock:
+            if self._decided is None:
+                # A fire() from now on is too late, and starts nothing.
+                self._decided = "ended"
+            fired = self._decided == "fired"
+        if fired:
+            # Its "requested" row is told on the firing thread, after the
+            # start; the end is told after it.
+            self._fire_done.wait()
+        with self._lock:
+            manual = self._manual
+        if manual is None:
+            self._model._undo_refused_pulse(self._before)
+            return False
+        operation = self.operation
+        state = operation.state
+        if state is LaserOperationState.COMPLETED:
+            self._model._record_baseline((self._pulse_train.channel_id,))
+            self._model.trace_received(
+                self._model._manual_pulse_trace(self._pulse_train, manual))
+            self._model._manual_pulse_ended(manual, "completed", "after_output_end")
+            return True
+        if state is LaserOperationState.CANCELLED:
+            # Worded as NidaqLaserController words a waited-for train's: a
+            # close says so, as System Mode's Stop and closing reachAQ close.
+            error = LaserPulseCancelled(
+                f"Laser operation {operation.operation_id} was cancelled"
+                + (": the laser controller was closed while it ran"
+                   if _controller_closed(self._controller) else ""))
+            self._model._manual_pulse_ended(
+                manual, "cancelled", "operation_cancelled", error)
+            raise error
+        error = operation.error or RuntimeError(
+            f"Laser operation {operation.operation_id} ended {state.value}")
+        self._model._manual_pulse_ended(manual, "failed", "operation_failure", error)
+        raise error
+
+
+class LaserModelEvents:
+    trace_received = Callable[[LaserTraceBlock], None]
+
+
+class LaserModel(ObservableObject):
+    CONFIGURATION = "configuration"
+    IS_CONNECTED = "is_connected"
+    LAST_FEEDBACK_SAMPLE = "last_feedback_sample"
+    trace_received: LaserModelEvents.trace_received
+
+    def __init__(self, controller: Optional[LaserControllerProtocol] = None):
+        super().__init__(("trace_received",))
+        self._controller: Optional[LaserControllerProtocol] = None
+        self._configuration = LaserSystemConfiguration()
+        self._last_feedback_sample: Optional[LaserFeedbackSample] = None
+        self._prepared_profiles = {}
+        self._prepared_profiles_lock = threading.RLock()
+        self._direct_trigger_lock = threading.RLock()
+        self._direct_trigger_queue = None
+        self._direct_trigger_observer = None
+        self._direct_trigger_stop = threading.Event()
+        self._direct_trigger_thread = None
+        #: The last command asked of each channel, in volts: a set command, or
+        #: a pulse train's amplitude until the train returns to its baseline.
+        #: What closing says an output may still hold when the controller
+        #: cannot be closed.
+        self._last_command_volts = {}
+        #: How many commands have been recorded for each channel: a pulse's
+        #: end resets its command only if nothing newer was recorded. Both,
+        #: and the look before a reset, under the lock: pulses end on threads
+        #: of their own.
+        self._command_records = {}
+        self._command_lock = threading.RLock()
+        #: Controllers this model closed whose close stopped waiting for a
+        #: pulse train or a ramp that had not ended (work_left_running).
+        self._closed_with_work_left = []
+        self._closed_with_work_left_lock = threading.Lock()
+        #: Lasers whose PMT margins have been said to be ignored, for want of
+        #: a PMT shutter line, since the controller was set; see
+        #: pmt_shutter_for_profile.
+        self._pmt_margins_ignored = set()
+        self._pmt_margins_lock = threading.Lock()
+        if controller is not None:
+            self.set_controller(controller)
+
+    @property
+    def configuration(self) -> LaserSystemConfiguration:
+        return self._configuration
+
+    @property
+    def is_connected(self) -> bool:
+        return self._controller is not None
+
+    @property
+    def last_command_volts(self) -> dict:
+        """The last command asked of each channel, by channel number, in volts."""
+        return dict(self._last_command_volts)
+
+    def _record_command(self, channel_id, volts: float) -> None:
+        with self._command_lock:
+            self._last_command_volts[int(channel_id)] = float(volts)
+            self._command_records[int(channel_id)] = (
+                self._command_records.get(int(channel_id), 0) + 1)
+
+    def _record_pulse_commands(self, pulse_trains) -> dict:
+        """Record each train's amplitude as its channel's last command.
+
+        Before the controller is asked: a train that fails once it runs may
+        leave its amplitude on the output. Returns the records as they were,
+        for _undo_refused_pulse.
+        """
+        with self._command_lock:
+            before = {}
+            for train in pulse_trains:
+                key = int(train.channel_id)
+                before[key] = (
+                    self._last_command_volts.get(key), self._command_records.get(key, 0))
+                self._record_command(train.channel_id, train.amplitude_volts)
+            return before
+
+    def _undo_refused_pulse(self, before: dict) -> None:
+        """A pulse the controller refused drove nothing: its records go back.
+
+        It left its amplitude as what the output "may still hold", and a close
+        that failed named it. Only on a channel nothing has recorded a
+        command on since, and with its count, so that an armed pulse's own
+        completion still finds its mark (_record_baseline_when_completed).
+        """
+        with self._command_lock:
+            for key, (volts, records) in before.items():
+                if self._command_records.get(key, 0) != records + 1:
+                    continue
+                if volts is None:
+                    self._last_command_volts.pop(key, None)
+                else:
+                    self._last_command_volts[key] = volts
+                self._command_records[key] = records
+
+    def _record_baseline_when_completed(self, operation, channel_ids) -> None:
+        """An armed or trial pulse's outputs are at their minimum once it completes.
+
+        As a waited-for pulse's are when it returns. Only for a channel with
+        no newer command recorded since, and only on completion: a pulse
+        cancelled or failed may have left its amplitude on the output.
+        """
+        add_terminal_callback = getattr(operation, "add_terminal_callback", None)
+        if add_terminal_callback is None:
+            return
+        with self._command_lock:
+            marks = {
+                int(channel_id): self._command_records.get(int(channel_id), 0)
+                for channel_id in channel_ids
+            }
+
+        def completed(ended):
+            if getattr(getattr(ended, "state", None), "value", None) != "completed":
+                return
+            # The look and the reset in one hold: a command recorded between
+            # them was overwritten with the minimum.
+            with self._command_lock:
+                self._record_baseline(
+                    channel_id for channel_id, mark in marks.items()
+                    if self._command_records.get(channel_id, 0) == mark)
+
+        add_terminal_callback(completed)
+
+    def _record_baseline(self, channel_ids) -> None:
+        """A waited-for pulse train has returned: its outputs are at their minimum."""
+        for channel_id in channel_ids:
+            self._record_command(
+                channel_id,
+                self._configuration.get_channel(channel_id).minimum_command_volts)
+
+    @property
+    def last_feedback_sample(self) -> Optional[LaserFeedbackSample]:
+        return self._last_feedback_sample
+
+    @property
+    def timing_status(self) -> dict:
+        status = getattr(self._controller, "timing_status", None)
+        return (
+            {"status": "independent", "reason": "Laser controller is unavailable"}
+            if status is None
+            else dict(status)
+        )
+
+    def configure_null(self, configuration: LaserSystemConfiguration) -> None:
+        self.set_controller(NullLaserController(configuration))
+
+    def configure_nidaq(
+        self,
+        configuration: LaserSystemConfiguration,
+        *,
+        feedback_reader: Optional[Callable[[str], float]] = None,
+        timing_plan: Optional[NidaqTimingPlan] = None,
+        analog_terminal_config: Optional[str] = None,
+    ) -> None:
+        self.set_controller(
+            NidaqLaserController(
+                configuration,
+                feedback_reader=feedback_reader,
+                timing_plan=timing_plan,
+                analog_terminal_config=analog_terminal_config,
+            )
+        )
+
+    def open_controller(
+        self,
+        configuration: LaserSystemConfiguration,
+        *,
+        timing_plan: Optional[NidaqTimingPlan] = None,
+        analog_terminal_config: Optional[str] = None,
+    ) -> LaserControllerProtocol:
+        """A controller for `configuration` that this model does not hold.
+
+        For the calibration ramp, which runs in Idle. The controller is opened
+        with no feedback reader: fed by the shared input stream, as System Mode
+        opens it, it refuses a ramp. It is not installed here, so the model
+        stays unconnected, and a Run cannot close it under the ramp; the
+        caller closes it.
+        """
+        if configuration.backend == "null":
+            return NullLaserController(configuration)
+        if configuration.backend == "nidaq":
+            return NidaqLaserController(
+                configuration, timing_plan=timing_plan,
+                analog_terminal_config=analog_terminal_config)
+        raise RuntimeError(
+            f"Laser backend {configuration.backend!r} has no controller to open")
+
+    def load_configuration(
+        self,
+        configuration: LaserSystemConfiguration,
+        *,
+        feedback_reader: Optional[Callable[[str], float]] = None,
+        persisted_configuration: Optional[LaserSystemConfiguration] = None,
+        timing_plan: Optional[NidaqTimingPlan] = None,
+        analog_terminal_config: Optional[str] = None,
+    ) -> None:
+        """Open the controller `configuration` names.
+
+        `analog_terminal_config` is the NI-DAQ stream's analogTerminalConfig:
+        a NI-DAQ controller references its own inputs as the stream does.
+        """
+        backend = configuration.backend
+        if backend == "disabled":
+            prev_config = self._configuration
+            self.close()
+            self._configuration = configuration
+            self._on_property_changed(self.CONFIGURATION, configuration, prev_config)
+            log_hardware_initialization(logger, "SKIP | laser controller | backend=disabled")
+            return
+
+        started = time.perf_counter()
+        log_hardware_initialization(
+            logger,
+            "START | laser controller | backend=%s hardware_timed=%s channels=%s",
+            backend,
+            configuration.hardware_timed,
+            tuple(
+                (
+                    channel.channel_id.value,
+                    channel.analog_output,
+                    channel.diode_input,
+                    channel.shutter_output,
+                )
+                for channel in configuration.channels
+            ),
+        )
+        try:
+            if backend == "null":
+                self.configure_null(configuration)
+            elif backend == "nidaq":
+                self.configure_nidaq(
+                    configuration,
+                    feedback_reader=feedback_reader,
+                    timing_plan=timing_plan,
+                    analog_terminal_config=analog_terminal_config,
+                )
+            else:
+                raise ValueError(f"Unsupported laser backend: {backend}")
+        except Exception as exc:
+            log_hardware_initialization(
+                logger,
+                "FAILED | laser controller | backend=%s elapsed=%.3fs error=%s",
+                backend,
+                time.perf_counter() - started,
+                str(exc) or exc.__class__.__name__,
+                level=logging.ERROR,
+            )
+            raise
+        log_hardware_initialization(
+            logger,
+            "READY | laser controller | backend=%s elapsed=%.3fs",
+            backend,
+            time.perf_counter() - started,
+        )
+        if (
+            persisted_configuration is not None
+            and persisted_configuration != configuration
+        ):
+            runtime_configuration = self._configuration
+            self._configuration = persisted_configuration
+            self._on_property_changed(
+                self.CONFIGURATION,
+                persisted_configuration,
+                runtime_configuration,
+            )
+
+    def set_configuration_offline(self, configuration: LaserSystemConfiguration) -> None:
+        prev_config = self._configuration
+        self.close()
+        self._configuration = configuration
+        self._on_property_changed(self.CONFIGURATION, configuration, prev_config)
+
+    def save_configuration(self) -> LaserSystemConfiguration:
+        return self._configuration
+
+    def set_controller(self, controller: LaserControllerProtocol) -> None:
+        prev_config = self._configuration
+        self.close()
+        self._controller = controller
+        self._configuration = controller.configuration
+        # A controller opens with every command at its minimum.
+        self._last_command_volts = {
+            int(channel.channel_id): channel.minimum_command_volts
+            for channel in self._configuration.channels
+        }
+        with self._pmt_margins_lock:
+            self._pmt_margins_ignored.clear()
+        self._on_property_changed(self.CONFIGURATION, self._configuration, prev_config)
+        self._on_property_changed(self.IS_CONNECTED, True, False)
+
+    def set_command_voltage(self, channel_id: Union[LaserChannelId, int], volts: float) -> float:
+        applied = self._require_controller().set_command_voltage(channel_id, volts)
+        self._record_command(channel_id, applied)
+        self.trace_received(
+            LaserTraceBlock(
+                channel_id=LaserChannelId(int(channel_id)),
+                source="manual command",
+                x_values=(0.0,),
+                command_volts=(applied,),
+            )
+        )
+        return applied
+
+    def set_shutter_open(self, channel_id: Union[LaserChannelId, int], is_open: bool) -> None:
+        self._require_controller().set_shutter_open(channel_id, is_open)
+        self.trace_received(
+            LaserTraceBlock(
+                channel_id=LaserChannelId(int(channel_id)),
+                source="output state",
+                output_name="shutter_open",
+                output_value=float(bool(is_open)),
+            )
+        )
+
+    def set_auxiliary_output(self, channel_id: Union[LaserChannelId, int], enabled: bool) -> None:
+        self._require_controller().set_auxiliary_output(channel_id, enabled)
+        self.trace_received(
+            LaserTraceBlock(
+                channel_id=LaserChannelId(int(channel_id)),
+                source="output state",
+                output_name="auxiliary_enabled",
+                output_value=float(bool(enabled)),
+            )
+        )
+
+    def read_feedback_sample(self, channel_id: Union[LaserChannelId, int]) -> LaserFeedbackSample:
+        sample = self._require_controller().read_feedback_sample(channel_id)
+        prev, self._last_feedback_sample = self._last_feedback_sample, sample
+        self._on_property_changed(self.LAST_FEEDBACK_SAMPLE, sample, prev)
+        self._emit_feedback_trace(sample)
+        return sample
+
+    def read_command_copy_voltage(self, channel_id: Union[LaserChannelId, int]) -> float:
+        return self._require_controller().read_command_copy_voltage(channel_id)
+
+    def run_pulse_train(
+        self,
+        pulse_train: LaserPulseTrain,
+        *,
+        manual_context: Optional[dict] = None,
+    ) -> None:
+        """Run a pulse train; one that waits returns once it has ended.
+
+        `manual_context` is Run Pulse's (LaserChannelTab), with what only the
+        tab knows: the profile and the trigger mode. The pulse is then told as
+        a manual laser event, which a recording session keeps
+        (SessionDataRecorder._on_laser_trace) as any laser trace: a
+        "requested" row as the controller is called, and one for how it
+        ended, "completed", "failed", "cancelled" or "refused", under one
+        manual- id. Every other caller passes none, and is told only the
+        train, as before.
+        """
+        controller = self._require_controller()
+        if manual_context is not None and not pulse_train.wait:
+            # It returns before it ends, so "completed" would be a guess.
+            raise ValueError("A manual pulse event needs a train that is waited for")
+        # Told before its command is recorded, so that nothing is recorded
+        # of a pulse whose telling failed. Told before the controller is
+        # called too, so a trace_received subscriber that raises here stops
+        # the pulse from firing (fail closed); the unmarked path is told only
+        # after the train has run, so a raising subscriber cannot stop it.
+        manual = (
+            None if manual_context is None
+            else self._manual_pulse_requested(pulse_train, manual_context)
+        )
+        before = self._record_pulse_commands((pulse_train,))
+        try:
+            controller.run_pulse_train(pulse_train)
+        except LaserPulseRefused as error:
+            self._undo_refused_pulse(before)
+            if manual is not None:
+                self._manual_pulse_ended(manual, "refused", "operation_refused", error)
+            raise
+        except LaserPulseCancelled as error:
+            # System Mode's Stop, or another close, cancelled it as it ran.
+            if manual is not None:
+                self._manual_pulse_ended(
+                    manual, "cancelled", "operation_cancelled", error)
+            raise
+        except Exception as error:
+            if manual is not None:
+                self._manual_pulse_ended(manual, "failed", "operation_failure", error)
+            raise
+        if pulse_train.wait:
+            # Returned: the train ended on its baseline, and its cleanup put
+            # the command back. One that raised keeps its amplitude, which
+            # its output may still hold.
+            self._record_baseline((pulse_train.channel_id,))
+        self.trace_received(
+            self._make_pulse_trace(pulse_train) if manual is None
+            else self._manual_pulse_trace(pulse_train, manual))
+        if manual is not None:
+            self._manual_pulse_ended(manual, "completed", "after_output_end")
+
+    def arm_manual_pulse(
+        self,
+        pulse_train: LaserPulseTrain,
+        *,
+        manual_context: dict,
+        start_wait_seconds: float,
+    ) -> ArmedManualPulse:
+        """Arm a manual Run Pulse for its click; ArmedManualPulse.fire() starts it.
+
+        Run Pulse's internal mode, from its press (Ben, 2026-10-02, decision
+        1 = D): the output is built, written and committed, and its shutter
+        opened (decision 2 = (a)), now, so that the click is left the start
+        alone. `start_wait_seconds` bounds how long it stays armed: unfired
+        by then it fails, and closes the shutter it opened. A train with an
+        external trigger is refused: its edge starts it, not the click, and
+        it runs through run_pulse_train as before.
+
+        Its amplitude is recorded as the laser's last command, as any
+        pulse's is before the controller is asked, and taken back if it is
+        not armed. Nothing is told until it fires.
+        """
+        if pulse_train.trigger_source:
+            raise ValueError(
+                "An externally triggered Run Pulse is armed at its click, by run_pulse_train")
+        controller = self._require_controller()
+        laser = int(pulse_train.channel_id)
+        synchronized = LaserSynchronizedPulseTrain(
+            pulse_trains=(pulse_train,),
+            trigger_edge=pulse_train.trigger_edge,
+            enable_pmt_shutter=pulse_train.enable_pmt_shutter,
+            wait=False,
+            defer_start=True,
+            timeout_seconds=pulse_train.timeout_seconds,
+            start_wait_seconds=start_wait_seconds,
+            # The label names it where it holds the board, in another
+            # pulse's refusal.
+            operation_context={
+                "operation_label": f"Laser {laser}'s Run Pulse",
+                "manual": True,
+                "laser_channel_id": laser,
+            },
+        )
+        # Not run_synchronized_pulse_train(), whose trace says a waveform
+        # ran: this one runs only if it is clicked.
+        before = self._record_pulse_commands((pulse_train,))
+        try:
+            operation = controller.run_synchronized_pulse_train(synchronized)
+        except Exception as error:
+            # Refused, or failed or cancelled before it was armed: a deferred
+            # output starts only at its trigger, so it drove nothing.
+            self._undo_refused_pulse(before)
+            if not isinstance(error, LaserPulseRefused) and _controller_closed(controller):
+                # A Stop or a close landed mid-arm: cancelled, not failed.
+                raise LaserPulseCancelled(
+                    f"Laser {laser}'s Run Pulse was cancelled as it armed: the "
+                    "laser controller was closed") from error
+            raise
+        if operation is None:
+            # Nothing armed, so nothing driven, as for the failures above.
+            self._undo_refused_pulse(before)
+            raise RuntimeError("The laser controller did not arm Run Pulse's operation")
+        return ArmedManualPulse(
+            self, controller, operation, pulse_train, dict(manual_context), before)
+
+    def tell_manual_pulse_not_armed(self, pulse_train, *, manual_context, error) -> None:
+        """Tell the click of a Run Pulse whose arm, at its press, raised `error`.
+
+        As run_pulse_train told a pulse that raised: "requested", then
+        "refused" for a LaserPulseRefused, which drove nothing, or "failed".
+        At the click, which is when the operator asked for it; its arm had
+        been tried at the press.
+        """
+        manual = self._manual_pulse_requested(pulse_train, manual_context)
+        if isinstance(error, LaserPulseRefused):
+            self._manual_pulse_ended(manual, "refused", "operation_refused", error)
+        else:
+            self._manual_pulse_ended(manual, "failed", "operation_failure", error)
+
+    def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
+        controller = self._require_controller()
+        before = self._record_pulse_commands(pulse_train.pulse_trains)
+        try:
+            operation = controller.run_synchronized_pulse_train(pulse_train)
+        except LaserPulseRefused:
+            self._undo_refused_pulse(before)
+            raise
+        channel_ids = tuple(
+            channel_pulse.channel_id for channel_pulse in pulse_train.pulse_trains)
+        if pulse_train.wait:
+            self._record_baseline(channel_ids)
+        elif operation is not None:
+            self._record_baseline_when_completed(operation, channel_ids)
+        for channel_pulse in pulse_train.pulse_trains:
+            self.trace_received(self._make_pulse_trace(channel_pulse))
+        return operation
+
+    def pmt_shutter_for_profile(self, profile, channel_id) -> bool:
+        """Whether a pulse of `profile` on `channel_id` drives the PMT shutter.
+
+        The PMT rule, for Run Pulse, Test stim and trials alike (Ben,
+        2026-09-30): only when the profile gives it a margin, its PMT open
+        lead or close lag above zero, and a PMT shutter line is configured.
+        With no line the margins are ignored, so the pulse fires without
+        them, and that is said once for each laser of each controller. Run
+        Pulse followed a checkbox of its own, and a trial with margins failed
+        on christielab10, which has no PMT line ("PMT shutter output
+        requested, but laser pmt_shutter_output is not configured").
+        """
+        lead_ms = float(profile.pmt_open_lead_ms)
+        lag_ms = float(profile.pmt_close_lag_ms)
+        if not (lead_ms > 0 or lag_ms > 0):
+            return False
+        if self._configuration.pmt_shutter_output:
+            return True
+        laser = int(channel_id)
+        with self._pmt_margins_lock:
+            said = laser in self._pmt_margins_ignored
+            self._pmt_margins_ignored.add(laser)
+        if not said:
+            logger.warning(
+                "Laser %s: profile %r's PMT shutter margins (open lead %g ms, "
+                "close lag %g ms) are ignored, since no PMT shutter line "
+                "(pmtShutterOutput) is configured; it fires without them",
+                laser, getattr(profile, "profile_id", "?"), lead_ms, lag_ms)
+        return False
+
+    def prepare_pulse_profile(self, profile, firing, recipe):
+        """Resolve a frozen protocol profile into one pre-armed finite output."""
+        route = firing.trigger_route.value
+        hardware_trigger = route == "hardware_stim3"
+        direct_start = route == "direct_ni_software"
+        if not hardware_trigger and not direct_start:
+            raise ValueError(f"Unsupported protocol laser trigger route: {route}")
+        pulse = LaserPulseTrain(
+            channel_id=LaserChannelId(int(firing.channel_id)),
+            amplitude_volts=float(profile.amplitude_volts),
+            duration_ms=float(profile.pulse_duration_ms),
+            pulse_count=int(profile.pulse_count),
+            frequency_hz=profile.frequency_hz,
+            baseline_ms=float(profile.baseline_ms),
+            post_stim_ms=float(profile.post_stim_ms),
+            pmt_shutter_open_delay_ms=float(profile.pmt_open_lead_ms),
+            pmt_shutter_close_delay_ms=float(profile.pmt_close_lag_ms),
+            # The margins pad the output only when the shutter is driven.
+            enable_pmt_shutter=self.pmt_shutter_for_profile(profile, firing.channel_id),
+        )
+        operation_context = {
+            "session_id": recipe.session_id,
+            "session_generation": recipe.session_generation,
+            "protocol_id": recipe.protocol_id,
+            "protocol_revision": recipe.protocol_revision,
+            "logical_trial_id": recipe.logical_trial_id,
+            "attempt_id": recipe.attempt_id,
+            "trial_operation_id": recipe.operation_id,
+            "profile_id": profile.profile_id,
+            "profile_revision": profile.revision,
+            "laser_channel_id": int(firing.channel_id),
+            "trigger_route": route,
+        }
+        label = getattr(recipe, "operation_label", None)
+        if label:
+            # How the operation is named where it holds the board: Test stim's
+            # recipe numbers its trial 0.
+            operation_context["operation_label"] = label
+        synchronized = LaserSynchronizedPulseTrain(
+            pulse_trains=(pulse,),
+            trigger_source=(firing.trigger_terminal if hardware_trigger else None),
+            wait=False,
+            defer_start=direct_start,
+            operation_context=operation_context,
+        )
+        # Preparing an asynchronous task is not a physical output. Do not use
+        # run_synchronized_pulse_train(), whose ordinary/manual trace represents
+        # an executed waveform.
+        controller = self._require_controller()
+        before = self._record_pulse_commands((pulse,))
+        try:
+            operation = controller.run_synchronized_pulse_train(synchronized)
+        except LaserPulseRefused:
+            self._undo_refused_pulse(before)
+            raise
+        if operation is None:
+            raise RuntimeError("Protocol laser preparation did not return an operation")
+        self._record_baseline_when_completed(operation, (pulse.channel_id,))
+        operation_record = operation.to_record()
+        timing_status = operation_record.get("timing_status") or {}
+        required_status = (
+            "hardware_synchronized" if hardware_trigger else "software_start"
+        )
+        observed_status = timing_status.get("status")
+        emulated_status = (
+            "emulated_software_start"
+            if direct_start and self._configuration.backend == "null"
+            else None
+        )
+        accepted_statuses = {required_status}
+        if emulated_status is not None:
+            accepted_statuses.add(emulated_status)
+        if observed_status not in accepted_statuses:
+            operation.cancel()
+            # Ended before this raises, so a retry finds the board free.
+            wait_until_cancelled_ends(operation)
+            raise RuntimeError(
+                "Protocol laser timing is not ready: expected "
+                f"{required_status}, found "
+                f"{observed_status or 'unknown'}; "
+                + str(
+                    timing_status.get("reason")
+                    or "no timing reason was reported"
+                )
+            )
+        self._emit_protocol_operation_event(
+            operation,
+            "prepared",
+            timing_confidence=(
+                "simulated" if observed_status == emulated_status else "planned_only"
+            ),
+        )
+        add_terminal_callback = getattr(operation, "add_terminal_callback", None)
+        if add_terminal_callback is not None:
+            add_terminal_callback(self._on_protocol_laser_terminal)
+        if direct_start:
+            with self._prepared_profiles_lock:
+                self._prepared_profiles[recipe.operation_id] = {
+                    "operation": operation,
+                    "context": operation_context,
+                    "nonce": None,
+                    "enabled": False,
+                }
+        return operation
+
+    def start_direct_trigger_receiver(self, trigger_queue, observer=None) -> None:
+        with self._direct_trigger_lock:
+            thread = self._direct_trigger_thread
+            if thread is not None and thread.is_alive():
+                if (
+                    trigger_queue is not self._direct_trigger_queue
+                    or observer != self._direct_trigger_observer
+                ):
+                    raise RuntimeError(
+                        "Direct laser trigger receiver is already running with "
+                        "different ownership"
+                    )
+                return
+            self._direct_trigger_queue = trigger_queue
+            self._direct_trigger_observer = observer
+            self._direct_trigger_stop.clear()
+            thread = threading.Thread(
+                target=self._run_direct_trigger_receiver,
+                name="StimToNidaqTrigger",
+                daemon=True,
+            )
+            self._direct_trigger_thread = thread
+            thread.start()
+
+    def bind_direct_trigger_nonce(self, operation_id: str, nonce: str) -> None:
+        with self._prepared_profiles_lock:
+            prepared = self._prepared_profiles.get(str(operation_id))
+            if prepared is None:
+                return
+            prepared["nonce"] = str(nonce)
+            prepared["enabled"] = True
+
+    def release_prepared_profile(self, operation) -> None:
+        with self._prepared_profiles_lock:
+            for operation_id, prepared in tuple(self._prepared_profiles.items()):
+                if prepared["operation"] is operation:
+                    self._prepared_profiles.pop(operation_id, None)
+
+    def stop_direct_trigger_receiver(self) -> None:
+        with self._direct_trigger_lock:
+            self._direct_trigger_stop.set()
+            thread = self._direct_trigger_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(2.0)
+        with self._direct_trigger_lock:
+            if self._direct_trigger_thread is thread:
+                self._direct_trigger_thread = None
+        with self._prepared_profiles_lock:
+            self._prepared_profiles.clear()
+
+    def _run_direct_trigger_receiver(self) -> None:
+        while not self._direct_trigger_stop.is_set():
+            try:
+                message = self._direct_trigger_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            received = time.perf_counter()
+            result = dict(message)
+            result["ipc_receive_perf_time"] = received
+            result["ipc_queue_delay_seconds"] = (
+                received - float(message["ipc_send_perf_time"])
+            )
+            try:
+                operation_id = str(message["operation_id"])
+                with self._prepared_profiles_lock:
+                    prepared = self._prepared_profiles.get(operation_id)
+                    if prepared is None:
+                        raise RuntimeError("direct trigger has no prepared NI operation")
+                    context = prepared["context"]
+                    expected = (
+                        int(context["session_generation"]),
+                        int(context["logical_trial_id"]),
+                        int(context["attempt_id"]),
+                        prepared["nonce"],
+                    )
+                    observed = (
+                        int(message["session_generation"]),
+                        int(message["logical_trial_id"]),
+                        int(message["attempt_id"]),
+                        str(message["nonce"]),
+                    )
+                    if observed != expected:
+                        raise RuntimeError("stale or mismatched direct trigger context")
+                    if not prepared["enabled"]:
+                        raise RuntimeError("direct trigger arrived before pellet presentation")
+                    operation = prepared["operation"]
+                result["validated_perf_time"] = time.perf_counter()
+                result["daqmx_start_entry_perf_time"] = time.perf_counter()
+                operation.trigger()
+                result["daqmx_start_return_perf_time"] = time.perf_counter()
+                result["accepted"] = True
+                timing_status = operation.to_record().get("timing_status") or {}
+                result["timing_confidence"] = (
+                    "simulated"
+                    if timing_status.get("emulated")
+                    else "software_start"
+                )
+                self._emit_protocol_operation_event(
+                    operation,
+                    "triggered",
+                    perf_time=result["daqmx_start_entry_perf_time"],
+                    timing_confidence=result["timing_confidence"],
+                )
+            except Exception as error:
+                result["accepted"] = False
+                result["error"] = f"{type(error).__name__}: {error}"
+                logger.exception("Direct stim-to-NI trigger rejected")
+            observer = self._direct_trigger_observer
+            if observer is not None:
+                try:
+                    observer(result)
+                except Exception:
+                    logger.exception("Direct trigger observer failed")
+
+    def _on_protocol_laser_terminal(self, operation) -> None:
+        state = getattr(operation.state, "value", operation.state)
+        observations = tuple(getattr(operation, "observations", ()))
+        perf_time = observations[-1][1] if observations else time.perf_counter()
+        confidence = (
+            "task_completion"
+            if state == "completed"
+            else "operation_failure"
+            if state == "failed"
+            else "operation_cancelled"
+        )
+        self._emit_protocol_operation_event(
+            operation,
+            str(state),
+            perf_time=perf_time,
+            timing_confidence=confidence,
+        )
+
+    def _emit_protocol_operation_event(
+        self,
+        operation,
+        event,
+        *,
+        perf_time=None,
+        timing_confidence,
+    ) -> None:
+        context = dict(getattr(operation, "context", {}) or {})
+        channel_id = int(context.get("channel_id", 0) or 0)
+        if channel_id <= 0:
+            # The prepared profile currently contains one laser channel. Keep
+            # the channel in the operation context for stable persistence.
+            channel_id = int(context.get("laser_channel_id", 1))
+        perf_time = time.perf_counter() if perf_time is None else float(perf_time)
+        wall_time = time.time() - (time.perf_counter() - perf_time)
+        self.trace_received(LaserTraceBlock(
+            channel_id=LaserChannelId(channel_id),
+            source="protocol operation",
+            event=str(event),
+            operation_id=str(getattr(operation, "operation_id", "")),
+            context_json=json.dumps(context, sort_keys=True),
+            timestamp_method="daqmx_operation_perf_counter",
+            timing_confidence=str(timing_confidence),
+            origin_perf_time=perf_time,
+            origin_wall_time=wall_time,
+        ))
+
+    def _manual_pulse_requested(self, pulse_train, manual_context) -> _ManualPulse:
+        """Tell a manual Run Pulse as asked for, as the controller is called.
+
+        Its time is taken before the call, so the output starts at or after
+        it: the controller has still to write and start the train, and an
+        external trigger's edge starts it later still.
+        """
+        manual = self._manual_pulse(
+            pulse_train, manual_context, time.perf_counter(), time.time())
+        self._emit_manual_pulse_event(
+            manual, "requested", "before_output_start", manual.context,
+            manual.perf_time, manual.wall_time)
+        return manual
+
+    def _manual_pulse(self, pulse_train, manual_context, perf_time, wall_time) -> _ManualPulse:
+        """A manual Run Pulse asked for at `perf_time`, under a new manual- id."""
+        external = bool(pulse_train.trigger_source)
+        return _ManualPulse(
+            channel_id=pulse_train.channel_id,
+            operation_id=MANUAL_PULSE_OPERATION_PREFIX + str(uuid.uuid4()),
+            context={
+                **dict(manual_context),
+                "manual": True,
+                "laser_channel_id": int(pulse_train.channel_id),
+                "amplitude_volts": float(pulse_train.amplitude_volts),
+                # How Run Pulse started it, in LaserFiring's names: an external
+                # trigger's terminal and edge, or none for an internal start.
+                # It never pulses a board STIM line.
+                "route": {
+                    "trigger_terminal": pulse_train.trigger_source or "",
+                    "trigger_edge": pulse_train.trigger_edge if external else None,
+                    "stim_line": None,
+                },
+            },
+            perf_time=perf_time,
+            wall_time=wall_time,
+        )
+
+    def _manual_pulse_trace(self, pulse_train, manual) -> LaserTraceBlock:
+        """A manual Run Pulse's waveform, told from the time it was asked for.
+
+        Stamped as it is told, its rows fell after the train had ended. Drawn
+        from the request's time, each point was output at or after its row's
+        time. The live graph places a trace by its own x values, not by these.
+        """
+        return dataclasses.replace(
+            self._make_pulse_trace(pulse_train),
+            origin_perf_time=manual.perf_time,
+            origin_wall_time=manual.wall_time,
+            timestamp_method=_MANUAL_PULSE_TIMESTAMP_METHOD,
+            timing_confidence="before_output",
+        )
+
+    def _manual_pulse_ended(self, manual, event, timing_confidence, error=None) -> None:
+        """Tell how a manual Run Pulse ended, and what its output may hold.
+
+        That is what the model keeps as the laser's last command: the minimum
+        once it completed, its amplitude once it failed or was cancelled, and
+        the command before it once it was refused, which drove nothing.
+        """
+        context = {
+            **manual.context,
+            "last_command_volts": self.last_command_volts.get(int(manual.channel_id)),
+        }
+        if error is not None:
+            context["error_class"] = type(error).__name__
+            context["error"] = str(error)
+        self._emit_manual_pulse_event(
+            manual, event, timing_confidence, context, time.perf_counter(), time.time())
+
+    def _emit_manual_pulse_event(
+        self, manual, event, timing_confidence, context, perf_time, wall_time,
+    ) -> None:
+        self.trace_received(LaserTraceBlock(
+            channel_id=manual.channel_id,
+            source="manual pulse",
+            event=event,
+            operation_id=manual.operation_id,
+            context_json=json.dumps(context, sort_keys=True),
+            timestamp_method=_MANUAL_PULSE_TIMESTAMP_METHOD,
+            timing_confidence=timing_confidence,
+            origin_perf_time=perf_time,
+            origin_wall_time=wall_time,
+        ))
+
+    def run_calibration_ramp(
+        self,
+        ramp: LaserCalibrationRamp,
+        *,
+        controller: Optional[LaserControllerProtocol] = None,
+    ) -> Tuple[LaserCalibrationPoint, ...]:
+        """Run the ramp on `controller`, or on this model's own controller."""
+        self.trace_received(
+            LaserTraceBlock(
+                channel_id=ramp.channel_id,
+                source="calibration",
+                replace=True,
+            )
+        )
+        if controller is None:
+            controller = self._require_controller()
+        points = controller.run_calibration_ramp(ramp)
+        if points:
+            prev, self._last_feedback_sample = self._last_feedback_sample, LaserFeedbackSample(
+                channel_id=points[-1].channel_id,
+                command_volts=points[-1].command_volts,
+                diode_volts=points[-1].diode_volts,
+                command_copy_volts=points[-1].command_copy_volts,
+            )
+            self._on_property_changed(self.LAST_FEEDBACK_SAMPLE, self._last_feedback_sample, prev)
+            sample_rate_hz = self._configuration.sample_rate_hz or 1.0
+            seconds_per_step = ramp.samples_per_step / sample_rate_hz
+            self.trace_received(
+                LaserTraceBlock(
+                    channel_id=ramp.channel_id,
+                    source="calibration",
+                    x_values=tuple(index * seconds_per_step for index in range(len(points))),
+                    command_volts=tuple(point.command_volts for point in points),
+                    diode_volts=tuple(point.diode_volts for point in points),
+                    command_copy_volts=tuple(
+                        math.nan if point.command_copy_volts is None else point.command_copy_volts
+                        for point in points
+                    ),
+                    replace=True,
+                )
+            )
+        return points
+
+    def make_diode_power_curve(self, points: Tuple[LaserCalibrationPoint, ...]) -> LaserDiodePowerCurve:
+        if not points:
+            raise ValueError("calibration points cannot be empty")
+        return LaserDiodePowerCurve(points[0].channel_id, points)
+
+    def close_all_shutters(self) -> None:
+        controller = self._controller
+        if controller is not None:
+            controller.close_all_shutters()
+
+    def close(self) -> None:
+        controller = self._controller
+        if controller is None:
+            return
+        was_connected = self.is_connected
+        try:
+            # The controller closes its shutters itself, once it has marked
+            # itself closed (NidaqLaserController.close). Driven from here
+            # first, a driver hung in that write held the close before
+            # anything was marked closed, with every cancel and abort behind.
+            controller.close()
+        finally:
+            self._controller = None
+            self._keep_if_work_left_running(controller)
+            self._on_property_changed(self.IS_CONNECTED, False, was_connected)
+
+    def _keep_if_work_left_running(self, controller) -> None:
+        work_left_running = getattr(controller, "work_left_running", None)
+        if work_left_running is not None and work_left_running():
+            with self._closed_with_work_left_lock:
+                self._closed_with_work_left.append(controller)
+
+    def work_left_running_after_close(self) -> tuple:
+        """What controllers this model closed left running, until it ends.
+
+        A pulse train or a ramp their close stopped waiting for, which can
+        still act on the lines a new controller would open on.
+        """
+        with self._closed_with_work_left_lock:
+            controllers = tuple(self._closed_with_work_left)
+        left = {controller: controller.work_left_running() for controller in controllers}
+        with self._closed_with_work_left_lock:
+            self._closed_with_work_left = [
+                controller for controller in self._closed_with_work_left
+                if left.get(controller, True)]
+        return tuple(item for items in left.values() for item in items)
+
+    def wait_for_work_left_running_after_close(self, timeout: Optional[float] = None) -> bool:
+        """Wait for work_left_running_after_close() to end; whether it has."""
+        with self._closed_with_work_left_lock:
+            controllers = tuple(self._closed_with_work_left)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for controller in controllers:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if not controller.wait_for_work_left_running(remaining):
+                return False
+        return not self.work_left_running_after_close()
+
+    def _require_controller(self) -> LaserControllerProtocol:
+        controller = self._controller
+        if controller is None:
+            raise RuntimeError("Laser controller is not configured")
+        return controller
+
+    def _emit_feedback_trace(self, sample: LaserFeedbackSample) -> None:
+        self.trace_received(
+            LaserTraceBlock(
+                channel_id=sample.channel_id,
+                source="feedback",
+                x_values=(0.0,),
+                command_volts=(sample.command_volts,),
+                diode_volts=(sample.diode_volts,),
+                command_copy_volts=(
+                    math.nan if sample.command_copy_volts is None else sample.command_copy_volts,
+                ),
+            )
+        )
+
+    def _make_pulse_trace(self, pulse_train: LaserPulseTrain) -> LaserTraceBlock:
+        channel = self._configuration.get_channel(pulse_train.channel_id)
+        minimum = channel.minimum_command_volts
+        amplitude = pulse_train.amplitude_volts
+        duration_s = pulse_train.duration_ms / 1000.0
+        baseline_s = pulse_train.baseline_ms / 1000.0
+        post_stim_s = pulse_train.post_stim_ms / 1000.0
+        period_s = (
+            1.0 / pulse_train.frequency_hz
+            if pulse_train.frequency_hz is not None
+            else duration_s
+        )
+        x_values = [0.0]
+        y_values = [minimum]
+        current_t = 0.0
+
+        def horizontal(to_t: float) -> None:
+            nonlocal current_t
+            if to_t <= current_t:
+                return
+            x_values.append(to_t)
+            y_values.append(y_values[-1])
+            current_t = to_t
+
+        def transition(value: float) -> None:
+            x_values.extend((current_t, current_t))
+            y_values.extend((y_values[-1], value))
+
+        horizontal(baseline_s)
+        for pulse_index in range(pulse_train.pulse_count):
+            pulse_start = baseline_s + pulse_index * period_s
+            horizontal(pulse_start)
+            transition(amplitude)
+            horizontal(pulse_start + duration_s)
+            transition(minimum)
+        horizontal(current_t + post_stim_s)
+        trigger_kind = "external" if pulse_train.trigger_source else "internal"
+        return LaserTraceBlock(
+            channel_id=pulse_train.channel_id,
+            source=f"{trigger_kind} pulse",
+            x_values=tuple(x_values),
+            command_volts=tuple(y_values),
+        )

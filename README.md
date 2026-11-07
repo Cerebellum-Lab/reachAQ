@@ -1,12 +1,12 @@
-# Autotrainer
+# Autotrainer / reachAQ
 
 
 * [Overview](#overview)
 * [Installation instructions](INSTALL.md)
+* [reachAQ Linux install guide](linux-install-instructions.md)
 * [Applications](#applications)
-  * [Acquisition](#acquisition-application)
-  * [Tunnel Test](#tunnel-test-application)
-  * [Pellet Delivery Test](#pellet-delivery-test-application)
+  * [Acquisition](#applications)
+  * [Pellet Delivery Test](#applications)
 * [Scripts](#scripts)
 * [Additional Tools](#additional-tools)
 * [Testing](#testing)
@@ -21,10 +21,35 @@
 * [Code Guidelines](#code-guidelines)
 
 ## Overview
-This repository contains the Autotrainer modules and applications that are primarily used on-device.  A monorepo
+This repository contains the Autotrainer modules and reachAQ applications that are primarily used on-device.  A monorepo
 is used here primarily as a development convenience.  Individual modules and applications can and are installed
 in on devices independently.  This loose-coupling should be assumed when managing dependencies or refactoring
 common code.
+
+For the current reachAQ Dell/Ubuntu runtime, use
+[linux-install-instructions.md](linux-install-instructions.md). The expected
+environment name is `reachaq`, the GUI entry point is `python -m reachAQ.app`,
+and local acquisition data should be configured under
+`$HOME/Documents/rawdatalocal`.
+
+Install, start and update in three commands - see [INSTALL.md](INSTALL.md):
+
+```bash
+./tools/install/reachaq-linux-install.sh   # install, or repair; Python 3.10, both pose engines
+reachaq                                    # start
+reachaq-sync                               # update the checkout
+```
+
+Portable host setup is automated by
+[`tools/install/reachaq-linux-install.sh`](tools/install/reachaq-linux-install.sh).
+Vendor drivers and rig-specific hardware configuration remain in separate
+guides selected from the Linux installation map. The portable installer also
+installs the terminal-visible mouse-icon desktop launcher, verifies the
+SoftMouse HTTPS/spreadsheet/keyring dependencies and RFID serial dependency and
+permissions, and installs the tracked publisher systemd units. Credential
+entry and enabling the one designated nightly timer remain explicit
+post-install steps in the
+[SoftMouse/RFID checklist](tools/softmouse_sync/CONFIGURATION_GUIDE.md).
 
 ## Applications
 
@@ -36,54 +61,80 @@ from the core logic of the applications for two reasons:
 **Current Applications**
 
 * Acquisition Application
-  *  The local user interface for integrated camera, head fix, pellet delivery, and pose inference modules 
-  * `python -m tools.acquisition.gui`
+  * The local user interface for integrated camera, pellet delivery, NI-DAQ,
+    laser, and pose-inference modules
+  * `conda run --no-capture-output -n reachaq python -m reachAQ.app -c ~/Autotrainer/system_configuration.yaml`
+    * The GUI starts idle by default. Use `--start-mode running` only when immediate startup is intentional.
+    * Use `--no-live-inference` or `--live-inference` to override the saved inference setting for one run.
+    * Hardware startup progress is written to the log and launching terminal as `HARDWARE INIT` records.
+    * The installed `reachAQ.desktop` mouse icon opens the same application in a terminal; `reachaq` starts it from any shell.
+    * Only one instance runs per user, however it is started: a second start exits with status 3 and names the running PID.
     * [Detailed Instructions](tools/acquisition/README.md)
+    * [Session recording, synchronization, persistence, and hardware isolation](docs/acquisition/session-recording-and-synchronization.md)
+    * [Recording sessions, pellet trials, protocols, and schema migration](docs/acquisition/session-trials-protocols.md)
+    * [Session validation command and rule coverage](docs/acquisition/session-validation.md)
+    * [Pellet firmware compatibility and rollout](docs/acquisition/pellet-firmware-compatibility.md)
+    * Use `--random-cameras` to start with software-generated frames when no physical cameras are configured.
   * Headless implementation for command line only
-    * `python -m tools.acquisition.headless`
-* Tunnel Test Application
-  * Standalone UI for interfacing with the tunnel hardware components
-  * `python -m tools.head_fix.gui`
+    * `auto-trainer-headless -c ~/Autotrainer/system_configuration.yaml`
+    * Headless mode continues to start acquisition by default because it has no UI start control.
 * Pellet Delivery Test Application
   * Standalone UI for interfacing with the pellet delivery system
   * `python -m tools.pellet_delivery.gui`
 
 ## Scripts
 
-Most of the content in `scripts` are lightweight utilities to determine if various components of the system are working as expected.
+The `scripts` directory contains focused diagnostics and offline processing
+utilities. Run them from the repository root in the configured environment.
 
-* acquire_image.py
-  * Captures a single image frame from the camera specified by the `cameraurl`.
-* can_console.py
-  * A command line interface to the Alogus hardware.
-* capture_camera.py
-  * Captures 150 frames from the camera specified by the `cameraurl` argument to the location specified by `output`.
-* head_fix_console.py
-  * A command line interface to the Anshutz tunnel unit.  Will log data stream to a csv file.  Supports subset of device commands.
-* list_cameras.py
-  * List all cameras available in the system.
-* load_dlc_model.py
-  * Validates loading of a DLC model with the network module
-* pellet_delivery_console.py
-  * A command line interface to the Anshutz pellet delivery unit.  Supports a subset of device commands.
-* run_dlc_model.py
-  * Sends two saved files through a DLC model with the network module.
+* `scripts/acquire_image.py` - capture and display one frame from a camera URL.
+* `scripts/capture.py` - preview a camera for a selected frame count and
+  optionally record images/video.
+* `scripts/list_cameras.py` - list random, Spinnaker, and playback camera URL
+  forms visible to the video layer.
+* `scripts/can_console.py` - interactive command interface for supported CAN
+  hardware.
+* `scripts/can_measure_counts.py` - decoded message-rate diagnostic using the
+  same environment-selected CAN transport as reachAQ.
+* `scripts/load_dlc_model.py` - load a DeepLabCut model and print its body-part
+  metadata.
+* `scripts/run_dlc_model.py` - run a DeepLabCut model against paired recorded
+  videos.
 
 ## Additional Tools
 
-* auto-trainer-device\tools\head_fix_server.py
-  * Mock server for the Anshutz tunnel unit for testing without the physical device
-  * `python auto-trainer-device\tools\head_fix_server.py`
-    * specify the serial port, `/dev/ttyACM1`, `COM4`, etc...
-    * specify measurement update frequency `-f 100` for 100 Hz
-    * specify random data vs. fixed `-r`
-    * specify firmware version to report `-v 3.0`
-  * whether set to random or fixed data, use the `s`, `d`, `a`, `t`, or `h` commands followed by the value to change those measurement values
-* auto-trainer-device\tools\pellet_server.py
-  * Mock server for the Anshutz pellet delivery unit for testing without the physical device
-  * `python auto-trainer-device\tools\pellet_server.py`
-    * specify the serial port, `/dev/ttyACM1`, `COM4`, etc...
-    * specify firmware version to report `-v 3
+Current hardware bring-up tools live under `tools/hardware`:
+
+* `tools/hardware/validate_can_hardware.py` - discover the pellet CAN board,
+  request status/configuration, or perform explicitly enabled motion tests.
+* `tools/hardware/validate_laser_hardware.py` - validate configured NI-DAQ laser
+  channels one controlled operation at a time.
+* `tools/hardware/verify_nidaq_wiring.py` - drive each board output and laser
+  command in turn and record which NI-DAQ line followed; the same test as
+  **Tools → DAQ Monitor → Wiring test**. See
+  [Check the wiring](docs/linux-install/ni-daq-pxi.md#check-the-wiring).
+* `tools/hardware/qualify_pellet_firmware.py` - collect the rig evidence needed
+  to qualify a new pellet firmware version. See
+  [pellet firmware compatibility](docs/acquisition/pellet-firmware-compatibility.md#qualifying-a-new-firmware-version).
+* `tools/hardware/reachaq-bring-up-can.sh` and the accompanying systemd files -
+  configure and bring up the selected reachAQ SocketCAN interface (`can0` by
+  default) automatically at boot.
+* `tools/hardware/reachaq-bring-down-can.sh` - service stop action that brings
+  down only the configured application CAN channel.
+* `tools/hardware/reachaq-reset-can.sh` and
+  `tools/hardware/reachaq-can-reset.sudoers` - root-owned, narrowly permitted
+  recovery helper used only after a confirmed CAN-domain failure. Ordinary
+  application close only closes its own socket. The helper serializes and
+  debounces service restart, refuses to reset a channel owned by another
+  reachAQ process, and is not a physical emergency stop or board power cycle.
+* [`tools/softmouse_sync/README.md`](tools/softmouse_sync/README.md) - configure
+  SoftMouse publication, per-computer metadata caches, USB RFID readers, the
+  manual UI sync, and the single-host midnight timer.
+
+See [linux-install-instructions.md](linux-install-instructions.md) for the
+installation map and [the PEAK SocketCAN guide](docs/linux-install/peak-socketcan.md)
+for service installation, permissions, termination, commissioning, updates,
+and current invocation examples.
 
 
 ## Testing
@@ -96,17 +147,20 @@ tests for high-level functionality in the applications and that combine elements
 Tests that are longer or require additional configuration are marked as `@pytest.mark.functional` and are not run
 by default.
 
-Tests that require the Alogus hardware are marked as `@pytest.mark.canbus` and are not run by default.
+Tests that require the physical pellet board are marked as `@pytest.mark.canbus` and are not run by default.
 
-PyTest is not installed with via the default installation. To enable testing use
+The portable installer already includes the test dependencies. To add them to
+another environment, from the repository root:
 
-`pip install -e .[test]`
+```bash
+conda run -n reachaq python -m pip install -e '.[test]'
+```
 
 You also need git LFS installed & enabled in your clone repo:
 
 1. install with: `sudo apt-get install git-lfs  # or yum or brew eventually`
-2. enable in current clone repo with: `git lfs --install`
-3. `git lfs pull` and `git checkout` or similar command might be needed to fetch the current binary files.
+2. enable in current clone repo with: `git lfs install --local`
+3. fetch the repository's binary test assets with: `git lfs pull`
 
 Now, to run *all* default tests from the root directory:
 
@@ -147,8 +201,9 @@ You can also give many at once.
 
 ### autotrainer.device
 
-[Device](auto-trainer-device/README.md) implements the hardware interfaces for most non-camera hardware for both existing
-and legacy hardware.  The primary purpose is to provide a consistent interface to the hardware for applications.
+[Device](auto-trainer-device/README.md) implements the shared interfaces for
+pellet-board, NI-DAQ, laser, and related non-camera hardware. The primary
+purpose is to provide a consistent interface to applications.
 
 
 **Autotrainer Dependencies**
@@ -193,7 +248,7 @@ guidelines are in place for future additions and changes to help with and improv
 * Style generally follows PEP8.  This is the default in most editors or lint tools.
   * An exception is made for `autotrainer.pyside`.  Classes derived from PySide follow PySide conventions.
 * All modules are defined as namespace packages to allow for separation of modules under the same `autotrainer` namespace.
-* Code, particularly in modules, should be as platform-agnostic as possible despite having a current target (Jetson->Ubuntu 20.04).
+* Code, particularly in modules, should be as platform-agnostic as possible despite having a current reachAQ target of Ubuntu 22.04 on x86_64.
   * Fallback support does not need to match the target platform behavior where is can not (e.g. CUDA), but allow the code to run as correctly as possible.
   * This is primarily for automated testing in other environments such as GitHub Actions.
   * Secondarily, it allows for development off-hardware when not available or not practical.

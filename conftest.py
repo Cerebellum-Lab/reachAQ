@@ -1,4 +1,31 @@
+import os
+import sys
+from pathlib import Path
+
 import pytest
+
+
+_REPO_ROOT = Path(__file__).resolve().parent
+
+# This is established before importing any application modules. Individual
+# transport codec/backend tests may construct mocked hardware configurations,
+# but no pytest process may select or reset a host CAN interface implicitly.
+os.environ["AUTOTRAINER_CAN_TRANSPORT"] = "emulation"
+os.environ["REACHAQ_PROHIBIT_PRIVILEGED_CAN_RESET"] = "1"
+for _source_dir in reversed((
+    _REPO_ROOT,
+    _REPO_ROOT / "auto-trainer-behavior" / "src",
+    _REPO_ROOT / "auto-trainer-core" / "src",
+    _REPO_ROOT / "auto-trainer-device" / "src",
+    _REPO_ROOT / "auto-trainer-inference" / "src",
+    _REPO_ROOT / "auto-trainer-model" / "src",
+    _REPO_ROOT / "auto-trainer-pyside" / "src",
+    _REPO_ROOT / "auto-trainer-video" / "src",
+)):
+    _source_text = str(_source_dir)
+    if _source_text in sys.path:
+        sys.path.remove(_source_text)
+    sys.path.insert(0, _source_text)
 
 
 pytest_plugins = [
@@ -48,3 +75,48 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_canbus)
         if "bench" in item.keywords and not include_bench:
             item.add_marker(skip_bench)
+
+
+def pytest_unconfigure(config):
+    """CI only: report what is alive as pytest hands over to interpreter exit.
+
+    The job once hung at exit with every test passed. A likely cause is an exit
+    blocked on a child that never died, so name the children and the process tree.
+    The timer armed first dumps every thread's stack only if this process is still
+    alive 5 minutes from now; a healthy exit takes about 22 s on CI, measured from
+    here to the end of the step, and cancels it. Nothing here may fail a healthy run.
+    """
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return
+    import faulthandler
+    import multiprocessing
+    import subprocess
+    import threading
+
+    out = sys.__stderr__ or sys.stderr
+    try:
+        # Armed before anything that could block, ps on a wedged process included.
+        faulthandler.dump_traceback_later(300, file=out)
+    except Exception:
+        pass
+    try:
+        print("\n=== exit diagnostics ===", file=out)
+        for proc in multiprocessing.active_children():
+            print(f"child {proc.name} pid={proc.pid} daemon={proc.daemon}", file=out)
+        print(
+            "non-daemon threads:",
+            [t.name for t in threading.enumerate() if not t.daemon and t is not threading.main_thread()],
+            file=out,
+        )
+        out.flush()
+        subprocess.run(
+            ["ps", "-ww", "--forest", "-u", str(os.getuid()), "-o", "pid,ppid,etimes,stat,wchan:20,comm,args"],
+            stdout=out,
+            check=False,
+            timeout=30,
+        )
+    except Exception as error:  # a diagnostic must never change the exit status
+        try:
+            print(f"exit diagnostics failed: {error!r}", file=out)
+        except Exception:
+            pass

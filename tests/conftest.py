@@ -6,6 +6,7 @@ from autotrainer.behavior import BehaviorAlgorithm
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core import SystemConfiguration, CameraConfiguration, CameraId
+from autotrainer.core.logging import unregister_fatal_exception_callback
 from autotrainer.device import MotorConfigurationFile, CompoundMovements
 
 from tools.acquisition.model.app_model import AppModel
@@ -15,13 +16,30 @@ from tools.acquisition.model.user_preferences import UserPreferences
 import top_fixtures
 
 
+@pytest.fixture(autouse=True)
+def _isolated_runtime_dir(tmp_path_factory, monkeypatch):
+    """Give each test its own XDG_RUNTIME_DIR, inherited by what it launches.
+
+    The application refuses to start while another instance holds the per-user
+    lock in the runtime directory. Tests that launch the real CLI were refused
+    with exit 3 whenever an operator's reachAQ was running on the same account,
+    as on christielab10 on 2026-09-24.
+    """
+    runtime = tmp_path_factory.mktemp("runtime")
+    runtime.chmod(0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+
+
 @pytest.fixture
 def system_config(trainer_config_dir, tmp_path):
     config = SystemConfiguration()
     # mostly ~all default params are good, but we need:
     config.behavior.pellet_delivery.is_enabled = True
     config.behavior.pellet_delivery.is_intersession_analysis_enabled = True
-    for cam_member in (CameraId.Left, CameraId.Right, CameraId.Web):
+    # Application tests use the mock device stack and must not depend on the
+    # host SocketCAN interface being up.
+    config.hardware.can_enabled = False
+    for cam_member in (CameraId.Left, CameraId.Right, CameraId.Camera3):
         params = dict(width=300, height=200)
         cam = CameraConfiguration(name=cam_member.name, params=params)
         cam.record_prebuffer_duration = 0
@@ -53,9 +71,17 @@ def app_model(mock_system, user_pref, calib_dir, diamond_config_path, system_con
     app = AppModel(
         user_pref,
         system_machine=mock_system.system_machine,
-        sensor_analysis=mock_system.sensor_analysis,
+        analysis=mock_system.sensor_analysis,
         inference_model=mock_system.inference,
         system_message_handler=fake_system_msg_handler,
         calib_dir=calib_dir,
     )
-    return app
+    try:
+        yield app
+    finally:
+        # Most tests use mocked worker lifecycles and cannot safely call the
+        # full AppModel.on_close(). Still unregister the process-global fatal
+        # callback so one later test exception cannot fan out across every
+        # AppModel created earlier in the pytest process.
+        unregister_fatal_exception_callback(app._on_fatal_exception)
+        top_fixtures.release_multiprocessing_resources(app)

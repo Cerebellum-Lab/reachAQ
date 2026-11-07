@@ -1,4 +1,6 @@
 import ctypes
+import copy
+import logging
 import math
 import multiprocessing
 import os
@@ -21,18 +23,37 @@ from autotrainer.core import clear_queue, FixedArrayQueue, FixedArrayMultiQueue,
     CameraConfiguration, CameraId, NotificationCenter, TriggerNotification, Notification, get_verbose_logger, \
     get_perf_now
 from autotrainer.core.multiproc import get_mp_ctx
+from autotrainer.core.logging import log_hardware_initialization
 from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
-from autotrainer.core.video_detection import PresenceDetectionAttrs
 from autotrainer.video import VideoCapture, VideoRecordProperties, VideoRecordMode, VideoManager, \
-    VideoReader, CaptureCommandKind, CaptureCameraAttrs, CaptureInferenceAttrs, CaptureAttrs
+    VideoReader, CaptureCommandKind, CaptureCameraAttrs, CaptureInferenceAttrs, CaptureAttrs, \
+    StimCameraDetectionConfiguration, StimRoiDefinition
 from autotrainer.core.capture import CaptureProcessStatus
+from autotrainer.video.camera_discovery import (
+    DEFAULT_CAMERA_DISCOVERY_TIMEOUT_SECONDS,
+    CameraDiscoveryError,
+    discover_spin_cameras,
+)
 
+from autotrainer.video.ffmpeg_writer import x264_available
+from tools.acquisition.model.capture_binning import (
+    CAPTURE_BINNING_PARAM,
+    OFFSET_ALIASES,
+    base_binning as params_base_binning,
+    capture_binning as params_capture_binning,
+    capture_factor,
+    runtime_capture_params,
+)
 from tools.acquisition.model.user_preferences import UserPreferences
 
 logger = get_verbose_logger(__name__)
 
 
-def create_camera_list():
+def create_camera_list(
+    *,
+    include_hardware: bool = False,
+    discovery_timeout_seconds: float = DEFAULT_CAMERA_DISCOVERY_TIMEOUT_SECONDS,
+):
     cameras = list()
 
     cameras.append(CaptureCameraAttrs(name="Random Image", url="random://0?width=300&height=200"))
@@ -46,9 +67,75 @@ def create_camera_list():
         for line in lines:
             parts = line.split(",")
             if len(parts) == 2:
-                cameras.append(CaptureCameraAttrs(name=parts[0].strip(), url=parts[1].strip()))
+                _append_unique_camera(cameras, parts[0].strip(), parts[1].strip())
+
+    if include_hardware:
+        started = time.perf_counter()
+        log_hardware_initialization(logger, "START | camera discovery | backend=spinnaker")
+        try:
+            spin_serials = discover_spin_cameras(
+                timeout_seconds=discovery_timeout_seconds
+            )
+        except Exception as exc:
+            stage = getattr(exc, "stage", "unknown")
+            exception_type = getattr(
+                exc,
+                "exception_type",
+                exc.__class__.__name__,
+            )
+            log_hardware_initialization(
+                logger,
+                "FAILED | camera discovery | backend=spinnaker stage=%s "
+                "elapsed=%.3fs exception=%s error=%s",
+                stage,
+                time.perf_counter() - started,
+                exception_type,
+                str(exc) or exc.__class__.__name__,
+                level=logging.ERROR,
+            )
+            if isinstance(exc, CameraDiscoveryError) and exc.traceback_text:
+                logger.error(
+                    "Spinnaker discovery child traceback:\n%s",
+                    exc.traceback_text,
+                )
+            raise
+        log_hardware_initialization(
+            logger,
+            "READY | camera discovery | backend=spinnaker count=%d elapsed=%.3fs serials=%s",
+            len(spin_serials),
+            time.perf_counter() - started,
+            spin_serials,
+        )
+        for serial in spin_serials:
+            _append_unique_camera(cameras, f"Spinnaker {serial}", f"spinnaker://{serial}")
 
     return cameras
+
+
+def _append_unique_camera(cameras: List[CaptureCameraAttrs], name: str, url: str) -> None:
+    if not name or not url:
+        return
+    if any(camera.url == url for camera in cameras):
+        return
+    candidate = name
+    suffix = 1
+    existing_names = {camera.name for camera in cameras}
+    while candidate in existing_names:
+        candidate = f"{name} ({suffix})"
+        suffix += 1
+    cameras.append(CaptureCameraAttrs(name=candidate, url=url))
+
+
+def _is_spinnaker_source(camera: CaptureCameraAttrs) -> bool:
+    return camera_source_binding_key(camera.url).startswith("spinnaker://")
+
+
+def camera_source_binding_key(url: str) -> str:
+    """Return the physical binding identity, excluding capture parameters."""
+    parsed = urllib.parse.urlparse(url or "")
+    if parsed.scheme.lower() == "spinnaker":
+        return f"spinnaker://{parsed.hostname or parsed.netloc}"
+    return url or ""
 
 
 class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
@@ -74,10 +161,13 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         cam_id: CameraId = CameraId.Left,
         mp_ctx: Optional[BaseContext] = None,
         msg_queue: Optional[multiprocessing.Queue] = None,
-        presence_detection: Optional[PresenceDetectionAttrs] = None,
         synced_cam_recording: Optional[Synchronized] = None,
         synced_cam_frame_index: Optional[Synchronized] = None,
+        record_start_perf: Optional[Synchronized] = None,
+        record_generation: Optional[Synchronized] = None,
+        align_record_start_perf: bool = False,
         record_stop_sema: Optional[SemaphoreType] = None,
+        stim_trigger_queue: Optional[multiprocessing.Queue] = None,
     ):
         super().__init__()
 
@@ -92,10 +182,13 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._name = name
         self._preferences = preferences
         self._camera_index = camera_index
-        self._presence_detection = presence_detection
         self._synced_cam_recording = synced_cam_recording
         self._synced_cam_frame_index = synced_cam_frame_index
+        self._record_start_perf = record_start_perf
+        self._record_generation = record_generation
+        self._align_record_start_perf = align_record_start_perf
         self._record_stop_sema = record_stop_sema
+        self._stim_trigger_queue = stim_trigger_queue
 
         self._camera_source: CaptureCameraAttrs = CaptureCameraAttrs(name="", url="")
         self._camera_properties = {}
@@ -108,17 +201,20 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._msg_queue = msg_queue  # for sending "status" message(s) to main process
         self._video_command_queue = mp_ctx.Queue(maxsize=64)
         self._video_status = mp_ctx.Value(ctypes.c_int, CaptureProcessStatus.UNKNOWN)
-        self._video_frame_index = mp_ctx.Value(ctypes.c_int64, -1)  # actually unused
+        self._video_frame_index = mp_ctx.Value(ctypes.c_int64, -1)
         self._video_image_queue: Optional[FixedArrayQueue] = None
-        self._errors: SynchronizedString = mp_ctx.Array(ctypes.c_char, bytes(512))
+        self._errors: SynchronizedString = mp_ctx.Array(ctypes.c_char, bytes(4096))
         self._watchdog_capture_perf_c = mp_ctx.Value(ctypes.c_double, math.nan)
         self._shape = None
 
         self._cur_conf: CameraConfiguration = CameraConfiguration()
+        self._operator_conf: Optional[CameraConfiguration] = None
+        self._runtime_stim_mode_active = False
         self._is_enabled = True
         self._is_primary = False
+        self._configured_is_primary = False
 
-        self._record_mode = VideoRecordMode.CONTINUOUS
+        self._record_mode = VideoRecordMode.TRIGGER
         self._is_recording_enabled = False
         self._record_rotate_interval = 3600
         self._is_still_capture_enabled = False
@@ -126,6 +222,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._display_dots_detection = True
 
         self._display_update_fcn = None
+        self._stim_detection_configuration = None
 
         self._frame_count = 0
         self._start = 0
@@ -149,6 +246,10 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         return self._camera_index
 
     @property
+    def camera_id(self) -> CameraId:
+        return self._id
+
+    @property
     def video_status(self) -> CaptureProcessStatus:
         return CaptureProcessStatus(self._video_status.value)
 
@@ -158,6 +259,10 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         if proc is None:
             return math.nan
         return self._watchdog_capture_perf_c.value
+
+    @property
+    def last_captured_frame_index(self) -> int:
+        return self._video_frame_index.value
 
     @property
     def capture_process_status(self) -> CaptureProcessStatus:
@@ -178,6 +283,36 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
     @property
     def camera_list(self) -> List[CaptureCameraAttrs]:
         return self._camera_list
+
+    def refresh_camera_list(self, camera_list: Optional[Iterable[CaptureCameraAttrs]] = None) -> int:
+        old_list = self._camera_list
+        refreshed = list(create_camera_list(include_hardware=True) if camera_list is None else camera_list)
+        current_source = self._camera_source
+        # Spinnaker serial bindings belong to CameraConfiguration. Discovery still
+        # verifies every serial, but the editor must not offer another camera's
+        # serial as an interchangeable source.
+        refreshed = [camera for camera in refreshed if not _is_spinnaker_source(camera)]
+        if (
+            current_source is not None
+            and current_source.url
+            and (
+                _is_spinnaker_source(current_source)
+                or not any(camera.url == current_source.url for camera in refreshed)
+            )
+        ):
+            refreshed.insert(0, current_source)
+        self._camera_list = refreshed
+        self.property_changed(self.CAMERA_LIST_PROP, self._camera_list, old_list)
+        if current_source is not None:
+            matching_source = next(
+                (camera for camera in refreshed if camera.url == current_source.url),
+                None,
+            )
+            if matching_source is not None and matching_source != current_source:
+                previous_source = self._camera_source
+                self._camera_source = matching_source
+                self.property_changed(self.CAMERA_PROP, matching_source, previous_source)
+        return len(self._camera_list)
 
     @property
     def camera_source(self) -> CaptureCameraAttrs:
@@ -241,6 +376,44 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         return self._is_primary
 
     @property
+    def configured_is_primary(self) -> bool:
+        return self._configured_is_primary
+
+    def set_runtime_primary(self, is_primary: bool) -> None:
+        self._is_primary = is_primary
+
+    def _runtime_camera_url(self) -> str:
+        """Apply the effective capture role and binning preset without mutating saved configuration."""
+        camera_url = self._camera_source.url
+        parsed = urllib.parse.urlsplit(camera_url)
+        is_spinnaker = parsed.scheme.lower() == "spinnaker"
+        # Resolved from the parsed properties, which include the camera
+        # class defaults (e.g. offsetx/offsety when the config omits them).
+        preset = runtime_capture_params(self._camera_properties)
+        if not is_spinnaker and preset is None:
+            return camera_url
+        dropped = set()
+        if is_spinnaker:
+            dropped |= {"primary", "secondary"}
+        if preset is not None:
+            dropped |= {CAPTURE_BINNING_PARAM, *preset, *OFFSET_ALIASES}
+        query = [
+            (name, value)
+            for name, value in urllib.parse.parse_qsl(
+                parsed.query,
+                keep_blank_values=True,
+            )
+            if name.lower() not in dropped
+        ]
+        if preset is not None:
+            query.extend(preset.items())
+        if is_spinnaker:
+            query.append(("primary", "yes" if self._is_primary else "no"))
+        return urllib.parse.urlunsplit(
+            parsed._replace(query=urllib.parse.urlencode(query))
+        )
+
+    @property
     def shape(self) -> Tuple[int, int]:
         """
         Be aware this is the shape as seen by the cameras ndarray frames which is row x col not width x height.
@@ -259,12 +432,63 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._on_property_changed(self.SHAPE_PROP, value, prev)
 
     @property
-    def last_error(self) -> str:
-        return self._last_error
+    def capture_binning(self) -> Optional[int]:
+        """The capture-binning preset, or None when the camera captures at its base binning."""
+        return params_capture_binning(self._camera_properties)
 
     @property
-    def presence_detection(self) -> PresenceDetectionAttrs:
-        return self._presence_detection
+    def base_binning(self) -> Optional[int]:
+        """The saved hbin when it equals vbin; what ``shape`` and the calibration are sized for."""
+        return params_base_binning(self._camera_properties)
+
+    @property
+    def effective_capture_binning(self) -> Optional[int]:
+        """The binning the camera captures at: the preset, else the base."""
+        preset = self.capture_binning
+        return self.base_binning if preset is None else preset
+
+    @property
+    def video_encoder(self) -> str:
+        """The recorder's encoder: "x264" at a capture-binning preset, else "mp4v".
+
+        OpenCV's mp4v writer cannot keep up with 1024x1024 at 150 fps on a lit
+        scene (136 fps per camera on christielab10); x264 through ffmpeg can.
+        The base capture keeps mp4v, so standard sessions keep today's files.
+        """
+        try:
+            larger = capture_factor(self._camera_properties) > 1
+        except ValueError:
+            larger = False  # an impossible preset fails the start instead
+        return "x264" if larger else "mp4v"
+
+    @property
+    def capture_shape(self) -> Tuple[int, int]:
+        """(rows, cols) of the frames the camera delivers. ``shape`` is what consumers receive.
+
+        An impossible preset reports the base shape here; it fails the capture
+        start (on_prepare_capture), which is where it is reported.
+        """
+        rows, cols = self.shape
+        try:
+            k = capture_factor(self._camera_properties)
+        except ValueError:
+            k = 1
+        return rows * k, cols * k
+
+    def set_capture_binning(self, value: Optional[int]) -> None:
+        """Choose the capture-binning preset; it applies from the next capture start."""
+        if self._video_capture is not None:
+            raise RuntimeError("Capture binning cannot change while capture is active")
+        conf = self.save_configuration()
+        if value is None:
+            conf.params.pop(CAPTURE_BINNING_PARAM, None)
+        else:
+            conf.params[CAPTURE_BINNING_PARAM] = int(value)
+        self.load_configuration(conf)
+
+    @property
+    def last_error(self) -> str:
+        return self._last_error
 
     @property
     def display_dots_detection(self):
@@ -300,7 +524,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
     def set_display_fcn(self, display_fcn):
         self._display_update_fcn = display_fcn
 
-    def refresh_image(self, data: ndarray):
+    def refresh_image(self, data: ndarray, frame_id: int = -1):
         if self._frame_count == 0:
             self._start = time.perf_counter_ns()
 
@@ -311,16 +535,27 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
             self._trace(f"display fps: {int(self._fps)}")
 
         if self._display_update_fcn is not None and self._video_capture is not None:
-            self._display_update_fcn(data, self._fps)
+            self._display_update_fcn(data, self._fps, frame_id)
 
     def on_prepare_capture(
         self,
         network_queue: Optional[FixedArrayMultiQueue] = None,
+        *,
+        inference_index: Optional[int] = None,
     ) -> bool:
         self._last_error = None
         if not self._is_enabled:
             return True
+        # Resolve the capture URL first: an impossible binning preset raises
+        # here, before any queue or reader is allocated for this start.
+        camera_url = None if self._camera_source is None else self._runtime_camera_url()
+        if self._is_recording_enabled and self.video_encoder == "x264" and not x264_available():
+            raise ValueError(
+                f"capture binning {self.capture_binning} records H.264 through ffmpeg's libx264, "
+                "which is not installed")
         self._frame_count = 0
+        self._video_frame_index.value = -1
+        self._errors.value = b""
 
         # before everything below, particularly video_reader
         self._video_image_queue = None if self._shape is None else FixedArrayQueue(
@@ -333,15 +568,17 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self._video_reader_initialize()
 
         if self._camera_source is not None:
-            if "?" in self._camera_source.url:
-                url = self._camera_source.url + f"&name={self._name}"
+            if "?" in camera_url:
+                url = camera_url + f"&name={self._name}"
             else:
-                url = self._camera_source.url + f"?name={self._name}"
+                url = camera_url + f"?name={self._name}"
 
             camera = CaptureCameraAttrs(name=self._name, url=url)
 
             inference = None if network_queue is None else CaptureInferenceAttrs(
-                queue=network_queue, index=self._camera_index)
+                queue=network_queue,
+                index=self._camera_index if inference_index is None else inference_index,
+            )
 
             capture_attrs = CaptureAttrs(
                 command_queue=self._video_command_queue,
@@ -353,21 +590,30 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
                 camera_index=self._camera_index,
                 inference=inference,
                 errors=self._errors,
-                presence_detection_attrs=self._presence_detection,
                 is_primary=self._is_primary,
                 msg_queue=self._msg_queue,
                 record_prebuffer_duration=self._cur_conf.record_prebuffer_duration,
                 watchdog_perf_c=self._watchdog_capture_perf_c,
                 synced_cam_record_enabled=self._synced_cam_recording,
                 synced_cam_frame_index=self._synced_cam_frame_index,
+                record_start_perf=self._record_start_perf,
+                record_generation=self._record_generation,
+                align_record_start_perf=self._align_record_start_perf,
                 record_stop_sema=self._record_stop_sema,
+                stim_detection=self._stim_detection_configuration,
+                stim_trigger_queue=self._stim_trigger_queue,
             )
 
             rotate_interval = self._record_rotate_interval if self._is_recording_enabled else -1
             image_interval = self._still_image_capture_interval if self._is_still_capture_enabled else 0
-            record_properties = VideoRecordProperties(project_info=self._project, record_mode=self.record_mode,
-                                                      video_rotate_interval=rotate_interval,
-                                                      image_interval=image_interval)
+            record_properties = VideoRecordProperties(
+                project_info=self._project,
+                record_mode=self.record_mode,
+                video_rotate_interval=rotate_interval,
+                image_interval=image_interval,
+                record_generation=self._record_generation,
+                encoder=self.video_encoder,
+            )
             # Leave the watchdog counter unset (nan) until the capture child writes its first
             # real timestamp; the monitor ignores nan. Seeding a live perf_counter here makes the
             # counter age in real time while the child is still spawning, which on slow spawn-based
@@ -423,14 +669,23 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
     def on_close(self):
         logger.debug("closing %s", self.name)
         self.on_capture_stop()
+        NotificationCenter.default_center().remove_observer(TriggerNotification.CAPTURE_ID, self._on_trigger)
 
     @property
     def active_config(self) -> CameraConfiguration:
         return self._cur_conf
 
-    def load_configuration(self, conf: CameraConfiguration):
+    def load_configuration(
+        self,
+        conf: CameraConfiguration,
+        *,
+        runtime_mode: bool = False,
+    ):
         self._id = conf.id
-        self._name = str(conf.id)
+        self._name = conf.name if conf.id == CameraId.Camera3 and conf.name else str(conf.id)
+        if not runtime_mode:
+            self._operator_conf = copy.deepcopy(conf)
+        self._runtime_stim_mode_active = bool(runtime_mode)
         self._cur_conf = conf  # keeping config on self too
         self.is_enabled = conf.is_enabled
         self.is_recording_enabled = conf.is_record_enabled
@@ -438,7 +693,13 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         self.is_still_capture_enabled = conf.is_still_image_capture_enabled
         self.still_image_capture_interval = conf.still_image_capture_interval
         raw_primary = conf.params.get("primary") or "false"
-        self._is_primary = raw_primary.lower() in {"yes", "true", "1", "on"} if isinstance(raw_primary, str) else raw_primary is True
+        self._configured_is_primary = (
+            raw_primary.lower() in {"yes", "true", "1", "on"}
+            if isinstance(raw_primary, str)
+            else raw_primary is True
+        )
+        self._is_primary = self._configured_is_primary
+        self._stim_detection_configuration = self._stim_configuration_from_camera(conf)
 
         url = f"{conf.scheme}://{conf.host}"
 
@@ -456,7 +717,19 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
 
         logger.debug("%s: built url=%s", conf.name, url)
 
-        existing = list(filter(lambda m: m.url == url, self._camera_list))
+        configured_spinnaker_source = (
+            conf.id in CameraId.reach_camera_ids()
+            and conf.scheme.lower() == "spinnaker"
+        )
+        if configured_spinnaker_source:
+            self._camera_list = [
+                camera
+                for camera in self._camera_list
+                if not _is_spinnaker_source(camera)
+            ]
+        existing = [] if configured_spinnaker_source else list(
+            filter(lambda m: m.url == url, self._camera_list)
+        )
 
         name = self._name or "<unnamed>"
 
@@ -476,7 +749,63 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
 
         self.camera_source = source
 
-    def save_configuration(self) -> CameraConfiguration:
+    def configure_stim_session_mode(self, stimulation: bool) -> None:
+        """Resolve the third camera's immutable mode before capture starts."""
+        if self.camera_id != CameraId.Camera3:
+            raise RuntimeError("Stim session mode applies only to Camera3")
+        if self._video_capture is not None:
+            raise RuntimeError("Stim camera mode cannot change while capture is active")
+        # Always derive the frozen runtime mode from the operator-authored
+        # camera configuration. Otherwise the first session's derived crop,
+        # role, frame rate, and recording flag can become the next session's
+        # base configuration (and can be persisted on shutdown).
+        if not self._runtime_stim_mode_active:
+            self._operator_conf = copy.deepcopy(
+                self.save_configuration(runtime_mode=True)
+            )
+        base = self._operator_conf or self._cur_conf
+        conf = copy.deepcopy(base)
+        conf.is_enabled = self._is_enabled
+        params = dict(conf.params)
+        mode = "stimulation" if stimulation else "ordinary"
+        prefix = "stim_" if stimulation else "ordinary_"
+        aliases = {
+            "fps": "fps",
+            "width": "width",
+            "height": "height",
+            "hbin": "hbin",
+            "vbin": "vbin",
+            "exposure": "exposure",
+            "gain": "gain",
+            "gamma": "gamma",
+            "offset_x": "offset_x",
+            "offset_y": "offset_y",
+        }
+        for destination, suffix in aliases.items():
+            profile_key = prefix + suffix
+            if profile_key in params:
+                params[destination] = params[profile_key]
+        params["fps"] = 900 if stimulation else params.get("ordinary_fps", 150)
+        params["stim_mode"] = mode
+        # Stimulation mode is an independent free-running high-rate domain.
+        # Ordinary mode is a triggered secondary in the behavioral group.
+        params["primary"] = "yes" if stimulation else "no"
+        conf.params = params
+        conf.is_record_enabled = not stimulation
+        self.load_configuration(conf, runtime_mode=True)
+
+    def save_configuration(self, *, runtime_mode: bool = False) -> CameraConfiguration:
+        if (
+            not runtime_mode
+            and self._id == CameraId.Camera3
+            and self._operator_conf is not None
+            and self._runtime_stim_mode_active
+        ):
+            conf = copy.deepcopy(self._operator_conf)
+            # Enabled is an operator-facing property and is not altered by
+            # session-mode resolution, so retain an explicit UI change.
+            conf.is_enabled = self._is_enabled
+            return conf
         parsed, params = VideoManager.parse_params(self._camera_source.url)
         params: Dict[str, Any]
         for key, value in params.items():
@@ -522,6 +851,35 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
                              self._name, expected, cur_status)
                 return False
             time.sleep(0.001)
+        if cur_status == CaptureProcessStatus.FAILED:
+            # The child puts the reason it failed in _errors. Callers that wait for
+            # (RUNNING, FAILED) read last_error next, and would otherwise show only
+            # their generic text instead of e.g. a refused camera setting.
+            self._last_error = self._errors.value.decode()
+        return True
+
+    def wait_for_first_frame(self, *, timeout: float) -> bool:
+        """Wait until the capture child has delivered an actual camera frame."""
+        perf_timeout = time.perf_counter() + timeout
+        logger.debug("<%s> waiting for first captured frame", self._name)
+        while self._video_frame_index.value < 0:
+            status = CaptureProcessStatus(self._video_status.value)
+            if status in (CaptureProcessStatus.FAILED, CaptureProcessStatus.TERMINATED):
+                self._last_error = self._errors.value.decode() or (
+                    f"capture process entered {status.name} before delivering a frame"
+                )
+                return False
+            if time.perf_counter() > perf_timeout:
+                first_capture_error = self._errors.value.decode()
+                self._last_error = (
+                    f"camera did not deliver a frame within {timeout:g} seconds; "
+                    "check the camera connection and hardware trigger"
+                )
+                if first_capture_error:
+                    self._last_error += f"; first capture error: {first_capture_error}"
+                logger.error("<%s> %s", self._name, self._last_error)
+                return False
+            time.sleep(0.001)
         return True
 
     def on_trigger_recording(self, record: bool, *, is_triggered: bool=False, is_from_start: bool=False):
@@ -529,6 +887,33 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
             self._send_command(CaptureCommandKind.ENABLE_RECORDING, is_from_start=is_from_start)
         else:
             self._send_command(CaptureCommandKind.DISABLE_RECORDING, is_triggered=is_triggered, is_from_start=is_from_start)
+
+    def arm_stim_detector(self, context) -> None:
+        self._send_command(CaptureCommandKind.ARM_STIM_DETECTOR, dict(context))
+
+    def disarm_stim_detector(self, operation_id=None) -> None:
+        self._send_command(CaptureCommandKind.DISARM_STIM_DETECTOR, operation_id)
+
+    @staticmethod
+    def _stim_configuration_from_camera(conf):
+        if conf.id != CameraId.Camera3 or conf.params.get("stim_mode") != "stimulation":
+            return None
+        params = conf.params
+        return StimCameraDetectionConfiguration(
+            enabled=True,
+            target_fps=float(params.get("fps", 900)),
+            roi=StimRoiDefinition(
+                x=int(params.get("stim_roi_x", 0)),
+                y=int(params.get("stim_roi_y", 0)),
+                width=int(params.get("stim_roi_width", 0)),
+                height=int(params.get("stim_roi_height", 0)),
+                threshold=float(params.get("stim_threshold", 0)),
+                hysteresis=float(params.get("stim_hysteresis", 0)),
+            ),
+            pre_event_frames=int(params.get("stim_pre_event_frames", 450)),
+            post_event_frames=int(params.get("stim_post_event_frames", 450)),
+            preview_fps=float(params.get("stim_preview_fps", 15)),
+        )
 
     def _on_trigger(self, notification: Notification):
         if self._video_capture is not None:

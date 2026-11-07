@@ -42,6 +42,10 @@ class DeviceConnectionProtocol(Protocol):
         """Request the connection to the physical device to be established"""
         raise NotImplementedError
 
+    def wait_connected(self, *, timeout: float = 3):
+        """Wait until the requested device connection is ready."""
+        raise NotImplementedError
+
     def request_disconnect(self):
         """Request disconnection from the physical device"""
         raise NotImplementedError
@@ -68,6 +72,32 @@ class DeviceConnectionProtocol(Protocol):
     def use_motor_configurations(self, data: MotorConfigurations):
         """Apply the given motor configuration"""
         raise NotImplementedError
+
+    def _motor_configuration_is_required(self, motor: Motor) -> bool:
+        """Return whether the connected device requires the motor's CAN target."""
+        is_motor_required = getattr(self.device, "is_motor_required", None)
+        if callable(is_motor_required):
+            required = is_motor_required(motor)
+            if not required:
+                logger.info("Skipping unused %s configuration", motor)
+            return required
+
+        required_targets = getattr(self.device, "required_targets", None)
+        if required_targets is None:
+            return True
+
+        # Import locally to avoid adding a package initialization cycle.
+        from .can_interface import target_of_motor
+
+        target = target_of_motor(motor)
+        if target in required_targets:
+            return True
+        logger.info(
+            "Skipping %s configuration because CAN target %s is not required",
+            motor,
+            target,
+        )
+        return False
 
     def load_default_move_config(self):
         default_move_cfg_file = CompoundMovements.DEFAULT_LOCATION.expanduser()

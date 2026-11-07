@@ -16,11 +16,15 @@ from autotrainer.core import FixedArrayMultiQueue, ProjectInfo, EventManager, cl
     InferenceConfiguration, Offset3DTuple, ApiEventKind
 from autotrainer.core.project import ProjectDependentProtocol
 from autotrainer.core.multiproc import get_mp_ctx, pool_init
-from autotrainer.core.logging import get_verbose_logger, make_log_dict_config
+from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization, make_log_dict_config
 from autotrainer.core.pose_elements import SceneElement, AllHandsParts
 
-from autotrainer.inference import PoseProcess, InferenceCommandMessageKind, InferenceStatusMessageKind, PoseAlgorithm, \
-    InferenceMode, InferenceStatus, InferenceMonitorDataMsg
+from autotrainer.inference import GpuRuntimeStatus, PoseProcess, InferenceCommandMessageKind, \
+    InferenceStatusMessageKind, PoseAlgorithm, InferenceMode, InferenceStatus, \
+    InferenceMonitorDataMsg, detect_gpu_runtime
+from autotrainer.inference.backend_selection import (
+    build_pose_model, confidence_threshold, selected_backend, trained_model_name,
+)
 from autotrainer.inference.pose_result_process import InferenceMonitorDataProc
 from autotrainer.inference.analysis import intersession_process, IntersessionResponse
 
@@ -35,11 +39,31 @@ logger = get_verbose_logger(__name__)
 _local_do_debug = False
 
 
+def _describe_exit(exitcode: int) -> str:
+    """How a process ended, as multiprocessing reports it: a negative code is a signal."""
+    if exitcode < 0:
+        try:
+            return f"pose process was killed by {signal.Signals(-exitcode).name}"
+        except ValueError:
+            pass
+    return f"pose process exited with code {exitcode}"
+
+
 class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
     IS_ENABLED = "is_enabled"
     IS_PREDICT_ENABLED = "is_predict_enabled"
     MODEL_LOCATION = "model_location"
+    OVERLAY_PARTS = "overlay_parts"
+    LIVE_POSE_STATS = "live_pose_stats"
+    """From the pose process, per reporting window:
+
+    (session_pose_count, call_mean_ms, call_max_ms, sensor_to_result_mean_ms,
+     sensor_to_result_max_ms)
+
+    The call figures are what the model costs. Sensor-to-result additionally
+    includes the queue wait, and is the number the sub-5 ms target is about.
+    """
 
     def __init__(self,
         pose_algorithm: PoseAlgorithm,
@@ -69,19 +93,28 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
         self._is_enabled = False
         self._model_location = ""
+        self._overlay_parts: tuple = ()
         self._pose_algorithm = pose_algorithm
         self._pose_parts: List[str] = []
         self._calib_dir = calib_dir
 
         self._msg_thread: Optional[threading.Thread] = None
+        # Ends the message loop. The None sentinel alone was not enough: a
+        # stop() on the loop's own thread clears its queue and can drain it.
+        self._msg_thread_exit = threading.Event()
 
         self._data_monitor_watchdog_perf_c = mp_ctx.Value(ctypes.c_double, math.nan)
         self._data_monitor_proc: Optional[InferenceMonitorDataProc] = None
+        self._live_recording_closed_event = threading.Event()
+        self._live_recording_closed_session_id: Optional[str] = None
 
         self._pose_process_watchdog_perf_c = mp_ctx.Value(ctypes.c_double, math.nan)
         self._pose_process: Optional[PoseProcess] = None
+        self._pose_process_error: Optional[str] = None
+        self._live_queue: Optional[FixedArrayMultiQueue] = None
         self._is_predict_enabled = True
         self._status = InferenceStatus.stopped
+        self._gpu_runtime_status: Optional[GpuRuntimeStatus] = None
 
         self._frames_per_camera = 0
         self._frame_width = 1
@@ -108,6 +141,15 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         if pose_proc is not None:
             return self._pose_process_watchdog_perf_c.value
         return math.nan
+
+    @property
+    def pose_process_error(self) -> Optional[str]:
+        """Why the current pose process said it was exiting, or None.
+
+        Read when live inference stops unexpectedly, so the failed subsystem
+        names the cause instead of only that something stopped.
+        """
+        return self._pose_process_error
 
     @property
     def watchdog_monitor_data_proc_perf_c(self) -> float:
@@ -160,6 +202,18 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
     def is_predict_enabled(self, value: bool):
         prev, self._is_predict_enabled = self._is_predict_enabled, value
         self._on_property_changed(self.IS_PREDICT_ENABLED, value, prev)
+
+    @property
+    def overlay_parts(self) -> tuple:
+        """Parts the live overlay draws; empty means every part emitted."""
+        return self._overlay_parts
+
+    @overlay_parts.setter
+    def overlay_parts(self, value):
+        value = tuple(value or ())
+        prev, self._overlay_parts = self._overlay_parts, value
+        if value != prev:
+            self._on_property_changed(self.OVERLAY_PARTS, value, prev)
 
     @property
     def model_location(self) -> str:
@@ -245,6 +299,24 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
     def start(self, live_queue: FixedArrayMultiQueue) -> bool:
 
+        started = time.perf_counter()
+        log_hardware_initialization(
+            logger,
+            "START | live inference | model=%s frames_per_camera=%s shape=%s",
+            self._model_location,
+            live_queue.frames_per_camera,
+            live_queue.shape,
+        )
+
+        if not self.can_start_live_inference():
+            self._set_status(InferenceStatus.stopped)
+            log_hardware_initialization(
+                logger,
+                "FAILED | live inference | GPU unavailable elapsed=%.3fs",
+                time.perf_counter() - started,
+            )
+            return False
+
         if self._process_pool is None:
             self._process_pool = multiprocessing.Pool(
                 processes=1,  # we only need 1 atm
@@ -254,6 +326,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
             )
 
         if self._msg_thread is None:
+            self._msg_thread_exit.clear()
             thread = Thread(target=self._monitor_msg_queue, name="monitor_msg_queue", daemon=True)
             thread.start()
             self._msg_thread = thread
@@ -281,6 +354,8 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         self._frames_per_camera = live_queue.frames_per_camera
 
         self._pose_process_watchdog_perf_c.value = time.perf_counter()
+        self._pose_process_error = None
+        self._live_queue = live_queue
         proc = self._pose_process = PoseProcess(
             live_queue,
             data_queue=self._output_data_queue,
@@ -294,8 +369,68 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
             record_stop_sema=self._record_stop_sema,
         )
         proc.start()
+        # Loading from the spawn, not from the child's first Loading message.
+        # Importing and building the model take seconds before that message,
+        # and while the status still read stopped a death there went unnoticed
+        # and stop() returned at once, leaving the process to load a model for
+        # a capture that had already ended.
+        self._set_status(InferenceStatus.loading)
+
+        log_hardware_initialization(
+            logger,
+            "READY | live inference processes started | elapsed=%.3fs",
+            time.perf_counter() - started,
+        )
 
         return True
+
+    def check_live_inference_runtime(self, *, force_refresh: bool = False) -> GpuRuntimeStatus:
+        if force_refresh or self._gpu_runtime_status is None:
+            # Probe the backend live inference will actually run on. The two
+            # are not interchangeable: on the reachAQ rig TensorFlow sees the
+            # GPU while every torch convolution aborts in cuDNN, so probing
+            # the wrong one passes the check and then crashes the pose process.
+            # With the model path, so a YOLO model probes the torch runtime
+            # rather than whatever the environment happens to default to. The
+            # probe deciding one engine while build_pose_model loads another is
+            # how a rig passes the check and then fails to start.
+            self._gpu_runtime_status = detect_gpu_runtime(
+                required_backend=selected_backend(model_path=self._model_location))
+        return self._gpu_runtime_status
+
+    def can_start_live_inference(self) -> bool:
+        gpu_status = self.check_live_inference_runtime()
+        if not gpu_status.is_available:
+            logger.error("Live inference requires GPU acceleration; refusing to start. backend=%s error=%s",
+                         gpu_status.backend, gpu_status.error)
+            return False
+        logger.info("Live inference GPU runtime available via %s: %s",
+                    gpu_status.backend, gpu_status.devices)
+        return self._can_load_pose_model()
+
+    def _can_load_pose_model(self) -> bool:
+        """
+        Check the configured model before the pose process is spawned.
+
+        Without this, a bad path surfaces from inside the child process as a
+        critical log and a non-zero exit, which reads as a crash rather than
+        as a misconfigured model. An empty location is not a failure: that
+        selects the in-memory model used for rig checkout.
+        """
+        if not self._model_location:
+            return True
+        backend = selected_backend(model_path=self._model_location)
+        try:
+            model = build_pose_model(self._model_location, backend=backend)
+            valid = model.is_valid()
+        except Exception as err:
+            logger.error("Live inference model %r is not usable by the %s backend: %s",
+                         self._model_location, backend, err)
+            return False
+        if not valid:
+            logger.error("Live inference model %r did not validate for the %s backend",
+                         self._model_location, backend)
+        return valid
 
     def stop(self):
         if self._status in {InferenceStatus.stopped, InferenceStatus.stopping}:
@@ -332,6 +467,13 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
             clear_queue(self._output_data_queue, name="inference_output_data_queue")
             clear_queue(self._notif_msg_queue, name="inference_notif_messages_queue")
             clear_queue(self._cmd_queue, name="inference_cmd_queue")
+
+        live_queue, self._live_queue = self._live_queue, None
+        if live_queue is not None:
+            # Nothing reads it from here on. The cameras hand it the end of a
+            # recording with a blocking put, which would otherwise wait out
+            # its timeout and raise out of the capture loop.
+            live_queue.close_consumer()
 
         self._stop_data_monitor_proc()
         clear_queue(
@@ -393,9 +535,13 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         msg_thread = self._msg_thread
         msg_queue = self._notif_msg_queue
         if msg_thread is not None:
-            msg_queue.put(None)
+            self._msg_thread_exit.set()
+            msg_queue.put(None)  # wakes the loop at once rather than at its next poll
             logger.debug("joining msg_thread")
-            msg_thread.join()
+            msg_thread.join(timeout)
+            if msg_thread.is_alive():
+                logger.warning("msg_thread still running %.1f s after terminate; not waiting",
+                               timeout)
             self._msg_thread = None
 
         logger.verbose("closing mp queues")
@@ -414,15 +560,39 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
     def load_configuration(self, configuration: InferenceConfiguration):
         self.model_location = configuration.pose_model_location
         self.is_enabled = configuration.is_enabled
+        self._overlay_parts = tuple(configuration.overlay_parts or ())
 
     def save_configuration(self) -> InferenceConfiguration:
         return InferenceConfiguration(
             pose_model_location=self.model_location,
             is_enabled=self.is_enabled,
+            overlay_parts=tuple(self._overlay_parts),
         )
 
     def send_message(self, kind: InferenceCommandMessageKind, context: Any = None):
         self._send_message(kind, context)
+
+    def prepare_session_recording(self, project: ProjectInfo) -> None:
+        """Reset the pose-writer acknowledgement before camera recording starts."""
+        self._live_recording_closed_session_id = None
+        self._live_recording_closed_event.clear()
+
+    def wait_session_pose_closed(self, project: ProjectInfo, *, timeout: float = 10.0) -> bool:
+        """Wait until live pose/frame-index files for ``project`` have closed."""
+        if not self._is_enabled:
+            return True
+        expected_session_id = project.short_id
+        deadline = time.perf_counter() + timeout
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return False
+            if not self._live_recording_closed_event.wait(min(0.1, remaining)):
+                continue
+            if self._live_recording_closed_session_id == expected_session_id:
+                return True
+            # A stale acknowledgement must not release a later session.
+            self._live_recording_closed_event.clear()
 
     def _send_message(self, kind: InferenceCommandMessageKind, context: Any = None):
         cmd_queue = self._cmd_queue
@@ -492,6 +662,11 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
             except Exception as err:
                 logger.exception("pose_response_ready event callback failed: %s", err)
 
+        elif msg is InferenceMonitorDataMsg.LIVE_RECORDING_CLOSED:
+            project = args[0]
+            self._live_recording_closed_session_id = project.short_id
+            self._live_recording_closed_event.set()
+
         elif msg is InferenceMonitorDataMsg.INTERSESSION_SEGMENTATION_FINISHED:
             self._cb_on_intersession_segmentation_finished(*args, **kwargs)
 
@@ -502,10 +677,11 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
             logger.warning("unknown monitor proc data: %s - ctx=%s", msg, ctx)
 
     def _monitor_msg_queue(self):
-        while True:
+        while not self._msg_thread_exit.is_set():
             try:
                 raw = self._notif_msg_queue.get(timeout=0.1)
             except queue.Empty:
+                self._check_pose_process_exited()
                 continue
             if raw is None:
                 logger.notice("received None exit sentinel, exiting loop")
@@ -516,10 +692,36 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
                     self._handle_monitor_data_proc_msg(msg, context)
                     continue
                 logger.debug("Processing msg %s ...", msg)
+                if (msg in {InferenceStatusMessageKind.Loading,
+                            InferenceStatusMessageKind.Initialized,
+                            InferenceStatusMessageKind.Running}
+                        and self._status in {InferenceStatus.stopping, InferenceStatus.stopped}):
+                    # A process stopped while it loads keeps loading until it
+                    # reads Terminate, and reports Loading and Initialized on
+                    # the way. Acting on them moved a stopping inference back to
+                    # loading, then waiting, and held this loop 3 s for the
+                    # acknowledgement of a Start that could not come. Arriving
+                    # after stop() had finished, they would leave the status
+                    # active with no process behind it.
+                    logger.info("ignoring %s from a pose process being stopped", msg)
+                    continue
                 if msg == InferenceStatusMessageKind.Initialized:
                     self._pose_parts = context
                     self._set_status(InferenceStatus.waiting)
                     pose_algo = self._pose_algorithm
+                    # The model is only certainly known here. Gating is
+                    # decided from the loaded model rather than from what
+                    # happens to be installed, which is how a YOLO model
+                    # ended up on TensorFlow's 0.9 and never drew a pellet.
+                    # Named directly rather than through a local, so the
+                    # contract test can see that the selector is told the
+                    # same model the loader will use. An empty location is
+                    # already handled downstream.
+                    pose_algo.set_confidence_threshold(confidence_threshold(
+                        selected_backend(model_path=self._model_location),
+                        model_name=trained_model_name(self._model_location),
+                        model_path=self._model_location,
+                    ))
                     pose_algo.initialize(context)
                     self._data_monitor_cmd_queue.put(
                         (InferenceMonitorDataProc.Msg.SET_POSE_ALGO, (pose_algo,), None))
@@ -527,24 +729,77 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
                 elif msg == InferenceStatusMessageKind.Loading:
                     self._set_status(InferenceStatus.loading)
                 elif msg == InferenceStatusMessageKind.Performance:
-                    logger.info(f"{context :.1f} predict calls/s")
-                    fps = context * self._frames_per_camera
+                    # The pose process sends (calls/s, session count, call
+                    # mean/max ms, sensor-to-result mean/max ms). A bare float
+                    # is still accepted so an older pose process does not break
+                    # the handler; it simply carries no timing.
+                    if isinstance(context, tuple):
+                        cps, pose_count, mean_ms, max_ms = context[:4]
+                        e2e_mean, e2e_max = (context[4:6] if len(context) >= 6
+                                             else (float("nan"), float("nan")))
+                        self._on_property_changed(
+                            self.LIVE_POSE_STATS,
+                            (pose_count, mean_ms, max_ms, e2e_mean, e2e_max),
+                            None)
+                    else:
+                        cps = context
+                    logger.info(f"{cps :.1f} predict calls/s")
+                    fps = cps * self._frames_per_camera
                     logger.info(f"{fps :.1f} frames/camera/s ({(fps * 2):.1f} total frames/s)")
                 elif msg == InferenceStatusMessageKind.Running:
                     mode = InferenceMode(context)
                     logger.info(f"predict running with {mode.name} queue")
                     self._set_status(InferenceStatus.live if mode == InferenceMode.Live
                                      else InferenceStatus.intersession)
-                elif msg in {
-                    InferenceStatusMessageKind.Created,
-                    InferenceStatusMessageKind.Terminated,
-                }:
+                elif msg == InferenceStatusMessageKind.Terminated:
+                    # Only the reason, when there is one. Whether the exit was
+                    # expected is decided from the process itself, in
+                    # _check_pose_process_exited: a process that fails to load
+                    # or is killed may say nothing at all.
+                    if context is not None:
+                        self._pose_process_error = context
+                elif msg == InferenceStatusMessageKind.Created:
                     # no-op handler
                     pass
                 else:
                     logger.warning("Unhandled msg: %s", msg)
             except Exception as err:
                 logger.exception("Error processing msg %s: %s", msg, err)
+
+    def _check_pose_process_exited(self):
+        """Stop live inference when its pose process has exited on its own.
+
+        Nothing else notices. LIVE_INFERENCE is marked READY when the process is
+        spawned, the pose watchdog is only registered once the first pose comes
+        back, and a process that fails to load or is killed sends no message.
+        On the rig a pose process raised on its first preview frame, and a
+        120 s recording then ran with nothing posed.
+
+        stop() ends in InferenceStatus.stopped, which the app turns into a
+        failed LIVE_INFERENCE: the run shows as degraded, and Record is refused
+        until live inference is restarted. A recording already under way
+        carries on, as for any non-camera failure. exitcode stays None until
+        the process has started and exited, and
+        stop() sets stopping before it asks the process to go, so neither a
+        process still starting nor a requested stop reads as a crash.
+        """
+        proc = self._pose_process
+        if proc is None or proc.exitcode is None:
+            return
+        if self._status in {InferenceStatus.stopping, InferenceStatus.stopped}:
+            return
+        if self._pose_process_error is None:
+            # Killed, or failed before it could say anything - while still
+            # importing, say. How it ended is then all there is to go on: the
+            # OOM killer sends SIGKILL, and a CUDA fault is a SIGSEGV.
+            self._pose_process_error = _describe_exit(proc.exitcode)
+        logger.error("pose process exited on its own (exit code %s) while %s: %s",
+                     proc.exitcode, self._status.value, self._pose_process_error)
+        try:
+            self.stop()
+        except Exception:
+            # Called from the message loop, which must outlive this.
+            logger.exception("Failed to stop live inference after its pose process exited")
 
     def _feed_intersession_analysis_execute(self, intersession_block: IntersessionBlock):
         pass  # todo: adapt for simulate with main window app

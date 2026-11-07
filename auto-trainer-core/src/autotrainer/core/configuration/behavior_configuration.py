@@ -1,31 +1,10 @@
 import dataclasses
-import datetime
-import enum
 from dataclasses import dataclass, field
-from typing import Type, Optional, Dict
-from typing_extensions import Self
+from typing import ClassVar, Type, Optional
 
 import yaml
 
-from autotrainer.core.logging import get_verbose_logger
-from .animal_presence_configuration import GlobalAnimalPresenceConfig
-from .autoclamp_evasion_config import AutoClampEvasionDetectorConfig
-from .external_doors_monitor_configuration import ExternalDoorsAlarmConfig
-from .presence_detection_configuration import PresenceDetectionConfig
-from .presence_in_cage_config import PresenceInCageAlarmConfig
-from .system_fault_config import SystemFaultConfig
-from .system_maintenance_config import SystemMaintenanceConfig
-from .. import build_kwargs_apply_mapping, make_camelize_representer, make_decamelize_constructor, Offset3DTuple
-
-from .headbar_pressure_config import HeadbarPressureConfiguration
-from .load_cell_config import LoadCellConfiguration, LoadCellAutoTareConfiguration
-from .audio_thrash_config import AudioSpectrumThrashMonitorConfig
-from .alarm_configuration import EmergencyAlarmConfiguration
-from .tunnel_sweep_config import AutoTunnelSweepConfiguration
-from .animal_thrash_config import AnimalThrashAlarmConfig
-from .device_comm_alarm_config import DeviceCommAlarmConfig
-
-logger = get_verbose_logger(__name__)
+from .. import make_camelize_representer, make_decamelize_constructor, Offset3DTuple
 
 
 @dataclasses.dataclass
@@ -54,11 +33,7 @@ class _ShiftXYZBufferHandlerConfig:
 
 @dataclasses.dataclass
 class ShiftXYZBufferHandlerConfig(_ShiftXYZBufferHandlerConfig):
-
-    def __init__(self, **kwargs):
-        for c in "xyz":
-            kwargs.pop(f"target_{c}", None)  # old config
-        super().__init__(**kwargs)
+    pass
 
 
 @dataclasses.dataclass
@@ -70,14 +45,6 @@ class ShiftXYZHandlerConfig:
     use_reach_buffer: bool = True
     selected: str = "ShiftXYZBufferHandler"
     buffer: ShiftXYZBufferHandlerConfig = field(default_factory=ShiftXYZBufferHandlerConfig)
-
-
-@dataclass
-class AutoCloseGateOnIntersessionConfiguration:
-
-    enabled: bool = False  # enabled/disabled
-    session_min_duration: float = 5  # do not try close gate if session duration shorter than this
-    delay_after_cage_enter: float = 2.5  # only close gate once this delay since cage enter has elapsed
 
 
 @dataclass
@@ -111,8 +78,12 @@ class PelletDeliveryConfiguration:
     is_enabled: bool = False
     """When disabled no automatic behavior movement will be peformed, but eventually on application start"""
 
+    lane_left_offset_dcs: Offset3DTuple = field(default_factory=Offset3DTuple.get_zero)
+    lane_right_offset_dcs: Offset3DTuple = field(default_factory=Offset3DTuple.get_zero)
+    """Calibrated categorical offsets from the animal's center pellet position."""
+
     pellet_send_wait_delay: float = 1
-    """In seconds, how long to wait before send_pellet when autoclamp disabled"""
+    """Seconds after recording starts before an automatic pellet send."""
 
     is_pellet_cover_enabled: bool = False
     """If enabled: cover pellet when session starts, and wait uncover condition"""
@@ -124,8 +95,6 @@ class PelletDeliveryConfiguration:
     is_intersession_analysis_enabled: bool = False
     is_intersession_pellet_shift_enabled: bool = True
 
-    max_pellets_per_session: int = 10  # actually unused
-    max_pellets_per_day: int = 50  # actually unused
     max_pellet_missing_seconds: float = 1.0  # how long to wait before load pellet when pellet missing/not seen
     # this help ensure we don't execute a load pellet if we get an incorrect pose_result with pellet seen == False,
     # which can happen eventually (missed inference detection basically).
@@ -137,193 +106,128 @@ class PelletDeliveryConfiguration:
     triangle_pellet_expected_distance: float = 5  # mm
     triangle_pellet_diff_too_far_threshold: float = 1  # mm
 
-    @classmethod
-    def from_version_zero(cls, content: dict) -> Self:
-        return cls(**build_kwargs_apply_mapping(content, (
-            *(f.name for f in dataclasses.fields(cls)),
-            ('is_enabled', 'is_deliver_pellet_enabled'),
-            ('is_pellet_cover_enabled', 'is_cover_pellet_enabled'),
-        ), skip_remaining=True))
+@dataclass
+class SessionControlConfiguration:
+    """Continuous recording and pellet-trial policy exposed to operators."""
 
+    automatic_pellet_cycles_enabled: bool = False
+    automatic_protocol_advance_enabled: bool = False
+    intertrial_analysis_enabled: bool = False
+    intertrial_progression_mode: str = "continue"
+    behavioral_retry_outcomes: tuple = ()
+    attempt_assignment: str = "retry_within_trial"
+    retry_settings: str = "reuse"
+    trial_count_basis: str = "completed"
+    counted_trial_outcomes: tuple = (
+        "success",
+        "failure",
+        "pellet_missing",
+        "no_reach",
+    )
+    duration_limit_seconds: Optional[float] = None
+    trial_limit: Optional[int] = None
+    stop_on_protocol_complete: bool = False
+    stop_drain_timeout_seconds: float = 15.0
 
-class HeadClampReleaseMode(str, enum.Enum):
-    ACTIVITY = "Activity"
-    FIXED_DURATION = "Fixed duration"
+    # Five hours, which is what the rig's buffers now hold: pressure has
+    # its own stream, so the decoded device ring spans about that long
+    # too. Raise both together if this grows.
+    MAX_DURATION_SECONDS: ClassVar[float] = 5 * 60 * 60
+
+    ATTEMPT_ASSIGNMENTS = (
+        "retry_within_trial",
+        "every_attempt_is_trial",
+        "successful_presentations_only",
+    )
+    RETRY_SETTINGS = ("reuse", "resample")
+    TRIAL_COUNT_BASES = ("started", "presented", "completed", "scored")
+    TRIAL_OUTCOMES = (
+        "success",
+        "failure",
+        "pellet_missing",
+        "no_reach",
+        "unscored",
+        "incomplete",
+        "aborted",
+    )
+    INTERTRIAL_PROGRESSION_MODES = ("continue", "wait")
+
+    def __post_init__(self):
+        self.counted_trial_outcomes = tuple(self.counted_trial_outcomes)
+        self.behavioral_retry_outcomes = tuple(self.behavioral_retry_outcomes)
+        if self.attempt_assignment not in self.ATTEMPT_ASSIGNMENTS:
+            raise ValueError(
+                "Unknown attempt assignment policy: "
+                f"{self.attempt_assignment}"
+            )
+        if self.retry_settings not in self.RETRY_SETTINGS:
+            raise ValueError(f"Unknown retry settings policy: {self.retry_settings}")
+        if self.trial_count_basis not in self.TRIAL_COUNT_BASES:
+            raise ValueError(f"Unknown trial count basis: {self.trial_count_basis}")
+        if self.intertrial_progression_mode not in self.INTERTRIAL_PROGRESSION_MODES:
+            raise ValueError(
+                "Unknown intertrial progression mode: "
+                f"{self.intertrial_progression_mode}"
+            )
+        unknown_outcomes = sorted(
+            set(self.counted_trial_outcomes) - set(self.TRIAL_OUTCOMES)
+        )
+        if unknown_outcomes:
+            raise ValueError(
+                "Unknown counted trial outcome(s): " + ", ".join(unknown_outcomes)
+            )
+        unknown_retry_outcomes = sorted(
+            set(self.behavioral_retry_outcomes) - set(self.TRIAL_OUTCOMES)
+        )
+        if unknown_retry_outcomes:
+            raise ValueError(
+                "Unknown behavioral retry outcome(s): "
+                + ", ".join(unknown_retry_outcomes)
+            )
+        analysis_retry_outcomes = set(self.behavioral_retry_outcomes) - {
+            "pellet_missing"
+        }
+        if analysis_retry_outcomes and not self.intertrial_analysis_enabled:
+            raise ValueError(
+                "Analysis-derived behavioral retry outcomes require intertrial "
+                "analysis"
+            )
+        if (
+            self.trial_count_basis == "scored"
+            and not self.intertrial_analysis_enabled
+        ):
+            raise ValueError("Scored trial counting requires intertrial analysis")
+        if self.duration_limit_seconds is not None and self.duration_limit_seconds <= 0:
+            raise ValueError("Recording duration limit must be positive")
+        if (
+            self.duration_limit_seconds is not None
+            and self.duration_limit_seconds > self.MAX_DURATION_SECONDS
+        ):
+            raise ValueError("Recording duration limit cannot exceed 5 hours")
+        if self.trial_limit is not None and self.trial_limit <= 0:
+            raise ValueError("Trial target must be positive")
+        if self.stop_drain_timeout_seconds <= 0:
+            raise ValueError("Stop drain timeout must be positive")
 
 
 @dataclass
-class HeadClampConfiguration:
-    """
-    Behavior model options related to the head clamp magnet including standard intensity and auto-clamp actions.
-    """
-
-    enabled: bool = False
-    wait_engaged_before_send_pellet: bool = True
-
-    baseline_intensity: float = 0.0
-    auto_clamp_intensity: float = 100.0
-    auto_clamp_release_tone_freq: int = 7000
-    auto_clamp_release_tone_delay: float = 0.1
-    before_reengage_delay: float = 5  # how long to wait/delay before allow/execute a re-engage after a disengage.
-
-    prerelease_intensity: float = 70  # absolute % value
-    prerelease_duration: float = 0  # seconds, if 0 then this pre-release is disabled / does not occur.
-
-    release_mode: str = HeadClampReleaseMode.ACTIVITY.value
-
-    # HeadClampReleaseMode.ACTIVITY
-    auto_clamp_no_activity_release_delay: float = 30  # seconds
-    auto_clamp_release_load_count: int = 100_000
-
-    # HeadClampReleaseMode.FIXED_DURATION
-    fixed_duration_release_delay: float = 30  # seconds
-
-
-    @classmethod
-    def from_version_zero(cls, content: dict) -> Self:
-        return cls(**build_kwargs_apply_mapping(
-            content,
-            tuple(f.name for f in dataclasses.fields(cls)),
-            skip_remaining=True,
-        ))
-
-
-@dataclasses.dataclass
-class AutoEndSessionConfiguration:
-    # enabled: bool = True
-
-    no_activity_delay_minutes: int = 1
-    """This is only for the Nose part. If it's not seen that much duration consecutively, 
-     then also auto-end session"""
-
-    animal_tunnel_no_activity_delay: float = 10  # seconds
-    """Delay without tunnel animal activity (== any animal part seen *and* low load-cell variance)
-     which triggers auto-end session"""
-
-
-@dataclasses.dataclass
-class BatchSessionRecordingConfiguration:
-
-    enabled: bool = False
-
-    maximum_batch_size: int = 0
-    """If 0: no max batch size, otherwise, once batch is over the size: force batch session processing"""
-
-
-@dataclass
-class CageCleaningConfig:
-
-    clean_days_interval: int = 14
-
-
-@dataclass
-class LEDAlarmConfig:
-
-    start_ignore_hour: datetime.time = datetime.time(10, 0)
-    stop_ignore_hour: datetime.time = datetime.time(20, 0)
-
-
-@dataclass
-class _BehaviorConfiguration:
+class BehaviorConfiguration:
     pellet_delivery: PelletDeliveryConfiguration = field(default_factory=PelletDeliveryConfiguration)
+    session_control: SessionControlConfiguration = field(default_factory=SessionControlConfiguration)
     pellet_uncover: PelletUncoverConfiguration = field(default_factory=PelletUncoverConfiguration)
     shift_xyz_handler: ShiftXYZHandlerConfig = field(default_factory=ShiftXYZHandlerConfig)
-    head_clamp: HeadClampConfiguration = field(default_factory=HeadClampConfiguration)
-    load_cell: LoadCellConfiguration = field(default_factory=LoadCellConfiguration)
-    headbar_pressure: HeadbarPressureConfiguration = field(default_factory=HeadbarPressureConfiguration)
-    auto_tare: LoadCellAutoTareConfiguration = field(default_factory=LoadCellAutoTareConfiguration)
-    audio: AudioSpectrumThrashMonitorConfig = field(default_factory=AudioSpectrumThrashMonitorConfig)
-    emergency_alarm: EmergencyAlarmConfiguration = field(default_factory=EmergencyAlarmConfiguration)
-    topcam_presence_detection: PresenceDetectionConfig = field(default_factory=PresenceDetectionConfig)
-    auto_end_session: AutoEndSessionConfiguration = field(default_factory=AutoEndSessionConfiguration)
-    auto_tunnel_sweep: AutoTunnelSweepConfiguration = field(default_factory=AutoTunnelSweepConfiguration)
-    batch_session_recording: BatchSessionRecordingConfiguration = field(default_factory=BatchSessionRecordingConfiguration)
-    auto_close_gate_on_intersession: AutoCloseGateOnIntersessionConfiguration = field(default_factory=AutoCloseGateOnIntersessionConfiguration)
     home_on_excessive_drift_distance: HomeOnExcessiveDriftDistanceConfiguration = field(default_factory=HomeOnExcessiveDriftDistanceConfiguration)
-    cage_cleaning: CageCleaningConfig = field(default_factory=CageCleaningConfig)
-    autoclamp_evasion_detector: AutoClampEvasionDetectorConfig = field(default_factory=AutoClampEvasionDetectorConfig)
-    led_alarm: LEDAlarmConfig = field(default_factory=LEDAlarmConfig)
-
-    @classmethod
-    def from_version_zero(cls, content: Dict) -> Self:
-        configuration = cls()
-
-        if "head_fix" in content:
-            if "load_cell" in content["head_fix"]:
-                configuration.load_cell = LoadCellConfiguration.from_version_zero(content["head_fix"]["load_cell"])
-            if "headbar_pressure" in content["head_fix"]:
-                configuration.headbar_pressure = HeadbarPressureConfiguration.from_version_zero(
-                    content["head_fix"]["headbar_pressure"]
-                )
-            if "auto_tare" in content["head_fix"]:
-                configuration.auto_tare = LoadCellAutoTareConfiguration.from_version_zero(
-                    content["head_fix"]["auto_tare"])
-
-        if "behavior" in content:
-            configuration.head_clamp = HeadClampConfiguration.from_version_zero(content["behavior"])
-            configuration.pellet_delivery = PelletDeliveryConfiguration.from_version_zero(content["behavior"])
-
-        return configuration
-
-    @classmethod
-    def from_version_one(cls, content: Dict):
-        headclamp = content.get("head_clamp", {})
-        headclamp.pop('max_baseline_intensity')
-        headclamp.pop('baseline_intensity_increment')
-        baseline = headclamp.pop('min_baseline_intensity')
-        if baseline is not None:
-            headclamp['baseline_intensity'] = baseline
-        return cls(
-            load_cell=LoadCellConfiguration.from_version_one(content.get("load_cell", {})),
-            headbar_pressure=HeadbarPressureConfiguration(**content.get("headbar_pressure", {})),
-            auto_tare=LoadCellAutoTareConfiguration(**content.get("auto_tare", {})),
-            head_clamp=HeadClampConfiguration(**headclamp),
-            pellet_delivery=PelletDeliveryConfiguration(**content.get("pellet_delivery", {})),
-        )
-
-
-@dataclasses.dataclass
-class BehaviorConfiguration(_BehaviorConfiguration):
-    # NB: having to subclass _BehaviorConfiguration dataclass type to allow to customize init signature (and body):
-
-    def __init__(self,
-                 *,
-                 mouse_presence=None,  # temporarily to be back-compatible with previous
-                 **kwargs):
-        if mouse_presence is not None:
-            logger.notice("Dropping previous mouse_presence config, new default one will be used. dropped entry: %s",
-                          mouse_presence)
-        super().__init__(**kwargs)
 
 
 _tag_2_cls = dict(
     PelletDeliveryConfiguration=PelletDeliveryConfiguration,
+    SessionControlConfiguration=SessionControlConfiguration,
     PelletUncoverConfiguration=PelletUncoverConfiguration,
-    LoadCellConfiguration=LoadCellConfiguration,
-    HeadClampConfiguration=HeadClampConfiguration,
-    HeadbarPressureConfiguration=HeadbarPressureConfiguration,
-    LoadCellAutoTareConfiguration=LoadCellAutoTareConfiguration,
     BehaviorConfiguration=BehaviorConfiguration,
-    AudioMonitorConfiguration=AudioSpectrumThrashMonitorConfig,
-    AnimalPresenceConfiguration=GlobalAnimalPresenceConfig,
-    EmergencyAlarmConfiguration=EmergencyAlarmConfiguration,
-    PresenceDetectionConfiguration=PresenceDetectionConfig,
-    ExternalDoorsMonitorConfiguration=ExternalDoorsAlarmConfig,
-    AutoEndSessionConfiguration=AutoEndSessionConfiguration,
-    AutoTunnelSweepConfiguration=AutoTunnelSweepConfiguration,
-    BatchSessionRecordingConfiguration=BatchSessionRecordingConfiguration,
-    AutoCloseGateOnIntersessionConfiguration=AutoCloseGateOnIntersessionConfiguration,
     HomeOnExcessiveDriftDistance=HomeOnExcessiveDriftDistanceConfiguration,  # missed Configuration suffix
     # ShiftXYZTarget="ShiftXYZTarget",  # replaced by Offset3dTuple.
     ShiftXYZHandlerConfiguration=ShiftXYZHandlerConfig,
     ShiftXYZBufferHandlerConfiguration=ShiftXYZBufferHandlerConfig,
-    SystemMaintenanceConfig=SystemMaintenanceConfig,
-    SystemFaultConfig=SystemFaultConfig,
-    CageCleaningConfig=CageCleaningConfig,
-    AnimalThrashAlarmConfig=AnimalThrashAlarmConfig,
-    PresenceInCageAlarmConfig=PresenceInCageAlarmConfig,
-    DeviceCommAlarmConfig=DeviceCommAlarmConfig,
-    LEDAlarmConfig=LEDAlarmConfig,
 )
 
 
@@ -347,8 +251,3 @@ def add_behavior_configuration_constructors(safe_loader: Type[yaml.SafeLoader]):
 
     for tag, cls in _tag_2_cls.items():
         add(cls, tag)
-
-    add(GlobalAnimalPresenceConfig, "MousePresenceConfiguration")
-    # keeping temporarily MousePresenceConfiguration, was renamed to AnimalPresenceConfiguration. Back-compatibility.
-    # todo: remove some when later.
-    #

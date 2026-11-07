@@ -1,0 +1,213 @@
+# reachAQ Dell/Ubuntu system configuration example.
+# Replace camera serials, NI-DAQ device/channel names, model paths, and voltage limits with the bench rig values.
+# CAN transport is configured through reachaq_hardware.env.example because the current CAN runtime reads environment.
+# stimCam is explicitly present but disabled; Cameras 4-6 are omitted.
+# The documented PXIe-1073 rig uses PXI1Slot5 (PXI-6221) for sampled inputs
+# and PXI1Slot4 (PXI-6713) for laser analog outputs. Discover every target rig;
+# aliases, serials, capabilities, and valid routes are not universal defaults.
+
+!SystemConfiguration
+version: 58
+cameras:
+- !CameraConfiguration
+  id: 0
+  name: left
+  isEnabled: true
+  isRecordEnabled: true
+  recordMode: 1
+  recordPrebufferDuration: 0.0
+  isStillImageCaptureEnabled: false
+  stillImageCaptureInterval: 0.0
+  scheme: spinnaker
+  host: '<LEFT_CAMERA_SERIAL>'
+  port: 0
+  path: ''
+  params:
+    fps: 150
+    width: 256
+    height: 256
+    hbin: 4
+    vbin: 4
+    exposure: 175
+    gain: 1
+    gamma: 0.7
+    primary: 'yes'
+- !CameraConfiguration
+  id: 1
+  name: right
+  isEnabled: true
+  isRecordEnabled: true
+  recordMode: 1
+  recordPrebufferDuration: 0.0
+  isStillImageCaptureEnabled: false
+  stillImageCaptureInterval: 0.0
+  scheme: spinnaker
+  host: '<RIGHT_CAMERA_SERIAL>'
+  port: 0
+  path: ''
+  params:
+    fps: 150
+    width: 256
+    height: 256
+    hbin: 4
+    vbin: 4
+    exposure: 175
+    gain: 1
+    gamma: 0.7
+    primary: 'no'
+- !CameraConfiguration
+  id: 3
+  name: stimCam
+  isEnabled: false
+  isRecordEnabled: false
+  recordMode: 1
+  recordPrebufferDuration: 0.0
+  isStillImageCaptureEnabled: false
+  stillImageCaptureInterval: 0.0
+  scheme: spinnaker
+  host: '<STIM_CAMERA_SERIAL>'
+  port: 0
+  path: ''
+  params:
+    # Ordinary sessions record stimCam continuously as a synchronized 150 Hz
+    # secondary. Protocols containing First Reach automatically select the
+    # independent 900 Hz cropped detector/evidence mode before System start.
+    fps: 150
+    width: 256
+    height: 256
+    hbin: 4
+    vbin: 4
+    exposure: 175
+    gain: 1
+    gamma: 0.7
+    primary: 'no'
+    ordinary_fps: 150
+    ordinary_width: 256
+    ordinary_height: 256
+    ordinary_hbin: 4
+    ordinary_vbin: 4
+    ordinary_exposure: 175
+    stim_fps: 900
+    stim_width: 128
+    stim_height: 128
+    stim_hbin: 1
+    stim_vbin: 1
+    stim_exposure: 800
+    stim_roi_x: 0
+    stim_roi_y: 0
+    stim_roi_width: 128
+    stim_roi_height: 128
+    stim_threshold: 0
+    stim_hysteresis: 0
+    # Half a second on each side at the stimulation-mode 900 Hz rate.
+    stim_pre_event_frames: 450
+    stim_post_event_frames: 450
+    stim_preview_fps: 15
+hardware: !HardwareConfiguration
+  pelletIdentifier: CAN
+  # Rig-level hardware availability switches are intentionally grouped here.
+  canEnabled: true
+  pelletControllerEnabled: true
+  nidaqEnabled: true
+  rfidReaderEnabled: false
+  rfidDevice: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG01OZ68-if00-port0
+  minAckTimeout: 3.0
+  boardStatusTimeout: 15.0
+inference: !InferenceConfiguration
+  poseModelLocation: /opt/reachaq/models/reach_pose_model
+  isEnabled: true
+laser: !LaserSystemConfiguration
+  # The PXI-6713 has analog outputs but no analog inputs. Keep laser feedback disabled
+  # until a supported analog-input device is configured for diode/command-copy inputs.
+  # Each channel also carries its own board wiring, next to triggerSource:
+  # boardStimLine (2 or 3) is the board line wired to that laser's trigger
+  # input, and boardTriggerPulseUs (100..5000000, default 1000) is the width
+  # of the board STIM pulse that starts it. Example channel, for reference:
+  # channels:
+  # - !LaserChannelConfiguration
+  #   channelId: 1
+  #   analogOutput: PXI1Slot4/ao0
+  #   diodeInput: PXI1Slot5/ai0
+  #   shutterOutput: PXI1Slot4/port0/line0
+  #   triggerSource: /PXI1Slot4/PXI_Trig0
+  #   boardStimLine: 3
+  #   boardTriggerPulseUs: 1000
+  #   # Optional: the board STIM line wired back into an analog input or a
+  #   # port0 line (not a PFI, nor port1/port2), acquired and recorded as
+  #   # laser1_trigger for the laser tab's Board trigger graph. Edit DAQ
+  #   # Ports sets it as "trigger readback input".
+  #   triggerMonitorInput: PXI1Slot5/ai9
+  backend: disabled
+  hardwareTimed: false
+  sampleRateHz: null
+  pmtShutterOutput: null
+  triggerListenerInputs: []
+  channels: []
+nidaqPorts: !NidaqPortConfiguration
+  deviceName: PXI1Slot5
+  tone1: PXI1Slot5/port0/line0
+  tone2: PXI1Slot5/port0/line1
+  tone3R: PXI1Slot5/port0/line2
+  tone3L: PXI1Slot5/port0/line3
+  camFrames: PXI1Slot5/port0/line4
+  barcode: PXI1Slot5/port0/line5
+  # Saving through Edit DAQ Ports fills productType and serialNumber from
+  # discovery. Do not copy a serial number from another rig.
+  deviceIdentities:
+  - !NidaqDeviceIdentity
+    logicalName: acquisition-input
+    runtimeName: PXI1Slot5
+    productType: null
+    serialNumber: null
+  timing: !NidaqTimingConfiguration
+    syncMode: auto
+    timingMaster: null
+    requireHardwareSynchronization: true
+    referenceClockSource: null
+    startTriggerSource: null
+    sampleClockSource: null
+nidaqStream: !NidaqSignalStreamConfiguration
+  # Every channel is continuously acquired and persisted during Record. The
+  # display selection below controls plots only.
+  isEnabled: true
+  sampleRateHz: 10000.0
+  readChunkSize: 500
+  rollingWindowSeconds: 10.0
+  channels:
+  - !NidaqSignalChannelConfiguration
+    name: tone1
+    physicalChannel: PXI1Slot5/port0/line0
+    kind: digital
+  - !NidaqSignalChannelConfiguration
+    name: tone2
+    physicalChannel: PXI1Slot5/port0/line1
+    kind: digital
+  - !NidaqSignalChannelConfiguration
+    name: tone3_r
+    physicalChannel: PXI1Slot5/port0/line2
+    kind: digital
+  - !NidaqSignalChannelConfiguration
+    name: tone3_l
+    physicalChannel: PXI1Slot5/port0/line3
+    kind: digital
+  - !NidaqSignalChannelConfiguration
+    name: cam_frames
+    physicalChannel: PXI1Slot5/port0/line4
+    kind: digital
+  - !NidaqSignalChannelConfiguration
+    name: barcode
+    physicalChannel: PXI1Slot5/port0/line5
+    kind: digital
+  displayChannels:
+  - cam_frames
+  - barcode
+behavior: !BehaviorConfiguration
+  pelletDelivery: !PelletDeliveryConfiguration
+    isEnabled: false
+    isPelletCoverEnabled: true
+    isIntersessionAnalysisEnabled: true
+    maxPelletMissingSeconds: 15.0
+persistence: !PersistenceConfiguration
+  outputLocation: /home/<USER>/Documents/rawdatalocal
+watchdog: !WatchdogConfig
+  timeoutTriggerDelay: 5.0

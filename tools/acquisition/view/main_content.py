@@ -1,21 +1,21 @@
 import math
+import threading
 import time
 from typing import Tuple, Optional, List
 
 import pandas
 
 from PySide6 import QtCore
-from PySide6.QtCore import QTimer, Slot, Signal, Qt, QSize, QPoint, QPointF
+from PySide6.QtCore import QTimer, Slot, Signal, Qt, QSize, QPoint, QPointF, QRect
 from PySide6.QtGui import QPixmap, QPainter, QPen, QPolygon, QPolygonF, QImage, QFont
-from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QVBoxLayout, QStackedLayout, QWidget, QSizePolicy, QScrollBar, \
-    QScrollArea, QLayout
+from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QStackedLayout, QWidget, QSizePolicy, QScrollBar, \
+    QScrollArea, QLayout, QTabWidget, QToolButton
 
-from autotrainer.core import AnimalSubject, ProjectInfo
+from autotrainer.core import AnimalSubject, CameraId, ProjectInfo
 from autotrainer.core.logging import get_verbose_logger
 
 from autotrainer.inference import PoseResponse, PoseAlgorithm, InferenceStatus
 
-from autotrainer.behavior import TrainingMode
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoProps
 from autotrainer.inference.analysis import IntersessionResponse
 
@@ -25,13 +25,18 @@ from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 
 from autotrainer.training import TrainingPlan, TrainingPhase
 from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.view.alarm_content import AlarmContent
+from tools.acquisition.model.inference_model import InferenceModel
+from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.view.analysis_content import AnalysisContent
 from tools.acquisition.view.behavior_content import BehaviorContent
 from tools.acquisition.view.camera_content import CameraContent
+from tools.acquisition.view.detachable_panel import DetachablePanelHost, PanelState
 from tools.acquisition.view.diagnostics_content import DiagnosticsContent
 from tools.acquisition.view.hardware_control_content import HardwareControlContent
 from tools.acquisition.view.hardware_status_content import HardwareStatusContent
+from tools.acquisition.view.laser_control_content import LaserControlContent
+from tools.acquisition.view.protocol_content import ProtocolContent
+from tools.acquisition.view.persistent_splitter import PersistentSplitter
 from tools.acquisition.view.training_phase_content import TrainingPhaseContent
 from tools.acquisition.view.training_phase_progress_content import TrainingPhaseProgressContent
 from tools.acquisition.view.training_plan_content import TrainingPlanContent
@@ -39,101 +44,177 @@ from tools.acquisition.view.training_plan_progress_content import TrainingPlanPr
 
 logger = get_verbose_logger(__name__)
 
+#: How many inference results to hold between display ticks. The panel picks
+#: the one matching the frame it is showing, and at 150 fps against a 15 Hz
+#: display about ten arrive per tick; a few ticks' worth covers the lag
+#: between the two queues without letting a stall grow this without limit.
+PENDING_POSE_LIMIT = 48
+
+
+_REACHAQ_PROTOCOL_UI_ENABLED = True
+
+
+def _camera_panel_title(camera_name: str) -> str:
+    if camera_name == "stimCam":
+        return "stimCam Camera"
+    if camera_name.startswith("camera") and camera_name[6:].isdigit():
+        return f"Camera {camera_name[6:]}"
+    return f"{camera_name.capitalize()} Camera"
+
+
+def _visible_reach_cameras(cameras, *, include_disabled_optional: bool = False):
+    """Show optional cameras when enabled, plus stimCam while settings are edited."""
+    return tuple(
+        camera
+        for camera in cameras
+        if (
+            camera.camera_id in (CameraId.Left, CameraId.Right)
+            or camera.is_enabled
+            or (include_disabled_optional and camera.camera_id == CameraId.Camera3)
+        )
+    )
+
 
 class MainContent(ContentWidget):
 
-    training_mode_changed = Signal(TrainingMode)
     training_plan_changed = Signal(TrainingPlan)
 
     def __init__(self, app_model: AppModel):
         super().__init__()
 
         self._app_model = app_model
+        self._protocol_ui_enabled = _REACHAQ_PROTOCOL_UI_ENABLED
 
+        self.setMinimumSize(0, 0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setObjectName("MainContent")
-        self.setStyleSheet("#MainContent {background-color: #f7f7f7}")
+        self.setStyleSheet("#MainContent {background-color: #f3f4f6}")
 
         self._content_widgets: List[ContentWidget] = []
+        self._preferences = app_model.preferences
+        self._is_camera_settings_editable = False
 
         self.setContentsMargins(0, 0, 0, 0)
 
-        main_layout = self._main_layout = QVBoxLayout()
-        self.setLayout(main_layout)
+        root_layout = QHBoxLayout()
+        self.setLayout(root_layout)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        self._main_splitter = PersistentSplitter(
+            Qt.Orientation.Horizontal,
+            self._preferences,
+            "main_horizontal",
+        )
+        root_layout.addWidget(self._main_splitter)
+
+        left_content = self._left_content = QWidget()
+        left_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._main_splitter.addWidget(left_content)
+
+        main_layout = self._main_layout = QVBoxLayout(left_content)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(4)
+        main_layout.setSpacing(0)
+
+        self._section_splitter = PersistentSplitter(
+            Qt.Orientation.Vertical,
+            self._preferences,
+            "main_vertical",
+            left_content,
+        )
+        main_layout.addWidget(self._section_splitter)
 
         self._top_widget_manual = self._create_top_widget_manual()
-        main_layout.addWidget(self._top_widget_manual)
+        self._section_splitter.addWidget(self._top_widget_manual)
         # don't put alignment or the stretch used below won't be effective
 
         # Second row - behavior and analysis
-        mid_stacked_layout = self._mid_stacked_layout = StackedLayout()
-        main_layout.addLayout(mid_stacked_layout, stretch=1)
+        mid_stacked_widget = self._mid_stacked_widget = QWidget()
+        mid_stacked_layout = self._mid_stacked_layout = StackedLayout(mid_stacked_widget)
+        self._section_splitter.addWidget(mid_stacked_widget)
 
         self._mid_widget_manual = self._create_mid_widget_manual(app_model)
         mid_stacked_layout.addWidget(self._mid_widget_manual)
 
-        self._protocol_phase_progress_widget = self._create_protocol_phase_progress_widget()
-        mid_stacked_layout.addWidget(self._protocol_phase_progress_widget)
+        # Defaults first. These used to sit below, after
+        # _create_protocol_phase_progress_widget had already assigned the two
+        # progress widgets, so the assignment to None overwrote them: with the
+        # protocol UI enabled, _update_training_plan then raised AttributeError
+        # on _training_plan_progress_content the moment a subject was selected.
+        # The other two are assigned later still, by
+        # _create_protocol_phase_end_widget, which is why only these two broke.
+        self._training_plan_content = None
+        self._training_phase_content = None
+        self._training_plan_progress_content = None
+        self._training_phase_progress_content = None
+        self._protocol_phase_end_widget = None
+
+        self._protocol_phase_progress_widget = None
+        if self._protocol_ui_enabled:
+            self._protocol_phase_progress_widget = self._create_protocol_phase_progress_widget()
+            mid_stacked_layout.addWidget(self._protocol_phase_progress_widget)
 
         # Third row // bottom widgets
         end_stacked_widget = self._end_stacked_widget = QWidget()
         end_stacked_layout = self._end_stacked_layout = StackedLayout(end_stacked_widget)
 
-        end_stacked_layout.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
-        main_layout.addWidget(end_stacked_widget, alignment=Qt.AlignmentFlag.AlignBottom)
+        self._section_splitter.addWidget(end_stacked_widget)
 
         end_widget_manual = self._end_widget_manual = self._create_end_widget_manual()
         end_stacked_layout.addWidget(end_widget_manual)
 
-        # we limit end_protocol_phase widget to max size between alarm and phase content:
-        def size_hint(orig=end_stacked_widget.sizeHint):
-            if end_stacked_layout.currentWidget() == end_protocol_phase_widget:
-                sz1 = self._training_phase_content.minimumSizeHint()
-                sz2 = self._alarm_content.minimumSizeHint()
-                w = max(sz1.width(), sz2.width())
-                h = max(sz1.height(), sz2.height())
-                return QSize(w, h)
-            else:
-                return orig()
-        end_stacked_widget.sizeHint = size_hint
+        if self._protocol_ui_enabled:
+            # Limit end_protocol_phase widget to the phase content size.
+            def size_hint(orig=end_stacked_widget.sizeHint):
+                if end_stacked_layout.currentWidget() == end_protocol_phase_widget:
+                    sz1 = self._training_phase_content.minimumSizeHint()
+                    return QSize(sz1.width(), sz1.height())
+                else:
+                    return orig()
+            end_stacked_widget.sizeHint = size_hint
 
-        def min_size(orig=end_stacked_widget.minimumSize):
-            if end_stacked_layout.currentWidget() == end_protocol_phase_widget:
-                sz1 = self._training_phase_content.minimumSize()
-                sz2 = self._alarm_content.minimumSize()
-                w = max(sz1.width(), sz2.width())
-                h = max(sz1.height(), sz2.height())
-                return QSize(w, h)
-            else:
-                return orig()
-        end_stacked_widget.minimumSize = min_size
+            def min_size(orig=end_stacked_widget.minimumSize):
+                if end_stacked_layout.currentWidget() == end_protocol_phase_widget:
+                    sz1 = self._training_phase_content.minimumSize()
+                    return QSize(sz1.width(), sz1.height())
+                else:
+                    return orig()
+            end_stacked_widget.minimumSize = min_size
 
-        # def max_size(orig=end_stacked_widget.maximumSize):
-        #     if end_stacked_layout.currentWidget() == end_protocol_phase_widget:
-        #         tpc = self._training_phase_content
-        #         h1 = tpc.maximumSize().height()    # or tpc.minimumSizeHint().height()
-        #         h2 = self._alarm_content.maximumSize().height()
-        #         sz.setHeight(max(h1, h2))
-        #     else:
-        #         return orig()
-        #     return sz
-        # end_stacked_widget.maximumSize = size_hint
+            end_protocol_phase_widget = self._protocol_phase_end_widget = self._create_protocol_phase_end_widget()
+            end_stacked_layout.addWidget(end_protocol_phase_widget)
 
-        end_protocol_phase_widget = self._protocol_phase_end_widget = self._create_protocol_phase_end_widget()
-        end_stacked_layout.addWidget(end_protocol_phase_widget)
-
-        self._training_plan_content.sizeHint = size_hint  # trying
-        # self._training_plan_content.minimumSize = size_hint
-        # self._training_phase_content.sizeHint = size_hint
-        # self._training_phase_content.minimumSize = size_hint
+            self._training_plan_content.sizeHint = size_hint  # trying
+            # self._training_plan_content.minimumSize = size_hint
+            # self._training_phase_content.sizeHint = size_hint
+            # self._training_phase_content.minimumSize = size_hint
 
         end_stacked_layout.setCurrentWidget(end_widget_manual)
 
         # Optional fourth row - diagnostics
         self._diagnostics_content = DiagnosticsContent(self._app_model)
-        main_layout.addWidget(self._diagnostics_content)
+        self._section_splitter.addWidget(self._diagnostics_content)
+
+        self._right_side_tabs = self._create_right_side_tabs()
+        self._main_splitter.addWidget(self._right_side_tabs)
+        self._main_splitter.setStretchFactor(0, 1)
+        self._main_splitter.setStretchFactor(1, 0)
+        self._main_splitter.apply_saved_or_default_sizes([1180, 430])
+        self._section_splitter.apply_saved_or_default_sizes([340, 410, 260, 120])
+
+        # 430 px is not enough for the protocol editor's 29 typed columns, so
+        # the panel can take most of the window or leave it for its own.
+        self._right_panel_host = DetachablePanelHost(
+            self._right_side_tabs,
+            self._main_splitter,
+            1,
+            title="Laser Control and Protocol",
+            parent=self,
+        )
+        self._closing_right_panel = False
+        self._right_panel_host.state_changed.connect(self._remember_right_panel_state)
+        self._restore_right_panel_placement()
 
         self._frame_count = 0
         self._start = 0
@@ -143,6 +224,10 @@ class MainContent(ContentWidget):
 
         self._prev_parts_3d_loc = {}
         self._next_parts_3d_loc_report = time.perf_counter()
+        #: Recent results awaiting the next display tick, oldest first. See
+        #: refresh_pose for why more than one is kept.
+        self._pending_pose_responses = []
+        self._pending_pose_lock = threading.Lock()
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.update_image)
@@ -156,101 +241,286 @@ class MainContent(ContentWidget):
         #
         inference = app_model.inference
         inference.pose_response_ready += self.refresh_pose
+        # The overlay dialog writes the choice here; the panels follow it.
+        inference.property_changed += self._inference_property_changed
         #
         # app_model.behavior.algorithm.property_changed += self._behavior_algo_property_changed
-        self.training_mode_changed.connect(self._update_training_mode)
         self.training_plan_changed.connect(self._update_training_plan)
+
+    def _inference_property_changed(self, name, value, _previous):
+        """Follow the overlay part choice as the operator changes it."""
+        if name != InferenceModel.OVERLAY_PARTS:
+            return
+        for _camera, camera_content in self._reach_camera_contents:
+            camera_content.set_overlay_parts(value)
+
+    @property
+    def protocol_ui_enabled(self) -> bool:
+        return self._protocol_ui_enabled
+
+    @property
+    def right_panel_host(self) -> DetachablePanelHost:
+        return self._right_panel_host
+
+    def update_right_panel_tracking(self) -> None:
+        """Keep an expanded panel over this widget as the window moves."""
+        self._right_panel_host.track(
+            QRect(self.mapToGlobal(self.rect().topLeft()), self.rect().size())
+        )
+
+    def _remember_right_panel_state(self, state: str) -> None:
+        # Teardown brings the panel home, which is not the operator choosing
+        # docked. Recording it would mean an expanded or detached panel never
+        # survived a restart, which is the whole point of remembering it.
+        if self._closing_right_panel:
+            return
+        self._preferences.right_panel_state = state
+        if state == PanelState.DETACHED.value:
+            window = self._right_panel_host.window
+            if window is not None:
+                self._preferences.right_panel_detached_geometry = window.geometry()
+
+    def _restore_right_panel_placement(self) -> None:
+        """Reopen where the panel was left, falling back to docked."""
+        state = self._preferences.right_panel_state
+        try:
+            if state == PanelState.EXPANDED.value:
+                self.update_right_panel_tracking()
+                self._right_panel_host.expand()
+            elif state == PanelState.DETACHED.value:
+                self._right_panel_host.detach(
+                    self._preferences.right_panel_detached_geometry
+                )
+        except Exception:
+            logger.exception("Could not restore the right panel placement")
+            self._right_panel_host.collapse()
+
+    def _toggle_right_panel_expanded(self) -> None:
+        if self._right_panel_host.state is PanelState.EXPANDED:
+            self._right_panel_host.collapse()
+            return
+        self.update_right_panel_tracking()
+        self._right_panel_host.expand()
+
+    def _toggle_right_panel_detached(self) -> None:
+        if self._right_panel_host.state is PanelState.DETACHED:
+            self._right_panel_host.collapse()
+            return
+        self._right_panel_host.detach(
+            self._preferences.right_panel_detached_geometry
+        )
 
     def _create_top_widget_manual(self):
         widget = QWidget()
-        widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         widget.setContentsMargins(4, 4, 4, 0)
-        top_layout = QHBoxLayout(widget)
+        top_layout = QVBoxLayout(widget)
         top_layout.setContentsMargins(4, 4, 4, 0)
-        top_layout.setSpacing(16)
-        top_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        top_layout.setSpacing(0)
 
-        # allow auto set of spacing between cameras
-        top_layout.addStretch(1)
+        self._camera_rows_splitter = PersistentSplitter(
+            Qt.Orientation.Vertical,
+            self._preferences,
+            "camera_rows",
+            widget,
+        )
+        top_layout.addWidget(self._camera_rows_splitter)
 
         app_model = self._app_model
-        self._left_camera_content = CameraContent(app_model, app_model.left_camera)
-        self._left_camera_content.camera_view.setTitle("Left Camera")
-        top_layout.addWidget(self._left_camera_content)
-        self._content_widgets.append(self._left_camera_content)
-
-        top_layout.addStretch(1)
-
-        self._right_camera_content = CameraContent(app_model, self._app_model.right_camera)
-        self._right_camera_content.camera_view.setTitle("Right Camera")
-        top_layout.addWidget(self._right_camera_content)
-        self._content_widgets.append(self._right_camera_content)
-
-        top_layout.addStretch(1)
-
-        self._top_camera_content = CameraContent(app_model, self._app_model.top_camera)
-        self._top_camera_content.camera_view.setTitle("Top Camera")
-        top_layout.addWidget(self._top_camera_content)
-        self._content_widgets.append(self._top_camera_content)
-
-        top_layout.addStretch(1)
-
+        self._reach_camera_contents = []
+        self._reach_camera_content_by_model = {}
+        self._left_camera_content = None
+        self._right_camera_content = None
+        self._camera_row_splitters = []
+        self._rebuild_reach_camera_grid()
         return widget
+
+    @staticmethod
+    def _reach_camera_grid_columns(camera_count: int) -> int:
+        if camera_count <= 1:
+            return 1
+        if camera_count <= 3:
+            return camera_count
+        if camera_count == 4:
+            return 2
+        return 3
+
+    def _clear_reach_camera_grid(self) -> None:
+        for camera, camera_content in self._reach_camera_contents:
+            camera.set_display_fcn(None)
+            if camera_content in self._content_widgets:
+                self._content_widgets.remove(camera_content)
+            camera_content.close()
+            camera_content.setParent(None)
+            camera_content.deleteLater()
+        self._reach_camera_contents = []
+        self._reach_camera_content_by_model = {}
+        self._left_camera_content = None
+        self._right_camera_content = None
+        for splitter in self._camera_row_splitters:
+            splitter.setParent(None)
+            splitter.deleteLater()
+        self._camera_row_splitters = []
+
+    def _rebuild_reach_camera_grid(self) -> None:
+        self._clear_reach_camera_grid()
+
+        app_model = self._app_model
+        cameras = _visible_reach_cameras(
+            app_model.reach_cameras,
+            include_disabled_optional=self._is_camera_settings_editable,
+        )
+        columns = self._reach_camera_grid_columns(len(cameras))
+        rows = max(1, math.ceil(len(cameras) / columns))
+
+        for row_index in range(rows):
+            row_splitter = PersistentSplitter(
+                Qt.Orientation.Horizontal,
+                self._preferences,
+                f"camera_row_{row_index}",
+                self._camera_rows_splitter,
+            )
+            self._camera_rows_splitter.addWidget(row_splitter)
+            self._camera_row_splitters.append(row_splitter)
+
+        for idx, camera in enumerate(cameras):
+            camera_content = CameraContent(app_model, camera)
+            camera_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            camera_content.camera_view.setTitle(_camera_panel_title(camera.name))
+            camera_content.set_is_editable(self._is_camera_settings_editable)
+            camera.set_display_fcn(camera_content.refresh_image)
+            self._camera_row_splitters[idx // columns].addWidget(camera_content)
+            self._content_widgets.append(camera_content)
+            self._reach_camera_contents.append((camera, camera_content))
+            self._reach_camera_content_by_model[camera] = camera_content
+            # Empty means draw every part the model emits, which is what the
+            # painter now does on its own; a configured list only narrows it.
+            # Asked of the class, not the instance: the inference object is
+            # an Events object whose __getattr__ raises EventsException for
+            # anything undeclared, which getattr's default does not catch.
+            if hasattr(type(app_model.inference), "overlay_parts"):
+                camera_content.set_overlay_parts(
+                    app_model.inference.overlay_parts)
+            if camera is app_model.left_camera:
+                self._left_camera_content = camera_content
+            elif camera is app_model.right_camera:
+                self._right_camera_content = camera_content
+
+        for splitter in self._camera_row_splitters:
+            splitter.apply_saved_or_default_sizes([1] * max(1, splitter.count()))
+        self._camera_rows_splitter.apply_saved_or_default_sizes([1] * rows)
 
     def _create_mid_widget_manual(self, app_model):
         widget = QWidget()
         widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         widget.setContentsMargins(4, 0, 4, 0)
 
-        mid_layout = QHBoxLayout(widget)
-        mid_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        mid_layout = QVBoxLayout(widget)
         mid_layout.setContentsMargins(4, 4, 4, 0)
-        mid_layout.setSpacing(16)
+        mid_layout.setSpacing(0)
+
+        self._mid_splitter = PersistentSplitter(
+            Qt.Orientation.Horizontal,
+            self._preferences,
+            "behavior_analysis",
+            widget,
+        )
+        mid_layout.addWidget(self._mid_splitter)
 
         behavior_content = BehaviorContent(
             app_model,
             app_model.behavior,
             app_model.inference,
         )
-        mid_layout.addWidget(behavior_content)
+        behavior_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._mid_splitter.addWidget(behavior_content)
         self._content_widgets.append(behavior_content)
 
-        self._analysis_content = AnalysisContent(
-            app_model.hardware,
-            app_model.inference,
-            app_model.analysis,
-            app_model.message_handler,
-            app_model.preferences,
-        )
-        mid_layout.addWidget(self._analysis_content, 1)
+        self._analysis_content = AnalysisContent(app_model)
+        self._mid_splitter.addWidget(self._analysis_content)
         self._content_widgets.append(self._analysis_content)
+
+        self._mid_splitter.apply_saved_or_default_sizes([360, 820])
 
         return widget
 
     def _create_end_widget_manual(self):
-        # Third row - hardware & alarms
+        # Third row - hardware controls/status
         widget = QWidget()
         widget.setContentsMargins(4, 0, 4, 0)
 
-        end_layout = QHBoxLayout(widget)
-        end_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        end_layout = QVBoxLayout(widget)
         end_layout.setContentsMargins(4, 4, 4, 4)
-        end_layout.setSpacing(16)
+        end_layout.setSpacing(0)
+
+        self._hardware_splitter = PersistentSplitter(
+            Qt.Orientation.Horizontal,
+            self._preferences,
+            "hardware_panels",
+            widget,
+        )
+        end_layout.addWidget(self._hardware_splitter)
 
         hardware_control_content = self._hardware_control_content = HardwareControlContent(self._app_model)
-        end_layout.addWidget(hardware_control_content)
+        hardware_control_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._hardware_splitter.addWidget(hardware_control_content)
         self._content_widgets.append(hardware_control_content)
 
         hardware_status_content = self._hardware_status_content = HardwareStatusContent(self._app_model)
-        end_layout.addWidget(hardware_status_content)
+        hardware_status_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._hardware_splitter.addWidget(hardware_status_content)
         self._content_widgets.append(hardware_status_content)
 
-        # self._alarm_content can be relocated inside other widget, see where it's used.
-        alarm_content = self._alarm_content = AlarmContent(self._app_model, self._app_model.hardware)
-        end_layout.addWidget(alarm_content)
-        self._alarm_content_manual_layout = end_layout
+        self._hardware_splitter.apply_saved_or_default_sizes([500, 680])
 
         return widget
+
+    def set_hardware_refreshing(self, is_refreshing: bool):
+        self._hardware_status_content.set_hardware_refreshing(is_refreshing)
+
+    def set_hardware_refresh_action(self, action):
+        self._hardware_status_content.set_refresh_action(action)
+
+    def _create_right_side_tabs(self):
+        tabs = QTabWidget()
+        tabs.setObjectName("ReachAQRightSideTabs")
+        tabs.setDocumentMode(True)
+        tabs.setMinimumWidth(0)
+        tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        tabs.setStyleSheet(
+            "QTabWidget::pane {border: 1px solid #c9cdd3; background: #ffffff; top: -1px;}"
+            "QTabBar::tab {background: #e7eaee; color: #20242a; border: 1px solid #c9cdd3; padding: 4px 10px;}"
+            "QTabBar::tab:selected {background: #ffffff; border-bottom-color: #ffffff;}"
+            "QTabBar::tab:!selected {margin-top: 2px;}"
+        )
+
+        laser_control_content = self._laser_control_content = LaserControlContent(self._app_model)
+        tabs.addTab(laser_control_content, "Laser Control")
+        self._content_widgets.append(laser_control_content)
+
+        protocol_content = self._protocol_content = ProtocolContent(self._app_model)
+        tabs.addTab(protocol_content, "Protocol")
+        self._content_widgets.append(protocol_content)
+
+        corner = QWidget()
+        corner_layout = QHBoxLayout(corner)
+        corner_layout.setContentsMargins(0, 0, 4, 0)
+        corner_layout.setSpacing(2)
+        self._expand_panel_button = QToolButton()
+        self._expand_panel_button.setText("Expand")
+        self._expand_panel_button.setToolTip(
+            "Expand this panel leftward over the other panels"
+        )
+        self._expand_panel_button.clicked.connect(self._toggle_right_panel_expanded)
+        self._detach_panel_button = QToolButton()
+        self._detach_panel_button.setText("Detach")
+        self._detach_panel_button.setToolTip("Move this panel into its own window")
+        self._detach_panel_button.clicked.connect(self._toggle_right_panel_detached)
+        corner_layout.addWidget(self._expand_panel_button)
+        corner_layout.addWidget(self._detach_panel_button)
+        tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
+
+        return tabs
 
     def _create_protocol_phase_end_widget(self):
         widget = QWidget()
@@ -274,8 +544,6 @@ class MainContent(ContentWidget):
 
         layout.addLayout(left, stretch=1)
 
-        self._protocol_progress_alarm_content_layout = layout
-
         return widget
 
     def _create_protocol_phase_progress_widget(self):
@@ -293,25 +561,16 @@ class MainContent(ContentWidget):
         right_layout.addWidget(content)
         return widget
 
-    def _update_training_mode(self, training_mode: TrainingMode):
-        logger.verbose("updating training mode to %s", training_mode)
-        alarm_content = self._alarm_content
-        # remove from both, given if not present then it's identical to no-op,
-        self._protocol_progress_alarm_content_layout.removeWidget(alarm_content)
-        self._alarm_content_manual_layout.removeWidget(alarm_content)
-        # and will add it back where needed:
-        if training_mode == TrainingMode.MANUAL:
-            self._alarm_content_manual_layout.addWidget(alarm_content)
+    def _update_training_plan(self, plan: Optional[TrainingPlan]):
+        if not self._protocol_ui_enabled:
+            return
+        logger.debug("setting plan to %s (%s)", plan, hex(id(plan)))
+        if plan is None:
             self._mid_stacked_layout.setCurrentWidget(self._mid_widget_manual)
             self._end_stacked_layout.setCurrentWidget(self._end_widget_manual)
         else:
-            self._protocol_progress_alarm_content_layout.addWidget(alarm_content)
             self._mid_stacked_layout.setCurrentWidget(self._protocol_phase_progress_widget)
             self._end_stacked_layout.setCurrentWidget(self._protocol_phase_end_widget)
-        self.update()
-
-    def _update_training_plan(self, plan: Optional[TrainingPlan]):
-        logger.debug("setting plan to %s (%s)", plan, hex(id(plan)))
         self._training_phase_content.set_training_phase(
             None if plan is None else plan.current_phase,
             force_refresh=True,
@@ -325,25 +584,68 @@ class MainContent(ContentWidget):
         self.update()
 
     def close(self):
-         self._diagnostics_content.close()  # to ensure the textbox handler is remove from root logger handlers
-         super().close()
+        # Bring the panel home first, so it is destroyed with its parent rather
+        # than left behind in a live top-level window. The flag keeps that from
+        # being recorded as the operator docking it.
+        self._closing_right_panel = True
+        self._right_panel_host.collapse()
+        self._clear_reach_camera_grid()
+        # Ensure the textbox handler is removed from root logger handlers.
+        self._diagnostics_content.close()
+        super().close()
 
     @Slot()
     def update_image(self):
-        model = self._app_model
-        if model.left_camera.is_enabled:
-            self._left_camera_content.update_image()
-        if model.right_camera.is_enabled:
-            self._right_camera_content.update_image()
-        if model.top_camera.is_enabled:
-            self._top_camera_content.update_image()
-        self._analysis_content.use_cache()
+        self._flush_pending_pose()
+        for camera, camera_content in self._reach_camera_contents:
+            if camera.is_enabled:
+                camera_content.update_image()
 
     def refresh_pose(self, response: PoseResponse):
-        if self._app_model.left_camera.is_enabled:
-            self._left_camera_content.refresh_pose(response.locations[0])
-        if self._app_model.right_camera.is_enabled:
-            self._right_camera_content.refresh_pose(response.locations[1])
+        """Buffer recent inference results until the next display tick.
+
+        Live inference produces results much faster than Qt renders the camera
+        panels, so these are collected rather than dispatched: dispatching each
+        one as it arrives creates an unbounded queue of UI-thread calls and
+        delays unrelated timers, including the live analysis plot.
+
+        Buffered rather than overwritten, which is what this used to do. The
+        panel draws the pose belonging to the frame it is showing, and the
+        display runs about a tenth of the capture rate - so keeping only the
+        newest threw away the matching one nine times out of ten and left the
+        overlay a median of two frames off with a quarter of them undrawable.
+
+        Bounded, because a stall must not grow this without limit.
+        """
+        with self._pending_pose_lock:
+            self._pending_pose_responses.append(response)
+            while len(self._pending_pose_responses) > PENDING_POSE_LIMIT:
+                self._pending_pose_responses.pop(0)
+
+    def _flush_pending_pose(self):
+        with self._pending_pose_lock:
+            responses = self._pending_pose_responses
+            self._pending_pose_responses = []
+        if not responses:
+            return
+        for response in responses:
+            self._dispatch_pose(response)
+
+    def _dispatch_pose(self, response: PoseResponse):
+        """Hand one result to each camera panel, tagged with its frame."""
+        # source_frame_ids records the camera frames this pose was computed
+        # from, per camera. Passing it through lets the panel draw the dots
+        # over the frame they belong to instead of whatever is on screen.
+        source_ids = getattr(response, "source_frame_ids", ())
+        for idx, camera in enumerate(self._app_model.inference_cameras):
+            camera_content = self._reach_camera_content_by_model.get(camera)
+            if camera_content is not None and camera.is_enabled and idx < len(response.locations):
+                frame_id = -1
+                if idx < len(source_ids) and source_ids[idx]:
+                    # Several frames per camera per batch; the last is the
+                    # one the pose describes.
+                    frame_id = source_ids[idx][-1]
+                camera_content.refresh_pose(response.locations[idx], frame_id)
         if __debug__:
             perf_now = time.perf_counter()
             if perf_now >= self._next_parts_3d_loc_report:
@@ -364,7 +666,11 @@ class MainContent(ContentWidget):
 
     @invoke_method
     def set_is_editable(self, is_editable: bool):
-        for widget in self._content_widgets:
+        is_editable = bool(is_editable)
+        if self._is_camera_settings_editable != is_editable:
+            self._is_camera_settings_editable = is_editable
+            self._rebuild_reach_camera_grid()
+        for _camera, widget in self._reach_camera_contents:
             widget.set_is_editable(is_editable)
 
     @invoke_method
@@ -377,10 +683,8 @@ class MainContent(ContentWidget):
     def on_activated(self):
         self._app_model.on_activated()
 
-        self._app_model.left_camera.set_display_fcn(self._left_camera_content.refresh_image)
-        self._app_model.right_camera.set_display_fcn(self._right_camera_content.refresh_image)
-        self._app_model.top_camera.set_display_fcn(self._top_camera_content.refresh_image)
-
+        for camera, camera_content in self._reach_camera_contents:
+            camera.set_display_fcn(camera_content.refresh_image)
         for widget in self._content_widgets:
             widget.on_activated()
 
@@ -463,8 +767,8 @@ class MainContent(ContentWidget):
     ):
         logger.verbose("show_analysis_reach_events: %s", prj)
         if prj is None:
-            for cam in (self._left_camera_content, self._right_camera_content):
-                cam.camera_view.image_view.set_reach_overlay(None)
+            for _, camera_content in self._reach_camera_contents:
+                camera_content.camera_view.image_view.set_reach_overlay(None)
             return
         loc = prj.get_reach_event_path()
         df_reach = pandas.read_hdf(loc, key="reach")
@@ -473,10 +777,12 @@ class MainContent(ContentWidget):
         logger.verbose("reach:\n%s\npellet:\n%s\n", df_reach, df_pellet)
         logger.debug("trajectory:\n%s", df_trajectory)
         logger.debug("looping over %s reaches", len(df_reach))
-        for (cam_name, cam) in (
-            ("left", self._left_camera_content),
-            ("right", self._right_camera_content),
-        ):
+        available_cam_names = set(df_trajectory.columns.get_level_values(0))
+        for camera, cam in self._reach_camera_contents:
+            cam_name = camera.name
+            if cam_name not in available_cam_names:
+                cam.camera_view.image_view.set_reach_overlay(None)
+                continue
             assert len(df_trajectory.index.unique(0)) == len(df_reach)
             img_view = cam.camera_view.image_view
             width_f, height_f = img_view.size_factor
@@ -501,8 +807,6 @@ class MainContent(ContentWidget):
         if name == props.SELECTED_ANIMAL:
             self._hardware_control_content.set_selected_animal(value)
             self.training_plan_changed.emit(app_model.training_plan)  # ensure it's refreshed too
-        elif name == props.TRAINING_MODE:
-            self.training_mode_changed.emit(value)
         elif name == props.TRAINING_PLAN:
             assert isinstance(value, (type(None), TrainingPlan))
             self.training_plan_changed.emit(value)
@@ -517,6 +821,7 @@ class MainContent(ContentWidget):
     @invoke_method
     def _on_config_loaded(self, config):
         del config  # unused
+        self._rebuild_reach_camera_grid()
         # only re-setting the current selected animal
         self._hardware_control_content.set_selected_animal(self._app_model.selected_animal)
         # this allows to set correctly for the possible diamond-triangle config loaded

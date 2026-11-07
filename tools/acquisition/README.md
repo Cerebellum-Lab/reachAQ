@@ -1,139 +1,624 @@
 # Acquisition UI
 
-## Using Configurations
-Configuration files load preset values for the settings of each module (cameras, devices, behavior, output).  When 
-the application starts it will load the most recent configuration file, if available and be in non-edit mode.
+The acquisition application is the reachAQ operator UI for camera acquisition,
+hardware status, pellet delivery, NI-DAQ port mapping, laser controls, behavior,
+and inference.
 
-To make changes to module settings use the Edit Configuration toolbar button.  This will change the controls in 
-each module view area to be editable where applicable.  Make the desired changes, exit edit mode (using the same
-toolbar button), and then use the Save or Save As... File menu items to save the configuration to a new or
-existing file.
+## Launch
 
-See a complete configuration file with all allowed fields at the end of this document.  Using only a subset
-of values that should not be the default is valid.
+Use the reachAQ entry point from the configured conda environment:
+
+```bash
+conda run --no-capture-output -n reachaq python -m reachAQ.app \
+  -c "$HOME/Autotrainer/system_configuration.yaml"
+```
+
+The `--no-capture-output` option is required for live terminal logging when the
+application is launched through Conda.
+
+The GUI starts idle by default, so camera and DAQ configuration remain editable
+until **System Mode** is changed to **Running**. Use `--start-mode running` only when immediate
+startup is intentional. The application window opens maximized by default while
+retaining its normal title bar and restore control. Before that maximized show,
+reachAQ restores the last valid normal geometry or seeds a practical centered
+normal size; the first title-bar drag therefore cannot collapse the window to a
+tiny Qt default. After restoring, it remains freely resizable in both width and
+height—even below child-panel size hints.
+Overflowing toolbar actions remain accessible from the toolbar menu, and the
+status-bar corner has a resize grip. The saved live-inference setting can be
+overridden for one run with `--live-inference` or `--no-live-inference`.
+
+All visible acquisition panel boundaries are draggable. This includes the
+camera panels, the vertical camera/analysis/hardware sections,
+Behavior/Analysis, Hardware Control/Status, and the main workspace/right-side
+tabs. Split positions are stored in the user preferences file and restored on
+the next launch. Splitter handles use deferred resize so high-rate graphs do
+not repaint continuously while a handle is being dragged.
+
+For software-only camera testing:
+
+```bash
+conda run --no-capture-output -n reachaq python -m reachAQ.app \
+  --random-cameras \
+  --no-live-inference \
+  -c "$HOME/Autotrainer/system_configuration.yaml"
+```
+
+The random-camera override is in-memory for that run and does not overwrite the
+configured physical camera serials when the app closes.
+
+## Startup and Live Inference
+
+Selecting Running first shows `Starting acquisition...` and temporarily
+disables camera and DAQ editing. If live inference is enabled, its NVIDIA driver
+and GPU preflight - for the engine the configured model runs on - is reported
+as the live-inference domain. A failed
+preflight prevents inference from starting but does not prevent independent
+camera, CAN, laser, or NI-DAQ initialization. Each domain reports its own Ready,
+Blocked, Failed, or Disabled state. Record remains unavailable until every
+configured source required for persistence is Ready.
+
+The **Live inference** switch in Preferences controls the saved setting. The
+`--live-inference` and `--no-live-inference` command-line flags override that
+setting for one run without changing it; other configuration edits made during
+the run can still be saved. Live inference intentionally refuses CPU fallback.
+
+## Configurations
+
+Configuration files load preset values for cameras, devices, NI-DAQ channels,
+laser controls, behavior, inference, and output. On Linux reachAQ rigs, the
+default local config is usually:
+
+```text
+~/Autotrainer/system_configuration.yaml
+```
+
+The app saves configuration back to the file it loaded: the one named with
+`-c`, or the preferences default when none is named. A software-only or test
+run started with `-c` on its own copy therefore never overwrites the bench
+config. Nothing is saved when the last load did not complete, or when the run
+used `--random-cameras`.
+
+Rig-level availability for CAN, the pellet controller, NI-DAQ, and the USB RFID
+reader is grouped in the YAML `hardware:` block. The same switches and the RFID
+serial path are editable under **File → Hardware** while acquisition is idle.
+The checkable multi-selection submenu stays open while choices are changed and
+closes when the operator clicks outside it. Each choice persists to the system
+YAML immediately; enabling runtime hardware queues one combined refresh after
+the submenu closes. The Hardware Status panel remains a compact, read-only view
+of live subsystem health.
+
+The current production schema is system-configuration version 58. Older and
+newer versions, unknown fields, retired load-cell/tunnel fields, and obsolete
+NI recording controls are rejected instead of being silently migrated. Start
+from the maintained example at
+[`tools/hardware/reachaq_system_configuration.example.yaml`](../hardware/reachaq_system_configuration.example.yaml)
+when converting a rig configuration.
+
+## Cameras
+
+Reach cameras are configured as `CameraConfiguration` entries. The left and
+right cameras are the normal two-camera reachAQ setup. A third `stimCam`
+(`id: 3`) is added as an optional, disabled camera. While disabled it is not
+shown in the normal camera grid or Hardware Status and is not opened or required
+at startup. **Edit → Edit Camera Settings** always shows the `stimCam` settings
+panel so it can be enabled or disabled there. Leaving camera-edit mode saves the
+selection and rebuilds the normal camera grid: enabled creates the third,
+far-right panel; disabled removes it. Cameras 4-6 likewise appear only while
+enabled.
+
+Enable `stimCam` by setting its `CameraConfiguration.isEnabled` value to
+`true`. Its source can then be selected from the far-right camera panel. Keep
+it `false` on rigs without the camera; the placeholder random source is never
+opened while the camera is disabled.
+
+For Spinnaker cameras, put the camera serial or configured Spinnaker identifier
+in `host`. The Edit Camera Settings selector keeps that configured binding under
+the logical camera name (`left`, `right`, or `stimCam`); discovered
+`Spinnaker <serial>` entries are intentionally excluded from the selector so a
+camera cannot be silently rebound to another configured position. Hardware
+Status still lists every discovered serial for connection diagnostics.
+
+```yaml
+- !CameraConfiguration
+  id: 0
+  name: left
+  isEnabled: true
+  isRecordEnabled: true
+  recordMode: 1
+  # Manual recordings begin at the first frame after Record; prebuffer is disabled.
+  recordPrebufferDuration: 0
+  scheme: spinnaker
+  host: '24152533'
+  port: 0
+  path: ''
+  params:
+    fps: 150
+    width: 256
+    height: 256
+    hbin: 4
+    vbin: 4
+    exposure: 175
+    primary: 'yes'
+```
+
+The matching right camera should use its own serial and `primary: 'no'`.
+
+The two-camera Spinnaker path is hardware synchronized: the primary camera
+drives a GPIO signal and the secondary waits for that signal before producing
+frames. A discovered secondary camera can therefore be connected yet show no
+preview when the trigger path is absent or invalid. See
+[FLIR Spinnaker camera setup](../../docs/linux-install/flir-spinnaker.md#work-in-progress-right-camera-preview-timeout)
+for the current right-camera timeout investigation and isolation procedure.
+
+## NI-DAQ Ports
+
+The DAQ port editor discovers devices through NI-DAQmx. The channel-source
+selector controls which device contributes new choices; assignments already
+selected from other devices remain visible and selected while the source
+changes. The editor also prevents duplicate channel assignments across roles.
+If the selected source has no channels of a required type and that role has no
+retained assignment, the role is disabled instead of allowing an invalid choice.
+
+Discovery runs in a background worker. While it is active, the UI displays
+`Discovering NI-DAQ devices...`; the editor opens when discovery completes or
+shows the discovery error if no usable device is returned.
+
+The Analysis card contains **Stream** and **Signals** tabs. Signals lists camera
+frame, barcode, Tone 1, Tone 2, Tone 3 right, and Tone 3 left inputs. Laser
+signals are intentionally excluded from this card. A checkbox becomes
+selectable only after that signal has a physical assignment in **Edit → Edit
+DAQ Ports** and NI-DAQ is enabled. Checkboxes can be changed at any time,
+including while the stream runs: a change shows or hides that curve at once,
+and the other curves keep their history. Every checkbox change is immediately
+saved as the `nidaqStream.displayChannels` plot selection. It never changes the
+complete acquisition channel plan. Clear is disabled when NI-DAQ is disabled.
+
+There is no Start or Stop button for the NI-DAQ input stream. It starts by
+itself whenever NI-DAQ is enabled and at least one input is mapped, in Idle as
+well as in System Mode: once the configuration loads when reachAQ opens, after
+a Hardware Refresh or enabling NI-DAQ under **File → Hardware**, after **Edit
+DAQ Ports** saves (with the new channel plan), and again when acquisition
+stops. Starting System Mode restarts it, so that recorded NI sample times
+count from a fresh task-start anchor rather than from whenever the Idle
+stream began: they are compared with host times, and the two clocks drift
+apart. The NI graphs clear for the few seconds that takes. The
+Analysis header shows `running`, `starting`, `stopped`, `disabled` or `error`;
+hover over it for the detail. A stream that fails to start stays stopped and
+reports the failure in Hardware Status and the log. It is not retried by
+itself; Hardware Refresh tries again. **Tools → DAQ Monitor** pauses the stream
+while its window is open, because it opens its own tasks on the same lines,
+and the stream starts again when that window closes.
+
+NI-DAQmx task creation and reads run in an isolated worker process. The Analysis
+card stays responsive while the worker starts, and a native driver crash such as
+`SIGSEGV` is shown as a stream error instead of terminating reachAQ. A worker
+that does not become ready within 10 seconds is stopped and reported as a
+startup timeout. Hardware initialization milestones from the worker are relayed
+to both the application log and terminal.
+
+The Analysis graph is visualization-only, but its checkbox selection does not
+control acquisition or persistence. While NI-DAQ is enabled, every mapped and
+custom acquisition channel is sampled continuously and saved to
+`streams/nidaq.h5` during a recording, even when it is not plotted. Incoming
+blocks, fixed-size NumPy circular buffers, and
+pixel-aligned peak-envelope reduction run in a dedicated plot-data process. The
+process publishes alternating fixed-size `float32` shared-memory buffers; no
+plot arrays are serialized through a multiprocessing queue. The GUI timer uses
+the refresh rate reported by the screen containing the application, consumes
+only the newest completed shared buffer, and performs the final Qt curve draw.
+Qt widgets themselves remain in the GUI process. Each curve contains exactly
+one minimum/maximum pair per physical graph pixel so narrow TTL activity remains
+visible without repainting every raw sample.
+Curves are always solid lines; digital signals are
+distinguished by color and label rather than dots or dashes. Controls below
+each graph set its visible time window in seconds and its minimum/maximum
+vertical range in volts.
+
+The default 10 kHz hardware sample rate provides ten samples across each half
+cycle of a 500 Hz square wave. At runtime, the NI read chunk is derived from the
+active screen rate (`sample rate / refresh rate`), so one new block is normally
+available per display refresh. The configured `readChunkSize` remains a
+backward-compatible fallback rather than the live display cadence. Digital-only tasks use an NI counter output as
+their sample clock instead of software-timed per-sample reads. A TTL must be
+connected to the exact physical channel named in `nidaqStream.channels`.
+
+On the current PXIe-1073 / PXI-6713 setup, NI-DAQmx reports:
+
+```text
+Device: PXI1Slot4
+AO: PXI1Slot4/ao0 through PXI1Slot4/ao7
+AI: none
+DIO: PXI1Slot4/port0/line0 through PXI1Slot4/port0/line7
+```
+
+The 6713 can provide analog outputs and digital I/O, but it cannot provide
+analog input readback. This rig also contains a PXI-6221 (`PXI1Slot5`) with 16
+analog inputs, hardware-clocked digital input support, and two counters. Prefer
+the 6221 for buffered input streams and verify that `nidaqPorts` and
+`nidaqStream.channels` identify the same wired terminals.
+
+When the stream's inputs span two boards in one PXI chassis, the timing
+master exports its sample clock onto the PXI_Trig line in
+`nidaqPorts.timing.sampleClockExportTerminal` and, when it has an analog
+input, its start trigger onto the one in `startTriggerExportTerminal`, such as
+`/PXI1Slot5/PXI_Trig4` and `/PXI1Slot5/PXI_Trig5`. An input board in another
+slot, say `PXI1Slot6`, names each line as its own (`/PXI1Slot6/PXI_Trig4`):
+named across the boards, the master's own terminals are a route DAQmx refuses
+on an unidentified chassis (-89125). `sampleClockExportTerminal` is then
+required, and `startTriggerExportTerminal` too when the master has an analog
+input; neither has a default. They are required on an identified chassis too,
+where DAQmx could route the master's terminals itself and the earlier direct
+naming worked: the code makes no exception for one. A stream start with a
+required one unset, or not a PXI_Trig line, is refused, naming the field. The
+two lines must differ from each other, from the laser's `backplaneClockLine`
+and `pulseClockLine`, from every laser `triggerSource` line and PXI_Trig
+`triggerRouteSource`, and from every `triggerListenerInputs` line; Run and the
+stream's own start, Idle's included, refuse a clash, once for each, and the DAQ
+Monitor lists it. The DAQ Monitor window's own stream is configured without the
+laser, so it refuses only one export line against the other. christielab10
+keeps every input on the 6221 and sets neither field. This path is tested
+against a DAQmx stand-in only and is not yet verified on hardware.
+
+Laser Control opens on **Pulse Builder**, the first tab, before the per-channel
+tabs. Every laser pulse profile is built and saved there; a laser's own tab
+only picks a saved profile or the builder's unsaved draft and fires it.
+
+Laser Control uses a smaller font (7.5 pt, graph axes 7 pt) so that each
+page fits the docked right-side panel without scrolling; the dialogs it opens
+keep the application font. On christielab10 that panel is 440 x 860 px. Each
+channel has **Pulse** and **Calibration** tabs.
+The panel's footer shows its status and, in red, every error or refusal it
+reports: Run Pulse, Test stim, Run Ramp, a profile no longer saved, a Pulse
+Builder save or delete, and a failed operation. Each also goes to the main
+window's status bar and the log, as before, so a detached panel shows its
+errors in its own window. An error stays until the panel's next status or
+error replaces it, the next operation's lines or the Ready line of a Run/Stop
+rebuild included; it has no timeout. A long one ends in an ellipsis, and
+hovering over it shows the whole line; for a failed operation, hovering also
+shows the whole error, a DAQmx error's task and status code included. While an
+operation runs the footer says so ("Running ..."), not why nothing else can
+be fired meanwhile.
+The Pulse tab has the **Profile:** picker at the top. Below it are the folding
+sections **Run Pulse**, **Test stim**, **Output stream** and **Board
+trigger**; click a section's title to fold or open it. A folded section gives
+its height to the output graph. The open/closed state is shared by every laser
+tab and survives the tab rebuilds at each Run/Stop. It is saved in the user
+preferences file as it changes, as the split positions are, under `[ui]` as
+`laser_control\sections\<section>`, so the next launch opens every section,
+the Pulse Builder's two included, as it was left. A missing or damaged value
+(anything but `true` or `false`) leaves that section as it starts by default.
+Output stream contains the graph, its legend, a status line
+naming the shared input stream's state with Clear beside it, the time window
+and voltage limits, and a **Signals** section, folded by default. Signals holds
+that laser's command-output, diode-feedback, command-copy and
+board-trigger-readback display options. Physical NI-DAQ paths are shown in
+signal tooltips instead of widening the panel. A line too long for the panel
+ends in an ellipsis, and hovering over it shows the whole text. Plots and
+controls shrink with the panel; use the main splitter to give them more room
+when desired. A mapped
+laser's graph follows the shared NI-DAQ input stream, which starts by itself
+(see above), so its inputs plot in Idle as well as in System Mode; there is no
+Start Stream or Start DAQ Inputs button. Every display option can be ticked or
+unticked at any time, including while the stream runs, and shows or hides its
+curve at once. The input selections persist immediately in
+`nidaqStream.displayChannels`, while remaining absent from the main Analysis
+selector and plot, which leaves out every laser's diode, command-copy and
+trigger-readback input; whether each laser's command output is shown is saved
+in the user preferences file, as `laser_control\command_output\laserN` under
+`[ui]`, and a missing or damaged value shows it. An input that is not in the
+acquisition plan is disabled and
+its tooltip says so. All three inputs are set per laser in **Edit DAQ Ports**:
+diode, laser_copy, and trigger readback input, the last being the board STIM
+line wired into an analog input (`aiN`) or a port0 line (`port0/lineN`) of
+the Channel source device, never a PFI terminal or a port1/port2 line (the
+same PFI pins), which the stream cannot clock. Each configured input is
+acquired and recorded as `laserN_diode`, `laserN_command_copy` or
+`laserN_trigger`, the readbacks last in the scan; *(none)* stops a readback
+being acquired. The Board trigger status line says whether no input is set,
+the stream is not running or has failed, or the readback is being read, shown
+or not. An input already used by another role, or a laser output line, is
+refused in the dialog, naming both. Manual/internal and
+externally triggered pulse operations append their command waveform. Selected
+measured inputs from the shared NI-DAQ stream are added to the corresponding
+laser graph. Calibration explicitly starts and clears the associated graph.
+The Calibration tab's **Run Ramp** runs only in Idle: it holds the shared
+NI-DAQ input stream stopped, through the same hold as the DAQ Monitor, opens a
+laser controller for the ramp alone, and hands both back when the ramp ends,
+however it ends. Run, the DAQ Monitor, configuration loads and DAQ Ports saves
+are refused while it runs, and its tooltip gives the reason whenever it is
+unavailable. Its **Settle:** field is how long the start of each step is left
+out of that step's point, 600 µs by default whatever **Samples/step:** is
+(500 by default, 5 ms at 100 kHz): the input is read on the clock edge the
+command changes on, and the laser, the diode and the input path take time to
+follow, so those first samples still read the step before. The laser
+controller's own inputs are referenced by the stream's `analogTerminalConfig`.
+Each live stream graph has its own editable time window and voltage limits.
+
+Every stream option and curve uses the same high-contrast color assignment:
+the first displayed signal is blue, the second green, followed by orange,
+purple, red, teal, magenta, and blue-gray. A compact matching legend appears
+below the main Analysis graph and below every laser Output stream graph.
+Every legend swatch and plotted curve is solid.
+
+All Analysis and laser graphs take their physical pixel width and height from
+the containing panel. Dragging a horizontal or vertical splitter therefore
+grows or shrinks the graph itself, and no graph forces its panel wider. Only
+the laser tabs' Board trigger graph keeps a fixed height, 76 px, for a single
+TTL edge; every other graph takes the height it is given. This is independent
+of the editable seconds and voltage ranges.
+
+## Output
+
+Set acquisition output in the persistence section:
+
+```yaml
+persistence: !PersistenceConfiguration
+  outputLocation: /home/<USER>/Documents/rawdatalocal
+```
+
+Create the directory before running acquisition:
+
+```bash
+mkdir -p "$HOME/Documents/rawdatalocal"
+```
 
 ## Reference
 
-### Menus/Toolbar Buttons
+### Toolbar
 
-#### Toolbars
-* Run/stop - start and stop acquisition and device interaction
-* Edit Configuration - change the window to edit mode to change settings
-* Preferences - set system level application preferences that are not part of configuration files
-  * Device Name of this system
-  * Log Level for the application and related services
+* System Mode - select Idle or Running. During transitions it explicitly shows
+  Starting or Stopping acquisition. The selector remains available in stable
+  Running/Ready state so the operator can return to Idle; it is locked during
+  recording lifecycle transitions and background hardware discovery.
+* Notes - set notes for the current acquisition session. Stop saves the current
+  value, and edits made after Stop (including during analysis) atomically update
+  that stopped session's JSON/YAML metadata. Starting the next recording
+  finalizes the preceding text and clears the field.
+* Subject - select the linked local animal name. The adjacent RFID label shows
+  the most recently scanned raw 15-digit RFID.
+  Subject and RFID are session-only: every application launch starts with both
+  empty, and creating or linking an animal selects it for the current session.
+  Recording is blocked until a subject is scanned or selected so every session
+  receives an immutable animal metadata snapshot. Subject selection is locked
+  from session Arming through analysis and becomes editable again in Ready.
+* Protocol - select a protocol, or select **Manual pellet control**. Automatic
+  pellet cycles and automatic protocol advance are independent settings. The
+  selector follows the same session lock as Subject.
+* Preferences - configure live inference and other application preferences.
 
-#### Menus
-* File -> Open Configuration - open an existing configuration file
-* File -> Save Configuration (As) - save the current configuration file or as a new file
-* View -> Diagnostics - show or hide the diagnostics panel
+Top-level controls share one lifecycle availability calculation. Camera/DAQ
+editing and **File → Hardware** are Idle-only; hardware refresh is available
+in stable Idle or Running/Ready; calibration requires its own valid hardware and
+coordinate state; conflicting controls are disabled while acquisition starts or
+stops, a recording is active, analysis runs, or discovery/refresh is in flight.
+
+Hardware Status uses one collapsible subpanel per category. Subpanels start
+collapsed and show only the category plus `Enabled` or `Disabled`; green,
+amber, red, blue-gray, and gray headers indicate ready, warning, failure, idle,
+and disabled states. Expand a category to see its scan and binding details. A
+scan runs once when the application opens; Hardware Refresh repeats it on
+demand. A successful scan leaves the pellet controller connected so
+acquisition can reuse the initialized session. The result is a stable scan
+snapshot and is not cleared or rewritten when acquisition starts. `CAN Adapter`
+reports the physical PCIe device,
+kernel driver, and Linux CAN interfaces separately from the `Pellet Controller`
+application session. Pellet Controller is green when its session is connected
+and red when initialization fails or its connection is lost. Compact vertical
+detail lines show each PXI slot and card
+model/product number, the configured CAN backend/interface, and the detected
+GPU model, memory, and driver.
+
+The `RFID Reader` category shows its stable serial path, connection state or
+error, and most recent scan result. Configure it under **Preferences → Animal
+metadata**. That panel also separates **Sync from SoftMouse**, which publishes
+to Isilon and refreshes the local cache, from **Refresh local cache**, which
+only consumes the latest completed Isilon publication. Neither action is
+available during recording. See the
+[SoftMouse/RFID guide](../softmouse_sync/README.md) for credentials, reader
+setup, required packages and serial permissions, metadata ownership, safety
+checks, and the single-host nightly timer. The normal portable installer
+installs and verifies these dependencies; credential entry remains a one-time
+per-publisher action.
+
+The Hardware Refresh icon is at the far right of the Hardware Status title bar.
+While idle it repeats discovery and refreshes bindings. While System Mode is
+Running and no recording or analysis is active, it retries failed subsystems
+without restarting healthy domains.
+
+### Menus
+
+* File -> Hardware - enable or disable the CAN adapter, pellet controller,
+  NI-DAQ, or USB RFID reader and edit the stable RFID serial path while Idle.
+  The submenu supports multiple changes without closing after every checkbox;
+  click outside it to close and start any queued hardware refresh.
+* File -> Quit - close the application through its controlled shutdown path.
+* Edit -> Edit Camera Settings - enable or disable editable camera fields while
+  idle.
+* Edit -> Edit DAQ Ports - discover NI-DAQ devices and configure named channel
+  roles while idle. The digital roles (tones, camera frames, barcode) must be
+  port0 lines on the input card, the only lines the stream can clock; the
+  dialog offers no others, and marks a stored one invalid with the reason. A
+  configuration file with a line the stream cannot acquire still loads, with
+  the NI-DAQ stream blocked and the reason in the status bar, until a valid
+  save here.
+* Tools -> Calibrate Coordinate System / Make 3D calibration - run the available
+  calibration workflows.
+* Tools -> DAQ Monitor - while idle, watch every line on every NI-DAQ card,
+  drive tones, board stimulus lines and laser commands to see which line moves,
+  and run the wiring test. The application's NI-DAQ input stream pauses while
+  the window is open and starts again when it closes. See
+  [Check the wiring](../../docs/linux-install/ni-daq-pxi.md#check-the-wiring).
+* View -> Logging - show or hide the application log. Errors are reported here,
+  in the status bar, in the launching terminal, and in the log file instead of
+  being rendered inside individual control panels.
+* View -> Debug - development-mode panel shown only when the application is
+  launched with development options.
+
+### Hardware Control
+
+Pellet Release Location contains the X/Y/Z editors, their Set buttons, and motor
+feedback directly below the label. The adjacent Compound Move column contains
+Home, Load, Send, Retract, Release, and Cover without spacer columns. These are
+intentional force-override operator commands, but they are still disabled when
+acquisition is Idle, the pellet controller is disconnected, or a command is
+pending; they re-enable after acknowledgement or failure cleanup once the
+controller is available in Running mode.
+
+### Trial Protocol
+
+The **Trial Protocol** tab manages reusable, versioned ordered protocols. A
+session selects one saved revision or **No protocol**. Protocols may be shared
+by animals; an animal stores only its preferred protocol ID. New, Duplicate,
+Rename, Import, Export, and Revert operate only while session configuration is
+unlocked.
+
+Each resolved row controls pellet-cycle behavior, center/left/right placement,
+base/fixed/automatic shift, cover policy, named tone and finite pulse-train
+profiles, assignment probability, trigger, and retry behavior. Values may be
+applied to one trial, arbitrary selections, epochs, blocks, or all future
+trials. Copy/fill/repeat, randomized preview, and Undo/Redo create a new saved
+revision. Future rows remain editable; an active row is highlighted and frozen;
+completed rows stay locked.
+
+The **New auto shift** profile editor defines reusable versioned automatic
+policies: eligible reach outcomes, mean/median reduction, desired reach offset,
+deadbands, per-update/absolute limits, and apply-versus-recommend-only behavior.
+Rows select one policy plus legacy-batch or sliding-last-X window semantics.
+
+Before SEND, reachAQ freezes and validates the row, resolves one absolute DCS
+and motor target, acknowledges positioning/cover actions, and pre-arms any laser
+operation. Only then may the pellet state machine queue SEND. Preparation errors
+do not create a pellet attempt. Every accepted attempt persists the requested
+row, compiled recipe, resolved target, profile revisions, action observations,
+and terminal state. Hardware-error retries reuse the logical row and absolute
+target rather than accumulating relative movement.
+
+`Pre-reveal` is a board-owned compound sequence: a finite pulse on the laser's
+board STIM line (STIM2 or STIM3), board delay, pellet reveal, then the
+configured SEND sequence. It requires the `hardware_stim3` (Board STIM) route
+and Reveal cover policy. First Reach uses the independently managed 900 Hz
+stim camera and either acknowledged board-STIM-to-NI triggering or the
+explicit Direct NI software-start route; it never silently switches routes.
+ROI1/ROI2 remain visible, versioned, and non-runnable future framework.
 
 ### Camera Control
-* Video Capture - will not start the camera subprocess when not enabled
-* Recode Mode - `Continuous` to record entire duration, `Trigger` to only record based on trigger events
-* Video Recording - capture all frames to video files
-* Image Capture - capture still images at a specified interval
-* Image Capture Interval - interval for still image capture
 
-### Head Fix Device
-* Port - local device serial port
-* Position - `0-100` (corresponds to `Axx` command)
-* Load Cell Trigger - value above which recording will be enabled if a camera record mde is `Trigger`
-* Graph - previous 5 seconds of scale data
-* Header/Load Cell/Force Detector `(Dis)Engaged` indicates the state of these sensors
-  * Note that this is not necessarily the instantaneous value of the sensor, but the result of
-  any logic such as a minimum time to consider the load cell engaged, etc.
-* Tare - Tare the load cell
+* Video Capture - starts capture only when the camera is enabled.
+* Video Recording - includes the camera in manually started sessions.
+* Image Capture - captures still images at a configured interval.
 
-### Pellet Delivery
-* Port - local device serial port
-* Home - device `H` command
-* Load - device `P` command
-* Send - device `M` command
-* Release - device `R` command
-* Cover - device `Q` command (not implemented)
-* X - device `Ixx` command
-* Y - device `Jxx` command
-* Z - device `Kxx` command
+Normal acquisition always uses triggered recording. Selecting System Mode
+`Running` starts acquisition and preview without writing session video. Use
+`Record` in the Behavior panel to initialize a session and begin writing,
+`Stop` to retain it and drain any already-closed pellet-trial analyses, or
+`Abort` to cancel the analysis generation and discard the entire session.
+Record remains unavailable until stopped-session finalization finishes.
+Presented, Reaches, Success, and Consumed are session-only counts: they reset on
+Record, remain visible after Stop, and reset to zero after Abort. The old System
+state display, day/total counters, load-cell UI, and load-cell recording triggers
+have been removed.
 
-### Behavior
-* Enable - enable or disable pellet delivery based on marker detection
-* Model - the folder containing the DLC model to use
+Optional live intertrial analysis uses the existing live tracking stream from a
+validated physical NI Tone 2 onset through exact pellet-cycle completion. When
+that NI input is unavailable, it falls back first to the pellet board's immediate
+tone status and then to legacy periodic GPIO status. It runs on a separate
+bounded worker while all recording streams continue and never reopens video or
+starts a second inference pass. Continue mode is advisory; Wait mode and
+analysis-dependent retry rules block only the next SEND. Pellet presence,
+missing-pellet retry selection, and misplacement are finalized synchronously and
+do not wait for analysis. If a
+required result fails, the Trial Protocol panel offers **Retry analysis** and
+**Continue without result** while Stop and Abort remain available.
 
-### Metadata
-* `Name` and `Notes` to be saved as part of the session metadata
+Session-aligned auxiliary files are stored beneath the matching `sessionNNN`
+directory:
 
-### Output
-* Output Location - location for recorded video files
-
-### Log
-Logs from any module that is not a subprocess.  Additional subprocess log messages can be seen at the command line.
-
-## System Configuration
-* The unit number for the output directory structure/file names can be set by editing `~/.config/Colorado/Auto Trainer.conf`
- and adding 
-```
-[system]
-serial_number=12345
+```text
+streams/nidaq.h5
+streams/device.csv
+streams/laser.csv
+streams/tracking/trial_<id>_attempt_<id>.json
+streams/trials.jsonl
+streams/trial_summary.json
+streams/alignment.json
+logs/session.log
 ```
 
-## Example Configuration File
+`alignment.json` records the primary-camera start/end boundary and the first
+and last saved timestamps and offsets for every auxiliary stream. It also
+records NI-DAQ topology, camera/NI edge matching, device-tone/NI confirmation,
+enabled-source paths and counts, gaps, overruns, failures, and session
+completeness. Final JSON/YAML metadata must contain the same finite canonical
+camera boundary before a session is reported as fully saved.
 
-Most values can be set by configuring the subsystem in the application and saving the configuration.  Others
-must explicitly be added to the file.
+Tone correlation treats the NI onset as the canonical physical event and groups
+the compound `PLAY_TONE` command, immediate `TONE_STATUS`, and periodic GPIO
+observation without changing their raw receipt timestamps. Pulses shorter than
+2 ms are reported as artifacts, not tone events, and all reported pulse onsets
+are restricted to the saved camera boundary.
+Each valid tone also stores its physical wall/UTC time, offset from Record, and
+the first actual recorded frame beginning at or after the event. The association
+includes the frame ID, zero-based video index, frame timestamps, delay, method,
+and confidence. It is calculated only during finalization and does not add live
+recording or preview latency.
 
-```yaml
-camera1:
-  id: left
-  name: Spinnaker 33199919
-  url: spinnaker://33199919?fps=150&width=300&height=200&hbin=4&vbin=4&exposure=250&primary=true
-  isEnabled: true
-  isRecordEnabled: true
-  recordMode: 1
-  isStillImageCaptureEnabled: false
-  stillImageCaptureInterval: 5
-camera2:
-  id: right
-  name: Spinnaker 33199895
-  url: spinnaker://33199895?fps=150&width=300&height=200&hbin=4&vbin=4&exposure=250&primary=true
-  isEnabled: true
-  isRecordEnabled: true
-  recordMode: 1
-  isStillImageCaptureEnabled: false
-  stillImageCaptureInterval: 5
-camera3:
-  id: web
-  name: ELP
-  url: opencv://0?mjpeg=true&width=1920&height=1080&fps=30
-  isEnabled: true
-  isRecordEnabled: true
-  recordMode: 0
-  isStillImageCaptureEnabled: true
-  stillImageCaptureInterval: 5.0
-headFix:
-  port: /dev/ttyACM0
-  position: 0
-  loadCell:
-    loadTrigger: 8
-    minLoadOnDuration: 0.250
-    minEventDuration: 4.0
-    minLoadOffDuration: 2.0
-pelletDelivery:
-  port: /dev/ttyACM1
-  x: 0
-  y: 0
-  z: 0
-inference:
-  model: /home/jetson/models/Christie-2024-05-02
-  isEnabled: true
-behavior:
-  maxPelletMissingSeconds: 1.0
-  maxPelletsPerSession: 15
-  maxPelletsPerDay: 120
-  minBaselineIntensity: 5.0
-  maxBaselineIntensity: 90.0
-  baselineIntensityIncrement: 15.0
-  defaultBaselineIntensity: 30.0
+The same contract applies to every discrete structured session event. All
+application/API events are preserved individually in `events.csv` before
+dispatcher repeat coalescing. Device/CAN and laser CSV rows include
+recorded-frame association columns; trial lifecycle records and tracking-window
+boundaries include nested event alignment.
+Method/confidence separates physical NI alignment from host-timestamp
+association. Continuous NI and pose samples already carry native sample/frame
+identity and are not duplicated into per-sample event records.
+`laser.csv` is in time order, and each row names the NI-DAQ sample its host
+time landed within (`nidaq_sample_index`). A Run Pulse fired while a session
+records is kept there as a marked manual event: a `requested` row and a
+`completed`, `failed`, `cancelled` or `refused` row under one `manual-`
+operation id, with its profile, laser, amplitude, trigger mode and route.
 
-outputLocation: /home/jetson/output
+See [Session recording, synchronization, and hardware isolation](../../docs/acquisition/session-recording-and-synchronization.md)
+for the complete state, persistence, timing, metadata, failure, and verification
+contract.
+
+## Startup Diagnostics
+
+Hardware initialization milestones are written to the normal log file and are
+always echoed to the launching terminal, even when the ordinary console log
+level is Warning. Search for records beginning with:
+
+```text
+HARDWARE INIT | START
+HARDWARE INIT | READY
+HARDWARE INIT | SKIP
+HARDWARE INIT | FAILED
 ```
+
+These records cover the GPU preflight, camera discovery and child processes,
+CAN adapter/controller, NI-DAQ discovery and tasks, and laser channels. Each slow
+operation records elapsed time so the final emitted `START` line identifies the
+initialization step that is still waiting.
+
+Hardware Status categories are collapsed by default. Expanded categories use
+independently scrollable, fixed-width tables with aligned columns and a bold,
+underlined header. Camera serials, NI card models and named port/stream routes,
+CAN driver/interface selection, GPU driver/memory, and laser channel/timing
+bindings are shown per device; only actionable scan warnings are added below
+those rows. Camera rows are limited to configured reach and optional stimCam
+roles; synthetic and playback test sources are omitted from hardware discovery.
+
+Some NI devices, including M-Series static digital I/O, return DAQmx status
+`-200303` because their digital lines have no internal hardware sample clock.
+The analysis stream automatically falls back to software-timed reads for a
+digital-only task and logs a warning. This mode is appropriate for operator
+visualization, but its timing is approximate and it can miss pulses shorter than
+the polling interval; use a routed hardware sample clock when edge-complete
+recording is required.
+
+See [../../linux-install-instructions.md](../../linux-install-instructions.md)
+and [../hardware/reachaq_system_configuration.example.yaml](../hardware/reachaq_system_configuration.example.yaml)
+for the current Linux hardware setup and example config.
+
+See [Recording sessions, pellet trials, protocols, and schema migration](../../docs/acquisition/session-trials-protocols.md)
+for trial numbering, retries, automatic stop behavior, protocol progress, and
+animal v4/v5/v6-to-v7 migration.

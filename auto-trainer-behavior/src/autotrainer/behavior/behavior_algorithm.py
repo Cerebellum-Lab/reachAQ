@@ -10,7 +10,7 @@ import math
 import queue
 import threading
 import time
-from datetime import datetime, date
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import Optional, Tuple, ClassVar, Any, Dict, Deque, List
@@ -27,11 +27,9 @@ from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.multiproc import make_daemon_timer, no_op_timer
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core.reach_event import ReachEvent
-from autotrainer.core.configuration.behavior_configuration import PelletDeliveryConfiguration, HeadClampConfiguration, \
-    BehaviorConfiguration, AutoCloseGateOnIntersessionConfiguration, AutoEndSessionConfiguration, \
-    BatchSessionRecordingConfiguration, HomeOnExcessiveDriftDistanceConfiguration, \
+from autotrainer.core.configuration.behavior_configuration import PelletDeliveryConfiguration, \
+    BehaviorConfiguration, HomeOnExcessiveDriftDistanceConfiguration, \
     PelletUncoverConfiguration
-from autotrainer.core.video_detection import PresenceDetectionAttrs
 from autotrainer.core.pose_elements import ScenePartsPresenceContext, SceneElement
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.interfaces import CaptureAnalysisResult, RecordingEndingReason, BehaviorAlgorithmProtocol, \
@@ -42,8 +40,9 @@ from .system_machine_state import SystemState
 from .intersession import IntersessionState
 
 from autotrainer.inference import PoseResponse
-from autotrainer.inference.pose_algorithm import update_scene_elements_context_from_pose
 from autotrainer.inference.analysis import IntersessionResponse
+
+from .pellet_presence_tracker import PelletPresenceTracker
 
 logger = get_verbose_logger(__name__)
 
@@ -88,21 +87,13 @@ class BehaviorAlgoProps(str, enum.Enum):
 
     ALGO_PAUSED = 'algo_paused'
 
-    # head-clamp / auto-clamp related:
-    BASELINE_INTENSITY = 'baseline_intensity'
-    HEAD_FIXATION_ENABLED = 'head_fixation_enabled'  # this is head-clamp
-
     # runtime context:
     PELLET_SHIFT_Y_LIMIT = 'pellet_shift_y_limit'
 
-    DAY_PELLET_COUNT = 'day_pellet_count'  # consumed
-    TOTAL_PELLET_COUNT = 'total_pellet_count'  # consumed
-    DAY_PELLET_PRESENTED = 'day_pellet_presented'
-    TOTAL_PELLET_PRESENTED = 'total_pellet_presented'
-    DAY_PELLET_REACHES = 'day_pellet_reaches'
-    TOTAL_PELLET_REACHES = 'total_pellet_reaches'
-    DAY_SUCCESSFUL_REACHES = 'day_successful_reaches'
-    TOTAL_SUCCESSFUL_REACHES = 'total_successful_reaches'
+    SESSION_PELLETS_CONSUMED = 'session_pellets_consumed'
+    SESSION_PELLETS_PRESENTED = 'session_pellets_presented'
+    SESSION_REACHES = 'session_reaches'
+    SESSION_SUCCESSFUL_REACHES = 'session_successful_reaches'
 
     INTERSESSION_ENABLED = 'intersession_enabled'  # config
     # INTERSESSION_PELLET_SHIFT_ENABLED = 'intersession_pellet_shift_enabled'
@@ -133,7 +124,6 @@ class BehaviorAlgoProps(str, enum.Enum):
     # PELLET_HANDS_DISTANCE = 'pellet_hands_min_distance'  # unused
 
     DIAMOND_TRIANGLE_CONFIG = 'diamond_triangle_config'
-    CAGE_CLEAN_CONFIG = 'cage_clean_config'
 
 
 #
@@ -170,9 +160,7 @@ def _relay_func(func, *, wait: bool=_DEFAULT_ALGO_HANDLER_THREAD_CALL_SYNC_WAIT_
 
 class BehaviorAlgoStatus(str, enum.Enum):
     IDLE = "idle"  # nothing running
-    ACQUIRING = "acquiring"  # camera + system running, but without animal-in-device
-    ANIMAL_IN_DEVICE = "animal_in_device"  # this is ACQUIRING with animal-in-device
-    ANIMAL_IN_TRAINING = "animal_in_training"  # this is ANIMAL_IN_DEVICE with training behavior algo **enabled**
+    RUNNING = "running"
 
 
 class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
@@ -182,10 +170,8 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     session_starting: BehaviorAlgoEvents.session_starting
     session_capture_ending: BehaviorAlgoEvents.session_capture_ending
 
-    batch_analysis_starting: BehaviorAlgoEvents.batch_analysis_starting
     session_processing_starting: BehaviorAlgoEvents.session_processing_starting
     session_ending: BehaviorAlgoEvents.session_ending
-    batch_analysis_ending: BehaviorAlgoEvents.batch_analysis_ending
 
     cover_servo_status_changed: BehaviorAlgoEvents.cover_servo_status_changed  # unused
 
@@ -207,7 +193,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         *,
         project_info: Optional[ProjectInfo] = None,
         diamond_triangle_offset_config_path: Optional[Path] = None,
-        topcam_presence: Optional[PresenceDetectionAttrs] = None,
     ):
         super().__init__(event_names=tuple(attr for attr in dir(BehaviorAlgoEvents) if not attr.startswith('_')))
 
@@ -220,18 +205,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self._active_config = BehaviorConfiguration()
         self._loaded_config: Optional[BehaviorConfiguration] = None
 
-        self._head_fixation_enabled = False
-        self._autoclamp_in_progress = False
-        self._autoclamp_engaged_perf_c = -math.inf
-
-        self._clean_raw_data_on_inactive_session = False  # NB: not saved in config
-
-        self._parts_pres_ctx_any_cam = ScenePartsPresenceContext()
-        self._parts_pres_ctx_all_cams = ScenePartsPresenceContext()
-
-        # now using self._active_config.head_clamp mainly,
-        # and also:
-        self._baseline_intensity = self._active_config.head_clamp.baseline_intensity
+        self._presence_tracker = PelletPresenceTracker()
 
         # NB: not saved in config:
         self._sess_min_duration = 1.5  # could add to config
@@ -245,18 +219,18 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self._session_started_perf_c = -math.inf
         self._start_session_reason = "NA"
         self._stop_session_reason = RecordingEndingReason.NA
+        self._pellet_automation_stop_requested = False
+        self._pellet_send_block_reason = ""
         self._timer_end_capture_session = no_op_timer
         self._prev_can_load_pellet_log_refuse_perf_c = -math.inf
 
-        self._session_mouse_seen = False
         self._pellet_hands_min_distance: float = math.inf
-        self._mouse_seen_last_perf_c = -math.inf
         self._triangle_pellet_last_offset = Offset3DTuple(math.nan, math.nan, math.nan)
         self._next_diamond_triangle_log_report = -math.inf
 
         self._uncover_ctx = PelletUncoverContext()
 
-        self._system_state = SystemState.cage
+        self._system_state = SystemState.ready
         self._intersession_state = IntersessionState.idle
         self._capture_status = CaptureProcessStatus.UNKNOWN
         self._recording_start_perf_c = math.nan
@@ -265,21 +239,14 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
         self._session_pellet_loaded_count = 0  # loaded
 
-        self._pellet_counts_day_date = date.today()
-        self._pellets_consumed_day = 0  # consumed
-        self._pellets_consumed_total = 0  # consumed
-        self._pellets_presented_day: int = 0
-        self._pellets_presented_total: int = 0
-        self._reaches_day: int = 0
-        self._reaches_total: int = 0
-        self._successful_reaches_day: int = 0
-        self._successful_reaches_total: int = 0
+        self._pellets_consumed = 0
+        self._pellets_presented = 0
+        self._reaches = 0
+        self._successful_reaches = 0
 
         self._previous_intersession_analysis_rsp: Optional[Tuple[ProjectInfo, IntersessionResponse]] = None
 
         self._cover_servo_status = CoverServoStatus.OK
-
-        self._topcam_presence: Optional[PresenceDetectionAttrs] = topcam_presence
 
         if diamond_triangle_offset_config_path is None:
             diamond_triangle_offset_config_path = DiamondTriangleOffsetConfig.DEFAULT_CONFIG_PATH
@@ -532,14 +499,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self._on_property_changed(BehaviorAlgoProps.ALGO_PAUSED, value, prev)
 
     @property
-    def top_camera_presence_detection(self) -> Optional[PresenceDetectionAttrs]:
-        return self._topcam_presence
-
-    @top_camera_presence_detection.setter
-    def top_camera_presence_detection(self, value: Optional[PresenceDetectionAttrs]):
-        self._topcam_presence = value
-
-    @property
     def system_state(self) -> SystemState:
         return self._system_state
 
@@ -591,10 +550,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     @property
     def is_in_session_age(self) -> float:
         return get_perf_now() - self._session_started_perf_c
-
-    @property
-    def auto_close_gate_on_intersession_config(self) -> AutoCloseGateOnIntersessionConfiguration:
-        return self._active_config.auto_close_gate_on_intersession
 
     @property
     def pellet_delivery_enabled(self) -> bool:
@@ -684,126 +639,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         # self._on_property_changed(BehaviorAlgoProps.INTERSESSION_PELLET_SHIFT_ENABLED, value, prev)
 
     @property
-    def head_fixation_enabled(self) -> bool:
-        """head fixation == autoclamp"""
-        # NB: not saved in config
-        return self._head_fixation_enabled
-
-    @head_fixation_enabled.setter
-    def head_fixation_enabled(self, value: bool):
-        # NB: not saved in config
-        prev, self._head_fixation_enabled = self._head_fixation_enabled, value
-        if value != prev:
-            logger.info("auto-clamp enabled changed to: %s", self._head_fixation_enabled)
-            self._event_manager.post_event_content(ApiEventKind.autoClampEnabledChanged, data=dict(is_enabled=value))
-            self._on_property_changed(BehaviorAlgoProps.HEAD_FIXATION_ENABLED, value, prev)
-
-    @property
-    def clean_raw_data_on_inactive_session(self):
-        return self._clean_raw_data_on_inactive_session
-
-    @clean_raw_data_on_inactive_session.setter
-    def clean_raw_data_on_inactive_session(self, value):
-        self._clean_raw_data_on_inactive_session = value
-
-    # auto/head clamp
-
-    @property
-    def autoclamp_in_progress(self) -> bool:
-        return self._autoclamp_in_progress
-
-    @autoclamp_in_progress.setter
-    def autoclamp_in_progress(self, value: bool):
-        self._autoclamp_in_progress = value
-        if value:
-            self._autoclamp_engaged_perf_c = get_perf_now()
-
-    @property
-    def baseline_intensity(self) -> float:
-        """Head magnet "baseline" intensity ; set from animal/subject"""
-        return self._baseline_intensity
-
-    @baseline_intensity.setter
-    def baseline_intensity(self, value: float):
-        prev, self._baseline_intensity = self._baseline_intensity, value
-        self._on_property_changed(BehaviorAlgoProps.BASELINE_INTENSITY, value, prev)
-
-    @property
-    def head_clamp_config(self) -> HeadClampConfiguration:
-        """The whole HeadClamp config, can be modified in place,
-        although no event/change cb, if any is configured on behavior algo, will be emitted in that case"""
-        return self._active_config.head_clamp
-
-    @property
-    def auto_clamp_intensity(self) -> float:
-        return self._active_config.head_clamp.auto_clamp_intensity
-
-    @auto_clamp_intensity.setter
-    def auto_clamp_intensity(self, value: float):
-        cfg = self._active_config.head_clamp
-        prev, cfg.auto_clamp_intensity = cfg.auto_clamp_intensity, value
-        if value != prev:
-            # prop unused
-            #     self._on_property_changed(BehaviorAlgoProps.AUTO_CLAMP_INTENSITY, value, prev)
-            self._event_manager.post_event_content(
-                ApiEventKind.autoClampIntensityChanged, data=dict(intensity=value))
-
-    @property
-    def auto_clamp_release_tone_freq(self) -> int:
-        """Frequency of the tone played when auto-clamp is released in Hz"""
-        return self._active_config.head_clamp.auto_clamp_release_tone_freq
-
-    @auto_clamp_release_tone_freq.setter
-    def auto_clamp_release_tone_freq(self, value: int):
-        cfg = self._active_config.head_clamp
-        prev, cfg.auto_clamp_release_tone_freq = cfg.auto_clamp_release_tone_freq, value
-        if value != prev:
-            # prop unused
-            # self._on_property_changed("auto_clamp_release_tone_freq", value, prev)
-            self._event_manager.post_event_content(ApiEventKind.autoClampReleaseToneFreqChanged,
-                                                   data=dict(frequency=value))
-
-    @property
-    def auto_clamp_release_tone_delay(self) -> float:
-        return self._active_config.head_clamp.auto_clamp_release_tone_delay
-
-    @auto_clamp_release_tone_delay.setter
-    def auto_clamp_release_tone_delay(self, value: float):
-        cfg = self._active_config.head_clamp
-        prev, cfg.auto_clamp_release_tone_delay = cfg.auto_clamp_release_tone_delay, value
-        if value != prev:
-            # prop unused
-            # self._on_property_changed("auto_clamp_release_tone_delay", value, prev)
-            self._event_manager.post_event_content(ApiEventKind.autoClampReleaseDelayChanged,
-                                                   data=dict(delay=value))
-
-    @property
-    def auto_clamp_release_load_count(self) -> int:
-        return self._active_config.head_clamp.auto_clamp_release_load_count
-
-    @auto_clamp_release_load_count.setter
-    def auto_clamp_release_load_count(self, value: int):
-        self._active_config.head_clamp.auto_clamp_release_load_count = value
-
-    @property
-    def auto_clamp_no_activity_release_delay(self):
-        return self._active_config.head_clamp.auto_clamp_no_activity_release_delay
-
-    @auto_clamp_no_activity_release_delay.setter
-    def auto_clamp_no_activity_release_delay(self, value):
-        self._active_config.head_clamp.auto_clamp_no_activity_release_delay = value
-
-    @property
-    def auto_clamp_before_reengage_delay(self) -> float:
-        return self._active_config.head_clamp.before_reengage_delay
-
-    @auto_clamp_before_reengage_delay.setter
-    def auto_clamp_before_reengage_delay(self, value):
-        self._active_config.head_clamp.before_reengage_delay = value
-
-    #
-
-    @property
     def record_prebuffer_duration(self) -> float:
         return self._recording_prebuffer_duration
 
@@ -823,23 +658,25 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
     @property
     def triangle_last_seen(self) -> float:  # only used by test atm
-        return self._parts_pres_ctx_any_cam.present_last_perf_c.get(SceneElement.Triangle, -math.inf)
+        return self._presence_tracker.last_seen(SceneElement.Triangle)
 
     @property
     def triangle_recently_seen(self) -> bool:
         # only used in tests and a log
-        return self._parts_pres_ctx_any_cam.get_recently_seen(
+        return self._presence_tracker.is_recently_seen(
             SceneElement.Triangle,
             self.limits.triangle_missing_time,
+            use_any_camera=True,
             perf_now=get_perf_now(),
         )
 
     @property
     def diamond_recently_seen(self) -> bool:
         # only used in test
-        return self._parts_pres_ctx_any_cam.get_recently_seen(
+        return self._presence_tracker.is_recently_seen(
             SceneElement.Diamond,
             self.limits.triangle_missing_time,
+            use_any_camera=True,
             perf_now=get_perf_now(),
         )
 
@@ -897,34 +734,14 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
     # counts
 
-    def _check_pellet_counts_day_date(self):
-        today = date.today()
-        if today != self._pellet_counts_day_date:
-            logger.verbose("resetting pellet day counts to 0")
-            self._pellet_counts_day_date = today
-            self.pellets_presented_day = 0
-            self.pellet_reaches_day = 0
-            self.pellet_consumed_day = 0
-            self.successful_reaches_day = 0
-
     @property
-    def pellet_consumed_day(self) -> int:
-        self._check_pellet_counts_day_date()
-        return self._pellets_consumed_day
+    def pellets_consumed(self) -> int:
+        return self._pellets_consumed
 
-    @pellet_consumed_day.setter
-    def pellet_consumed_day(self, value: int):
-        prev_value, self._pellets_consumed_day = self._pellets_consumed_day, value
-        self._on_property_changed(BehaviorAlgoProps.DAY_PELLET_COUNT, value, prev_value)
-
-    @property
-    def pellet_consumed_total(self) -> int:
-        return self._pellets_consumed_total
-
-    @pellet_consumed_total.setter
-    def pellet_consumed_total(self, value: int):
-        prev, self._pellets_consumed_total = self._pellets_consumed_total, value
-        self._on_property_changed(BehaviorAlgoProps.TOTAL_PELLET_COUNT, value, prev)
+    @pellets_consumed.setter
+    def pellets_consumed(self, value: int):
+        prev, self._pellets_consumed = self._pellets_consumed, int(value)
+        self._on_property_changed(BehaviorAlgoProps.SESSION_PELLETS_CONSUMED, self._pellets_consumed, prev)
 
     @property
     def session_pellet_loaded_count(self) -> int:
@@ -936,109 +753,69 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self._on_property_changed(BehaviorAlgoProps.SESSION_PELLET_COUNT, value, prev)  # property unused
 
     def increase_pellets_consumed(self, increment: int = 1):
-        self.pellet_consumed_day += increment
-        self.pellet_consumed_total += increment
+        self.pellets_consumed += increment
         if increment:
             self.pellets_consumed_evt(increment)
             self._event_manager.post_event_content(
                 ApiEventKind.pelletConsumedCountChanged,
-                data=dict(change=increment, count=self._pellets_consumed_total))
-            self._event_manager.post_event_content(
-                ApiEventKind.dayPelletConsumedCountChanged,
-                data=dict(change=increment, count=self._pellets_consumed_day))
+                data=dict(change=increment, count=self._pellets_consumed))
 
     @property
-    def pellets_presented_day(self):
-        self._check_pellet_counts_day_date()
-        return self._pellets_presented_day
+    def pellets_presented(self) -> int:
+        return self._pellets_presented
 
-    @pellets_presented_day.setter
-    def pellets_presented_day(self, value):
-        prev, self._pellets_presented_day = self._pellets_presented_day, value
-        self._on_property_changed(BehaviorAlgoProps.DAY_PELLET_PRESENTED, value, prev)
-
-    @property
-    def pellets_presented_total(self):
-        return self._pellets_presented_total
-
-    @pellets_presented_total.setter
-    def pellets_presented_total(self, value):
-        prev, self._pellets_presented_total = self._pellets_presented_total, value
-        self._on_property_changed(BehaviorAlgoProps.TOTAL_PELLET_PRESENTED, value, prev)
+    @pellets_presented.setter
+    def pellets_presented(self, value: int):
+        prev, self._pellets_presented = self._pellets_presented, int(value)
+        self._on_property_changed(BehaviorAlgoProps.SESSION_PELLETS_PRESENTED, self._pellets_presented, prev)
 
     def increase_pellets_presented(self, increment: int = 1):
-        self.pellets_presented_day += increment
-        self.pellets_presented_total += increment
+        self.pellets_presented += increment
         if increment:
             self.pellets_presented_evt(increment)
             self._event_manager.post_event_content(
                 ApiEventKind.pelletPresentedCountChanged,
-                data=dict(change=increment, count=self._pellets_presented_total))
-            self._event_manager.post_event_content(
-                ApiEventKind.dayPelletPresentedCountChanged,
-                data=dict(change=increment, count=self._pellets_presented_day))
+                data=dict(change=increment, count=self._pellets_presented))
 
     @property
-    def pellet_reaches_day(self):
-        self._check_pellet_counts_day_date()
-        return self._reaches_day
+    def pellet_reaches(self) -> int:
+        return self._reaches
 
-    @pellet_reaches_day.setter
-    def pellet_reaches_day(self, value):
-        prev, self._reaches_day = self._reaches_day, value
-        self._on_property_changed(BehaviorAlgoProps.DAY_PELLET_REACHES, value, prev)
-
-    @property
-    def pellet_reaches_total(self):
-        return self._reaches_total
-
-    @pellet_reaches_total.setter
-    def pellet_reaches_total(self, value):
-        prev, self._reaches_total = self._reaches_total, value
-        self._on_property_changed(BehaviorAlgoProps.TOTAL_PELLET_REACHES, value, prev)
+    @pellet_reaches.setter
+    def pellet_reaches(self, value: int):
+        prev, self._reaches = self._reaches, int(value)
+        self._on_property_changed(BehaviorAlgoProps.SESSION_REACHES, self._reaches, prev)
 
     def increase_pellet_total_reaches(self, increment: int = 1):
-        self.pellet_reaches_day += increment
-        self.pellet_reaches_total += increment
+        self.pellet_reaches += increment
         if increment:
             self.total_reaches_evt(increment)
             self._event_manager.post_event_content(
                 ApiEventKind.reachCountChanged,
-                data=dict(change=increment, count=self._reaches_total))
-            self._event_manager.post_event_content(
-                ApiEventKind.dayReachCountChanged,
-                data=dict(change=increment, count=self._reaches_day))
+                data=dict(change=increment, count=self._reaches))
 
     @property
-    def successful_reaches_day(self):
-        self._check_pellet_counts_day_date()
-        return self._successful_reaches_day
+    def successful_reaches(self) -> int:
+        return self._successful_reaches
 
-    @successful_reaches_day.setter
-    def successful_reaches_day(self, value):
-        prev, self._successful_reaches_day = self._successful_reaches_day, value
-        self._on_property_changed(BehaviorAlgoProps.DAY_SUCCESSFUL_REACHES, value, prev)
-
-    @property
-    def successful_reaches_total(self):
-        return self._successful_reaches_total
-
-    @successful_reaches_total.setter
-    def successful_reaches_total(self, value):
-        prev, self._successful_reaches_total = self._successful_reaches_total, value
-        self._on_property_changed(BehaviorAlgoProps.TOTAL_SUCCESSFUL_REACHES, value, prev)
+    @successful_reaches.setter
+    def successful_reaches(self, value: int):
+        prev, self._successful_reaches = self._successful_reaches, int(value)
+        self._on_property_changed(BehaviorAlgoProps.SESSION_SUCCESSFUL_REACHES, self._successful_reaches, prev)
 
     def increase_successful_reaches(self, increment: int = 1):
-        self.successful_reaches_day += increment
-        self.successful_reaches_total += increment
+        self.successful_reaches += increment
         if increment:
             self.successful_reaches_evt(increment)
             self._event_manager.post_event_content(
                 ApiEventKind.successfulReachesCountChanged,
-                data=dict(change=increment, count=self._successful_reaches_total))
-            self._event_manager.post_event_content(
-                ApiEventKind.daySuccessfulReachesCountChanged,
-                data=dict(change=increment, count=self._successful_reaches_day))
+                data=dict(change=increment, count=self._successful_reaches))
+
+    def reset_session_counts(self):
+        self.pellets_presented = 0
+        self.pellet_reaches = 0
+        self.successful_reaches = 0
+        self.pellets_consumed = 0
     #
 
     @property
@@ -1082,14 +859,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     #
 
     @property
-    def auto_end_session_config(self) -> AutoEndSessionConfiguration:
-        return self._active_config.auto_end_session
-
-    @property
-    def batch_session_recording_config(self) -> BatchSessionRecordingConfiguration:
-        return self._active_config.batch_session_recording
-
-    @property
     def auto_correct_motors_drift(self) -> bool:
         return self._active_config.pellet_delivery.auto_correct_motors_drift
 
@@ -1101,20 +870,33 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
     @property
     def any_cams_scene_parts_presence_context(self) -> ScenePartsPresenceContext:
-        return self._parts_pres_ctx_any_cam
+        return self._presence_tracker.any_camera
 
     @property
     def all_cams_scene_parts_presence_context(self) -> ScenePartsPresenceContext:
-        return self._parts_pres_ctx_all_cams
+        return self._presence_tracker.all_cameras
 
     #
 
-    def start_session(self, *, reason: str = "NA"):
-        """Start a session/trial recording"""
+    def start_session(
+        self,
+        *,
+        reason: str = "NA",
+        allocate_project_session: bool = True,
+    ):
+        """Start a recording session."""
         with self._thread_lock:
-            return self._start_session(reason=reason)
+            return self._start_session(
+                reason=reason,
+                allocate_project_session=allocate_project_session,
+            )
 
-    def _start_session(self, *, reason: str = "NA"):
+    def _start_session(
+        self,
+        *,
+        reason: str = "NA",
+        allocate_project_session: bool = True,
+    ):
         if self._is_in_session:
             logger.warning("%s: start_session() called but already in session", reason)
             return False
@@ -1128,18 +910,16 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
         logger.success("%s: starting new session recording ...", reason)
         self._is_in_session = True
+        self._pellet_automation_stop_requested = False
         self._session_started_perf_c = get_perf_now()
         self._start_session_reason = reason
         self.reset_session_pellet_count()
+        self.reset_session_counts()
 
-        project.calculate_next_session_index()
-        self._event_manager.post_event_content(
-            ApiEventKind.projectSessionChanged,
-            data=dict(root=project.root, session=project.session),
-        )
-
+        if allocate_project_session:
+            project.calculate_next_session_index()
         # ensure we look at their state on start:
-        self._session_mouse_seen = False
+        self._presence_tracker.reset_session()
         self._uncover_ctx.reset()  # always
 
         self.session_starting_before_record_start()
@@ -1152,9 +932,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         # given it's an async task.
 
         self.session_starting()
-
-        self._event_manager.post_event_content(
-            ApiEventKind.trialStarted, data=dict(trial_id=project.session, reason=reason))
 
         return True
 
@@ -1171,7 +948,16 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         p_now = get_perf_now()
         sess_duration = p_now - self._session_started_perf_c
         miss_delay = self._sess_min_duration - sess_duration
-        if miss_delay > 0 and reason != RecordingEndingReason.ALGO_PAUSED:
+        immediate_reasons = {
+            RecordingEndingReason.ALGO_PAUSED,
+            RecordingEndingReason.MANUAL_STOP,
+            RecordingEndingReason.MANUAL_ABORT,
+            RecordingEndingReason.DURATION_LIMIT,
+            RecordingEndingReason.TRIAL_LIMIT,
+            RecordingEndingReason.PROTOCOL_COMPLETE,
+            RecordingEndingReason.STOP_DRAIN_TIMEOUT,
+        }
+        if miss_delay > 0 and reason not in immediate_reasons:
             logger.verbose("current trial record too short, delaying end_capture_session of %.1f",
                            miss_delay)
             timer = self._timer_end_capture_session = make_daemon_timer(
@@ -1184,8 +970,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         # but must be at least before self.session_ending() here after, given test_covered_load_cycle rely on that atm.
         self._stop_session_reason = reason
         post_trigger_enable(self, False)  # tells cameras processes to stop recording - ASYNC
-        self._event_manager.post_event_content(
-            ApiEventKind.trialCaptureEnded, data=dict(trial_id=self._project_info.session, reason=reason))
         with self.set_allow_reentrant(True):
             self.session_capture_ending(reason)
         self.get_diamond_triangle_drifts(show_log=True)  # convenience to log current values
@@ -1196,8 +980,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         But this is still called from system machine when analysis is delayed.
         """
         logger.notice("session processing end: %s ; project=%s", result, project)
-        self._event_manager.post_event_content(
-            ApiEventKind.trialEnded, data=dict(result=result))
         self.session_ending(project, result)
 
     def reset_session_pellet_count(self):
@@ -1206,7 +988,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     @property
     def pellet_presence_age(self) -> float:
         """Return value in seconds unit"""
-        return self._parts_pres_ctx_any_cam.get_presence_age(SceneElement.Pellet)
+        return self._presence_tracker.presence_age(SceneElement.Pellet)
 
     @property
     def pellet_recently_seen(self):
@@ -1214,16 +996,20 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         # which using _any_ cam seen, not _all/both_ cams seen flags,
         # but for better certainty, most-if-not-all of them shall be using the later.
         # there is the algo.is_pellet_recently_seen() method which is doing that.
-        return self._parts_pres_ctx_any_cam.get_recently_seen(
-            SceneElement.Pellet, self.limits.pellet_missing_time,
+        return self._presence_tracker.is_recently_seen(
+            SceneElement.Pellet,
+            self.limits.pellet_missing_time,
+            use_any_camera=True,
             perf_now=get_perf_now(),
         )
 
     def is_part_recently_seen(self, part: str, *, use_any_cam: bool=False, perf_now: Optional[float]=None) -> bool:
-        ctx = self._parts_pres_ctx_any_cam if use_any_cam else self._parts_pres_ctx_all_cams
-        if perf_now is None:
-            perf_now = get_perf_now()
-        return ctx.get_recently_seen(part, self.limits.pellet_missing_time, perf_now=perf_now)
+        return self._presence_tracker.is_recently_seen(
+            part,
+            self.limits.pellet_missing_time,
+            use_any_camera=use_any_cam,
+            perf_now=perf_now,
+        )
 
     def is_pellet_recently_seen(self, *, use_any_cam: bool=False, perf_now: Optional[float]=None) -> bool:
         return self.is_part_recently_seen(SceneElement.Pellet, use_any_cam=use_any_cam, perf_now=perf_now)
@@ -1231,20 +1017,19 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     #
 
     def can_send_pellet(self):
-        if self._algo_paused or self._status is not BehaviorAlgoStatus.ANIMAL_IN_TRAINING:
+        if (
+            self._algo_paused
+            or self._pellet_send_block_reason
+            or not self._pellet_automation_enabled_for_session()
+        ):
             return False
         cfg = self._active_config
         if not cfg.pellet_delivery.is_enabled:
             return False
         if not cfg.pellet_delivery.retract_enabled:
-            if self._system_state in {SystemState.cage, SystemState.tunnel}:
-                if self.is_pellet_recently_seen(use_any_cam=True):
-                    return True
-                return False
+            return self.is_pellet_recently_seen(use_any_cam=True)
         if not (self._is_in_session and self._capture_status == CaptureProcessStatus.RECORDING):
             return False
-        if self._head_fixation_enabled and cfg.head_clamp.wait_engaged_before_send_pellet:
-            return self._autoclamp_in_progress
         t_since_rec_started = get_perf_now() - self._recording_start_perf_c
         prebuffer_duration = self._recording_prebuffer_duration
         if math.isfinite(prebuffer_duration):
@@ -1253,6 +1038,14 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
             self._is_in_session
             and t_since_rec_started >= cfg.pellet_delivery.pellet_send_wait_delay
         )
+
+    @property
+    def pellet_send_block_reason(self) -> str:
+        return self._pellet_send_block_reason
+
+    @pellet_send_block_reason.setter
+    def pellet_send_block_reason(self, value: str) -> None:
+        self._pellet_send_block_reason = str(value or "")
 
     def would_load_pellet(
         self,
@@ -1274,9 +1067,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         if pellet_missing:
             # logger.verbose("BehaviorAlgo.can_load_pellet: pellet missing")
             return True
-        # NB: todo: pellet_too_far should probably not immediately trigger a load-pellet...
-        # first a tunnel FAN can be executed..
-        # then maybe normal pellet-load (with pellet fully mussing) will be triggered
+        # A distance failure is treated like a missing pellet and triggers reload.
         pellet_too_far = (
             (delivery_cfg is None or delivery_cfg.use_triangle_pellet_distance_too_far)
              and pellet_state == PelletState.monitoring
@@ -1296,7 +1087,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     ) -> bool:
         """Say if a pellet can and must be loaded"""
         # is more has_to_load_pellet()
-        if self._status is not BehaviorAlgoStatus.ANIMAL_IN_TRAINING:
+        if not self._pellet_automation_enabled_for_session():
             return False
         cfg = self._active_config.pellet_delivery
         if not cfg.is_enabled or self._algo_paused:
@@ -1319,7 +1110,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
     def can_cover_pellet(self) -> bool:
         """Say if cover-pellet is enabled"""
-        if self._status is not BehaviorAlgoStatus.ANIMAL_IN_TRAINING:
+        if not self._pellet_automation_enabled_for_session():
             return False
         cfg = self._active_config.pellet_delivery
         return cfg.is_enabled and cfg.is_pellet_cover_enabled and not self._algo_paused
@@ -1327,7 +1118,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
     def can_release_pellet(self, *, pellet_state: PelletState = PelletState.monitoring) -> bool:
         """Say if algo should release pellet"""
         # self._check_date()
-        if self._status is not BehaviorAlgoStatus.ANIMAL_IN_TRAINING:
+        if not self._pellet_automation_enabled_for_session():
             return False
         if self._algo_paused:
             return False
@@ -1346,22 +1137,8 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
             return False
         return True
 
-        # TODO: Covering for session counts is on hold due to a) not knowing actual consumed, only load cycles (
-        # determining consumed happens during intersession) and b) need to determine whether said limit should
-        # reset per session or per tunnel entrance (which can have multiple "sessions" when a pellet is dropped).
-        # if not self.pellet_cover_enabled:
-        #    if self.system_state == SystemState.tunnel:
-        #        return self.session_pellet_count <= self.limits.max_pellets_per_session
-        #    else:
-        #        return True
-        #
-        # return self._is_in_session and self.session_pellet_count <= self.limits.max_pellets_per_session
-
     def can_retract_pellet(self, *, pellet_state: PelletState) -> bool:
-        if self._algo_paused or self._status not in {
-            BehaviorAlgoStatus.ANIMAL_IN_DEVICE,
-            BehaviorAlgoStatus.ANIMAL_IN_TRAINING,
-        } or pellet_state in {
+        if self._algo_paused or pellet_state in {
             # PelletState.home,  # not sure
             PelletState.retract,  # prevent executing the command again and again and..
         }:
@@ -1370,39 +1147,43 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
             return self._system_state == SystemState.intersession
         if not self._is_in_session:
             return True
-        if self._head_fixation_enabled and self._active_config.head_clamp.wait_engaged_before_send_pellet:
-            return not self._autoclamp_in_progress
         return False
 
     def can_perform_intersession_analysis(self):
-        return self._active_config.pellet_delivery.is_intersession_analysis_enabled and self._session_mouse_seen
+        return (
+            self._active_config.pellet_delivery.is_intersession_analysis_enabled
+            and self._presence_tracker.session_mouse_seen
+        )
+
+    @property
+    def pellet_automation_stop_requested(self) -> bool:
+        return self._pellet_automation_stop_requested
+
+    @pellet_automation_stop_requested.setter
+    def pellet_automation_stop_requested(self, value: bool) -> None:
+        self._pellet_automation_stop_requested = bool(value)
+
+    def _pellet_automation_enabled_for_session(self) -> bool:
+        return (
+            not self._pellet_automation_stop_requested
+            and
+            self._active_config.session_control.automatic_pellet_cycles_enabled
+            and self._is_in_session
+            and self._capture_status == CaptureProcessStatus.RECORDING
+        )
 
     #
 
     def update_parts_seen(self, pose_rsp: PoseResponse):
-        any_ctx = self._parts_pres_ctx_any_cam
-        all_ctx = self._parts_pres_ctx_all_cams
-        get_seen = all_ctx.get_part_seen
-        need_api_post = (
-            [SceneElement.R_Hand, ApiEventKind.trialRightHandSeen, get_seen(SceneElement.R_Hand)],
-            [SceneElement.Pellet, ApiEventKind.trialPelletSeen, get_seen(SceneElement.Pellet)],
-        )
-        #
-        update_scene_elements_context_from_pose(any_ctx, all_ctx, pose_rsp)
-        # little special case for mouse:
-        self.update_mouse_seen(pose_rsp.mouse_seen, perf_now=pose_rsp.perf_c)
-        #
-        post = self._event_manager.post_event_content
-        for part, evt, prev_seen in need_api_post:
-            if prev_seen != get_seen(part):
-                post(evt)
+        if self._presence_tracker.update_pose(pose_rsp, in_session=self._is_in_session):
+            logger.verbose("Session mouse seen")
+            self._on_property_changed(BehaviorAlgoProps.SESSION_MOUSE_SEEN, True, False)
 
     def update_pellet_seen(self, seen: bool = True):
         self.update_part_seen(SceneElement.Pellet, seen, perf_now=get_perf_now())
 
     def update_part_seen(self, part, seen: bool, *, perf_now: Optional[float] = None):
-        self._parts_pres_ctx_any_cam.update_part_seen(part, seen, perf_now=perf_now)
-        self._parts_pres_ctx_all_cams.update_part_seen(part, seen, perf_now=perf_now)
+        self._presence_tracker.update_part(part, seen, perf_now=perf_now)
 
     def pellet_loaded(self):
         self.session_pellet_loaded_count += 1
@@ -1415,26 +1196,22 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
     def update_mouse_seen(self, seen: bool = True, *, perf_now: Optional[float] = None):
         # NB: "mouse" == SceneElement.Nose
-        if perf_now is None:
-            perf_now = get_perf_now()
-        self.update_part_seen(SceneElement.Nose, seen, perf_now=perf_now)  # ensure presence_context gets updated
-        if seen:
-            self._mouse_seen_last_perf_c = perf_now
-        if self._is_in_session and seen:
-            prev_seen, self._session_mouse_seen = self._session_mouse_seen, True
-            if not prev_seen:
-                logger.verbose("Session mouse seen")
-                # property currently unused:
-                self._on_property_changed(BehaviorAlgoProps.SESSION_MOUSE_SEEN, True, False)
-                self._event_manager.post_event_content(ApiEventKind.trialAnimalSeen)
+        newly_seen = self._presence_tracker.update_mouse(
+            seen,
+            in_session=self._is_in_session,
+            perf_now=perf_now,
+        )
+        if newly_seen:
+            logger.verbose("Session mouse seen")
+            self._on_property_changed(BehaviorAlgoProps.SESSION_MOUSE_SEEN, True, False)
 
     @property
     def mouse_last_seen_age(self) -> float:
-        return get_perf_now() - self._mouse_seen_last_perf_c
+        return self._presence_tracker.mouse_last_seen_age
 
     @property
     def session_mouse_seen(self):
-        return self._session_mouse_seen
+        return self._presence_tracker.session_mouse_seen
 
     @property
     def active_config(self) -> BehaviorConfiguration:
@@ -1464,10 +1241,6 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
                 # use 50% more, in case of:
                 maxlen=int(1.5 * config.home_on_excessive_drift_distance.min_samples))
         self._load_pellet_cfg(config.pellet_delivery)
-        if self._topcam_presence is not None:
-            self._topcam_presence.load_config(config.topcam_presence_detection)
-        self.head_fixation_enabled = config.head_clamp.enabled
-        self.baseline_intensity = config.head_clamp.baseline_intensity
         self.reload_diamond_triangle_config()
         self._active_config = config  # set it as new active one only at the end,
         #   so that possible on_property_changed event can be relayed if some changed.
@@ -1589,35 +1362,13 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
     def set_previous_intersession_analysis_rsp(self, project: ProjectInfo, res: IntersessionResponse):
         self._previous_intersession_analysis_rsp = (project, res)
-        self._event_manager.post_event_content(
-            ApiEventKind.trialReachEvents,
-            data=dict(trial_reach_events=res.reach_events, trial_id=project.session))
 
     def reset_selected_animal_counts(self, animal: Optional[AnimalSubject]):
-        logger.verbose("Resetting counts for animal change to %s", animal)
+        logger.verbose("Updating animal-dependent behavior context for %s", animal)
         if animal is None:
             self.pellet_shift_y_limit = None
-            self.pellets_presented_day = \
-            self.pellet_reaches_day = \
-            self.pellet_consumed_day = \
-            self.successful_reaches_day = 0
-            self.pellets_presented_total = \
-            self.pellet_reaches_total = \
-            self.pellet_consumed_total = \
-            self.successful_reaches_total = 0
             return
         self.pellet_shift_y_limit = animal.target_y_limit
-        day_counts = animal.pellet_counts_day
-        self.pellets_presented_day = day_counts.presented
-        self.pellet_consumed_day = day_counts.consumed
-        self.pellet_reaches_day = day_counts.reaches
-        self.successful_reaches_day = day_counts.success_reaches
-        #
-        total_counts = animal.pellet_counts_total
-        self.pellets_presented_total = total_counts.presented
-        self.pellet_consumed_total = total_counts.consumed
-        self.pellet_reaches_total = total_counts.reaches
-        self.successful_reaches_total = total_counts.success_reaches
 
     @staticmethod
     def close_algorithm_handler(*, timeout: float=3):

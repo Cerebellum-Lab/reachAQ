@@ -126,17 +126,6 @@ class TrainingPhaseCard(CardWidget):
             grid.addWidget(label, r, c + 1)
             r += 1
 
-        magnet_intensity = phase.magnet_intensity
-        if not phase.use_magnet_baseline_intensity and magnet_intensity is not None:
-            grid.addWidget(QLabel("Magnet Intensity"), r, c)
-            hbox = QHBoxLayout()
-            label = self._device_magnet_start_intensity_label = QLabel(str(magnet_intensity))
-            hbox.addWidget(label)
-            hbox.addWidget(self._make_unit_label("%"))
-            hbox.setStretch(0, 1)
-            grid.addLayout(hbox, r, c + 1, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
-            r += 1
-
         for coord, value in zip("XYZ", (phase.send_x, phase.send_y, phase.send_z)):
             if value is not None:
                 grid.addWidget(QLabel(f"Send-{coord}"), r, c)
@@ -192,33 +181,9 @@ class TrainingPhaseCard(CardWidget):
         layout.addLayout(grid)
         r = c = 0
         #
-        if phase.use_magnet_baseline_intensity:
-            grid.addWidget(QLabel("Use Baseline Intensity"), r, c)
-            grid.addWidget(QLabel("On"), r, c + 1)
-            r += 1
-        #
         grid.addWidget(QLabel("Pellet Shift"), r, c)
         grid.addWidget(QLabel("On" if phase.is_pellet_shift_enabled else "Off"), r, c + 1)
         r += 1
-        #
-        grid.addWidget(QLabel("Auto-Clamp"), r, c)
-        grid.addWidget(QLabel("On" if phase.is_auto_clamp_enabled else "Off"), r, c + 1)
-        r += 1
-        if phase.is_auto_clamp_enabled:
-            grid.addWidget(QLabel("Auto-Clamp Release Delay"), r, c)
-            hbox = QHBoxLayout()
-            hbox.addWidget(QLabel(f"{phase.auto_clamp_no_activity_release_delay:.1f}"))
-            hbox.setStretch(0, 1)
-            hbox.addWidget(self._make_unit_label("sec."))
-            grid.addLayout(hbox, r, c + 1, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
-            r += 1
-            grid.addWidget(QLabel("Auto-Clamp Release Pellets"), r, c)
-            hbox = QHBoxLayout()
-            hbox.addWidget(QLabel(f"{phase.auto_clamp_release_load_count}"))
-            hbox.setStretch(0, 1)
-            hbox.addWidget(self._make_unit_label("Cycles"))
-            grid.addLayout(hbox, r, c + 1, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
-            r += 1
 
         self._apply_background(grid)
 
@@ -241,9 +206,6 @@ class TrainingPhaseContent(StackedWidget):
         if phase is None:
             self.setCurrentWidget(self._empty_card)
             return
-
-        phase.use_magnet_baseline_intensity
-        phase.magnet_intensity
 
         card = self._phase_card_by_phase_id.get(phase.phase_id)
         if card is not None and not force_refresh:

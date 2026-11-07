@@ -38,14 +38,14 @@ def test_implicit_session(root):
     when = datetime(2024, 6, 8, 8, 45, 23)
     info = ProjectInfo(root=root, device_id=device_id, when=when)
     session_source = info.get_session_path("camera-1")
-    assert session_source.location == os.path.join(root, "20240608", "A1357", "trial001")
-    assert session_source.prefix == f"20240608_A1357_trial001_camera-1"
+    assert session_source.location == os.path.join(root, "20240608", "A1357", "session001")
+    assert session_source.prefix == f"20240608_A1357_session001_camera-1"
     assert session_source.session_index == 1
     # Would normally happen through calculate_next_session_index, but this uses the filesystem
     info.session = 9
     session_source = info.get_session_path("camera-1")
-    assert session_source.location == os.path.join(root, "20240608", "A1357", "trial009")
-    assert session_source.prefix == f"20240608_A1357_trial009_camera-1"
+    assert session_source.location == os.path.join(root, "20240608", "A1357", "session009")
+    assert session_source.prefix == f"20240608_A1357_session009_camera-1"
     assert session_source.session_index == 9
 
 
@@ -53,9 +53,22 @@ def test_explicit_session(root):
     when = datetime(2023, 6, 8, 8, 45, 23)
     info = ProjectInfo(root=root, device_id=device_id, when=when)
     session_source = info.get_session_path("camera-1", session=12)
-    assert session_source.location == os.path.join(root, "20230608", "A1357", "trial012")
-    assert session_source.prefix == f"20230608_A1357_trial012_camera-1"
+    assert session_source.location == os.path.join(root, "20230608", "A1357", "session012")
+    assert session_source.prefix == f"20230608_A1357_session012_camera-1"
     assert session_source.session_index == 12
+
+
+def test_camera_names_round_trip_to_local_value(root):
+    info = ProjectInfo(
+        root=root,
+        camera_names=("left", "right", "camera3"),
+        session_generation=7,
+    )
+
+    assert info.camera_names == ("left", "right", "camera3")
+    local = info.to_local_value()
+    assert local.camera_names == info.camera_names
+    assert local.session_generation == 7
 
 
 def test_without_session_and_when_are_shared(root):

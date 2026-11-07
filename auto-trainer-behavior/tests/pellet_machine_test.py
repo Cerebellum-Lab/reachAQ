@@ -26,7 +26,7 @@ def test_cover_or_release_pellet_on_load_pellet(mock_system, machine, cover_enab
     algo.update_pellet_seen(True)
     algo.update_triangle_seen(True)
 
-    assert machine.state == SystemState.cage
+    assert machine.state == SystemState.ready
     assert not algo.is_in_session
     assert algo.pellet_recently_seen
     # assert pellet_m.state == PelletState.monitoring
@@ -48,8 +48,7 @@ def test_cover_or_release_pellet_on_load_pellet(mock_system, machine, cover_enab
     assert algo.session_pellet_loaded_count == 0
     mock_system.mock_pellet_ack()  # ack the load
     assert algo.session_pellet_loaded_count == 1  # here it is !
-    # mock_system.make_load_cell_active()
-    mock_system.start_session_in_tunnel(set_recording_status=True)
+    mock_system.start_recording_session(set_recording_status=True)
     assert algo.session_pellet_loaded_count == 0  # back to 0 given new session/trial
     mock_system.mock_pose_response(pellet_seen=True)
     mock_system.mock_pellet_ack()  # ack the retract
@@ -89,10 +88,10 @@ def test_send_pellet_after_load_when_triangle_not_seen(mock_system, machine, cov
     algo.update_pellet_seen(True)
     algo.update_triangle_seen(True)
 
-    assert machine.state == SystemState.cage
+    assert machine.state == SystemState.ready
     assert not algo.is_in_session
     assert algo.pellet_recently_seen
-    # Send a pose response with pellet not seen which should trigger a load/cover cycle while out of tunnel.
+    # A missing pellet should trigger a load/cover cycle while no session is recording.
     mock_system.mock_pose_response(pellet_seen=False, triangle_seen=True)
     mock_system.mock_pellet_ack(until_none=True)
     assert algo.session_pellet_loaded_count == 0
@@ -135,7 +134,6 @@ def test_send_pellet_after_load_when_triangle_not_seen(mock_system, machine, cov
 
 def test_uncover_when_record_aged_enough_with_no_pellet_hand_uncover_distance(mock_system, machine):
     pellet_m = machine.pellet
-    load_cell = machine._analysis.load_cell_monitor
     algo = machine.algorithm
     algo.pellet_cover_enabled = True
     uncov_cfg = algo.active_config.pellet_uncover
@@ -149,12 +147,12 @@ def test_uncover_when_record_aged_enough_with_no_pellet_hand_uncover_distance(mo
     assert pellet_m.state == PelletState.monitoring
     assert not algo.is_in_session
 
-    load_cell.is_engaged = True
+    algo.start_session(reason="manual")
     assert algo.is_in_session
     assert mock_system.pellet_state_trans == []
 
     mock_system.make_recording_aged_enough()
-    algo.project.t_pellet_delivered = 0
+    algo.project.first_pellet_delivery_offset = 0
 
     uncov_ctx = algo.uncover_context
     uncov_ctx.y_dcs_valid = True
@@ -180,11 +178,10 @@ def test_uncover_when_hands_near_pellet_after_recording_aged_enough(mock_system,
     uncov_cfg = algo.active_config.pellet_uncover
     uncov_cfg.min_y_dcs = 5
     uncov_cfg.trigger_delay = 2.5
-    load_cell = machine._analysis.load_cell_monitor
     algo.update_pellet_seen(True)
     algo.update_triangle_seen(True)
     pellet_m._covered_state = True  # fake already covered to simplify test
-    load_cell.is_engaged = True
+    algo.start_session(reason="manual")
     assert algo.is_in_session
     #
     mock_system.make_recording_aged_enough()
@@ -261,7 +258,7 @@ def test_move_home(machine, mock_system):
     assert pellet_m._api_status_token is not None
     assert pellet_m.state == PelletState.home
     mock_system.mock_pellet_ack()
-    mock_system.start_session_in_tunnel(set_recording_status=True)
+    mock_system.start_recording_session(set_recording_status=True)
     assert algo.is_in_session
     mock_system.mock_pellet_ack()
     mock_system.mock_pose_response(pellet_seen=True)
@@ -404,3 +401,98 @@ def test_manual_send_pellet_when_delivery_not_enabled(machine, mock_system, befo
     assert pellet_m._api_status_token is None
     assert pellet_m.state == before_state
     assert mock_system.pellet_state_trans == []
+
+
+def test_protocol_send_guard_blocks_before_hardware_dispatch(machine):
+    pellet_m = machine.pellet
+    pellet_m.set_send_preparation_callbacks(
+        guard=lambda: (_ for _ in ()).throw(RuntimeError("not prepared")),
+    )
+
+    with pytest.raises(RuntimeError, match="not prepared"):
+        pellet_m.send_pellet(force=True)
+
+    assert pellet_m._token_pellet_send is None
+
+
+def test_protocol_readiness_can_defer_automatic_send(machine, monkeypatch):
+    pellet_m = machine.pellet
+    monkeypatch.setattr(machine.algorithm, "can_send_pellet", lambda: True)
+    pellet_m.set_send_preparation_callbacks(readiness=lambda: False)
+
+    assert pellet_m.can_send_pellet() is False
+    assert pellet_m.can_send_pellet(force=True) is True
+
+
+def test_prepared_keep_current_cover_policy_is_not_overridden(machine, mock_system):
+    pellet_m = machine.pellet
+    machine.algorithm.pellet_cover_enabled = True
+    pellet_m._covered_state = False
+    pellet_m.prepare_cover_policy("keep_current")
+    mock_system.pellet_state_trans.clear()
+
+    pellet_m.send_pellet(force=True)
+
+    assert mock_system.pellet_state_trans == [PelletState.sending]
+
+
+def test_prepared_embedded_tone_is_bound_to_send_command(machine):
+    pellet_m = machine.pellet
+    pellet_m.prepare_embedded_tone(6000, 125)
+
+    pellet_m.send_pellet(force=True)
+
+    pellet_m._pellet_device.send_pellet.assert_called_with(
+        embedded_tone=(6000, 125),
+        pre_reveal_stimulus=None,
+    )
+    assert pellet_m._prepared_embedded_tone is None
+
+
+def test_prepared_pre_reveal_stimulus_is_bound_once(machine):
+    pellet_m = machine.pellet
+    pellet_m.prepare_pre_reveal_stimulus(200, 1000)
+
+    pellet_m.send_pellet(force=True)
+
+    # No line given still means board STIM3, and the SEND data now says so.
+    pellet_m._pellet_device.send_pellet.assert_called_with(
+        embedded_tone=None,
+        pre_reveal_stimulus=(200, 1000, 3),
+    )
+    assert pellet_m._prepared_pre_reveal_stimulus is None
+
+
+def test_prepared_pre_reveal_stimulus_carries_the_trial_lasers_board_line(machine):
+    # christielab10 laser 2 is wired to board STIM2.
+    pellet_m = machine.pellet
+    pellet_m.prepare_pre_reveal_stimulus(200, 1000, stim_line=2)
+
+    pellet_m.send_pellet(force=True)
+
+    pellet_m._pellet_device.send_pellet.assert_called_with(
+        embedded_tone=None,
+        pre_reveal_stimulus=(200, 1000, 2),
+    )
+
+
+@pytest.mark.parametrize("stim_line", [0, 1, 4])
+def test_pre_reveal_stimulus_refuses_a_line_that_cannot_carry_a_stimulus(
+    machine, stim_line,
+):
+    pellet_m = machine.pellet
+
+    with pytest.raises(
+        ValueError,
+        match=f"Board STIM{stim_line} cannot carry a stimulus pulse; "
+              "use board STIM2 or STIM3",
+    ):
+        pellet_m.prepare_pre_reveal_stimulus(200, 1000, stim_line=stim_line)
+
+    assert pellet_m._prepared_pre_reveal_stimulus is None
+    assert pellet_m._prepared_cover_policy is None
+
+
+def test_pre_reveal_pulse_refusal_names_the_line(machine):
+    with pytest.raises(ValueError, match="STIM2 pulse duration must be within"):
+        machine.pellet.prepare_pre_reveal_stimulus(200, 99, stim_line=2)

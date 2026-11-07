@@ -1,15 +1,14 @@
+import math
 from typing import Optional, Callable
 from functools import partial
 
 from PySide6.QtCore import Signal, Qt
 from PySide6.QtWidgets import (QLabel, QSpinBox, QWidget, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout,
-                               QFormLayout, QStackedLayout, QSizePolicy, QComboBox, QDoubleSpinBox)
+                               QDoubleSpinBox)
 
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoProps
 from autotrainer.core import AnimalSubject, Offset3DTuple
 from autotrainer.core.logging import get_verbose_logger
-
-from autotrainer.model import EnvironmentProvider, HardwareVersion
 
 from autotrainer.pyside import CardWidget
 from autotrainer.pyside.StackedContent import StackedLayout
@@ -23,19 +22,56 @@ from tools.acquisition.model.hardware_model import HardwareModel
 logger = get_verbose_logger(__name__)
 
 
-# TODO: This is just to see if the behavior is correct.  They should end up somewhere that any application or script can
-#  access.
-_anshutz_travel_limits = {
-    "x": (-10, 10),
-    "y": (-10, 10),
-    "z": (-10, 10),
-}
+_UI_POSITION_MIN = 0.0
+_UI_POSITION_MAX = 35.0
 
-_alogus_travel_limits = {
-    "x": (0, 35),
-    "y": (0, 35),
-    "z": (0, 35),
-}
+
+def _format_motor_feedback_value(value: float) -> str:
+    if not math.isfinite(value):
+        return "—"
+    formatted = f"{value:.1f}"
+    if formatted == "-0.0":
+        formatted = "0.0"
+    return formatted.replace("-", "−", 1)
+
+
+def _format_motor_feedback(status: str, position: Offset3DTuple) -> str:
+    x, y, z = (_format_motor_feedback_value(value) for value in position)
+    return f"• {status} •   X {x} | Y {y} | Z {z} mm"
+
+
+def _motor_to_ui_value(value: float) -> float:
+    if not math.isfinite(value):
+        return value
+    return min(_UI_POSITION_MAX, max(_UI_POSITION_MIN, value))
+
+
+def _motor_to_ui_position(position: Offset3DTuple) -> Offset3DTuple:
+    return Offset3DTuple(*(
+        _motor_to_ui_value(value)
+        for value in position
+    ))
+
+
+class _EditablePositionSpinBox(QDoubleSpinBox):
+    """A position editor whose first keyboard input replaces the current value."""
+
+    def __init__(self):
+        super().__init__()
+        self._replace_on_next_key = False
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self._replace_on_next_key = True
+
+    def keyPressEvent(self, event):
+        if self._replace_on_next_key and (
+            event.text()
+            or event.key() in {Qt.Key.Key_Backspace, Qt.Key.Key_Delete}
+        ):
+            self.selectAll()
+        self._replace_on_next_key = False
+        super().keyPressEvent(event)
 
 
 class HardwareControlContent(ContentWidget):
@@ -48,6 +84,7 @@ class HardwareControlContent(ContentWidget):
 
         self._app_model = app_model
         self._hardware_model = app_model.hardware
+        self._capture_active = app_model.status != AppModelStatus.IDLE
 
         self._commands_widgets = []
         add_cmd_widget = self._commands_widgets.append
@@ -62,10 +99,6 @@ class HardwareControlContent(ContentWidget):
         layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
         layout.setSpacing(8)
 
-        layout.addWidget(QLabel("Tunnel:"))
-        self._tunnel_version = QLabel("(unknown version)")
-        layout.addWidget(self._tunnel_version)
-
         layout.addWidget(QLabel("Pellet:"))
         self._pellet_version = QLabel("(unknown version)")
         layout.addWidget(self._pellet_version)
@@ -73,79 +106,23 @@ class HardwareControlContent(ContentWidget):
         self._card_widget = CardWidget(title="Hardware Control", header_right_layout=layout)
         # self._card_widget.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Preferred)
 
-        if EnvironmentProvider.hardware_version() == HardwareVersion.ANSHUTZ:
-            self._travel_limits = _anshutz_travel_limits
-        else:
-            self._travel_limits = _alogus_travel_limits
-
         layout = QGridLayout()
         layout.setContentsMargins(8, 4, 8, 6)
         layout.setHorizontalSpacing(8)
         layout.setVerticalSpacing(4)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
-        label = QLabel("<b>Tunnel</b>")
-        label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(label, 0, 0)
-        vbox = QVBoxLayout()
         label = QLabel("<b>Pellet Release Location (mm)</b>")
         label.setAlignment(Qt.AlignCenter)
-        vbox.addWidget(label)
-        label = self._is_motor_cs_label = QLabel("<b>@ MotorCoordSystem</b>")
-        if app_model.behavior.algorithm.diamond_triangle_config is not None:
-            label.hide()
-        label.setAlignment(Qt.AlignCenter)
-        vbox.addWidget(label)
-        layout.addLayout(vbox, 0, 2)
+        layout.addWidget(label, 0, 0)
 
         label = QLabel("<b>Compound Move</b>")
         label.setAlignment(Qt.AlignCenter)
         label.setContentsMargins(0, 0, 0, 4)  # ensure small margin below
-        layout.addWidget(label, 0, 4)
-
-        form_layout = QFormLayout()
-        form_layout.setContentsMargins(0, 4, 0, 0)
-        form_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        form_layout.setHorizontalSpacing(8)
-        form_layout.setVerticalSpacing(4)
-
-        spinbox = self._head_magnet_position_spinbox = QSpinBox()
-        add_cmd_widget(spinbox)
-        spinbox.setValue(0)
-        spinbox.setMaximum(100)
-        spinbox.setWrapping(False)
-        button = self._head_magnet_move_button = QPushButton("Move")
-        add_cmd_widget(button)
-        def head_magnet_intensity_updated():
-            self._hardware_model.update_head_magnet_intensity(self._head_magnet_position_spinbox.value())
-        button.clicked.connect(lambda: log_hardware_cmd(head_magnet_intensity_updated))
-
-        right_layout = QHBoxLayout()
-        right_layout.setSpacing(4)
-        right_layout.addWidget(self._head_magnet_position_spinbox)
-        right_layout.addWidget(self._head_magnet_move_button)
-        form_layout.addRow("Head magnet intensity (%):", right_layout)
-
-        button = self._tare_button = QPushButton("Tare")
-        add_cmd_widget(button)
-        button.clicked.connect(lambda: log_hardware_cmd(self._hardware_model.tare_load_cell))
-        form_layout.addRow(QLabel("Load cell:"), self._tare_button)
-
-        layout.addLayout(form_layout, 1, 0)
-
-        algo = app_model.behavior.algorithm
+        layout.addWidget(label, 0, 1)
 
         def set_xyz(coord: str):
             value = getattr(self, f"_{coord}_pos").value()
-            coord_idx = "xyz".index(coord)
-            assert coord_idx in (0, 1, 2)
-            t = [self._x_pos.value(), self._y_pos.value(), self._z_pos.value()]
-            t[coord_idx] = value
-            xyz = Offset3DTuple(*t)
-            cfg = algo.diamond_triangle_config
-            if cfg is not None:
-                xyz = cfg.diamond_to_motor(xyz)
-            value = xyz[coord_idx]
             meth = getattr(self._hardware_model, f"set_{coord}")
             meth(value, sender="UI-Set-Button")
 
@@ -158,15 +135,21 @@ class HardwareControlContent(ContentWidget):
 
         def add_coord(coord: str):
             nonlocal row
-            pos = QDoubleSpinBox()
+            pos = _EditablePositionSpinBox()
             add_cmd_widget(pos)
+            pos.setReadOnly(False)
+            pos.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            pos.lineEdit().setReadOnly(False)
             pos.setValue(0)
             pos.setContentsMargins(0, 0, 0, 0)
             pos.setMinimumWidth(60)
             pos.setDecimals(1)
             pos.setSingleStep(0.5)
+            pos.setRange(_UI_POSITION_MIN, _UI_POSITION_MAX)
             pos.setAlignment(Qt.AlignmentFlag.AlignRight)
-            range_label = QLabel()
+            range_label = QLabel(
+                f"[ {_UI_POSITION_MIN:>5.1f} : {_UI_POSITION_MAX:<5.1f}]"
+            )
             set_button = QPushButton("Set")
             add_cmd_widget(set_button)
             set_button.clicked.connect(partial(set_xyz, coord))
@@ -175,15 +158,26 @@ class HardwareControlContent(ContentWidget):
             sub_layout.addWidget(range_label, row, col + 2)
             sub_layout.addWidget(set_button, row, col + 3)
             row += 1
-            return pos, set_button, range_label
+            return pos, set_button
 
-        self._x_pos, self._x_set_button, self._x_range_label = add_coord('x')
-        self._y_pos, self._y_set_button, self._y_range_label = add_coord('y')
-        self._z_pos, self._z_set_button, self._z_range_label = add_coord('z')
+        self._x_pos, self._x_set_button = add_coord('x')
+        self._y_pos, self._y_set_button = add_coord('y')
+        self._z_pos, self._z_set_button = add_coord('z')
 
-        layout.addLayout(sub_layout, 1, 2, alignment=Qt.AlignmentFlag.AlignTop)
+        self._motor_feedback_label = QLabel()
+        self._motor_feedback_label.setObjectName("motorFeedbackLabel")
+        self._motor_feedback_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        sub_layout.addWidget(self._motor_feedback_label, row, col, 1, 4)
+        row += 1
 
-        self._set_pos_limits()
+        self._motor_set_feedback_label = QLabel()
+        self._motor_set_feedback_label.setObjectName("motorSetFeedbackLabel")
+        self._motor_set_feedback_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        sub_layout.addWidget(self._motor_set_feedback_label, row, col, 1, 4)
+
+        layout.addLayout(sub_layout, 1, 0, alignment=Qt.AlignmentFlag.AlignTop)
+
+        self._update_motor_feedback()
 
         #
 
@@ -206,7 +200,9 @@ class HardwareControlContent(ContentWidget):
         #
         button = QPushButton("Send")
         add_cmd_widget(button)
-        button.clicked.connect(lambda: log_hardware_cmd(partial(pellet_machine.send_pellet, force=True)))
+        button.clicked.connect(
+            lambda: log_hardware_cmd(partial(app_model.request_pellet_send, force=True))
+        )
         button_layout.addWidget(button)
         #
         button = QPushButton("Retract")
@@ -225,7 +221,9 @@ class HardwareControlContent(ContentWidget):
         button.clicked.connect(
             lambda: log_hardware_cmd(partial(pellet_machine.cover_pellet, force=True)))
         button_layout.addWidget(button)
-        layout.addLayout(button_layout, 1, 4)
+        layout.addLayout(button_layout, 1, 1, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.setColumnStretch(0, 0)
+        layout.setColumnStretch(1, 0)
 
         # central layout/widget
         widget = QWidget()
@@ -267,52 +265,29 @@ class HardwareControlContent(ContentWidget):
         app_model.property_changed += self._on_app_model_property_changed
         self._hardware_model.property_changed += self._on_hardware_model_property_changed
 
-    def _set_pos_limits(self):
-        limits = self._travel_limits
-        if limits is not None:
-            algo = self._app_model.behavior.algorithm
-            min_xyz = Offset3DTuple(*(limits[c][0] for c in 'xyz'))
-            max_xyz = Offset3DTuple(*(limits[c][1] for c in 'xyz'))
-            diamond_triangle_cfg = algo.diamond_triangle_config
-            if diamond_triangle_cfg is not None and diamond_triangle_cfg.fully_valid:
-                min_xyz = diamond_triangle_cfg.motor_to_diamond(min_xyz)
-                max_xyz = diamond_triangle_cfg.motor_to_diamond(max_xyz)
-            for idx, pos in enumerate((self._x_pos, self._y_pos, self._z_pos)):
-                c = "xyz"[idx]
-                v1, v2 = min_xyz[idx], max_xyz[idx]
-                r = min(v1, v2), max(v1, v2)
-                pos.setRange(*r)
-                getattr(self, f"_{c}_range_label").setText(f"[ {r[0]:>5.1f} : {r[1]:<5.1f}]")
-
     @invoke_method
     def set_is_capture_active(self, is_active: bool):
-        pass
+        self._capture_active = bool(is_active)
+        self._refresh_enabled_state()
 
     @invoke_method
     def set_selected_animal(self, animal: Optional[AnimalSubject]):
-        self._set_pos_limits()
-        algo = self._app_model.behavior.algorithm
-        cfg = algo.diamond_triangle_config
-        if cfg is None or not cfg.fully_valid:
-            logger.notice("Displaying animal data with Motor coordinate system")
-            self._is_motor_cs_label.show()
-            if animal is None:
-                xyz = Offset3DTuple(0, 0, 0)
-            else:
-                if animal.is_pellet_dcs:
-                    animal.pellet_x = animal.pellet_y = animal.pellet_z = 0
-                    animal.is_pellet_dcs = False
-                xyz = Offset3DTuple(animal.pellet_x, animal.pellet_y, animal.pellet_z)
+        cfg = self._app_model.behavior.algorithm.diamond_triangle_config
+        if animal is None:
+            xyz = Offset3DTuple(0, 0, 0)
         else:
-            logger.debug("Displaying animal data with Diamond coordinate system")
-            self._is_motor_cs_label.hide()
-            if animal is None:
-                xyz = Offset3DTuple(0, 0, 0)
-                xyz = cfg.motor_to_diamond(xyz)
-            else:
-                xyz = Offset3DTuple(animal.pellet_x, animal.pellet_y, animal.pellet_z)
-                if not animal.is_pellet_dcs:
-                    xyz = cfg.motor_to_diamond(xyz)
+            xyz = Offset3DTuple(animal.pellet_x, animal.pellet_y, animal.pellet_z)
+            if animal.is_pellet_dcs:
+                if cfg is not None and cfg.fully_valid:
+                    xyz = cfg.diamond_to_motor(xyz)
+                else:
+                    logger.notice(
+                        "Cannot display the animal's Diamond coordinates without "
+                        "a valid calibration; displaying UI home"
+                    )
+                    xyz = Offset3DTuple(0, 0, 0)
+
+        xyz = _motor_to_ui_position(xyz)
 
         for widget, value in (
             (self._x_pos, xyz.x),
@@ -326,15 +301,41 @@ class HardwareControlContent(ContentWidget):
 
         self.update()
 
-    def _update_head_magnet_position(self):
-        self._hardware_model.update_head_magnet_intensity(self._head_magnet_position_spinbox.value())
+    def _update_motor_feedback(self):
+        position = self._hardware_model.last_position
+        if position is None:
+            position = Offset3DTuple(math.nan, math.nan, math.nan)
+        position = _motor_to_ui_position(position)
+        set_position = _motor_to_ui_position(
+            self._hardware_model.motor_send_coordinates
+        )
+
+        if not self._hardware_model.pellet_version:
+            status = "DISCONNECTED"
+            color = "#6b7280"
+        elif self._hardware_model.pellet_status_timeout_engaged:
+            status = "STALE"
+            color = "#9a6700"
+        elif all(math.isfinite(value) for value in position):
+            status = "LIVE"
+            color = "#1a7f37"
+        else:
+            status = "STALE"
+            color = "#9a6700"
+
+        self._motor_feedback_label.setText(_format_motor_feedback(status, position))
+        self._motor_feedback_label.setStyleSheet(f"color: {color};")
+        self._motor_set_feedback_label.setText(
+            _format_motor_feedback("SET", set_position)
+        )
+        self._motor_set_feedback_label.setStyleSheet("color: #2563a8;")
 
     def _update_title(self, value: str):
         if value:
             if value.find("emulator") != -1:
-                self._card_widget.header.setTitle("Hardware Control: Alogus Emulation")
+                self._card_widget.header.setTitle("Hardware Control: Pellet Board Emulation")
             else:
-                self._card_widget.header.setTitle(f"Hardware Control: {EnvironmentProvider.hardware_version()}")
+                self._card_widget.header.setTitle("Hardware Control: Pellet Board")
         else:
             self._card_widget.header.setTitle("Hardware Control")
 
@@ -342,42 +343,57 @@ class HardwareControlContent(ContentWidget):
         for widget in self._commands_widgets:
             widget.setEnabled(enabled)
 
+    def _refresh_enabled_state(self) -> None:
+        panel_enabled = (
+            self._capture_active
+            and bool(self._hardware_model.pellet_version)
+            and self._hardware_model.pellet_commands_allowed
+        )
+        self.setEnabled(panel_enabled)
+        self.set_commands_enabled(
+            panel_enabled and not self._hardware_model.pending_tokens
+        )
+
     @invoke_method
     def _on_app_model_property_changed(self, name, value, _):
         app_model = self._app_model
         if name == app_model.Props.STATUS:
-            self.setEnabled(value != AppModelStatus.IDLE)
+            self._capture_active = value != AppModelStatus.IDLE
+            self._refresh_enabled_state()
 
     @invoke_method
     def _on_hardware_model_property_changed(self, property_name: str, value, _):
-        if property_name == HardwareModel.TUNNEL_VERSION_PROPERTY:
-            self._update_title(value)
-            if value:
-                self._tunnel_version.setText(value.replace("emulator", "").strip())
-            else:
-                self._tunnel_version.setText("(unknown version)")
-
-        elif property_name == HardwareModel.PELLET_VERSION_PROPERTY:
+        if property_name == HardwareModel.PELLET_VERSION_PROPERTY:
             self._update_title(value)
             if value:
                 self._pellet_version.setText(value.replace("emulator", "").strip())
-                self.setEnabled(True)
             else:
                 self._pellet_version.setText("(unknown version)")
-                self.setEnabled(False)
                 self.command_changed.emit("None")
+            self._refresh_enabled_state()
+            self._update_motor_feedback()
+
+        elif property_name == HardwareModel.FIRMWARE_COMPATIBILITY_PROPERTY:
+            self._refresh_enabled_state()
+
+        elif property_name in {
+            HardwareModel.POS_XYZ,
+            HardwareModel.SEND_X,
+            HardwareModel.SEND_Y,
+            HardwareModel.SEND_Z,
+            HardwareModel.DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED,
+        }:
+            self._update_motor_feedback()
 
         elif property_name == HardwareModel.PENDING_COMMAND_PROPERTY:
             if value is not None:
                 self.command_changed.emit(value)
-                self.set_commands_enabled(False)
             else:
                 self.command_changed.emit("None")
-                self.set_commands_enabled(True)
+            self._refresh_enabled_state()
 
     @invoke_method
     def _on_algo_property_changed(self, name, value, _):
         if name == BehaviorAlgoProps.DIAMOND_TRIANGLE_CONFIG:
             # force execute set-selected-animal
             self.set_selected_animal(self._app_model.selected_animal)
-            # this will set as desired the UI elements.

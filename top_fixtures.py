@@ -4,7 +4,10 @@ import contextlib
 import logging
 import math
 import multiprocessing
+import os
 import queue
+import shutil
+import sys
 import threading
 import time
 from multiprocessing import synchronize
@@ -21,18 +24,22 @@ import verboselogs
 import autotrainer.core
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
 
-from autotrainer.core import EventManager, SensorAnalysis, MessageHandler, SystemMessageHandler, ProjectInfo
+from autotrainer.core import EventManager, MessageHandler, SystemMessageHandler, ProjectInfo, \
+    PersistenceConfiguration
+from autotrainer.core.analysis import ReachAnalysis
 from autotrainer.core.multiproc import make_daemon_timer, DaemonTimer
 from autotrainer.device import MotorConfigurationFile, CompoundMovements
 from autotrainer.inference.analysis import IntersessionResponse
 
 from autotrainer.core.capture import CaptureProcessStatus
+from autotrainer.core.interfaces import RecordingEndingReason
 from autotrainer.inference import PoseAlgorithm, PoseResponse, InferenceStatus
 
-from autotrainer.behavior import TunnelDeviceProtocol, SystemMachine, PelletDeviceProtocol, BehaviorAlgorithm, \
+from autotrainer.behavior import SystemMachine, PelletDeviceProtocol, BehaviorAlgorithm, \
     InferenceProtocol, SystemState
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.behavior.pellet import PelletState
+from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.behavior_model import BehaviorModel
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.user_preferences import UserPreferences
@@ -45,6 +52,316 @@ repo_root_tests_subdir = repo_root_dir.joinpath("tests")
 
 
 fake_perf_now = 0  # used to control time.perf_counter() in BehaviorAlgo/SystemMachine/PelletMachine/Intersession
+
+
+@pytest.fixture(autouse=True)
+def isolate_host_can(monkeypatch):
+    """Never let an automated test control the workstation's SocketCAN link."""
+    monkeypatch.setenv("AUTOTRAINER_CAN_TRANSPORT", "emulation")
+
+
+# ~/Documents/rawdatalocal, where christielab10 records its real sessions.
+# Read at import, before any fixture replaces it.
+PRODUCTION_DEFAULT_OUTPUT_PATH = PersistenceConfiguration.DEFAULT_OUTPUT_PATH
+
+
+def _own_monkeypatch():
+    # Not the test's monkeypatch, which a test can undo(): the undo() that
+    # test_saving_resumes_once_a_load_completes used to call lifted the
+    # isolation below with its own patches, and its app's teardown then tried
+    # to unlink the operator's real ~/.config/Colorado/
+    # autotrainer_running_status.env (refused by the guard on christielab10 on
+    # 2026-10-01).
+    return pytest.MonkeyPatch.context()
+
+
+@pytest.fixture(autouse=True)
+def isolated_default_data_root(tmp_path_factory) -> Generator[Path, None, None]:
+    """Give each test a default data folder of its own, under pytest's tmp.
+
+    AppModel opens its log, its hourly event file and its first project under
+    the default data folder while it is constructed, before a configuration's
+    outputLocation is loaded, and a test that never loads one records its
+    sessions there too. The fixtures isolated the configuration and the
+    preferences file, but not this: the full runs on christielab10 on
+    2026-10-01 left 1,533 logs, two event files and two empty session folders
+    in the operator's ~/Documents/rawdatalocal/20261001/christielab10.
+    """
+    root = tmp_path_factory.mktemp("default-data")
+    # autotrainer.core.logging.get_log_file_location builds this folder from
+    # Path.home() itself, out of this patch's reach; only tools/pellet_delivery
+    # calls it, no test does, and the guard refuses it.
+    with _own_monkeypatch() as patch:
+        patch.setattr(PersistenceConfiguration, "DEFAULT_OUTPUT_PATH", root)
+        yield root
+
+
+# ~/.config/Colorado/autotrainer_running_status.env, beside the operator's
+# preferences file. Read at import, before any fixture replaces it.
+PRODUCTION_STATUS_FILE_PATH = AppModel.status_file_path
+
+
+@pytest.fixture(autouse=True)
+def isolated_running_status_file(tmp_path_factory) -> Generator[Path, None, None]:
+    """Give each test a running-status file of its own, under pytest's tmp.
+
+    AppModel writes this file when acquisition leaves IDLE and removes it when
+    acquisition returns, and nothing patched it, so every test that started
+    and stopped acquisition created and deleted the operator's real one: the
+    folder's mtime moved during each full run on christielab10 on 2026-10-01.
+    During a real session that would overwrite, then delete, the running
+    app's file.
+    """
+    path = tmp_path_factory.mktemp("running-status").joinpath(AppModel.status_file_path.name)
+    with _own_monkeypatch() as patch:
+        patch.setattr(AppModel, "status_file_path", path)
+        yield path
+
+
+@pytest.fixture
+def app_launch_env(tmp_path) -> dict:
+    """The environment for a test that starts reachAQ in a child process.
+
+    The child resolves its default data folder from its own HOME, out of the
+    fixture above's reach, so it gets a HOME under tmp_path. What else the
+    child finds under HOME (~/Autotrainer, ~/.config) moves with it, so its
+    ~/Autotrainer is given the motor and move files the motor_config fixture
+    gives in-process tests.
+    """
+    home = tmp_path.joinpath("home")
+    autotrainer = home.joinpath("Autotrainer")
+    autotrainer.mkdir(parents=True)
+    for default in (MotorConfigurationFile.DEFAULT_LOCATION, CompoundMovements.DEFAULT_LOCATION):
+        shutil.copy(repo_root_tests_subdir.joinpath(default.name), autotrainer)
+    env = os.environ.copy()
+    env["HOME"] = home.as_posix()
+    return env
+
+
+class DataRootWriteRefused(RuntimeError):
+    """A test tried to write under the operator's data or preferences folder.
+
+    Not an OSError, so Path.mkdir(exist_ok=True) cannot mistake it for an
+    existing folder and carry on.
+    """
+
+
+class DataRootGuard:
+    """Refuse, and record, every write a test makes under the operator's folders.
+
+    They are the data folder and ~/.config/Colorado, which holds the
+    preferences file and the running-status file.
+
+    It is an audit hook (PEP 578), so it sees each file and folder this process
+    creates, changes or removes through Python, whatever route reached the
+    folder: a ProjectInfo rooted there, a configuration left at the
+    PersistenceConfiguration default (fixed at import, out of the fixture's
+    reach), a path built from Path.home(), or a test that builds the app
+    without the fixtures. Raising stops the write, including the shutil.rmtree
+    that removes an aborted session, which tests ran on the operator's
+    20261001/christielab10/session001 several times on 2026-10-01 (the day's
+    logs there record nine). The refusal is recorded as well, because some
+    callers swallow it (the event file plugin logs and carries on), and
+    fail_on_refusals() fails the test.
+
+    A child process is beyond the hook, so starting reachAQ with a HOME that
+    puts its default data folder here is refused too.
+
+    Writes made in C (cv2, HDF5) are not audited; the application reaches
+    them through folders it first ensures with Path.mkdir, which is. Qt's
+    QSettings writes the preferences file in C++ with no such step, so that
+    file, with its lock and temporary siblings, is also compared before and
+    after each test: that catches the write afterwards, though it cannot stop
+    it, and cannot tell this test from another process. Only that file: the
+    operator's running reachAQ rewrites its status file beside it at every
+    mode change, which in this process the hook already refuses.
+    """
+
+    # Audit events that create, change or remove what a path names, with the
+    # positions of those paths among the event's arguments.
+    _WRITE_EVENTS = {
+        "os.mkdir": (0,),
+        "os.rename": (0, 1),  # os.replace too
+        "os.remove": (0,),  # os.unlink too
+        "os.rmdir": (0,),
+        "os.link": (1,),
+        "os.symlink": (1,),
+        "os.truncate": (0,),
+        "os.chmod": (0,),
+        "os.chown": (0,),
+        "os.utime": (0,),
+        "shutil.rmtree": (0,),
+    }
+    _EVENTS = frozenset((*_WRITE_EVENTS, "open", "subprocess.Popen"))
+    _OPEN_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+    # What starts reachAQ: its entry modules, by -m or by path, and its
+    # console scripts (pyproject.toml).
+    _APP_MODULES = (
+        "tools.acquisition.headless",
+        "tools.acquisition.gui",
+        "tools.acquisition.run_acquisition",
+        "reachAQ.app",
+    )
+    _APP_SCRIPTS = ("reachaq", "auto-trainer-local", "auto-trainer-headless")
+    # QSettings' file for organisation "Colorado", application "Auto Trainer"
+    # (user_preferences.py).
+    PREFERENCES_FILE_NAME = "Auto Trainer.conf"
+
+    def __init__(self, default_output_path: Path, preferences_folder: Path):
+        # The default is under HOME, which each process resolves for itself.
+        self._under_home = default_output_path.relative_to("~")
+        self.home = Path("~").expanduser()
+        preferences_folder = preferences_folder.expanduser()
+        self.roots = (self.home.joinpath(self._under_home), preferences_folder)
+        self.watched = (preferences_folder.joinpath(self.PREFERENCES_FILE_NAME),)
+        self._refused: List[str] = []
+
+    @property
+    def roots(self) -> tuple:
+        return self._roots
+
+    @roots.setter
+    def roots(self, value) -> None:
+        self._roots = tuple(Path(root) for root in value)
+        self._prefixes = {
+            resolve(root) for root in self._roots for resolve in (os.path.abspath, os.path.realpath)
+        }
+
+    def __call__(self, event: str, args: tuple) -> None:
+        if event not in self._EVENTS:
+            return
+        try:
+            refusal = self._refusal(event, args)
+        except Exception:
+            return  # the guard must never break a call it has no business with
+        if refusal is not None:
+            self._refused.append(refusal)
+            raise DataRootWriteRefused(f"refused by the test suite's data folder guard: {refusal}")
+
+    def take_refused(self) -> List[str]:
+        refused, self._refused = self._refused, []
+        return refused
+
+    def snapshot(self) -> dict:
+        """Each watched file's stat, with its siblings', for changes_since()."""
+        return {path: self._stat_with_siblings(path) for path in self.watched}
+
+    def changes_since(self, snapshot: dict) -> List[str]:
+        changes = []
+        for path, before in snapshot.items():
+            after = self._stat_with_siblings(path)
+            for name in sorted(before.keys() | after.keys()):
+                if before.get(name) != after.get(name):
+                    state = ("created" if name not in before
+                             else "removed" if name not in after else "changed")
+                    changes.append(f"{path.parent / name} {state}")
+        return changes
+
+    def fail_on_refusals(self, snapshot: Optional[dict] = None) -> None:
+        refused = self.take_refused()
+        changed = [] if snapshot is None else self.changes_since(snapshot)
+        report = []
+        if refused:
+            report.append("tried to write under the operator's folders, and was refused"
+                          " (a background thread's attempt may belong to an earlier test):")
+            report.extend(f"  {what}" for what in refused)
+        if changed:
+            report.append("changed during this test (by this test, or by another process"
+                          " such as a running reachAQ):")
+            report.extend(f"  {what}" for what in changed)
+        if report:
+            pytest.fail("\n".join(report), pytrace=False)
+
+    @staticmethod
+    def _stat_with_siblings(path: Path) -> dict:
+        # QSettings saves through QSaveFile, a temporary file renamed over this
+        # one, under a QLockFile "<name>.lock". A save changes the file's inode,
+        # so it shows here without the folder's own stat, which the operator's
+        # status file moves too.
+        def key(stat):
+            return stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino
+        try:
+            with os.scandir(path.parent) as entries:
+                return {
+                    entry.name: key(entry.stat(follow_symlinks=False))
+                    for entry in entries
+                    if entry.name == path.name or entry.name.startswith(path.name + ".")
+                }
+        except FileNotFoundError:
+            return {}
+
+    def _refusal(self, event: str, args: tuple) -> Optional[str]:
+        if event == "subprocess.Popen":
+            executable, command, _cwd, env = args
+            return self._launch_refusal(executable, command, env)
+        if event == "open":
+            path, mode, flags = args  # mode is None from os.open
+            writes = (isinstance(mode, str) and any(c in mode for c in "wax+")
+                      or isinstance(flags, int) and bool(flags & self._OPEN_WRITE_FLAGS))
+            paths = (path,) if writes else ()
+        else:
+            paths = tuple(args[i] for i in self._WRITE_EVENTS[event])
+        for path in paths:
+            if not isinstance(path, int):  # a descriptor was audited when it was opened
+                path = os.path.abspath(os.fsdecode(path))
+                if self._is_protected(path):
+                    return f"{event} {path}"
+        return None
+
+    def _launch_refusal(self, executable, command, env) -> Optional[str]:
+        if isinstance(command, (str, bytes, os.PathLike)):
+            command = [command]
+        words = [os.fsdecode(word) for word in command]
+
+        def is_app_module(word: str) -> bool:
+            module = word[:-3] if word.endswith(".py") else word
+            return module.replace("\\", "/").replace("/", ".").endswith(self._APP_MODULES)
+
+        programs = {os.path.basename(os.fsdecode(executable or words[0])), os.path.basename(words[0])}
+        if not (programs & set(self._APP_SCRIPTS) or any(is_app_module(word) for word in words)):
+            return None
+        home = (os.environ if env is None else env).get("HOME") or self.home
+        root = os.path.abspath(os.path.join(os.fsdecode(home), self._under_home))
+        if not self._is_protected(root):
+            return None
+        return f"subprocess.Popen {' '.join(words)} (its HOME puts its data folder at {root})"
+
+    def _is_protected(self, path: str) -> bool:
+        return any(path == prefix or path.startswith(prefix + os.sep) for prefix in self._prefixes)
+
+
+# Installed at import, so collection is covered too; an audit hook cannot be removed.
+data_root_guard = DataRootGuard(PRODUCTION_DEFAULT_OUTPUT_PATH, PRODUCTION_STATUS_FILE_PATH.parent)
+sys.addaudithook(data_root_guard)
+
+
+@pytest.fixture(autouse=True)
+def guard_the_operator_data_root():
+    """Fail any test that tried to write under the operator's folders."""
+    before = data_root_guard.snapshot()
+    yield
+    data_root_guard.fail_on_refusals(before)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Fail the run on a refusal that no test's check saw.
+
+    A session fixture's teardown, or a thread still running, can try after the
+    last test's teardown.
+    """
+    refused = data_root_guard.take_refused()
+    if not refused:
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line("")  # past the progress line
+        reporter.write_line(
+            "tried to write under the operator's folders after the last test's check,"
+            " and was refused:", red=True)
+        for what in refused:
+            reporter.write_line(f"  {what}", red=True)
+    if session.exitstatus == pytest.ExitCode.OK:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 def simulate_get_perf_now():
@@ -73,6 +390,96 @@ def increase_simulate_perf_now(delay: float = 60, refresh_func: Optional[Callabl
 class AlmostEqualFloat(float):
     def __eq__(self, other):
         return abs(self - other) < 0.01
+
+
+def release_multiprocessing_resources(app):
+    """Close the multiprocessing resources an AppModel opens in __init__.
+
+    AppModel.__init__ starts a multiprocessing Manager and two mp Queues, and
+    every VideoCaptureModel it builds adds one more. Nothing closes them:
+    on_close() leaves the message queue open on purpose ("do not close to allow
+    multiple on_close() calls") and its manager shutdown is commented out, and
+    the mocked fixture cannot call on_close() at all.
+
+    Each test therefore leaked about 13 descriptors. Measured on the rig, a full
+    run grew from 12 open descriptors to 1106, past the default 1024 soft limit,
+    and about 37 unrelated tests near the end failed with OSError: [Errno 24]
+    Too many open files. Each of them passes on its own, which is what made
+    exhaustion look like flakiness.
+
+    The releases have to be explicit. Measured on this interpreter:
+
+      Queue.close()                      frees 1 of the pipe's 2 descriptors
+      Queue._reader/_writer.close()      frees both
+      Manager.shutdown()                 frees 0
+      Manager.shutdown() + _process.close()  frees both
+
+    The remainder is left to garbage collection, which never runs here because
+    the AppModel graph stays reachable through process-global observers.
+
+    Cleanup failures are swallowed: this runs in fixture teardown, where raising
+    would replace the real test result with a teardown error.
+    """
+    message_queue = getattr(app, "_multiproc_msg_queue", None)
+    thread = getattr(app, "_handle_proc_msg_thread", None)
+    if message_queue is not None and thread is not None and thread.is_alive():
+        # The thread blocks in queue.get(). Closing the read end underneath it
+        # raises EOFError, which pytest reports as an unhandled thread
+        # exception, so send the same sentinel on_close() uses and let it
+        # finish first.
+        try:
+            message_queue.put(None)
+            thread.join(5)
+        except Exception:
+            pass
+        if thread.is_alive():
+            # Still blocked. Leave this one open rather than trade two
+            # descriptors for a spurious warning on every test.
+            message_queue = None
+
+    queues = [
+        message_queue,
+        getattr(app, "_stim_direct_trigger_queue", None),
+    ]
+    for camera in getattr(app, "_cameras", None) or ():
+        queues.append(getattr(camera, "_video_command_queue", None))
+
+    for mp_queue in queues:
+        if mp_queue is None:
+            continue
+        try:
+            # A feeder thread can hold a queue open indefinitely when a test
+            # left an unflushed item in it, so do not wait for it.
+            mp_queue.cancel_join_thread()
+        except Exception:
+            pass
+        for attribute in ("_reader", "_writer"):
+            connection = getattr(mp_queue, attribute, None)
+            if connection is None:
+                continue
+            try:
+                connection.close()
+            except Exception:
+                pass
+        try:
+            mp_queue.close()
+        except Exception:
+            pass
+
+    manager = getattr(app, "_mp_manager", None)
+    if manager is None:
+        return
+    try:
+        manager.shutdown()
+    except Exception:
+        pass
+    process = getattr(manager, "_process", None)
+    if process is not None:
+        try:
+            process.join(5)
+            process.close()
+        except Exception:
+            pass
 
 
 @pytest.fixture
@@ -233,11 +640,6 @@ def _disable_timers():
 
 
 @pytest.fixture
-def tunnel_device() -> TunnelDeviceProtocol:
-    return mock.create_autospec(TunnelDeviceProtocol)
-
-
-@pytest.fixture
 def pellet_device() -> PelletDeviceProtocol:
     return mock.create_autospec(PelletDeviceProtocol)
 
@@ -286,8 +688,8 @@ def system_msg_queue():
 
 
 @pytest.fixture
-def sensor_analysis(mock_get_perf_now) -> SensorAnalysis:
-    s = SensorAnalysis()
+def sensor_analysis(mock_get_perf_now) -> ReachAnalysis:
+    s = ReachAnalysis()
     try:
         yield s
     finally:
@@ -297,7 +699,7 @@ def sensor_analysis(mock_get_perf_now) -> SensorAnalysis:
 @pytest.fixture
 def system_msg_handler(system_msg_queue, sensor_analysis):
     # Unused
-    handler = SystemMessageHandler(system_msg_queue, sensor_analysis=sensor_analysis)
+    handler = SystemMessageHandler(system_msg_queue)
     handler.start()
     try:
         yield handler
@@ -320,8 +722,8 @@ class FakeMsgQueue:
 
 class FakeSystemMsgHandler(SystemMessageHandler):
 
-    def __init__(self, input_queue, *, sensor_analysis):
-        super().__init__(input_queue, sensor_analysis=sensor_analysis)
+    def __init__(self, input_queue):
+        super().__init__(input_queue)
 
     def start(self):
         pass
@@ -340,11 +742,11 @@ def fake_msg_queue():
 
 @pytest.fixture
 def fake_system_msg_handler(fake_msg_queue, sensor_analysis):
-    return FakeSystemMsgHandler(fake_msg_queue, sensor_analysis=sensor_analysis)
+    return FakeSystemMsgHandler(fake_msg_queue)
 
 
 @pytest.fixture
-def machine(project_info, tunnel_device, pellet_device, inference, sensor_analysis, monkeypatch, mock_get_perf_now, fake_system_msg_handler) -> SystemMachine:
+def machine(project_info, pellet_device, inference, sensor_analysis, monkeypatch, mock_get_perf_now, fake_system_msg_handler) -> SystemMachine:
     # Disable algo handler thread
     assert BehaviorAlgorithm._no_handler_thread is False
     monkeypatch.setattr(BehaviorAlgorithm, "_no_handler_thread", True)
@@ -355,7 +757,6 @@ def machine(project_info, tunnel_device, pellet_device, inference, sensor_analys
     inference.project = project_info
     #
     machine = SystemMachine(
-        tunnel_device=tunnel_device,
         pellet_device=pellet_device,
         analysis=sensor_analysis,
         inference=inference,
@@ -374,7 +775,11 @@ def machine(project_info, tunnel_device, pellet_device, inference, sensor_analys
     algo.session_minimum_duration = 0  # needed for most current tests
     # might be needed to reset:
     algo.capture_status = CaptureProcessStatus.RUNNING
-    algo.status = BehaviorAlgoStatus.ANIMAL_IN_TRAINING
+    algo.status = BehaviorAlgoStatus.RUNNING
+    # State-machine unit tests exercise individual transitions without building
+    # a complete recording session. Session-bound automation gating is covered
+    # separately by behavior_algo_test.
+    monkeypatch.setattr(algo, "_pellet_automation_enabled_for_session", lambda: True)
     machine.pellet.state = PelletState.monitoring  # force monitoring for current tests
     return machine
 
@@ -393,7 +798,6 @@ class MockSystemMachine:
     def _init(self, machine: SystemMachine):
         self._machine: SystemMachine = machine
         self.project = machine.project
-        self._load_cell = machine._analysis.load_cell_monitor  # noqa
         # register state_changed (and system_state_changed for algo at end) transition recorder,
         # so that can be used to ensure/assert that the given states have passed through all the desired values,
         # and in any desired specific order - or not.
@@ -442,37 +846,24 @@ class MockSystemMachine:
         return self._machine._msg_handler
 
     @property
-    def tunnel_dev(self) -> Union[mock.MagicMock, TunnelDeviceProtocol]:
-        return self._machine._tunnel_device
-
-    @property
     def pellet_dev(self) -> Union[mock.MagicMock, PelletDeviceProtocol]:
         return self._machine._pellet_device
 
     #
 
-    def start_session_in_tunnel(self, set_recording_status: bool = False):
+    def start_recording_session(self, set_recording_status: bool = False):
         algo = self.algo
         assert not algo.is_in_session
-        assert self._machine.state == SystemState.cage
-        self.make_load_cell_active()
-        self.sensor_analysis.load_cell_monitor.is_engaged = True
-        self._machine.enter_tunnel(reason="manual")
-        # algo.start_session(reason="manual")
+        assert self._machine.state == SystemState.ready
+        algo.start_session(reason="manual")
         if set_recording_status:
             algo.set_capture_status(CaptureProcessStatus.RECORDING)
         # assert algo.is_in_session
-        assert self._machine.state == SystemState.tunnel
+        assert self._machine.state == SystemState.ready
 
-    def exit_tunnel(self):
-        assert self._machine.state != SystemState.cage
-        load_cell = self.sensor_analysis.load_cell_monitor
-        if load_cell.is_engaged:
-            logger.info("exiting tunnel with load-cell")
-            load_cell.is_engaged = False
-        else:
-            logger.info("exiting tunnel with manual")
-            self._machine.exit_tunnel(reason="manual")
+    def stop_recording_session(self):
+        if self.algo.is_in_session:
+            self.algo.end_capture_session(reason=RecordingEndingReason.MANUAL_STOP)
 
     @contextlib.contextmanager
     def patch_timer(self, place, new=None) -> ContextManager[Union[mock.MagicMock, DaemonTimer]]:  # noqa
@@ -601,25 +992,6 @@ class MockSystemMachine:
         self.increment_perf_now(self._machine.algorithm.pellet_missing_time + 1e-9)
         self.mock_pose_response(pellet_seen=False, mouse_seen=mouse_seen)
 
-    def make_load_cell_active(self):
-        # NB: this could be moved to auto-trainer-core (where load_cell_monitor is defined),
-        # so to be reused by auto-trainer-core/tests dedicated to load cell monitor.
-        batch_count = self._load_cell._engaged_batch_count
-        for _ in range(2 * batch_count):
-            self.increment_perf_now(self._load_cell.config.threshold_duration / batch_count + 0.001)
-            p_now = self.get_current_perf_now()
-            self._load_cell.update(
-                self._load_cell.config.weight_active_threshold + 0.001, time.time(), int(p_now * 1e9)
-            )
-
-    def make_load_cell_inactive(self):
-        batch_count = self._load_cell._engaged_batch_count
-        for _ in range(3 * batch_count):
-            self.increment_perf_now(self._load_cell.config.min_post_event_hold_duration / batch_count + 0.001)
-            p_now = self.get_current_perf_now()
-            self._load_cell.update(
-                self._load_cell.config.weight_inactive_threshold - 0.001, time.time(), int(p_now * 1e9))
-
     def make_recording_aged_enough(self):
         algo = self._machine.algorithm
         algo.capture_status = CaptureProcessStatus.RECORDING
@@ -639,7 +1011,7 @@ def mock_system(machine) -> MockSystemMachine:
 
 @pytest.fixture
 def hardware_model(fake_system_msg_handler, sensor_analysis) -> HardwareModel:
-    return HardwareModel(fake_system_msg_handler, sensor_analysis=sensor_analysis)
+    return HardwareModel(fake_system_msg_handler)
 
 
 @pytest.fixture

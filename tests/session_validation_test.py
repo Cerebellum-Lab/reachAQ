@@ -1,0 +1,1106 @@
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+import yaml
+
+from tools.session_validation import ValidationProfile, validate_session
+from tools.session_validation.cli import main
+
+
+def _write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value, encoding="utf-8")
+
+
+def _session(tmp_path):
+    root = tmp_path / "session001"
+    generation = "session001-g1"
+    metadata = {
+        "metadataSchemaVersion": 2,
+        "metadataGenerationId": generation,
+        "sessionId": "session001",
+    }
+    metadata_json = root / "session001_metadata.json"
+    _write(metadata_json, json.dumps(metadata))
+    _write(root / "session001_metadata.yaml", yaml.safe_dump(metadata))
+    _write(root / "streams/alignment.json", json.dumps({
+        "schemaVersion": 2, "metadataGenerationId": generation,
+    }))
+    stream_manifest = {
+        "schemaVersion": 2,
+        "metadataGenerationId": generation,
+        "sessionId": "session001",
+        "sessionComplete": True,
+        "enabledSources": [],
+        # As _write_session publishes it: alignment.json is always listed.
+        "files": [_manifest_entry(root, "streams/alignment.json")],
+    }
+    _write(root / "streams/stream_manifest.json", json.dumps(stream_manifest))
+    files = []
+    for path in (
+        metadata_json,
+        root / "session001_metadata.yaml",
+        root / "streams/stream_manifest.json",
+    ):
+        data = path.read_bytes()
+        files.append({
+            "path": path.relative_to(root).as_posix(),
+            "sizeBytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        })
+    _write(root / "manifest.json", json.dumps({
+        "schemaVersion": 1,
+        "metadataGenerationId": generation,
+        "authoritativeMetadata": metadata_json.name,
+        "files": files,
+    }))
+    return root
+
+
+def test_quick_validator_is_read_only(tmp_path):
+    root = _session(tmp_path)
+    before = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in root.rglob("*") if path.is_file()
+    }
+    report = validate_session(root, profile=ValidationProfile.QUICK)
+    after = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in root.rglob("*") if path.is_file()
+    }
+    assert report.exit_code == 0
+    assert before == after
+
+
+def test_full_validator_detects_manifest_hash_failure(tmp_path):
+    root = _session(tmp_path)
+    (root / "session001_metadata.yaml").write_text("changed", encoding="utf-8")
+    report = validate_session(root, profile=ValidationProfile.FULL)
+    assert report.exit_code in {1, 2}
+    manifest = next(item for item in report.results if item.rule_id == "session.manifest")
+    assert manifest.status.value == "fail"
+
+
+def test_cli_writes_only_explicit_output(tmp_path):
+    root = _session(tmp_path)
+    output = tmp_path / "report.json"
+    assert main([str(root), "--quick", "--json", "--output", str(output)]) == 0
+    assert json.loads(output.read_text(encoding="utf-8"))["profile"] == "quick"
+
+
+def test_fast_validator_checks_board_clock_and_sequence_evidence(tmp_path):
+    root = _session(tmp_path)
+    columns = (
+        "perf_time", "host_receive_perf_time", "board_boot_id",
+        "board_sequence", "board_time_us", "board_timestamp_kind",
+        "board_aligned_perf_time", "board_clock_model_id",
+        "board_clock_uncertainty_seconds", "estimated_transport_delay_seconds",
+        "event_perf_time", "event_timestamp_method", "event_timing_confidence",
+    )
+    rows = (
+        (10.0, 10.01, 7, 1, 1000, "physical_start", 10.0, "m1", 0.001,
+         0.01, 10.0, "board_clock_affine", "board_timestamp"),
+        (10.1, 10.11, 7, 2, 101000, "completed", 10.1, "m1", 0.001,
+         0.01, 10.1, "board_clock_affine", "board_timestamp"),
+    )
+    path = root / "streams/device.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        import csv
+        writer = csv.writer(stream)
+        writer.writerow(columns)
+        writer.writerows(rows)
+
+    report = validate_session(root, profile=ValidationProfile.FAST)
+
+    result = next(item for item in report.results if item.rule_id == "events.board_time")
+    assert result.status.value == "pass"
+    assert result.observed["timestamped_rows"] == 2
+
+
+def test_validator_checks_merged_frame_ids_and_event_association(tmp_path):
+    root = _session(tmp_path)
+    stream_path = root / "streams/stream_manifest.json"
+    stream = json.loads(stream_path.read_text(encoding="utf-8"))
+    stream["enabledSources"] = [{
+        "id": "camera.left",
+        "kind": "camera",
+        "path": "left.mp4",
+        "sampleCount": 2,
+        "persistenceStatus": "written",
+        "diagnostics": {
+            "writer_frame_count": 2,
+            "timestamp_row_count": 2,
+            "decoded_frame_count": 2,
+        },
+    }]
+    _write(stream_path, json.dumps(stream))
+    _write(root / "left.mp4", "fixture")
+    _write(
+        root / "session001_frame_timing.csv",
+        "frame_id,utc_when,frame_present_left\n10,1000.0,1\n11,1000.01,1\n",
+    )
+    event_columns = (
+        "perf_time,offset_seconds,wall_time,event_name,event_id,event_index,"
+        "context_json,timestamp_method,frame_id,recorded_frame_index,"
+        "frame_relation,frame_start_perf_time,frame_start_offset_seconds,"
+        "frame_start_wall_time,event_to_frame_start_seconds,alignment_method,"
+        "alignment_confidence\n"
+    )
+    _write(
+        root / "streams/events.csv",
+        event_columns
+        + "20.0,1.0,1000.005,event,id,1,{},host,11,1,following,20.005,"
+        "1.005,1000.01,0.005,writer_timeline,writer_timestamp\n",
+    )
+
+    report = validate_session(
+        root,
+        profile=ValidationProfile.FAST,
+        selected_rules=("camera.ledger", "events.frames"),
+    )
+
+    assert next(
+        item for item in report.results if item.rule_id == "camera.ledger"
+    ).status.value == "pass"
+    assert next(
+        item for item in report.results if item.rule_id == "events.frames"
+    ).status.value == "pass"
+
+
+def test_validator_reconciles_trial_and_protocol_operation(tmp_path):
+    root = _session(tmp_path)
+    recipe = {
+        "operation_id": "prepared-op",
+        "protocol_id": "p",
+        "logical_trial_id": 1,
+        "attempt_id": 1,
+        "requested_row": {"trial_id": 1},
+        "resolved_dcs_target": [1, 2, 3],
+        "resolved_motor_target": [4, 5, 6],
+        "position_evidence": {"mode": "base"},
+        "stimulus_selected": False,
+        "stimulus_seed": 1,
+        "stimulus_draw": 0.5,
+    }
+    record = {
+        "session_id": "session001",
+        "operation_id": "can-send-context",
+        "trial_id": 1,
+        "attempt_id": 1,
+        "attempt_label": "1.1",
+        "send_perf_time": 10.0,
+        "send_ack_perf_time": 10.1,
+        "finalized_perf_time": 11.0,
+        "outcome": "success",
+        "reach_count": 1,
+        "success_count": 1,
+        "consumption_count": 1,
+        "protocol_context": {
+            "protocol_id": "p",
+            "compiled_recipe": recipe,
+        },
+        "protocol_operation": {
+            "recipe": recipe,
+            "state": "completed",
+            "observations": [
+                {"state": "preparing", "perf_time": 9.0},
+                {"state": "completed", "perf_time": 11.0},
+            ],
+        },
+    }
+    _write(root / "streams/trials.jsonl", json.dumps(record) + "\n")
+    _write(root / "streams/trial_summary.json", json.dumps({
+        "physical_attempts": 1,
+        "hardware_errors": 0,
+        "incomplete_attempts": 0,
+        "pending_analysis_attempts": 0,
+        "pellets_presented": 1,
+        "reaches": 1,
+        "successful_reaches": 1,
+        "pellets_consumed": 1,
+    }))
+
+    report = validate_session(
+        root,
+        profile=ValidationProfile.FAST,
+        selected_rules=("trials.lifecycle", "trials.protocol"),
+    )
+
+    assert next(
+        item for item in report.results if item.rule_id == "trials.lifecycle"
+    ).status.value == "pass"
+    assert next(
+        item for item in report.results if item.rule_id == "trials.protocol"
+    ).status.value == "pass"
+
+
+def test_validator_reconciles_automatic_shift_policy_and_recommendation(tmp_path):
+    root = _session(tmp_path)
+    policy = {
+        "policy_id": "rolling-failures",
+        "revision": 2,
+        "eligible_outcomes": ["failure"],
+        "reduction_method": "median",
+        "target_reach_offset_dcs": [1.5, -3.0, 1.0],
+        "deadbands_mm": [0.5, 1.0, 0.5],
+        "maximum_update_mm": [2.0, 2.0, 2.0],
+        "maximum_absolute_mm": [5.0, 5.0, 5.0],
+        "apply_automatically": False,
+    }
+    recommendation = {
+        "generation": 3,
+        "resolved_target_dcs": [4.0, 5.0, 6.0],
+        "apply_automatically": False,
+    }
+    recipe = {
+        "operation_id": "prepared-op",
+        "protocol_id": "p",
+        "logical_trial_id": 1,
+        "attempt_id": 1,
+        "requested_row": {
+            "trial_id": 1,
+            "position_mode": "reach_derived_automatic",
+            "automatic_shift_policy_id": "rolling-failures",
+        },
+        "resolved_dcs_target": [1.0, 2.0, 3.0],
+        "resolved_motor_target": [1.0, 2.0, 3.0],
+        "position_evidence": {
+            "mode": "reach_derived_automatic",
+            "automatic_status": "recommendation_only",
+            "automatic_policy": policy,
+            "automatic_recommendation": recommendation,
+        },
+        "stimulus_selected": False,
+        "stimulus_seed": 1,
+        "stimulus_draw": 0.5,
+    }
+    record = {
+        "trial_id": 1,
+        "attempt_id": 1,
+        "protocol_context": {"protocol_id": "p", "compiled_recipe": recipe},
+        "protocol_operation": {
+            "recipe": recipe,
+            "state": "completed",
+            "observations": [{"state": "completed", "perf_time": 1.0}],
+        },
+    }
+    _write(root / "streams/trials.jsonl", json.dumps(record) + "\n")
+
+    report = validate_session(
+        root,
+        profile=ValidationProfile.FAST,
+        selected_rules=("trials.protocol",),
+    )
+
+    assert next(
+        item for item in report.results if item.rule_id == "trials.protocol"
+    ).status.value == "pass"
+
+
+def _pose_source_contract(tmp_path, listed, present):
+    # As the recorder writes it: "path" names the source, "paths" are its files.
+    root = _session(tmp_path)
+    stream_path = root / "streams/stream_manifest.json"
+    stream = json.loads(stream_path.read_text(encoding="utf-8"))
+    stream["enabledSources"] = [{
+        "id": "pose",
+        "kind": "pose",
+        "path": "pose",
+        "paths": listed,
+        "sampleCount": 10,
+        "persistenceStatus": "written",
+    }]
+    _write(stream_path, json.dumps(stream))
+    for name in present:
+        _write(root / name, "h5")
+    report = validate_session(
+        root, profile=ValidationProfile.QUICK, selected_rules=("sources.contract",))
+    return next(item for item in report.results if item.rule_id == "sources.contract")
+
+
+def test_a_source_written_as_several_files_is_checked_by_its_paths(tmp_path):
+    files = ["s_left_raw2D_live.h5", "s_right_raw2D_live.h5"]
+    assert _pose_source_contract(tmp_path, files, files).status.value == "pass"
+
+
+def test_a_missing_file_among_a_sources_paths_is_named(tmp_path):
+    files = ["s_left_raw2D_live.h5", "s_right_raw2D_live.h5"]
+    result = _pose_source_contract(tmp_path, files, files[:1])
+    assert result.status.value == "fail"
+    assert "pose: artifact missing: s_right_raw2D_live.h5" in result.message
+
+
+def test_a_source_with_an_empty_paths_list_is_missing(tmp_path):
+    result = _pose_source_contract(tmp_path, [], [])
+    assert result.status.value == "fail"
+    assert "pose: artifact missing" in result.message
+
+
+def test_event_sources_may_be_empty_without_failing_continuous_coverage(tmp_path):
+    root = _session(tmp_path)
+    stream_path = root / "streams/stream_manifest.json"
+    stream = json.loads(stream_path.read_text(encoding="utf-8"))
+    stream["enabledSources"] = [{
+        "id": "laser_outputs",
+        "kind": "laser_commands_and_states",
+        "path": "streams/laser.csv",
+        "sampleCount": 0,
+        "persistenceStatus": "written",
+    }]
+    _write(stream_path, json.dumps(stream))
+    _write(root / "streams/laser.csv", "perf_time,event\n")
+
+    report = validate_session(
+        root,
+        profile=ValidationProfile.FAST,
+        selected_rules=("sources.contract", "events.frames"),
+    )
+
+    assert next(
+        item for item in report.results if item.rule_id == "sources.contract"
+    ).status.value == "pass"
+    assert next(
+        item for item in report.results if item.rule_id == "events.frames"
+    ).status.value == "not_applicable"
+
+
+def test_tone_confirmation_rejects_unmatched_in_session_evidence(tmp_path):
+    root = _session(tmp_path)
+    alignment_path = root / "streams/alignment.json"
+    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    alignment.update({
+        "canonicalBoundary": {"startPerfTime": 10.0, "endPerfTime": 20.0},
+        "toneConfirmation": {
+            "matched": [],
+            "unmatchedEvents": [{"eventPerfTime": 12.0}],
+            "unmatchedEdges": [{"perfTime": 13.0}],
+            "artifacts": [],
+        },
+    })
+    _write(alignment_path, json.dumps(alignment))
+
+    report = validate_session(
+        root,
+        profile=ValidationProfile.FAST,
+        selected_rules=("events.tones",),
+    )
+
+    result = next(item for item in report.results if item.rule_id == "events.tones")
+    assert result.status.value == "fail"
+    assert result.observed["unmatched_events"] == 1
+    assert result.observed["unmatched_edges"] == 1
+
+
+# ------------------------------------- manual Run Pulse events in laser.csv (D-D)
+
+_LASER_HEADER = "perf_time,event,channel,source,operation_id,context_json,frame_id\n"
+
+
+def _laser_row(perf, event, source, operation_id, frame_id=11):
+    context = '"{""manual"": true}"' if operation_id.startswith("manual-") else "{}"
+    return f"{perf},{event},1,{source},{operation_id},{context},{frame_id}\n"
+
+
+def _rule(root, rule_id):
+    report = validate_session(
+        root, profile=ValidationProfile.FAST, selected_rules=(rule_id,))
+    return next(item for item in report.results if item.rule_id == rule_id)
+
+
+def test_events_laser_counts_the_manual_run_pulse_events(tmp_path):
+    # A manual Run Pulse fired while recording is kept as a requested row and
+    # an outcome row sharing its manual- id; the rule says how many it found,
+    # and how each ended, so a reviewer sees them and never takes a refused
+    # one for one that fired (Ben, 2026-09-30).
+    root = _session(tmp_path)
+    _write(root / "streams/laser.csv", _LASER_HEADER + "".join((
+        _laser_row(10.0, "requested", "manual pulse", "manual-a"),
+        _laser_row(10.0, "trace", "internal pulse", ""),
+        _laser_row(10.2, "completed", "manual pulse", "manual-a"),
+        _laser_row(11.0, "requested", "manual pulse", "manual-b"),
+        _laser_row(11.1, "refused", "manual pulse", "manual-b"),
+        _laser_row(12.0, "requested", "manual pulse", "manual-c"),
+        _laser_row(12.5, "cancelled", "manual pulse", "manual-c"),
+        # Its request fell before Record: a legitimate single row, no warning.
+        _laser_row(13.0, "failed", "manual pulse", "manual-d"),
+        # Its outcome fell after Stop.
+        _laser_row(14.0, "requested", "manual pulse", "manual-e"),
+    )))
+
+    result = _rule(root, "events.laser")
+
+    assert result.status.value == "pass"
+    assert result.message == (
+        "Laser events have recorded-frame evidence; 5 manual Run Pulse event(s) "
+        "(1 completed, 1 failed, 1 cancelled, 1 refused, 1 with no outcome)")
+
+    # With none, the message is what it was.
+    _write(root / "streams/laser.csv", _LASER_HEADER + _laser_row(
+        10.0, "trace", "internal pulse", ""))
+    assert _rule(root, "events.laser").message == (
+        "Laser events have recorded-frame evidence")
+
+
+def _write_protocol_trial_with_a_laser(root, laser_operation_id):
+    recipe = {
+        "operation_id": "prepared-op",
+        "protocol_id": "p",
+        "logical_trial_id": 1,
+        "attempt_id": 1,
+        "requested_row": {"trial_id": 1},
+        "resolved_dcs_target": [1, 2, 3],
+        "resolved_motor_target": [4, 5, 6],
+        "position_evidence": {"mode": "base"},
+        "stimulus_selected": False,
+        "stimulus_seed": 1,
+        "stimulus_draw": 0.5,
+        "laser_profile": {"profile_id": "burst", "revision": 1},
+    }
+    record = {
+        "trial_id": 1,
+        "attempt_id": 1,
+        "protocol_context": {"protocol_id": "p", "compiled_recipe": recipe},
+        "protocol_operation": {
+            "recipe": recipe,
+            "state": "completed",
+            "observations": [{"state": "completed", "perf_time": 11.0}],
+            "actions": {"laser": {
+                "state": "completed", "operation_id": laser_operation_id}},
+        },
+    }
+    _write(root / "streams/trials.jsonl", json.dumps(record) + "\n")
+
+
+def test_manual_run_pulse_events_are_never_a_protocol_lasers_evidence(tmp_path):
+    root = _session(tmp_path)
+    manual = (
+        _laser_row(10.5, "requested", "manual pulse", "manual-a"),
+        _laser_row(10.6, "completed", "manual pulse", "manual-a"),
+    )
+    _write(root / "streams/laser.csv", _LASER_HEADER + "".join((
+        _laser_row(10.0, "prepared", "protocol operation", "protocol-op"),
+        *manual,
+        _laser_row(11.0, "completed", "protocol operation", "protocol-op"),
+    )))
+    _write_protocol_trial_with_a_laser(root, "protocol-op")
+
+    # Manual events beside a trial's own leave it passing.
+    assert _rule(root, "trials.protocol").status.value == "pass"
+
+    # A trial naming a manual- id is not satisfied by rows under it, even
+    # rows that read as a protocol operation's.
+    _write(root / "streams/laser.csv", _LASER_HEADER + "".join((
+        _laser_row(10.0, "prepared", "manual pulse", "manual-a"),
+        *manual,
+    )))
+    _write_protocol_trial_with_a_laser(root, "manual-a")
+
+    result = _rule(root, "trials.protocol")
+    assert result.status.value == "fail"
+    assert "laser prepared event is absent" in result.message
+
+
+def _manifest_entry(root, relative):
+    data = (root / relative).read_bytes()
+    return {
+        "path": relative,
+        "sizeBytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+def _publish_stream_manifest(root, **changes):
+    """Rewrite the stream manifest, then the top-level entries that hash it."""
+    stream_path = root / "streams/stream_manifest.json"
+    stream = json.loads(stream_path.read_text(encoding="utf-8"))
+    stream.update(changes)
+    _write(stream_path, json.dumps(stream))
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"] = [
+        _manifest_entry(root, item["path"]) for item in manifest["files"]
+    ]
+    _write(manifest_path, json.dumps(manifest))
+
+
+def _manifest_result(root, profile=ValidationProfile.QUICK):
+    report = validate_session(
+        root, profile=profile, selected_rules=("session.manifest",))
+    return next(item for item in report.results if item.rule_id == "session.manifest")
+
+
+def _source(source_id, kind, path):
+    return {
+        "id": source_id, "kind": kind, "path": path,
+        "sampleCount": 1, "persistenceStatus": "written",
+    }
+
+
+def _session_with_sources(tmp_path, *, present, listed, sources=None):
+    root = _session(tmp_path)
+    for relative in present:
+        _write(root / relative, f"{relative}\n")
+    _publish_stream_manifest(
+        root,
+        enabledSources=sources if sources is not None else [
+            _source("device", "decoded_can_and_device_events", "streams/device.csv"),
+            # Every NI channel names the one file they share.
+            _source("nidaq.force", "nidaq_analog", "streams/nidaq.h5"),
+            _source("nidaq.cam_frames", "nidaq_digital", "streams/nidaq.h5"),
+            _source("laser_outputs", "laser_commands_and_states", "streams/laser.csv"),
+        ],
+        files=[
+            _manifest_entry(root, relative)
+            for relative in ("streams/alignment.json", *listed)
+        ],
+    )
+    return root
+
+
+_SOURCE_FILES = ("streams/device.csv", "streams/nidaq.h5", "streams/laser.csv")
+
+
+def test_session_manifest_fails_a_source_file_on_disk_that_is_not_listed(tmp_path):
+    # Listing is what puts a file under the size and hash checks; a file left off the
+    # list is checked by nothing, and every other check still passes.
+    root = _session_with_sources(
+        tmp_path, present=_SOURCE_FILES,
+        listed=("streams/device.csv", "streams/laser.csv"))
+
+    for profile in (ValidationProfile.QUICK, ValidationProfile.FULL):
+        result = _manifest_result(root, profile)
+        assert result.status.value == "fail", profile
+        assert "streams/nidaq.h5" in result.message
+        assert "nidaq_analog" in result.message
+        assert "streams/device.csv" not in result.message
+        assert "streams/laser.csv" not in result.message
+        # Two sources share that file; it is named once.
+        assert result.message.count("streams/nidaq.h5") == 1
+
+
+def test_session_manifest_passes_when_every_source_file_is_listed(tmp_path):
+    root = _session_with_sources(
+        tmp_path, present=_SOURCE_FILES, listed=_SOURCE_FILES)
+
+    for profile in (ValidationProfile.QUICK, ValidationProfile.FULL):
+        assert _manifest_result(root, profile).status.value == "pass", profile
+
+
+def test_session_manifest_leaves_a_source_file_that_is_absent_to_the_source_rule(
+    tmp_path,
+):
+    root = _session_with_sources(
+        tmp_path, present=("streams/device.csv",), listed=("streams/device.csv",))
+
+    assert _manifest_result(root).status.value == "pass"
+    report = validate_session(
+        root, profile=ValidationProfile.QUICK,
+        selected_rules=("session.manifest", "sources.contract"))
+    contract = next(item for item in report.results if item.rule_id == "sources.contract")
+    assert contract.status.value == "fail"
+    assert "nidaq.force: artifact missing" in contract.message
+
+
+def test_session_manifest_does_not_expect_video_or_pose_files_to_be_listed(tmp_path):
+    # The recorder lists none of these; camera.frames and stim.evidence check the video
+    # and the evidence by content, and pose gets only an existence and sampleCount check.
+    root = _session_with_sources(
+        tmp_path,
+        present=("s_left.mp4", "s_left_raw2D_live.h5", "streams/stim_camera_evidence.h5"),
+        listed=(),
+        sources=[
+            _source("camera.left", "camera", "s_left.mp4"),
+            {**_source("pose", "pose", "pose"), "paths": ["s_left_raw2D_live.h5"]},
+            _source("stim_camera_evidence", "stim_camera_detection_evidence",
+                    "streams/stim_camera_evidence.h5"),
+        ],
+    )
+
+    assert _manifest_result(root, ValidationProfile.FULL).status.value == "pass"
+
+
+def test_session_manifest_names_every_unlisted_file_of_a_source_with_several(tmp_path):
+    # "paths" is read the way sources.contract reads it, for a kind that is listed.
+    root = _session_with_sources(
+        tmp_path,
+        present=("streams/a.csv", "streams/b.csv"),
+        listed=("streams/a.csv",),
+        sources=[{**_source("device", "decoded_can_and_device_events", "streams"),
+                  "paths": ["streams/a.csv", "streams/b.csv"]}],
+    )
+
+    result = _manifest_result(root)
+    assert result.status.value == "fail"
+    assert "streams/b.csv" in result.message
+    assert "streams/a.csv" not in result.message
+
+
+def test_session_manifest_reports_a_source_path_that_leaves_the_session(tmp_path):
+    root = _session_with_sources(
+        tmp_path, present=(), listed=(),
+        sources=[_source("device", "decoded_can_and_device_events", "../outside.csv")],
+    )
+
+    result = _manifest_result(root)
+    assert result.status.value == "fail"
+    assert "escapes session" in result.message
+
+
+def test_session_manifest_skips_an_empty_entry_among_a_sources_paths(tmp_path):
+    root = _session_with_sources(
+        tmp_path, present=(), listed=(),
+        sources=[{**_source("device", "decoded_can_and_device_events", "streams"),
+                  "paths": [None, ""]}],
+    )
+
+    assert _manifest_result(root).status.value == "pass"
+
+
+# What _write_session lists whenever it exists, bar alignment.json (every session has
+# that one) and the raw latency streams (left out when their writer is still closing).
+_FINALIZED_FILES = (
+    "streams/device.csv",
+    "streams/events.csv",
+    "streams/trials.jsonl",
+    "streams/trial_summary.json",
+    "streams/laser.csv",
+    "streams/pressure.csv",
+    "logs/session.log",
+    "streams/camera_alignment.json",
+    "streams/nidaq.h5",
+    "streams/latency.h5",
+    "20260102_test_session001_frame_timing.csv",
+    "streams/tracking/trial_000001_attempt_001.json",
+)
+
+
+def _session_with_finalized_files(tmp_path, *, unlisted=()):
+    root = _session(tmp_path)
+    for relative in _FINALIZED_FILES:
+        _write(root / relative, f"{relative}\n")
+    _publish_stream_manifest(
+        root,
+        files=[
+            _manifest_entry(root, relative)
+            for relative in ("streams/alignment.json", *_FINALIZED_FILES)
+            if relative not in unlisted
+        ],
+    )
+    return root
+
+
+@pytest.mark.parametrize("relative", ("streams/alignment.json", *_FINALIZED_FILES))
+def test_session_manifest_fails_a_finalized_file_on_disk_that_is_not_listed(
+    tmp_path, relative,
+):
+    # No enabled source names pressure.csv, camera_alignment.json, the frame timing or a
+    # tracking file, so the source check cannot see them go missing from the list.
+    root = _session_with_finalized_files(tmp_path, unlisted=(relative,))
+
+    for profile in (ValidationProfile.QUICK, ValidationProfile.FULL):
+        result = _manifest_result(root, profile)
+        assert result.status.value == "fail", profile
+        assert f"unlisted {relative}" in result.message
+
+
+def test_session_manifest_passes_when_every_finalized_file_is_listed(tmp_path):
+    root = _session_with_finalized_files(tmp_path)
+
+    for profile in (ValidationProfile.QUICK, ValidationProfile.FULL):
+        assert _manifest_result(root, profile).status.value == "pass", profile
+
+
+def test_session_manifest_does_not_require_a_raw_latency_stream(tmp_path):
+    # Finalization leaves one out of the list when its writer was still closing it, and
+    # a later rewrite cannot say that it is final.
+    root = _session_with_finalized_files(tmp_path)
+    _write(root / "streams/latency/camera_right.h5", "raw")
+
+    assert _manifest_result(root, ValidationProfile.FULL).status.value == "pass"
+
+
+def test_session_manifest_matches_a_listed_file_whatever_its_spelling(tmp_path):
+    spellings = (
+        "./streams/device.csv",
+        "streams/../streams/nidaq.h5",
+        (tmp_path / "session001" / "streams/laser.csv").as_posix(),
+    )
+    root = _session_with_sources(tmp_path, present=_SOURCE_FILES, listed=spellings)
+
+    assert _manifest_result(root, ValidationProfile.FULL).status.value == "pass"
+
+
+def test_validation_passes_after_the_post_stop_trial_ledger_update(tmp_path):
+    from datetime import datetime
+
+    from autotrainer.core import ProjectInfo
+    from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=7)
+    root = Path(project.get_session_path().location)
+    (root / "streams/tracking").mkdir(parents=True)
+    tracking = root / "streams/tracking/trial_000001_attempt_001.json"
+    tracking.write_text(json.dumps({"window": {"startPerf": 10.3, "endPerf": 11.0}}))
+    pending = {
+        "session_id": project.short_id, "operation_id": "send-1", "trial_id": 1,
+        "attempt_id": 1, "attempt_label": "1.1", "send_perf_time": 10.25,
+        "outcome": "pending_analysis",
+    }
+    # The files other processes write: video, pose and stim evidence.
+    unlisted_files = (
+        "session007_left.mp4",
+        "session007_left_raw2D_live.h5",
+        "streams/stim_camera_evidence.h5",
+    )
+    for relative in unlisted_files:
+        (root / relative).write_bytes(b"written elsewhere")
+    SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 12.0, (), (), (), (),
+        trial_records=(pending,),
+        trial_summary={"pending_analysis_attempts": 1},
+        # The sources the app builds (_build_session_source_manifest).
+        source_manifest=(
+            _source("camera.left", "camera", "video/left"),
+            _source("pose", "pose", "pose"),
+            _source("nidaq.force", "nidaq_analog", "streams/nidaq.h5"),
+            _source("device", "decoded_can_and_device_events", "streams/device.csv"),
+            _source("stim_camera_evidence", "stim_camera_detection_evidence",
+                    "streams/stim_camera_evidence.h5"),
+            _source("laser_outputs", "laser_commands_and_states", "streams/laser.csv"),
+            _source("session_logs", "logs", "logs/session.log"),
+            _source("trials", "pellet_trial_ledger", "streams/trials.jsonl"),
+        ),
+        source_results={
+            "camera.left": {"sampleCount": 3, "path": "session007_left.mp4", "failure": ""},
+        },
+    )
+    # What persist_trial_tracking and then the ledger update do once analysis ends.
+    record = json.loads(tracking.read_text())
+    tracking.write_text(json.dumps({**record, "result": {"outcome": "success"}}))
+    SessionDataRecorder.update_persisted_trial_ledger(
+        project, ({**pending, "outcome": "success"},),
+        {"pending_analysis_attempts": 0, "scored_trials": 1},
+    )
+    # The metadata publish that follows analysis hashes the stream manifest it left.
+    _write(root / "metadata.json", json.dumps({"metadataGenerationId": "g"}))
+    _write(root / "manifest.json", json.dumps({
+        "schemaVersion": 1,
+        "files": [_manifest_entry(root, "metadata.json"),
+                  _manifest_entry(root, "streams/stream_manifest.json")],
+    }))
+
+    stream = json.loads((root / "streams/stream_manifest.json").read_text())
+    listed = {item["path"] for item in stream["files"]}
+    on_disk = {
+        relative
+        for source in stream["enabledSources"]
+        for relative in (source.get("paths") or [source["path"]])
+        if (root / relative).is_file()
+    }
+    # Every source's file is there, so the pass is not for want of anything to check;
+    # and the recorder lists the exempt ones no more than the rule expects it to.
+    assert {"streams/nidaq.h5", *unlisted_files} <= on_disk
+    assert not set(unlisted_files) & listed
+    assert {"streams/pressure.csv", "streams/alignment.json"} <= listed
+    result = _manifest_result(root, ValidationProfile.FULL)
+    assert result.status.value == "pass", result.message
+
+
+# ------------------------------------- the camera/NI frame anchor (alignment.frames)
+
+_FIT = {"valid": True, "method": "raw_bridged", "reason": "", "knotCount": 7}
+
+
+def _camera_alignment(**changes):
+    """cameraNidaqAlignment as the recorder writes a clean schema-3 latch anchor."""
+    return {
+        "status": "matched",
+        "confidence": "hardware_edge",
+        "anchorMethod": "camera_latch",
+        "niToHost": dict(_FIT),
+        "exposureSeconds": 0.000175,
+        "expectedLagSeconds": 0.001275,
+        "impliedLagSeconds": 0.001156,
+        "lagGateSeconds": [0.000275, 0.002275],
+        "latch": {"status": "paired", "shift": 0},
+        "anchorsAgree": True,
+        "reason": "Camera-clock latch pairing on the fitted NI timeline (shift 0)",
+        **changes,
+    }
+
+
+def _epoch_alignment(**changes):
+    """cameraNidaqAlignment from the epoch fallback, which leaves the fit-only fields unset."""
+    return _camera_alignment(**{
+        "confidence": "ambiguous_hardware_edge", "anchorMethod": "epoch_nearest_edge",
+        "expectedLagSeconds": None, "impliedLagSeconds": None, "lagGateSeconds": None,
+        "latch": None, "anchorsAgree": None,
+        **changes,
+    })
+
+
+def _schema_four_alignment(**changes):
+    """cameraNidaqAlignment as the recorder writes a clean schema-4 latch anchor: the
+    schema-3 record without the expected-lag keys, plus the arrival match."""
+    removed = ("expectedLagSeconds", "lagGateSeconds", "expectedLagSampleIndex")
+    return {
+        **{key: value for key, value in _camera_alignment().items()
+           if key not in removed},
+        "arrival": {"status": "paired", "shift": 0, "medianLagSeconds": 0.00438,
+                    "agreement": 1.0, "reason": ""},
+        "arrivalSampleIndex": 40,
+        **changes,
+    }
+
+
+def _alignment_session(tmp_path, camera=None, *, schema=3, nidaq=True, tone=None):
+    root = _session(tmp_path)
+    alignment_path = root / "streams/alignment.json"
+    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    alignment["schemaVersion"] = schema
+    alignment["cameraNidaqAlignment"] = (
+        _camera_alignment() if camera is None else camera
+    )
+    if tone is not None:
+        alignment["toneConfirmation"] = tone
+    _write(alignment_path, json.dumps(alignment))
+    if nidaq:
+        manifest_path = root / "streams/stream_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["enabledSources"] = [
+            _source("nidaq.cam_frames", "nidaq_digital", "streams/nidaq.h5")]
+        _write(manifest_path, json.dumps(manifest))
+    return root
+
+
+def _alignment_result(root, profile=ValidationProfile.QUICK):
+    report = validate_session(
+        root, profile=profile, selected_rules=("alignment.frames",))
+    return next(item for item in report.results if item.rule_id == "alignment.frames")
+
+
+def test_frame_alignment_passes_a_clean_anchor_in_the_automatic_quick_check(tmp_path):
+    result = _alignment_result(_alignment_session(tmp_path))
+    assert result.status.value == "pass", result.message
+    assert "camera_latch" in result.message
+    assert result.observed["anchorMethod"] == "camera_latch"
+    assert result.observed["niToHostMethod"] == "raw_bridged"
+    # A schema-3 record has no arrival match: nothing to report and no lag to add.
+    assert "exposure-to-arrival" not in result.message
+    for key in ("arrivalStatus", "arrivalReason", "arrivalMedianLagSeconds",
+                "arrivalSampleIndex"):
+        assert result.observed[key] is None, key
+
+
+def test_frame_alignment_passes_a_clean_schema_four_anchor(tmp_path):
+    result = _alignment_result(
+        _alignment_session(tmp_path, _schema_four_alignment(), schema=4))
+    assert result.status.value == "pass", result.message
+    assert "exposure-to-arrival 4.380 ms" in result.message
+    assert result.observed["arrivalStatus"] == "paired"
+    assert result.observed["arrivalReason"] == ""
+    assert result.observed["arrivalMedianLagSeconds"] == pytest.approx(0.00438)
+    assert result.observed["arrivalSampleIndex"] == 40
+
+
+def test_frame_alignment_still_passes_a_clean_schema_three_expected_lag_anchor(
+        tmp_path):
+    # Sessions recorded before schema 4 are revalidated offline, and read as they were.
+    camera = _camera_alignment(
+        anchorMethod="expected_lag", anchorsAgree=None,
+        latch={"status": "unavailable"})
+    result = _alignment_result(_alignment_session(tmp_path, camera, schema=3))
+    assert result.status.value == "pass", result.message
+
+
+@pytest.mark.parametrize("camera, key, value", (
+    # A perf-only fit: RAW was left out, and the fit says why without failing.
+    (_camera_alignment(niToHost={**_FIT, "method": "piecewise_envelope",
+                                 "reason": "RAW on 40 stamps, need 100"}),
+     "niToHostReason", "RAW on 40 stamps, need 100"),
+    # No exposure: the anchor took the bare allowance, and the gate still held.
+    (_camera_alignment(anchorMethod="expected_lag", exposureSeconds=None,
+                       anchorsAgree=None, latch={"status": "unavailable",
+                                                 "reason": "no latency stream"},
+                       reason="cam_frames transition nearest the expected exposure "
+                              "edge on the fitted NI timeline; exposure unknown, "
+                              "assumed 0"),
+     "reason", "cam_frames transition nearest the expected exposure edge on the "
+               "fitted NI timeline; exposure unknown, assumed 0"),
+    # A latch pairing that was tried and not used, with the gate passing.
+    (_camera_alignment(anchorMethod="expected_lag", anchorsAgree=None,
+                       latch={"status": "ambiguous", "reason": "two shifts tie"}),
+     "latchReason", "two shifts tie"),
+), ids=("perf-only-fit", "exposure-unknown", "latch-not-used"))
+def test_frame_alignment_records_what_does_not_degrade_the_anchor(
+        tmp_path, camera, key, value):
+    result = _alignment_result(_alignment_session(tmp_path, camera))
+    assert result.status.value == "pass", result.message
+    assert result.observed[key] == value
+
+
+@pytest.mark.parametrize("camera, expected", (
+    (_epoch_alignment(
+        niToHost={**_FIT, "valid": False, "reason": "fewer than 100 stamps"},
+        reason="NI-to-host fit unavailable (fewer than 100 stamps); nearest "
+               "cam_frames transition on the NI-DAQ epoch timeline"),
+     "fewer than 100 stamps"),
+    # The fit is valid and still maps the frames; only the edge was picked on the epoch.
+    (_epoch_alignment(
+        reason="fitted anchor failed (ValueError: empty spool); nearest "
+               "cam_frames transition on the NI-DAQ epoch timeline"),
+     "fitted anchor failed"),
+    (_epoch_alignment(
+        status="unmatched", confidence="none",
+        niToHost=None,
+        reason="NI-to-host fit unavailable (no NI-to-host fit); Nearest cam_frames "
+               "edge was outside half of the observed frame period"),
+     "no NI-to-host fit"),
+    (_camera_alignment(anchorMethod=None, reason="matched without a method"),
+     "unrecognised anchor method"),
+    (_camera_alignment(
+        confidence="ambiguous_hardware_edge", anchorMethod="expected_lag",
+        anchorsAgree=None, latch={"status": "unavailable"},
+        reason="cam_frames transition nearest the expected exposure edge on the "
+               "fitted NI timeline; implied lag 2.900 ms is outside the gate "
+               "0.275..2.275 ms"),
+     "outside the gate"),
+    (_camera_alignment(
+        confidence="ambiguous_hardware_edge", anchorsAgree=False,
+        reason="Camera-clock latch pairing on the fitted NI timeline (shift 1); "
+               "the camera-latch anchor (sample 40) and the expected-lag anchor "
+               "(sample 107) disagree"),
+     "disagree"),
+    (_camera_alignment(
+        status="unmatched", confidence="none", anchorMethod=None,
+        impliedLagSeconds=None, latch=None, anchorsAgree=None,
+        reason="Nearest cam_frames transition to the expected exposure edge was "
+               "outside half of the observed frame period"),
+     "outside half of the observed frame period"),
+    (_camera_alignment(
+        status="host_estimated", confidence="host_estimated",
+        anchorMethod="host_estimated", impliedLagSeconds=None, latch=None,
+        anchorsAgree=None,
+        reason="cam_frames was not configured; alignment uses the single NI-DAQ "
+               "epoch anchor"),
+     "cam_frames was not configured"),
+), ids=("epoch-fallback", "fitted-anchor-failed", "epoch-unmatched",
+        "unknown-method", "outside-gate", "anchors-disagree", "unmatched",
+        "host-estimated"))
+def test_frame_alignment_warns_on_a_degraded_anchor_with_the_recorders_reason(
+        tmp_path, camera, expected):
+    result = _alignment_result(_alignment_session(tmp_path, camera))
+    assert result.status.value == "warning", result.message
+    assert expected in result.message
+    assert "cameraNidaqAlignment.reason" in result.remediation
+
+
+@pytest.mark.parametrize("camera, expected", (
+    # The camera clock gave no match, so the arrival pairing alone placed the anchor.
+    (_schema_four_alignment(
+        confidence="ambiguous_hardware_edge", anchorMethod="host_arrival",
+        anchorsAgree=None, latch={"status": "unavailable",
+                                  "reason": "no latency stream"},
+        reason="Host-arrival pairing on the fitted NI timeline (shift 0); "
+               "camera-clock match not available (unavailable: no latency stream)"),
+     "camera-clock match not available"),
+    # Neither match was available, so the anchor is the first frame's host stamp.
+    (_schema_four_alignment(
+        confidence="ambiguous_hardware_edge", anchorMethod="first_frame_stamp",
+        anchorsAgree=None, latch={"status": "unavailable",
+                                  "reason": "no latency stream"},
+        arrival={"status": "unavailable", "shift": None, "medianLagSeconds": None,
+                 "agreement": None, "reason": "no latency stream"},
+        arrivalSampleIndex=None,
+        reason="cam_frames transition at or before the first frame's host stamp "
+               "on the fitted NI timeline; camera-clock match not available "
+               "(unavailable: no latency stream); arrival match not available "
+               "(unavailable: no latency stream)"),
+     "camera-clock match not available"),
+    (_schema_four_alignment(
+        confidence="ambiguous_hardware_edge", anchorsAgree=False, arrivalSampleIndex=107,
+        reason="Camera-clock latch pairing on the fitted NI timeline (shift 1); "
+               "the camera-clock anchor (sample 40) and the arrival anchor "
+               "(sample 107) disagree"),
+     "disagree"),
+), ids=("host-arrival", "first-frame-stamp", "anchors-disagree"))
+def test_frame_alignment_warns_on_a_degraded_schema_four_anchor(
+        tmp_path, camera, expected):
+    result = _alignment_result(_alignment_session(tmp_path, camera, schema=4))
+    assert result.status.value == "warning", result.message
+    assert expected in result.message
+    assert "unrecognised anchor method" not in result.message
+    assert "cameraNidaqAlignment.reason" in result.remediation
+
+
+def test_frame_alignment_does_not_call_a_valid_fit_invalid_when_the_anchor_failed(
+        tmp_path):
+    # The fit still maps the frames; only the first frame's edge came off the epoch.
+    camera = _epoch_alignment(
+        reason="fitted anchor failed (ValueError: empty spool); nearest "
+               "cam_frames transition on the NI-DAQ epoch timeline")
+    result = _alignment_result(_alignment_session(tmp_path, camera))
+    assert result.status.value == "warning", result.message
+    assert result.message.startswith("the first frame was anchored on the NI epoch timeline")
+    assert "fit is invalid" not in result.message
+    assert result.observed["niToHostValid"] is True
+
+
+def test_frame_alignment_warns_when_no_anchor_was_recorded(tmp_path):
+    root = _alignment_session(tmp_path)
+    alignment_path = root / "streams/alignment.json"
+    alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+    del alignment["cameraNidaqAlignment"]
+    _write(alignment_path, json.dumps(alignment))
+    result = _alignment_result(root)
+    assert result.status.value == "warning", result.message
+    assert "cameraNidaqAlignment is missing" in result.message
+    assert "cameraNidaqAlignment.reason" not in result.remediation
+
+
+def test_frame_alignment_warns_when_the_tones_fell_back_to_the_epoch(tmp_path):
+    tone = {"matched": [], "hostTimeFallbackReason": "ValueError: bad device row"}
+    result = _alignment_result(_alignment_session(tmp_path, tone=tone))
+    assert result.status.value == "warning", result.message
+    assert "ValueError: bad device row" in result.message
+    # The frame anchor itself is clean, so only the tones are pointed at.
+    assert "toneConfirmation.hostTimeFallbackReason" in result.remediation
+    assert "cameraNidaqAlignment" not in result.remediation
+
+
+def test_frame_alignment_warns_on_a_session_recorded_before_the_drift_correction(
+        tmp_path):
+    root = _alignment_session(tmp_path, schema=2)
+    result = _alignment_result(root)
+    assert result.status.value == "warning", result.message
+    assert "predates" in result.message and "15 of 36" in result.message
+    assert result.observed["schemaVersion"] == 2
+
+
+def _alignment_session_without_stream_manifest(tmp_path):
+    # Sessions from before the stream manifest (August 2026) have alignment.json alone.
+    root = _alignment_session(tmp_path, schema=1)
+    (root / "streams/stream_manifest.json").unlink()
+    return root
+
+
+@pytest.mark.parametrize("build", (
+    _alignment_session_without_stream_manifest,
+    lambda tmp_path: _alignment_session(tmp_path, nidaq=False),
+    lambda tmp_path: _alignment_session(tmp_path, schema=2, nidaq=False),
+    lambda tmp_path: _alignment_session(tmp_path, _camera_alignment(
+        status="unavailable", confidence="none", anchorMethod=None,
+        reason="No NI-DAQ samples were saved for the session")),
+    # An old session that saved no samples has no frame anchor to doubt.
+    lambda tmp_path: _alignment_session(tmp_path, _camera_alignment(
+        status="unavailable", confidence="none", anchorMethod=None,
+        reason="No NI-DAQ samples were saved for the session"), schema=2),
+), ids=("no-stream-manifest", "no-nidaq", "old-session-without-nidaq",
+        "no-samples-saved", "old-session-no-samples-saved"))
+def test_frame_alignment_is_not_applicable_without_ni_samples(tmp_path, build):
+    result = _alignment_result(build(tmp_path))
+    assert result.status.value == "not_applicable", result.message

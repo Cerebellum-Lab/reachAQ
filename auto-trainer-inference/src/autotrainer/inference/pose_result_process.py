@@ -6,6 +6,7 @@ import queue
 import statistics
 import signal
 import threading
+import json
 import time
 from itertools import chain
 from multiprocessing import synchronize
@@ -21,6 +22,12 @@ from autotrainer.core.frame_index import FrameIndexCategory
 from autotrainer.core.multiproc import get_mp_ctx
 from autotrainer.core.logging import get_verbose_logger, make_log_dict_config, setup_logging, install_log_exception_hook, \
     get_multiprocess_log_queue
+from autotrainer.core.latency import (
+    LatencyStreamWriter,
+    latency_recording_enabled,
+    latency_stream_path,
+)
+from autotrainer.core.latency.schema import POSE_FORWARD_DTYPE, pose_batch_dtype
 
 from autotrainer.inference import InferenceMode, PoseAlgorithm, InferenceMonitorDataMsg
 from .analysis.intersession_inference import intersession_inference
@@ -39,6 +46,10 @@ logger = get_verbose_logger(__name__)
 # default 1 hour renew delay:
 LIVE_WORKERS_RENEW_TIMER_DELAY = float(os.getenv("AUTOTRAINER_LIVE_WORKERS_RENEW_TIMER_DELAY",
                                                  60 * 60))
+
+
+def _get_project_camera_names(project: ProjectInfo) -> Tuple[str, ...]:
+    return tuple(project.camera_names)
 
 
 # even better is to use __debug__ and use "python -O ..."
@@ -66,6 +77,95 @@ def _close_fhs(cams_frame_idx_fhs: Optional[List[Optional[TextIO]]]):
         logger.verbose("closed fhs: %s", closed)
 
 #
+
+def split_pose_item(item):
+    """(pose, mode, frame indices, latency, frame capture times) from one data-queue item.
+
+    The pose process sends five elements: the batch's latency stamps, then
+    each live frame's capture time (``frame_perf_c``, host arrival). The
+    end-of-offline marker and older producers send three; a producer from
+    before the capture times sends four, which is the latency only.
+    """
+    pose_data, mode, frames_indices, *rest = item
+    latency = rest[0] if len(rest) > 0 else None
+    frames_perf = rest[1] if len(rest) > 1 else None
+    return pose_data, mode, frames_indices, latency, frames_perf
+
+
+def live_source_frames(frames_indices, frames_perf):
+    """(source frame ids, source frame capture times) for the live workers.
+
+    A padded slot has a negative id and no frame, so its time is dropped with
+    it and the two tuples stay parallel. ``frames_perf`` is None from a
+    producer that sends no capture times; the times are then empty, not
+    invented.
+    """
+    source_frame_ids = tuple(
+        tuple(int(frame_id) for frame_id in cam_frame_ids if frame_id >= 0)
+        for cam_frame_ids in frames_indices
+    )
+    if frames_perf is None:
+        return source_frame_ids, ()
+    source_frame_perf_times = tuple(
+        tuple(
+            float(frame_perf)
+            for frame_id, frame_perf in zip(cam_frame_ids, cam_frames_perf)
+            if frame_id >= 0
+        )
+        for cam_frame_ids, cam_frames_perf in zip(frames_indices, frames_perf)
+    )
+    return source_frame_ids, source_frame_perf_times
+
+
+def _finish_latency_writer(writer):
+    """Close a latency writer and say so when it lost rows.
+
+    close() gives up on its own after 10 s and a timeout drops the rows still
+    queued, so its timeout is left alone. Never raises: it also runs on a
+    thread nobody is watching.
+    """
+    try:
+        stats = writer.close()
+        if stats["failed"] or any(stats["rowsDropped"].values()):
+            logger.warning("pose latency stream incomplete: %s", stats)
+        if stats.get("rowsRejected"):
+            # A rejected row here means the row did not fit the schema.
+            logger.error("pose latency stream rejected %d rows: %s",
+                         stats["rowsRejected"], stats)
+    except Exception:
+        logger.exception("pose latency stream could not be closed cleanly")
+
+
+def close_in_background(writer, name):
+    """Close ``writer`` on its own short-lived thread and return that thread.
+
+    The monitor loop calls this where a recording ends: close() joins the
+    writer's thread, which takes as long as the disk takes to flush, and the
+    loop must not stop for that. It still has to say the live pose files are
+    closed, which the feeder waits on for 10 s, and keep draining the data
+    queue. Returns None when no thread could be started; the close has then
+    already happened here, slowly but without losing anything.
+    """
+    try:
+        closer = threading.Thread(
+            target=_finish_latency_writer, args=(writer,), name=name, daemon=True)
+        closer.start()
+    except Exception:
+        logger.exception("pose latency close thread could not start")
+        _finish_latency_writer(writer)
+        return None
+    return closer
+
+
+def wait_for_latency_closers(closers):
+    """Wait for closes still running, so no stream is open past the caller.
+
+    close() gives up on its own after 10 s; this only has to outlast that.
+    """
+    for closer in list(closers):
+        closer.join(15)
+    closers[:] = [closer for closer in closers if closer.is_alive()]
+
 
 class InferenceMonitorDataProc(multiprocessing.Process):
 
@@ -103,6 +203,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
         self._cmd_ack_event = cmd_ack_event
         self._msg_queue = msg_queue
         self._frames_per_camera = frames_per_cam
+        self._camera_count = len(_get_project_camera_names(project))
         self._recording_live_batch = int(os.getenv("INFERENCE_LIVE_BATCH", 150 * 5))  # 5s at 150 FPS
         self._monitored_parts_offsets = monitored_parts_offsets
         self._parts_offsets = 0
@@ -158,6 +259,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
             monitored_parts_offsets=self._monitored_parts_offsets,
             output_q=self._msg_queue,
             input_q=self._live_input_q,
+            camera_count=self._camera_count,
             generation=generation,
             log_config=self._log_dict_config,
         )
@@ -333,8 +435,8 @@ class InferenceMonitorDataProc(multiprocessing.Process):
         pose_data: Optional[List[numpy.ndarray]]
         frames_indices: Optional[numpy.ndarray]
 
-        frames_per_batch = 3
-        cams = [project.camera_1, project.camera_2]
+        frames_per_batch = self._frames_per_camera
+        cams = list(_get_project_camera_names(project))
         n_cams = len(cams)
         range_cams: List[int] = list(range(n_cams))
         cams_frame_idx_fhs = None
@@ -368,6 +470,48 @@ class InferenceMonitorDataProc(multiprocessing.Process):
 
         perf_c_log_counters = time.perf_counter()
         t_perf_live_check_data_queue_size = time.perf_counter() + 5
+        pose_latency: Optional[LatencyStreamWriter] = None
+        # Writers whose close is still running on a PoseLatencyClose thread.
+        # A new recording and the end of this loop wait on it.
+        pose_latency_closers: List[threading.Thread] = []
+
+        def close_pose_latency_in_background():
+            # The loop never waits on a close: a stalled disk would hold it
+            # for up to 10 s, past the feeder's own 10 s wait for the live
+            # pose files, and stop it draining the data queue meanwhile.
+            nonlocal pose_latency
+            writer, pose_latency = pose_latency, None
+            if writer is None:
+                return
+            closer = close_in_background(writer, "PoseLatencyClose")
+            pose_latency_closers[:] = [
+                thread for thread in pose_latency_closers if thread.is_alive()
+            ]
+            if closer is not None:
+                pose_latency_closers.append(closer)
+
+        def close_live_recording(columns):
+            # Normally on the end-of-recording marker. Also when the loop ends
+            # mid-recording - live inference stopped, so no marker will come -
+            # or the poses since the last batch write, up to 5 s, are lost.
+            nonlocal recording_in_progress, cams_frame_idx_fhs
+            recording_in_progress = False
+            _close_fhs(cams_frame_idx_fhs)
+            cams_frame_idx_fhs = None
+            close_pose_latency_in_background()
+            for cam_pose_path, cam_indices, cam_h5_live in zip(pose_paths, cur_cams_indices, cur_h5_live_batch):
+                if len(cam_h5_live) == 0:
+                    continue
+                write_duration = write_h5_batch(cam_pose_path, cam_h5_live, cam_indices,
+                                                columns=columns)
+                writes_h5_live_durations.append(write_duration)
+            #
+            logger.debug("setting stop_recorded event")
+            self._stop_recorded.set()  # this is for the feeder thread to know when it can open the data files
+            self._send_msg(
+                InferenceMonitorDataMsg.LIVE_RECORDING_CLOSED,
+                cur_local_prj,
+            )
 
         def get_next_pose_data(timeout: Optional[float] = 0.25):
             nonlocal pose_data
@@ -384,12 +528,13 @@ class InferenceMonitorDataProc(multiprocessing.Process):
             else:
                 cur_qsize = 0
 
-            next_pose_data = next_mode = next_frames_indices = None
+            next_pose_data = next_mode = next_frames_indices = next_latency = next_frames_perf = None
 
             while self._is_running:
                 if prev_pose_data is None:
                     try:
-                        next_pose_data, next_mode, next_frames_indices = self._data_queue.get_nowait()
+                        next_pose_data, next_mode, next_frames_indices, next_latency, next_frames_perf = split_pose_item(
+                            self._data_queue.get_nowait())
                     except queue.Empty:
                         if tot_flushed > 0:
                             # defensive:
@@ -397,7 +542,8 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                             break
                         raise  # nothing we can do, so re-raise to caller
                 else:
-                    next_pose_data, next_mode, next_frames_indices = self._data_queue.get(timeout=timeout)
+                    next_pose_data, next_mode, next_frames_indices, next_latency, next_frames_perf = split_pose_item(
+                        self._data_queue.get(timeout=timeout))
                     break
                 if (
                     next_mode != InferenceMode.Live
@@ -416,7 +562,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                                cur_qsize, tot_flushed)
                 nonlocal skip_next_pose_data
                 skip_next_pose_data = 0
-            return next_pose_data, next_mode, next_frames_indices
+            return next_pose_data, next_mode, next_frames_indices, next_latency, next_frames_perf
 
         def live_old_worker_give_up(w: LivePoseResultProcessWorker):
             if not w.is_alive():
@@ -469,9 +615,10 @@ class InferenceMonitorDataProc(multiprocessing.Process):
             prev_mode = next_prev_mode  # don't forget
 
             try:
-                (pose_data, mode, frames_indices) = get_next_pose_data()
+                (pose_data, mode, frames_indices, pose_latency_item, frames_perf) = get_next_pose_data()
             except queue.Empty:
                 continue
+            monitor_recv_perf = time.perf_counter()
 
             tot_count_data_received += 1
             perf_now = get_perf_now()
@@ -597,6 +744,21 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                               cur_local_prj.session, mode, frames_indices.tolist())
                 self._stop_recorded.clear()
                 logger.debug("cleared stop_recorded")
+                if pose_latency is not None:
+                    # A recording that never saw its stop marker.
+                    _finish_latency_writer(pose_latency)
+                    pose_latency = None
+                # A new stream must not open on a file the last one is still flushing.
+                wait_for_latency_closers(pose_latency_closers)
+                if latency_recording_enabled():
+                    try:
+                        pose_latency = LatencyStreamWriter(
+                            latency_stream_path(cur_local_prj, "pose"),
+                            {"batches": pose_batch_dtype(n_cams), "forwards": POSE_FORWARD_DTYPE},
+                            attrs={"cameras": json.dumps(list(cams))},
+                        )
+                    except Exception:
+                        logger.exception("pose latency stream could not start")
                 cams_frame_idx_fhs = []
                 pose_paths = []
                 cur_h5_live_batch = [[] for _ in range_cams]  # safer
@@ -621,20 +783,23 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                 # this condition allows to know when to close/stopping writing to live files,
                 # and reopen for offline mode
                 if (frames_indices[:, 0] == FrameIndexCategory.EOF_RECORDING).any():
-                    recording_in_progress = False
                     logger.notice("Detected stop of recording in progress ; mode=%s prev=%s frames_indices=%s",
                                   mode, prev_mode, frames_indices.tolist())
-                    _close_fhs(cams_frame_idx_fhs)
-                    cams_frame_idx_fhs = None
-                    for cam_pose_path, cam_indices, cam_h5_live in zip(pose_paths, cur_cams_indices, cur_h5_live_batch):
-                        if len(cam_h5_live) == 0:
-                            continue
-                        write_duration = write_h5_batch(cam_pose_path, cam_h5_live, cam_indices,
-                                                        columns=pose_algo.pose_result_columns)
-                        writes_h5_live_durations.append(write_duration)
-                    #
-                    logger.debug("setting stop_recorded event")
-                    self._stop_recorded.set()  # this is for the feeder thread to know when it can open the data files
+                    close_live_recording(pose_algo.pose_result_columns)
+
+            if (
+                pose_latency is not None
+                and recording_in_progress
+                and mode == InferenceMode.Live
+                and pose_latency_item is not None
+            ):
+                try:
+                    pose_latency.append("batches", (*pose_latency_item, monitor_recv_perf))
+                except Exception:
+                    # A row that does not fit the stream's layout (camera count)
+                    # would recur on every batch: stop the stream, keep the loop.
+                    logger.exception("pose latency row rejected; the pose stream stops here")
+                    close_pose_latency_in_background()
 
             cnt_data_received += 1
 
@@ -685,9 +850,20 @@ class InferenceMonitorDataProc(multiprocessing.Process):
 
                     if len(live_pose_workers) > 0:
                         try:
-                            self._live_input_q.put((pose_data, live_pose_sequence), block=False)
+                            source_frame_ids, source_frame_perf_times = live_source_frames(
+                                frames_indices, frames_perf)
+                            live_put_perf = time.perf_counter()
+                            self._live_input_q.put(
+                                (pose_data, live_pose_sequence, source_frame_ids,
+                                 source_frame_perf_times),
+                                block=False,
+                            )
                         except queue.Full:
                             pass
+                        else:
+                            if pose_latency is not None and pose_latency_item is not None:
+                                pose_latency.append("forwards", (
+                                    pose_latency_item[0], live_pose_sequence, live_put_perf))
                         live_pose_sequence += 1
                         # always increase, even on queue full, so that consumers can infer there was drop, in case of.
 
@@ -817,4 +993,17 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                                  mode, type(pose_data), err)
 
         # end while self._is_running
-
+        if recording_in_progress:
+            # Live inference stopped during the recording, so no
+            # end-of-recording marker will come to close the live files.
+            logger.warning("closing the live pose files of %s: inference stopped mid-recording",
+                           cur_local_prj)
+            try:
+                close_live_recording(self._pose_algo.pose_result_columns)
+            except Exception:
+                logger.exception("could not close the live pose files")
+        # Here the close is waited on: nothing runs after this, and the file
+        # must be closed before the process ends.
+        if pose_latency is not None:
+            _finish_latency_writer(pose_latency)
+        wait_for_latency_closers(pose_latency_closers)

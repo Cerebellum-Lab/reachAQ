@@ -1,0 +1,3 @@
+# Shared advisory-lock directory for the reachAQ operator and root reset helper.
+# The setgid bit keeps lock files in the reachaq group.
+d /run/lock/reachaq 2770 root reachaq -

@@ -1,12 +1,11 @@
+from __future__ import annotations
+
 import logging
-import os
+import multiprocessing
 import signal
 import sys
-import time
 from pathlib import Path
 from typing import Optional
-
-from PySide6 import QtGui
 
 from autotrainer.core import EventManager, ApiEventKind
 from autotrainer.core.event import try_register_api_event_plugin
@@ -17,22 +16,42 @@ from autotrainer.behavior import BehaviorAlgorithm
 
 logger = get_verbose_logger(__name__)
 
-missing_file = "The configuration file {0} does not exist.  A default configuration will be loaded."
+missing_file = "The configuration file %s does not exist; a default configuration will be loaded"
 
 CardHeader.DEFAULT_BACKGROUND_COLOR = "#cfb87c"
 CardHeader.DEFAULT_TITLE_COLOR = "black"
 
 
-def verify_configuration(configuration: Optional[Path]):
-    from PySide6.QtWidgets import QMessageBox
+def _terminate_owned_children(*, force: bool = False) -> tuple[int, ...]:
+    """Signal only direct multiprocessing children created by reachAQ."""
 
+    children = tuple(multiprocessing.active_children())
+    signaled = []
+    for child in children:
+        if child.pid is None or not child.is_alive():
+            continue
+        try:
+            child.kill() if force else child.terminate()
+        except (OSError, ValueError):
+            logger.exception("Failed to signal owned child pid=%s", child.pid)
+        else:
+            signaled.append(child.pid)
+    return tuple(signaled)
+
+
+def verify_configuration(configuration: Optional[Path]):
     if configuration is not None and not configuration.exists():
-        # noinspection PyTypeChecker
-        result = QMessageBox.warning(None, "Configuration File not Found", missing_file.format(configuration),
-                                     QMessageBox.StandardButton.Ok, QMessageBox.StandardButton.Close)
-        return result == QMessageBox.StandardButton.Ok
+        logger.error(missing_file, configuration)
 
     return True
+
+
+def _show_default_window(window) -> None:
+    """Open maximized while retaining the normal window frame and restore control."""
+    restore = getattr(window, "restore_normal_window_geometry", None)
+    if restore is not None:
+        restore()
+    window.showMaximized()
 
 
 def run_acquisition(
@@ -50,7 +69,10 @@ def run_acquisition(
     args: AutoTrainerParsedArgs
 
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
+    # Fusion, with disabled controls made obvious (dashed outline, muted
+    # fill) and no change to any control's size.
+    from tools.acquisition.view.disabled_style import apply_disabled_style
+    apply_disabled_style(app)
 
     if not verify_configuration(args.configuration):
         return -1
@@ -66,7 +88,14 @@ def run_acquisition(
     plugin = try_register_api_event_plugin()
 
     try:
-        window = MainWindow(app, preferences, args.configuration, is_dev=args.dev)
+        window = MainWindow(
+            app,
+            preferences,
+            args.configuration,
+            is_dev=args.dev,
+            random_cameras=args.random_cameras,
+            live_inference=args.live_inference,
+        )
     except:
         event_manager.close()
         BehaviorAlgorithm.close_algorithm_handler()
@@ -80,19 +109,27 @@ def run_acquisition(
     def handle_sigint(signum, frame):
         nonlocal sigint_received
         sigint_received += 1
-        logger.notice("Got signal %s ; closing window..", signum)
-        window.close()
-        if sigint_received > 2:
-            logger.critical("too many sigint, exiting with SIG_TERMINATE ..")
-            time.sleep(0.5)
-            os.kill(-os.getpid(), signal.SIGTERM)
-            # killing negative of pid is killing process group
+        if sigint_received == 1:
+            logger.notice("Got signal %s; requesting orderly window close", signum)
+            window.close()
+        elif sigint_received == 2:
+            pids = _terminate_owned_children(force=False)
+            logger.warning(
+                "Shutdown is still draining; terminated reachAQ-owned children: %s",
+                pids or "none",
+            )
+        else:
+            pids = _terminate_owned_children(force=True)
+            logger.critical(
+                "Third interrupt; forcing reachAQ exit code 130; killed owned "
+                "children: %s",
+                pids or "none",
+            )
+            app.exit(130)
 
     signal.signal(signal.SIGINT, handle_sigint)
 
-    window.show()
-    # window.showMaximized()
-    window.move(QtGui.QGuiApplication.primaryScreen().availableGeometry().center() - window.rect().center())
+    _show_default_window(window)
 
     try:
         window.on_activated(target_status=args.start_mode)

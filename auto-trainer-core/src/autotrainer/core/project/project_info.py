@@ -13,7 +13,7 @@ from datetime import datetime
 from enum import IntEnum
 from multiprocessing.sharedctypes import Synchronized
 from pathlib import Path
-from typing import Tuple, NamedTuple, Union, Optional, ClassVar
+from typing import Tuple, NamedTuple, Union, Optional, ClassVar, Sequence
 
 from typing_extensions import Self
 
@@ -64,7 +64,7 @@ class IntervalSource(NamedTuple):
 class SessionSource(NamedTuple):
     location: str
     prefix: str
-    session_index: int  # trial index
+    session_index: int
 
 
 class IntervalFileInfo(NamedTuple):
@@ -113,15 +113,15 @@ class _ProjectInfo:
         convert_to=lambda v: v.timestamp(),
     )
     ensure_exists: bool = False
-    camera_1: str = ""
-    camera_2: str = ""
+    camera_names: Tuple[str, ...] = ()
     _session: Union[Synchronized[ctypes.c_uint32], RawValueHolder] = None
     session: ClassVar[int] = ValueHolderDescriptor()  # noqa
     send_position: Optional[Offset3DTuple] = None
     dcs_send_position: Optional[Offset3DTuple] = None
     start_record_timestamp: float = math.nan  # regular unix timestamp, in seconds
-    t_pellet_delivered: float = math.nan  # in seconds (zero-based on start_recording)
-    t_pellet_presented: float = math.nan
+    first_pellet_delivery_offset: float = math.nan
+    first_pellet_presentation_offset: float = math.nan
+    session_generation: int = 0
 
 
 @dataclass
@@ -135,14 +135,14 @@ class ProjectInfo(_ProjectInfo):
         device_id: str = _ProjectInfo.device_id,
         when: Optional[datetime] = None,
         ensure_exists: bool = _ProjectInfo.ensure_exists,
-        camera_1: str = _ProjectInfo.camera_1,
-        camera_2: str = _ProjectInfo.camera_2,
+        camera_names: Optional[Sequence[str]] = None,
         session: Optional[int] = None,
         send_position: Optional[Offset3DTuple] = _ProjectInfo.send_position,
         dcs_send_position: Optional[Offset3DTuple] = _ProjectInfo.dcs_send_position,
         start_record_timestamp: float = _ProjectInfo.start_record_timestamp,
-        t_pellet_delivered: float = _ProjectInfo.t_pellet_delivered,
-        t_pellet_presented: float = _ProjectInfo.t_pellet_presented,
+        first_pellet_delivery_offset: float = _ProjectInfo.first_pellet_delivery_offset,
+        first_pellet_presentation_offset: float = _ProjectInfo.first_pellet_presentation_offset,
+        session_generation: int = _ProjectInfo.session_generation,
         #
         mp_manager: Optional[multiprocessing.managers.BaseManager]=None,
     ):
@@ -175,13 +175,13 @@ class ProjectInfo(_ProjectInfo):
         self._when = _when
         self._session = _session
         self.ensure_exists = ensure_exists
-        self.camera_1 = camera_1
-        self.camera_2 = camera_2
+        self.camera_names = tuple(camera_names or ())
         self.send_position = send_position
         self.dcs_send_position = dcs_send_position
         self.start_record_timestamp = start_record_timestamp
-        self.t_pellet_delivered = t_pellet_delivered
-        self.t_pellet_presented = t_pellet_presented
+        self.first_pellet_delivery_offset = first_pellet_delivery_offset
+        self.first_pellet_presentation_offset = first_pellet_presentation_offset
+        self.session_generation = int(session_generation)
 
     @property
     def short_id(self) -> str:
@@ -199,8 +199,7 @@ class ProjectInfo(_ProjectInfo):
                 self.root == other.root
                 and self.device_id == other.device_id
                 and self.when == other.when
-                and self.camera_1 == other.camera_1
-                and self.camera_2 == other.camera_2
+                and self.camera_names == other.camera_names
                 and self.session == other.session
             )
         return super().__eq__(other)
@@ -221,13 +220,13 @@ class ProjectInfo(_ProjectInfo):
     def is_valid(self):
         return self.root is not None and len(self.root) > 0
 
-    def get_t_pellet_delivered_or_default(self, *, default: float=0.) -> float:
-        t = self.t_pellet_delivered
+    def get_first_pellet_delivery_offset(self, *, default: float=0.) -> float:
+        t = self.first_pellet_delivery_offset
         return t if math.isfinite(t) else default
 
-    def get_t_pellet_presented_or_default(self, *, default: float=0.):
-        t = self.t_pellet_presented
-        return t if math.isfinite(t) else self.get_t_pellet_delivered_or_default(default=default)
+    def get_first_pellet_presentation_offset(self, *, default: float=0.):
+        t = self.first_pellet_presentation_offset
+        return t if math.isfinite(t) else self.get_first_pellet_delivery_offset(default=default)
 
     def get_day_path(self, skip_ensure: bool = False, when: Optional[datetime]=None) -> Tuple[str, str]:
         """Get the location and related datetime for given arguments. If when is None then self.when is used."""
@@ -269,7 +268,7 @@ class ProjectInfo(_ProjectInfo):
         (location, today) = self.get_day_path(True, when=when)
         if session < 0:
             session = self.session
-        session_str = f"trial{session:03}"
+        session_str = f"session{session:03}"
         location = os.path.join(location, session_str)
         if not skip_ensure and self.ensure_exists:
             _ensure_location(location)
@@ -295,7 +294,7 @@ class ProjectInfo(_ProjectInfo):
 
     def get_metadata_file(self, session: Optional[int] = -1, when: Optional[datetime] = None) -> str:
         """Returns the metadata file path,
-            if session is None it's non-trial based.
+            if session is None it's not scoped to a recording session.
             if < -1 then self.session is used
         """
         when: datetime = self._get_when_or_now(when)
@@ -327,18 +326,6 @@ class ProjectInfo(_ProjectInfo):
         return IntervalFileInfo(audio_path.location,
                                 os.path.join(audio_path.location, f"{audio_path.prefix}.{ext}"),
                                 audio_path.interval)
-
-    def get_webcam_presence_file(
-        self,
-        name: str = "cage",
-        ext: str = "csv",
-        interval: ProjectInterval = ProjectInterval.HOUR,
-        when: Optional[datetime] = None,
-    ) -> IntervalFileInfo:
-        web_path = self.get_interval_path(name, interval, when=when)
-        return IntervalFileInfo(web_path.location,
-                                os.path.join(web_path.location, f"{web_path.prefix}.{ext}"),
-                                web_path.interval)
 
     def get_video_path(
         self,
@@ -403,7 +390,9 @@ class ProjectInfo(_ProjectInfo):
         with self:
             self.when = when  # noqa
             self.session = session  # noqa
-            self.start_record_timestamp = self.t_pellet_delivered = self.t_pellet_presented = math.nan
+            self.start_record_timestamp = math.nan
+            self.first_pellet_delivery_offset = math.nan
+            self.first_pellet_presentation_offset = math.nan
 
     def _calculate_next_session_index(self, when: Optional[datetime] = None):
         """Calculate the next session index & date and store it locally"""
@@ -446,7 +435,11 @@ class ProjectInfo(_ProjectInfo):
                 return
 
         # slower code way
-        session_dirs = [x.name[-3:] for x in path.iterdir() if x.is_dir() and "trial" in x.name]
+        session_dirs = [
+            x.name[len("session"):]
+            for x in path.iterdir()
+            if x.is_dir() and x.name.startswith("session")
+        ]
 
         def int_map_fcn(value: str):
             try:

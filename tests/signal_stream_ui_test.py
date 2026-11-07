@@ -1,0 +1,1612 @@
+import dataclasses
+import os
+import time
+from types import SimpleNamespace
+
+import pytest
+import numpy as np
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication, QSizePolicy  # noqa: E402
+
+from autotrainer.core import (  # noqa: E402
+    LaserChannelConfiguration,
+    LaserChannelId,
+    LaserSystemConfiguration,
+    NidaqDeviceIdentity,
+    NidaqPortConfiguration,
+    NidaqSignalChannelConfiguration,
+    NidaqSignalStreamConfiguration,
+    ObservableObject,
+)
+from autotrainer.device import (  # noqa: E402
+    LaserCalibrationRamp,
+    LaserPulseTrain,
+    NidaqSignalSampleBlock,
+    NullLaserController,
+)
+from tools.acquisition.model.laser_model import LaserModel  # noqa: E402
+from tools.acquisition.model.laser_plot_process import LaserPlotProcess  # noqa: E402
+from tools.acquisition.model.app_model import AppModel  # noqa: E402
+from tools.acquisition.model.nidaq_signal_monitor_model import (  # noqa: E402
+    NidaqSignalMonitorModel,
+)
+from tools.acquisition.model.nidaq_sample_ring import SharedNidaqSampleRing  # noqa: E402
+from tools.acquisition.model.nidaq_channel_plan import (  # noqa: E402
+    build_nidaq_acquisition_configuration,
+)
+from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts  # noqa: E402
+from tools.acquisition.view.analysis_content import AnalysisContent  # noqa: E402
+from tools.acquisition.view.laser_control_content import (  # noqa: E402
+    LaserControlContent,
+    _LaserChannelTab,
+)
+from tools.acquisition.view.rolling_stream_buffer import RollingStreamBuffer  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    return app
+
+
+class _MessageHandlerStub(ObservableObject):
+    def __init__(self):
+        super().__init__(("decoded_message_received",))
+
+
+class _AnalysisAppStub(ObservableObject):
+    def __init__(self, monitor):
+        super().__init__(("configuration_loaded_event",))
+        self.nidaq_signal_monitor = monitor
+        self.message_handler = _MessageHandlerStub()
+        self.nidaq_ports = NidaqPortConfiguration(
+            cam_frames="Dev1/port0/line0",
+            tone1="Dev1/port0/line3",
+            tone2="Dev1/port0/line4",
+            device_identities=(
+                NidaqDeviceIdentity(
+                    logical_name="input-device",
+                    runtime_name="Dev1",
+                    product_type="Test Device",
+                    serial_number=123,
+                ),
+            ),
+        )
+        self.laser = LaserModel()
+        self.laser.set_configuration_offline(
+            LaserSystemConfiguration.from_channels((_laser_channel(),), backend="disabled")
+        )
+        monitor._configuration = build_nidaq_acquisition_configuration(
+            monitor.configuration,
+            self.nidaq_ports,
+            self.laser.configuration,
+        )
+        self.signal_configuration_save_count = 0
+
+    def update_nidaq_signal_stream_channels(self, channels):
+        self.nidaq_signal_monitor.set_display_channels(
+            channel.name if hasattr(channel, "name") else channel
+            for channel in channels
+        )
+        self.signal_configuration_save_count += 1
+
+
+class _NoEvents:
+    """An event nothing here raises: Laser Control only subscribes to it."""
+
+    def __iadd__(self, _handler):
+        return self
+
+    def __isub__(self, _handler):
+        return self
+
+
+class _LaserAppStub:
+    def __init__(self, laser):
+        # Laser Control follows the application's System Mode and recording
+        # state for Run Ramp; these tests never change either.
+        self.property_changed = _NoEvents()
+        self.laser = laser
+        self.nidaq_signal_monitor = NidaqSignalMonitorModel()
+        self.nidaq_signal_monitor._hardware_enabled = True
+        self.nidaq_signal_monitor._configuration = build_nidaq_acquisition_configuration(
+            self.nidaq_signal_monitor.configuration,
+            NidaqPortConfiguration(),
+            laser.configuration,
+        )
+        self.signal_configuration_save_count = 0
+
+    def laser_calibration_refusal(self):
+        return ""
+
+    def laser_controller_close_refusal(self):
+        return ""
+
+    def update_nidaq_signal_stream_channels(self, channels):
+        self.nidaq_signal_monitor.set_display_channels(
+            channel.name if hasattr(channel, "name") else channel
+            for channel in channels
+        )
+        self.signal_configuration_save_count += 1
+
+
+def _crashing_signal_worker(
+    _configuration, _timing_plan, _message_queue, _sample_ring, _stop_event, _log_dict_config,
+):
+    os._exit(23)
+
+
+def _hanging_signal_worker(
+    _configuration, _timing_plan, _message_queue, _sample_ring, stop_event, _log_dict_config,
+):
+    stop_event.wait(60.0)
+
+
+def _shared_ring_signal_worker(
+    configuration, _timing_plan, message_queue, sample_ring, stop_event, _log_dict_config,
+):
+    sample_ring.write_block(NidaqSignalSampleBlock(
+        wall_time=time.time(),
+        perf_time=time.perf_counter(),
+        sample_rate_hz=configuration.sample_rate_hz,
+        sample_index=0,
+        channels=configuration.channels,
+        values={"cam_frames": (0.0, 1.0, 0.0, 1.0)},
+    ))
+    message_queue.put(("ready", None))
+    stop_event.wait(10.0)
+    message_queue.put(("stopped", None))
+
+
+def _stream_configuration():
+    return NidaqSignalStreamConfiguration(
+        channels=(
+            NidaqSignalChannelConfiguration(
+                name="cam_frames",
+                physical_channel="Dev1/port0/line0",
+                kind="digital",
+            ),
+        ),
+        is_enabled=True,
+    )
+
+
+def _discover_dev1():
+    return (NidaqDevicePorts(name="Dev1"),), None
+
+
+def _wait_for_plot_snapshot(content, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if content._rolling_plot.display_latest(content._plot_process):
+            frame = content._rolling_plot._last_frame
+            if any(
+                np.isfinite(content._rolling_plot._display_y[channel_name][:point_count]).any()
+                for channel_name, point_count in zip(
+                    content._rolling_plot._curves,
+                    frame.point_counts,
+                )
+            ):
+                return frame
+        time.sleep(0.02)
+    raise AssertionError("analysis plot process did not produce a snapshot")
+
+
+def _wait_for_laser_plot(content, channel_id=1, timeout=5.0, minimum_points=1):
+    deadline = time.monotonic() + timeout
+    tab = content._channel_tabs[channel_id - 1]
+    while time.monotonic() < deadline:
+        content._flush_laser_plots()
+        tab.redraw_trace()
+        if any(
+            len(x_values) >= minimum_points
+            for x_values, _y_values in tab._trace_data.values()
+        ):
+            return tab
+        time.sleep(0.02)
+    raise AssertionError("laser plot process did not produce a snapshot")
+
+
+def _laser_channel():
+    return LaserChannelConfiguration(
+        channel_id=LaserChannelId.LASER_1,
+        analog_output="Dev1/ao0",
+        diode_input="Dev1/ai0",
+        shutter_output="Dev1/port0/line2",
+        command_copy_input="Dev1/ai1",
+    )
+
+
+def test_signal_monitor_refuses_to_start_when_nidaq_hardware_is_disabled():
+    monitor = NidaqSignalMonitorModel()
+    monitor.load_configuration(_stream_configuration())
+
+    assert not monitor.hardware_enabled
+    assert not monitor.is_running
+    assert not monitor.start()
+    assert "hardware disabled" in monitor.status_message
+
+
+def test_configured_signal_monitor_remains_stopped_until_explicit_start():
+    monitor = NidaqSignalMonitorModel()
+    monitor._hardware_enabled = True
+    start_calls = []
+    monitor.start = lambda: start_calls.append(True)
+
+    monitor.load_configuration(_stream_configuration())
+
+    assert start_calls == []
+    assert not monitor.is_running
+    assert monitor.status_message == "NI-DAQ signal stream stopped"
+
+
+def test_signal_monitor_derives_read_chunk_from_display_refresh_rate():
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = _stream_configuration()
+
+    monitor.set_display_refresh_rate(120.0)
+
+    assert monitor.display_refresh_rate_hz == 120.0
+    assert monitor.effective_read_chunk_size == 83
+    assert monitor.configuration.read_chunk_size == 500
+
+
+def test_signal_monitor_shared_ring_preserves_samples_and_reports_overrun():
+    configuration = _stream_configuration()
+    ring = SharedNidaqSampleRing(configuration, capacity=5)
+    ring.write_block(NidaqSignalSampleBlock(
+        wall_time=1.0,
+        perf_time=1.0,
+        sample_rate_hz=10_000.0,
+        sample_index=0,
+        channels=configuration.channels,
+        values={"cam_frames": (0.0, 1.0, 0.0)},
+    ))
+    ring.write_block(NidaqSignalSampleBlock(
+        wall_time=1.1,
+        perf_time=1.1,
+        sample_rate_hz=10_000.0,
+        sample_index=3,
+        channels=configuration.channels,
+        values={"cam_frames": (1.0, 0.0, 1.0, 0.0)},
+    ))
+    destination = np.empty((1, 5), dtype=np.float32)
+
+    snapshot = ring.copy_since(0, destination)
+
+    assert snapshot.start_sample_index == 2
+    assert snapshot.end_sample_index == 7
+    assert snapshot.overrun_samples == 2
+    assert snapshot.epoch == 0
+    assert snapshot.generation == 2
+    assert destination[0, :5].tolist() == [0.0, 1.0, 0.0, 1.0, 0.0]
+
+
+def test_signal_monitor_shared_ring_reports_source_sample_gap():
+    configuration = _stream_configuration()
+    ring = SharedNidaqSampleRing(configuration, capacity=8)
+    ring.write_block(NidaqSignalSampleBlock(
+        wall_time=1.0,
+        perf_time=1.0,
+        sample_rate_hz=10_000.0,
+        sample_index=0,
+        channels=configuration.channels,
+        values={"cam_frames": (0.0, 1.0)},
+    ))
+    ring.write_block(NidaqSignalSampleBlock(
+        wall_time=1.1,
+        perf_time=1.1,
+        sample_rate_hz=10_000.0,
+        sample_index=5,
+        channels=configuration.channels,
+        values={"cam_frames": (1.0, 0.0)},
+    ))
+    destination = np.empty((1, 8), dtype=np.float32)
+
+    snapshot = ring.copy_since(2, destination)
+
+    assert snapshot.gap_count == 1
+    assert snapshot.start_sample_index == 5
+    assert snapshot.end_sample_index == 7
+    assert snapshot.overrun_samples == 3
+    assert destination[0, :2].tolist() == [1.0, 0.0]
+
+
+def test_laser_plot_process_bounds_raw_daq_history_outside_qt():
+    stream_channel = NidaqSignalChannelConfiguration(
+        name="laser1_diode",
+        physical_channel="Dev1/ai0",
+        kind="analog",
+        unit="V",
+    )
+    configuration = NidaqSignalStreamConfiguration(
+        channels=(stream_channel,),
+        is_enabled=True,
+        sample_rate_hz=1000.0,
+        rolling_window_seconds=10.0,
+    )
+    ring = SharedNidaqSampleRing(configuration)
+    process = LaserPlotProcess(ring)
+    destinations_x = {
+        (1, curve_name): np.empty(process.MAX_POINTS, dtype=np.float32)
+        for curve_name in process.CURVE_NAMES
+    }
+    destinations_y = {
+        (1, curve_name): np.empty(process.MAX_POINTS, dtype=np.float32)
+        for curve_name in process.CURVE_NAMES
+    }
+    try:
+        process.configure_channel(
+            1,
+            window_seconds=10.0,
+            pixel_width=300,
+            diode_name="laser1_diode",
+            copy_name=None,
+        )
+        process.set_streaming(1, True)
+        ring.write_block(NidaqSignalSampleBlock(
+            wall_time=1.0,
+            perf_time=1.0,
+            sample_rate_hz=1000.0,
+            sample_index=0,
+            channels=(stream_channel,),
+            values={
+                "laser1_diode": tuple(
+                    float((index // 25) % 2) for index in range(10_000)
+                ),
+            },
+        ))
+        deadline = time.monotonic() + 5.0
+        frame = None
+        diode_slot = process.curve_slot(1, "diode")
+        while time.monotonic() < deadline:
+            candidate = process.copy_latest_into(destinations_x, destinations_y)
+            if candidate is not None and candidate.point_counts[diode_slot]:
+                frame = candidate
+                break
+            time.sleep(0.02)
+
+        assert frame is not None
+        assert process.pid != os.getpid()
+        assert frame.point_counts[diode_slot] <= 300
+        displayed = destinations_y[(1, "diode")][:frame.point_counts[diode_slot]]
+        assert displayed.min() == 0.0
+        assert displayed.max() == 1.0
+    finally:
+        process.close()
+
+
+def test_numpy_stream_buffer_wraps_without_shifting_existing_window():
+    buffer = RollingStreamBuffer(5)
+    buffer.append((0, 1, 2), (10, 11, 12))
+    buffer.append((3, 4, 5, 6), (13, 14, 15, 16))
+
+    x_values, y_values = buffer.ordered()
+
+    assert x_values.tolist() == [2, 3, 4, 5, 6]
+    assert y_values.tolist() == [12, 13, 14, 15, 16]
+    assert buffer.latest_x == 6
+    reusable_y = np.empty(5)
+    assert buffer.copy_ordered_y_into(reusable_y) == 5
+    assert reusable_y.tolist() == [12, 13, 14, 15, 16]
+    reusable_x = np.empty(5)
+    assert buffer.copy_ordered_into(reusable_x, reusable_y) == 5
+    assert reusable_x.tolist() == [2, 3, 4, 5, 6]
+    assert reusable_y.tolist() == [12, 13, 14, 15, 16]
+
+
+def test_numpy_stream_buffer_peak_reduction_is_bounded_and_preserves_ttl_pulses():
+    buffer = RollingStreamBuffer(10_000)
+    x_values = tuple(index / 10_000 for index in range(10_000))
+    y_values = [0.0] * 10_000
+    y_values[123] = 5.0
+    y_values[8_765] = 5.0
+    buffer.append(x_values, y_values)
+
+    plot_x, plot_y = buffer.ordered_for_plot(400)
+
+    assert len(plot_x) == len(plot_y) <= 400
+    assert plot_y.min() == 0.0
+    assert plot_y.max() == 5.0
+    assert list(plot_x) == sorted(plot_x)
+
+
+def test_numpy_stream_buffer_resize_keeps_newest_samples():
+    buffer = RollingStreamBuffer(10)
+    buffer.append(range(10), range(10))
+
+    buffer.resize(4)
+
+    x_values, y_values = buffer.ordered()
+    assert x_values.tolist() == [6, 7, 8, 9]
+    assert y_values.tolist() == [6, 7, 8, 9]
+
+
+def test_analysis_signal_selection_requires_mapped_port_and_nidaq_enable(qapp):
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = _stream_configuration()
+    monitor._hardware_enabled = True
+    app_model = _AnalysisAppStub(monitor)
+    content = AnalysisContent(app_model)
+    try:
+        camera_frames = content._signal_checkboxes["cam_frames"]
+        barcode = content._signal_checkboxes["barcode"]
+        tone1 = content._signal_checkboxes["tone1"]
+        tone2 = content._signal_checkboxes["tone2"]
+        assert camera_frames.isEnabled()
+        assert camera_frames.isChecked()
+        assert not barcode.isEnabled()
+        assert not barcode.isChecked()
+        assert tone1.isEnabled()
+        assert tone2.isEnabled()
+        assert set(content._signal_checkboxes) == {
+            "cam_frames",
+            "barcode",
+            "tone1",
+            "tone2",
+            "tone3_r",
+            "tone3_l",
+        }
+        assert camera_frames.property("signalColor") == "#1769e0"
+        assert barcode.property("signalColor") == "#128a43"
+        assert content._rolling_plot._legend.entries == (
+            ("cam_frames (logic)", (23, 105, 224), False),
+        )
+        assert all(
+            curve.opts["pen"].style().name == "SolidLine"
+            for curve in content._rolling_plot._curves.values()
+        )
+        assert content._channel_count_label.text() == "1"
+        # The stream starts by itself; there is no button to start it.
+        assert not hasattr(content, "_start_stop_button")
+        assert content._clear_button.isEnabled()
+        assert content._live_button.isEnabled()
+        assert not hasattr(content, "_graph_seconds")
+        assert not hasattr(content, "_graph_min_volts")
+        assert not hasattr(content, "_graph_max_volts")
+        assert content._rolling_plot.minimumSize().isEmpty()
+        assert content._rolling_plot._plot.minimumSize().isEmpty()
+        assert content._rolling_plot._plot.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Ignored
+        assert content._rolling_plot._plot.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Ignored
+
+        view_box = content._rolling_plot._plot.getPlotItem().getViewBox()
+        assert view_box.state["mouseEnabled"] == [True, False]
+        assert view_box.viewRange()[0] == pytest.approx([-10.0, 0.0])
+        assert view_box.viewRange()[1] == pytest.approx([-0.2, 1.2])
+        assert view_box.state["limits"]["xLimits"] == [-10.0, 0.0]
+        assert view_box.state["limits"]["yLimits"] == [-0.2, 1.2]
+        assert view_box.state["limits"]["xRange"][1] == 10.0
+        view_box.setXRange(-5.0, 0.0, padding=0)
+        assert view_box.viewRange()[0] == pytest.approx([-5.0, 0.0])
+        assert view_box.viewRange()[1] == pytest.approx([-0.2, 1.2])
+        view_box.setXRange(-20.0, 0.0, padding=0)
+        assert view_box.viewRange()[0] == pytest.approx([-10.0, 0.0])
+        view_box.setXRange(-8.0, -3.0, padding=0)
+        content._live_button.click()
+        assert view_box.viewRange()[0] == pytest.approx([-5.0, 0.0])
+        assert view_box.viewRange()[1] == pytest.approx([-0.2, 1.2])
+        assert content._plot_process.pid != os.getpid()
+
+        tone1.setChecked(True)
+        qapp.processEvents()
+        assert content._signal_checkboxes["tone1"].property("signalColor") == "#128a43"
+        assert content._rolling_plot._legend.entries[1] == (
+            "tone1 (logic)",
+            (18, 138, 67),
+            False,
+        )
+        content._signal_checkboxes["tone1"].setChecked(False)
+        qapp.processEvents()
+
+        content._signal_checkboxes["cam_frames"].setChecked(False)
+        qapp.processEvents()
+        assert monitor.configuration.display_channels == tuple()
+        assert tuple(channel.name for channel in monitor.configuration.channels) == (
+            "cam_frames",
+            "tone1",
+            "tone2",
+        )
+        assert not content._live_button.isEnabled()
+        assert app_model.signal_configuration_save_count == 3
+
+        content._signal_checkboxes["tone1"].setChecked(True)
+        qapp.processEvents()
+        assert content._signal_checkboxes["tone1"].property("signalColor") == "#128a43"
+        assert content._rolling_plot._legend.entries == (
+            ("tone1 (logic)", (18, 138, 67), False),
+        )
+        content._signal_checkboxes["tone1"].setChecked(False)
+        qapp.processEvents()
+
+        content._signal_checkboxes["cam_frames"].setChecked(True)
+        qapp.processEvents()
+        assert monitor.configuration.display_channels == ("cam_frames",)
+        assert app_model.signal_configuration_save_count == 6
+
+        monitor.set_hardware_enabled(False)
+        qapp.processEvents()
+
+        assert not content._clear_button.isEnabled()
+        assert not content._signal_checkboxes["cam_frames"].isEnabled()
+
+        monitor._set_error("native NI-DAQ crash details")
+        qapp.processEvents()
+        assert "native NI-DAQ crash details" not in content._status_label.text()
+        assert content._status_label.styleSheet() == ""
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
+def test_analysis_excludes_laser_owned_inputs_from_selector_and_graph(qapp):
+    laser_input = NidaqSignalChannelConfiguration(
+        name="laser1_diode",
+        physical_channel="Dev1/ai0",
+        kind="analog",
+    )
+    # The trigger readback is the laser tab's too. Matched by name suffix,
+    # it showed here as custom:laser1_trigger, with a tooltip about DAQ-port
+    # assignments, and ticking either one toggled the other's curve.
+    trigger_input = NidaqSignalChannelConfiguration(
+        name="laser1_trigger",
+        physical_channel="Dev1/ai7",
+        kind="analog",
+    )
+    # Owned by its pin as well: whatever it is called, a laser's input is
+    # the laser tab's to show.
+    renamed_readback = NidaqSignalChannelConfiguration(
+        name="stim_readback",
+        physical_channel="Dev1/ai6",
+        kind="analog",
+    )
+    base = _stream_configuration()
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = NidaqSignalStreamConfiguration(
+        channels=base.channels + (laser_input, trigger_input, renamed_readback),
+        is_enabled=True,
+    )
+    monitor._hardware_enabled = True
+    app_model = _AnalysisAppStub(monitor)
+    app_model.laser.set_configuration_offline(LaserSystemConfiguration.from_channels(
+        (dataclasses.replace(_laser_channel(), trigger_monitor_input="Dev1/ai6"),),
+        backend="disabled",
+    ))
+    content = AnalysisContent(app_model)
+    try:
+        # By what they name, not how the key starts: a custom input is keyed
+        # custom:<name>, which a startswith("laser") check never saw.
+        assert not any(
+            "laser" in key or "readback" in key for key in content._signal_checkboxes
+        ), tuple(content._signal_checkboxes)
+        assert tuple(channel.name for channel in content._display_configuration().channels) == (
+            "cam_frames",
+        )
+        assert content._channel_count_label.text() == "1"
+        assert tuple(entry[0] for entry in content._rolling_plot._legend.entries) == (
+            "cam_frames (logic)",
+        )
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
+def test_analysis_prepares_sample_blocks_in_dedicated_process(qapp):
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = dataclasses.replace(
+        _stream_configuration(), sample_rate_hz=1000.0,
+    )
+    monitor._hardware_enabled = True
+    content = AnalysisContent(_AnalysisAppStub(monitor))
+    content.show()
+    qapp.processEvents()
+    try:
+        monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.0,
+                perf_time=1.0,
+                sample_rate_hz=1000.0,
+                sample_index=0,
+                channels=monitor.configuration.channels,
+                values={"cam_frames": tuple(float(index % 2) for index in range(300))},
+            )
+        )
+
+        snapshot = _wait_for_plot_snapshot(content)
+        assert content._plot_process.pid != os.getpid()
+        assert not hasattr(content._plot_process, "_snapshot_queue")
+        assert not hasattr(content._plot_process, "_block_queue")
+        assert "_sample_queue" not in vars(monitor)
+        displayed = content._rolling_plot._display_y["cam_frames"][:snapshot.point_counts[0]]
+        assert np.count_nonzero(np.isfinite(displayed)) == 600
+        assert snapshot.latest_x == pytest.approx(0.299)
+        display_array_id = id(content._rolling_plot._display_y["cam_frames"])
+        monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.1,
+                perf_time=1.1,
+                sample_rate_hz=1000.0,
+                sample_index=300,
+                channels=monitor.configuration.channels,
+                values={"cam_frames": (0.0, 1.0)},
+            )
+        )
+        _wait_for_plot_snapshot(content)
+        assert id(content._rolling_plot._display_y["cam_frames"]) == display_array_id
+
+        monitor.sample_ring.reset()
+        monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=2.0,
+                perf_time=2.0,
+                sample_rate_hz=1000.0,
+                sample_index=0,
+                channels=monitor.configuration.channels,
+                values={"cam_frames": (1.0, 1.0)},
+            )
+        )
+        restarted = _wait_for_plot_snapshot(content)
+        restarted_values = content._rolling_plot._display_y["cam_frames"][
+            :restarted.point_counts[0]
+        ]
+        assert restarted.latest_x == pytest.approx(0.001)
+        assert restarted_values.tolist() == [1.0, 1.0]
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
+def test_analysis_redraw_sends_timestamped_square_steps_to_qt(qapp):
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = _stream_configuration()
+    monitor._hardware_enabled = True
+    content = AnalysisContent(_AnalysisAppStub(monitor))
+    try:
+        values = [0.0] * 100_000
+        values[50_000] = 1.0
+        monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.0,
+                perf_time=1.0,
+                sample_rate_hz=10_000.0,
+                sample_index=0,
+                channels=monitor.configuration.channels,
+                values={"cam_frames": tuple(values)},
+            )
+        )
+        content.show()
+        qapp.processEvents()
+        _wait_for_plot_snapshot(content)
+
+        curve = content._rolling_plot._curves["cam_frames"]
+        assert len(curve.xData) == 6
+        assert curve.yData.min() == 0.0
+        assert curve.yData.max() == 1.0
+        assert curve.xData[1] == curve.xData[2]
+        assert curve.xData[3] == curve.xData[4]
+        changing_segments = np.flatnonzero(np.diff(curve.yData) != 0)
+        assert np.all(np.diff(curve.xData)[changing_segments] == 0)
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
+def test_analysis_does_not_stretch_partial_history_across_full_window(qapp):
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = _stream_configuration()
+    monitor._hardware_enabled = True
+    content = AnalysisContent(_AnalysisAppStub(monitor))
+    try:
+        monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.0,
+                perf_time=1.0,
+                sample_rate_hz=10_000.0,
+                sample_index=0,
+                channels=monitor.configuration.channels,
+                values={"cam_frames": tuple(float((index // 100) % 2) for index in range(1000))},
+            )
+        )
+        content.show()
+        qapp.processEvents()
+        _wait_for_plot_snapshot(content)
+
+        curve = content._rolling_plot._curves["cam_frames"]
+        assert curve.xData[0] == pytest.approx(-0.0999, abs=1e-5)
+        assert curve.xData[-1] == pytest.approx(0.0, abs=1e-6)
+        assert np.all(np.diff(curve.xData) >= 0)
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
+def test_analysis_uses_active_screen_refresh_rate_for_timer_and_chunk(qapp):
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = _stream_configuration()
+    monitor._hardware_enabled = True
+    content = AnalysisContent(_AnalysisAppStub(monitor))
+    try:
+        content._screen_changed(SimpleNamespace(refreshRate=lambda: 120.0))
+
+        assert content._display_refresh_rate_hz == 120.0
+        assert content._plot_timer.interval() == 8
+        assert monitor.effective_read_chunk_size == 83
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
+def test_signal_monitor_has_no_analysis_stream_persistence(tmp_path):
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = _stream_configuration()
+    monitor.project = SimpleNamespace(
+        get_source_path=lambda _name: (_ for _ in ()).throw(
+            AssertionError("visualization stream must not request an output path")
+        )
+    )
+
+    assert "_open_recording_file" not in vars(type(monitor))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_signal_monitor_contains_native_worker_failure_outside_application_process():
+    monitor = NidaqSignalMonitorModel(
+        worker_target=_crashing_signal_worker,
+        device_discovery=_discover_dev1,
+    )
+    monitor._configuration = _stream_configuration()
+    monitor._hardware_enabled = True
+
+    assert monitor.start()
+    deadline = time.monotonic() + 10.0
+    while (monitor.is_starting or not monitor.error_message) and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    assert not monitor.is_starting
+    assert not monitor.is_running
+    assert "exit code 23" in monitor.error_message
+
+
+def test_signal_monitor_worker_publishes_directly_to_shared_ring():
+    # The worker is a forkserver child that must import this module before it reports
+    # ready. It was still not running after 5 s on slower CI runners (the model's own
+    # startup timeout is 10 s), so both limits are wide; the loop exits as soon as
+    # the worker is running.
+    monitor = NidaqSignalMonitorModel(
+        worker_target=_shared_ring_signal_worker,
+        device_discovery=_discover_dev1,
+        startup_timeout_seconds=30.0,
+    )
+    monitor._configuration = _stream_configuration()
+    monitor._hardware_enabled = True
+    try:
+        assert monitor.start()
+        deadline = time.monotonic() + 30.0
+        while not monitor.is_running and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        destination = np.empty((1, monitor.sample_ring.capacity), dtype=np.float32)
+        snapshot = monitor.sample_ring.copy_since(None, destination)
+
+        assert monitor.is_running
+        assert snapshot.sample_count == 4
+        assert snapshot.generation == 1
+        assert destination[0, :4].tolist() == [0.0, 1.0, 0.0, 1.0]
+    finally:
+        monitor.close()
+
+
+def test_signal_monitor_times_out_hung_runtime_without_blocking_caller():
+    monitor = NidaqSignalMonitorModel(
+        worker_target=_hanging_signal_worker,
+        device_discovery=_discover_dev1,
+        startup_timeout_seconds=0.2,
+    )
+    monitor._configuration = _stream_configuration()
+    monitor._hardware_enabled = True
+
+    call_started = time.monotonic()
+    assert monitor.start()
+    assert time.monotonic() - call_started < 0.5
+
+    deadline = time.monotonic() + 10.0
+    while (monitor.is_starting or not monitor.error_message) and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    assert not monitor.is_starting
+    assert not monitor.is_running
+    assert "did not become ready within 0.2 seconds" in monitor.error_message
+
+
+def test_app_model_persists_analysis_signal_selection_to_loaded_configuration():
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = _stream_configuration()
+    app_model = object.__new__(AppModel)
+    app_model._nidaq_signal_monitor = monitor
+    app_model._loaded_configuration = SimpleNamespace(nidaq_stream=None)
+    # No refused NI-DAQ plan: selections are refused while one is held.
+    app_model._nidaq_plan_error = ""
+    save_calls = []
+    app_model.save_configuration = lambda: save_calls.append(True)
+
+    channels = _stream_configuration().channels
+    app_model.update_nidaq_signal_stream_channels(())
+
+    assert monitor.configuration.channels == channels
+    assert monitor.configuration.is_enabled
+    assert monitor.configuration.display_channels == ()
+    assert app_model._loaded_configuration.nidaq_stream == monitor.configuration
+    assert save_calls == [True]
+
+
+def test_laser_trace_auto_resumes_and_displays_entire_calibration_ramp(qapp):
+    channel = _laser_channel()
+    configuration = LaserSystemConfiguration.from_channels(
+        (channel,),
+        backend="null",
+        sample_rate_hz=1000.0,
+    )
+    laser = LaserModel(NullLaserController(configuration))
+    app_model = _LaserAppStub(laser)
+    content = LaserControlContent(app_model)
+    tab = content._channel_tabs[0]
+    try:
+        # A mapped laser's graph follows the shared input stream from the
+        # start; there is no per-graph Start Stream any more.
+        assert tab._trace_streaming
+        assert not hasattr(tab, "_trace_toggle_button")
+        tab._set_trace_streaming(False)
+        points = laser.run_calibration_ramp(
+            LaserCalibrationRamp(
+                channel_id=LaserChannelId.LASER_1,
+                start_volts=0.0,
+                stop_volts=4.0,
+                steps=5,
+                samples_per_step=100,
+            )
+        )
+        _wait_for_laser_plot(content, minimum_points=5)
+
+        command_x, command_y = tab._trace_data["command"]
+        diode_x, diode_y = tab._trace_data["diode"]
+        assert tab._trace_streaming
+        # The Output page only said the stream had moved to the Pulse page.
+        assert tuple(
+            tab._mode_tabs.tabText(index)
+            for index in range(tab._mode_tabs.count())
+        ) == ("Pulse", "Calibration")
+        assert tab._trace_signal_checkboxes["diode"].property("signalColor") == "#128a43"
+        assert tab._trace_signal_checkboxes["copy"].property("signalColor") == "#d66b00"
+        # The signal choices fold away under the graph instead of hiding it
+        # behind a Signals tab.
+        assert not hasattr(tab, "_trace_tabs")
+        output_stream = tab.sections["output_stream"].content
+        signals = tab.sections["signals"].content
+        assert output_stream.isAncestorOf(tab._trace_plot)
+        assert not signals.isAncestorOf(tab._trace_plot)
+        assert signals.isAncestorOf(tab._trace_command_checkbox)
+        assert signals.isAncestorOf(tab._trace_signal_checkboxes["diode"])
+        assert signals.isAncestorOf(tab._trace_signal_checkboxes["copy"])
+        assert tab._trace_signal_checkboxes["diode"].text().endswith("Diode feedback")
+        assert "Dev1/ai0" not in tab._trace_signal_checkboxes["diode"].text()
+        assert tab._trace_signal_checkboxes["diode"].toolTip().startswith("Dev1/ai0\n")
+        assert tab._trace_legend._columns == 2
+        assert tab._trace_plot.minimumSize().isEmpty()
+        assert tab._trace_plot.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Ignored
+        assert tab.minimumSizeHint().width() < 430
+        # The legend names what is drawn: the command, and whichever inputs
+        # are ticked under Signals, which here is none yet.
+        assert tuple(entry[0] for entry in tab._trace_legend.entries) == (
+            "Command output",
+        )
+        tab._trace_signal_checkboxes["diode"].setChecked(True)
+        tab._trace_signal_checkboxes["copy"].setChecked(True)
+        qapp.processEvents()
+        assert tuple(entry[0] for entry in tab._trace_legend.entries) == (
+            "Command output",
+            "Diode feedback",
+            "Command copy",
+        )
+        assert all(
+            curve.opts["pen"].style().name == "SolidLine"
+            for curve in tab._trace_curves.values()
+        )
+        assert tab._trace_seconds.suffix() == " s"
+        assert tab._trace_min_volts.suffix() == " V"
+        assert tab._trace_max_volts.suffix() == " V"
+        assert tab._trace_plot.getPlotItem().getViewBox().viewRange()[0] == pytest.approx(
+            [-10.0, 0.0]
+        )
+        assert len(points) == len(command_x) == len(command_y) == 5
+        assert len(diode_x) == len(diode_y) == 5
+        assert command_y == pytest.approx([0.0, 1.0, 2.0, 3.0, 4.0])
+        assert diode_y == pytest.approx(command_y)
+        assert "5 ramp points displayed" in tab._trace_status.text()
+
+        laser.run_pulse_train(
+            LaserPulseTrain(
+                channel_id=LaserChannelId.LASER_1,
+                amplitude_volts=2.0,
+                duration_ms=10.0,
+            )
+        )
+        deadline = time.monotonic() + 5.0
+        while len(tab._trace_data["command"][0]) <= 5 and time.monotonic() < deadline:
+            content._flush_laser_plots()
+            tab.redraw_trace()
+            time.sleep(0.02)
+        assert "internal pulse" in tab._trace_status.text()
+        assert len(tab._trace_data["command"][0]) > 5
+    finally:
+        content.on_close()
+        content.deleteLater()
+        app_model.nidaq_signal_monitor.close()
+        laser.close()
+
+
+def test_a_manual_run_pulse_draws_its_train_as_any_pulse_does(qapp):
+    # Its waveform is stamped with the time it was asked for, for the
+    # session (LaserModel.run_pulse_train); the graph places a trace by its
+    # own x values, so it draws the same train. Its request and outcome have
+    # nothing to draw, and leave the status on the pulse.
+    laser, app_model, content = _laser_content_with_diode_stream()
+    try:
+        train = LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1, amplitude_volts=2.0, duration_ms=10.0,
+            baseline_ms=5.0)
+        expected = laser._make_pulse_trace(train)
+
+        laser.run_pulse_train(train, manual_context={
+            "profile_id": "burst", "profile_revision": 1, "trigger_mode": "internal"})
+
+        tab = _wait_for_laser_plot(content, minimum_points=len(expected.x_values))
+        command_x, command_y = tab._trace_data["command"]
+        # Drawn as seconds before the newest point, which is at 0.
+        assert list(command_x) == pytest.approx(
+            [x - expected.x_values[-1] for x in expected.x_values])
+        assert list(command_y) == pytest.approx(expected.command_volts)
+        assert tab._trace_status.text().endswith("latest: internal pulse")
+    finally:
+        content.on_close()
+        content.deleteLater()
+        app_model.nidaq_signal_monitor.close()
+        laser.close()
+
+
+def test_laser_control_reads_nidaq_samples_directly_from_shared_ring(qapp):
+    channel = _laser_channel()
+    configuration = LaserSystemConfiguration.from_channels(
+        (channel,), backend="null", sample_rate_hz=1000.0,
+    )
+    laser = LaserModel(NullLaserController(configuration))
+    app_model = _LaserAppStub(laser)
+    stream_channel = NidaqSignalChannelConfiguration(
+        name="laser1_diode",
+        physical_channel="Dev1/ai0",
+        kind="analog",
+        unit="V",
+    )
+    app_model.nidaq_signal_monitor._configuration = NidaqSignalStreamConfiguration(
+        channels=(stream_channel,),
+        is_enabled=True,
+        sample_rate_hz=1000.0,
+    )
+    content = LaserControlContent(app_model)
+    try:
+        tab = content._channel_tabs[0]
+        tab._set_trace_streaming(True)
+        app_model.nidaq_signal_monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.0,
+                perf_time=1.0,
+                sample_rate_hz=1000.0,
+                sample_index=0,
+                channels=(stream_channel,),
+                values={"laser1_diode": (0.25, 0.5, 0.75)},
+            )
+        )
+
+        _wait_for_laser_plot(content, minimum_points=3)
+
+        diode_x, diode_y = tab._trace_data["diode"]
+        assert diode_x == pytest.approx([-0.002, -0.001, 0.0])
+        assert diode_y == pytest.approx([0.25, 0.5, 0.75])
+        assert content._plot_process.pid != os.getpid()
+        assert not hasattr(content._plot_process, "_block_queue")
+        assert "_trace_buffers" not in vars(tab)
+        assert tab._last_plot_frame.raw_generation == 1
+        assert "Seq 1" in content._stream_telemetry_label.text()
+        display_array_id = id(tab._trace_display_y["diode"])
+
+        app_model.nidaq_signal_monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.1,
+                perf_time=1.1,
+                sample_rate_hz=1000.0,
+                sample_index=3,
+                channels=(stream_channel,),
+                values={"laser1_diode": (1.0, 1.25)},
+            )
+        )
+        deadline = time.monotonic() + 5.0
+        while (
+            tab._last_plot_frame.raw_generation < 2
+            and time.monotonic() < deadline
+        ):
+            content._flush_laser_plots()
+            time.sleep(0.02)
+        assert id(tab._trace_display_y["diode"]) == display_array_id
+        assert tab._last_plot_frame.raw_generation == 2
+
+        app_model.nidaq_signal_monitor.set_display_refresh_rate(120.0)
+        content._flush_laser_plots()
+        assert content._stream_plot_timer.interval() == 8
+    finally:
+        content.on_close()
+        content.deleteLater()
+        app_model.nidaq_signal_monitor.close()
+        laser.close()
+
+
+def test_laser_tab_owns_and_persists_its_input_stream_options(qapp):
+    channel = _laser_channel()
+    configuration = LaserSystemConfiguration.from_channels(
+        (channel,),
+        backend="null",
+        sample_rate_hz=1000.0,
+    )
+    laser = LaserModel(NullLaserController(configuration))
+    app_model = _LaserAppStub(laser)
+    tab = _LaserChannelTab(
+        app_model,
+        channel,
+        True,
+        configuration.sample_rate_hz,
+        lambda _status, operation: operation(),
+        lambda _message, _is_error: None,
+    )
+    try:
+        diode = tab._trace_signal_checkboxes["diode"]
+        command_copy = tab._trace_signal_checkboxes["copy"]
+        assert diode.isEnabled()
+        assert command_copy.isEnabled()
+        assert not diode.isChecked()
+        assert not command_copy.isChecked()
+
+        diode.setChecked(True)
+        qapp.processEvents()
+        monitor_configuration = app_model.nidaq_signal_monitor.configuration
+        assert ("laser1_diode", "Dev1/ai0") in tuple(
+            (stream_channel.name, stream_channel.physical_channel)
+            for stream_channel in monitor_configuration.channels
+        )
+        assert monitor_configuration.display_channels == ("laser1_diode",)
+        assert app_model.signal_configuration_save_count == 1
+        assert not hasattr(tab, "_trace_daq_button")
+
+        command_copy.setChecked(True)
+        qapp.processEvents()
+        assert app_model.nidaq_signal_monitor.configuration.display_channels == (
+            "laser1_diode",
+            "laser1_command_copy",
+        )
+        assert app_model.signal_configuration_save_count == 2
+    finally:
+        app_model.nidaq_signal_monitor.close()
+        laser.close()
+        tab.deleteLater()
+
+
+def test_turning_a_trace_on_shows_samples_the_ring_already_holds(qapp):
+    """A control message and the ring have no ordering between them.
+
+    The plot worker reads two independent channels: a control queue and the
+    shared ring. It could read samples the parent wrote *after* enabling a
+    trace, decide the trace was not streaming yet because the enable had not
+    arrived, discard them, and advance the shared read cursor past them. The
+    cursor is the only record of what has been seen, so those samples were
+    gone for good.
+
+    A running rig hid it: the next chunk arrives a few milliseconds later and
+    the plot fills in. With no further samples it never recovered, which is
+    what made the test above fail about a quarter of the time.
+
+    This forces the losing order rather than waiting for it: the worker is
+    given time to consume the samples while the trace is still off, and only
+    then is the trace turned on.
+    """
+    channel = _laser_channel()
+    configuration = LaserSystemConfiguration.from_channels(
+        (channel,), backend="null", sample_rate_hz=1000.0,
+    )
+    laser = LaserModel(NullLaserController(configuration))
+    app_model = _LaserAppStub(laser)
+    stream_channel = NidaqSignalChannelConfiguration(
+        name="laser1_diode",
+        physical_channel="Dev1/ai0",
+        kind="analog",
+        unit="V",
+    )
+    app_model.nidaq_signal_monitor._configuration = NidaqSignalStreamConfiguration(
+        channels=(stream_channel,),
+        is_enabled=True,
+        sample_rate_hz=1000.0,
+    )
+    content = LaserControlContent(app_model)
+    try:
+        tab = content._channel_tabs[0]
+        content._flush_laser_plots()
+        app_model.nidaq_signal_monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.0,
+                perf_time=1.0,
+                sample_rate_hz=1000.0,
+                sample_index=0,
+                channels=(stream_channel,),
+                values={"laser1_diode": (0.25, 0.5, 0.75)},
+            )
+        )
+        # The worker polls the ring every millisecond. This is long enough
+        # that it has certainly read these samples with the trace still off.
+        time.sleep(0.5)
+
+        tab._set_trace_streaming(True)
+
+        _wait_for_laser_plot(content, minimum_points=3)
+        diode_x, diode_y = tab._trace_data["diode"]
+        assert diode_y == pytest.approx([0.25, 0.5, 0.75])
+    finally:
+        content.on_close()
+        app_model.nidaq_signal_monitor.close()
+        laser.close()
+
+
+def _running(monitor, *, starting=False):
+    """Mark the stream running (or starting) the way its reader thread does."""
+    if starting:
+        monitor._set_starting(True)
+    else:
+        monitor._set_running(True)
+
+
+def test_the_analysis_card_has_no_stream_button_and_names_the_stream_state(qapp):
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = _stream_configuration()
+    app_model = _AnalysisAppStub(monitor)
+    content = AnalysisContent(app_model)
+    try:
+        assert not hasattr(content, "_start_stop_button")
+        assert content._clear_button.text() == "Clear"
+        assert content._live_button.text() == "Live"
+        assert content._stream_state_label.text() == "disabled"
+
+        monitor.set_hardware_enabled(True)
+        qapp.processEvents()
+        assert content._stream_state_label.text() == "stopped"
+
+        _running(monitor, starting=True)
+        qapp.processEvents()
+        assert content._stream_state_label.text() == "starting"
+
+        monitor._set_starting(False)
+        _running(monitor)
+        qapp.processEvents()
+        assert content._stream_state_label.text() == "running"
+
+        monitor._set_running(False)
+        monitor._set_error("the task was refused")
+        qapp.processEvents()
+        assert content._stream_state_label.text() == "error"
+        assert "the task was refused" in content._stream_state_label.toolTip()
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
+@pytest.mark.parametrize("starting", [False, True], ids=["running", "starting"])
+def test_analysis_selections_stay_editable_while_the_stream_runs(qapp, starting):
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = _stream_configuration()
+    monitor._hardware_enabled = True
+    app_model = _AnalysisAppStub(monitor)
+    content = AnalysisContent(app_model)
+    try:
+        _running(monitor, starting=starting)
+        qapp.processEvents()
+
+        for key in ("cam_frames", "tone1", "tone2"):
+            checkbox = content._signal_checkboxes[key]
+            assert checkbox.isEnabled(), key
+            assert "Stop the NI-DAQ stream" not in checkbox.toolTip()
+        # Unmapped ports still say why they cannot be ticked.
+        barcode = content._signal_checkboxes["barcode"]
+        assert not barcode.isEnabled()
+        assert "Edit DAQ Ports" in barcode.toolTip()
+
+        content._signal_checkboxes["tone1"].setChecked(True)
+        qapp.processEvents()
+        assert monitor.configuration.display_channels == ("cam_frames", "tone1")
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
+def test_toggling_an_analysis_signal_keeps_every_other_signals_history(qapp):
+    # Showing or hiding one line used to rebuild the plot process with the
+    # new selection, which emptied every graph and needed the stream stopped.
+    monitor = NidaqSignalMonitorModel()
+    monitor._configuration = dataclasses.replace(
+        _stream_configuration(), sample_rate_hz=1000.0,
+    )
+    monitor._hardware_enabled = True
+    content = AnalysisContent(_AnalysisAppStub(monitor))
+    content.show()
+    qapp.processEvents()
+    try:
+        _running(monitor)
+        qapp.processEvents()
+        monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.0,
+                perf_time=1.0,
+                sample_rate_hz=1000.0,
+                sample_index=0,
+                channels=monitor.configuration.channels,
+                values={
+                    "cam_frames": tuple(float(index % 2) for index in range(300)),
+                    "tone1": tuple(float((index // 50) % 2) for index in range(300)),
+                },
+            )
+        )
+        _wait_for_plot_snapshot(content)
+        curves = content._rolling_plot._curves
+        camera_x = np.array(curves["cam_frames"].xData)
+        assert camera_x.size
+        reconfigured = []
+        original_configure = content._plot_process.configure
+        content._plot_process.configure = lambda *args, **kwargs: (
+            reconfigured.append(args), original_configure(*args, **kwargs))
+
+        content._signal_checkboxes["tone1"].setChecked(True)
+        qapp.processEvents()
+
+        assert reconfigured == []
+        assert curves["tone1"].isVisible()
+        # Its history is there at once, with no new samples arriving.
+        assert curves["tone1"].yData is not None and len(curves["tone1"].yData)
+        assert np.array_equal(np.array(curves["cam_frames"].xData), camera_x)
+
+        content._signal_checkboxes["cam_frames"].setChecked(False)
+        qapp.processEvents()
+
+        assert reconfigured == []
+        assert not curves["cam_frames"].isVisible()
+        assert len(curves["tone1"].yData)
+        assert tuple(entry[0] for entry in content._rolling_plot._legend.entries) == (
+            "tone1 (logic)",
+        )
+    finally:
+        content.on_close()
+        content.deleteLater()
+
+
+def _laser_content_with_diode_stream():
+    channel = _laser_channel()
+    configuration = LaserSystemConfiguration.from_channels(
+        (channel,), backend="null", sample_rate_hz=1000.0,
+    )
+    laser = LaserModel(NullLaserController(configuration))
+    app_model = _LaserAppStub(laser)
+    app_model.nidaq_signal_monitor._configuration = dataclasses.replace(
+        app_model.nidaq_signal_monitor.configuration, sample_rate_hz=1000.0,
+    )
+    return laser, app_model, LaserControlContent(app_model)
+
+
+def test_laser_graphs_follow_the_shared_stream_without_a_button(qapp):
+    laser, app_model, content = _laser_content_with_diode_stream()
+    monitor = app_model.nidaq_signal_monitor
+    try:
+        tab = content._channel_tabs[0]
+        assert not hasattr(tab, "_trace_toggle_button")
+        assert not hasattr(tab, "_trace_daq_button")
+        assert tab._trace_clear_button.text() == "Clear"
+        assert tab._trace_streaming
+        assert "stopped" in tab._trace_status.text()
+
+        _running(monitor)
+        qapp.processEvents()
+        assert "running" in tab._trace_status.text()
+
+        # System Mode is still Idle: nothing has called set_is_capture_active.
+        monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.0,
+                perf_time=1.0,
+                sample_rate_hz=1000.0,
+                sample_index=0,
+                channels=monitor.configuration.channels,
+                values={"laser1_diode": (0.25, 0.5, 0.75)},
+            )
+        )
+        _wait_for_laser_plot(content, minimum_points=3)
+        assert tab._trace_data["diode"][1] == pytest.approx([0.25, 0.5, 0.75])
+
+        # Leaving System Mode no longer stops the laser graphs.
+        content.set_is_capture_active(True)
+        content.set_is_capture_active(False)
+        assert tab._trace_streaming
+    finally:
+        content.on_close()
+        content.deleteLater()
+        monitor.close()
+        laser.close()
+
+
+@pytest.mark.parametrize("starting", [False, True], ids=["running", "starting"])
+def test_every_laser_trace_can_be_hidden_and_shown_while_streaming(qapp, starting):
+    laser, app_model, content = _laser_content_with_diode_stream()
+    monitor = app_model.nidaq_signal_monitor
+    try:
+        _running(monitor, starting=starting)
+        qapp.processEvents()
+        tab = content._channel_tabs[0]
+        command = tab._trace_command_checkbox
+        assert command.isEnabled()
+        assert command.isChecked()
+        assert "always shown" not in command.text()
+        for key in ("diode", "copy"):
+            assert tab._trace_signal_checkboxes[key].isEnabled(), key
+
+        laser.run_pulse_train(LaserPulseTrain(
+            channel_id=LaserChannelId.LASER_1, amplitude_volts=2.0, duration_ms=10.0))
+        deadline = time.monotonic() + 5.0
+        while not len(tab._trace_data["command"][0]) and time.monotonic() < deadline:
+            content._flush_laser_plots()
+            tab.redraw_trace()
+            time.sleep(0.02)
+        command_points = len(tab._trace_data["command"][0])
+        assert command_points
+        assert tab._trace_curves["command"].isVisible()
+
+        command.setChecked(False)
+        qapp.processEvents()
+        assert not tab._trace_curves["command"].isVisible()
+        assert "Command output" not in tuple(
+            entry[0] for entry in tab._trace_legend.entries)
+
+        command.setChecked(True)
+        qapp.processEvents()
+        assert tab._trace_curves["command"].isVisible()
+        assert len(tab._trace_data["command"][0]) == command_points
+
+        diode = tab._trace_signal_checkboxes["diode"]
+        diode.setChecked(True)
+        qapp.processEvents()
+        assert tab._trace_curves["diode"].isVisible()
+        diode.setChecked(False)
+        qapp.processEvents()
+        assert not tab._trace_curves["diode"].isVisible()
+        assert "laser1_diode" not in monitor.configuration.display_channels
+    finally:
+        content.on_close()
+        content.deleteLater()
+        monitor.close()
+        laser.close()
+
+
+def test_a_hidden_command_trace_stays_hidden_when_laser_control_rebuilds(qapp):
+    laser, app_model, content = _laser_content_with_diode_stream()
+    try:
+        content._channel_tabs[0]._trace_command_checkbox.setChecked(False)
+
+        content._refresh_from_model()
+
+        rebuilt = content._channel_tabs[0]
+        assert not rebuilt._trace_command_checkbox.isChecked()
+        assert not rebuilt._trace_curves["command"].isVisible()
+        assert content._channel_tabs[1]._trace_command_checkbox.isChecked()
+    finally:
+        content.on_close()
+        content.deleteLater()
+        app_model.nidaq_signal_monitor.close()
+        laser.close()
+
+
+def _without_stream_channel(monitor, name):
+    """The stream's plan less one channel, as before the plan names it."""
+    planned = monitor.configuration
+    monitor._configuration = dataclasses.replace(
+        planned,
+        channels=tuple(item for item in planned.channels if item.name != name),
+        display_channels=tuple(
+            item for item in planned.display_channels if item != name),
+    )
+    return planned
+
+
+def test_a_laser_input_outside_the_acquisition_plan_cannot_be_ticked(qapp):
+    # Ticking an input the stream does not acquire named a channel the
+    # stream does not have, and raised. The board trigger readback was the
+    # case: it was never in the plan. It is now, so the stream here is given
+    # a plan without it, as it has until a new plan is loaded.
+    channel = dataclasses.replace(_laser_channel(), trigger_monitor_input="Dev1/ai7")
+    configuration = LaserSystemConfiguration.from_channels(
+        (channel,), backend="null", sample_rate_hz=1000.0,
+    )
+    laser = LaserModel(NullLaserController(configuration))
+    app_model = _LaserAppStub(laser)
+    _without_stream_channel(app_model.nidaq_signal_monitor, "laser1_trigger")
+    tab = _LaserChannelTab(
+        app_model,
+        channel,
+        True,
+        configuration.sample_rate_hz,
+        lambda _status, operation: operation(),
+        lambda _message, _is_error: None,
+    )
+    try:
+        trigger = tab._trace_signal_checkboxes["trigger"]
+        assert not trigger.isEnabled()
+        assert "acquisition plan" in trigger.toolTip()
+        assert tab._trace_signal_checkboxes["diode"].isEnabled()
+    finally:
+        app_model.nidaq_signal_monitor.close()
+        laser.close()
+        tab.deleteLater()
+
+
+def _laser_content_with_trigger_readback(terminal="Dev1/ai7"):
+    channel = dataclasses.replace(_laser_channel(), trigger_monitor_input=terminal)
+    configuration = LaserSystemConfiguration.from_channels(
+        (channel,), backend="null", sample_rate_hz=1000.0,
+    )
+    laser = LaserModel(NullLaserController(configuration))
+    app_model = _LaserAppStub(laser)
+    app_model.nidaq_signal_monitor._configuration = dataclasses.replace(
+        app_model.nidaq_signal_monitor.configuration, sample_rate_hz=1000.0,
+    )
+    return laser, app_model
+
+
+def test_a_configured_board_trigger_readback_is_acquired_ticked_and_plotted(qapp):
+    # It was never in the acquisition plan, so its box stayed disabled and
+    # the Board trigger graph could never show the edge.
+    laser, app_model = _laser_content_with_trigger_readback()
+    monitor = app_model.nidaq_signal_monitor
+    content = LaserControlContent(app_model)
+    try:
+        acquired = {
+            item.name: item.physical_channel for item in monitor.configuration.channels
+        }
+        assert acquired.get("laser1_trigger") == "Dev1/ai7"
+        tab = content._channel_tabs[0]
+        trigger = tab._trace_signal_checkboxes["trigger"]
+        assert trigger.isEnabled()
+        assert "recorded either way" in trigger.toolTip()
+        assert "Dev1/ai7" in tab.trigger_status.text()
+        assert "laser1_trigger" in tab.trigger_status.text()
+
+        trigger.setChecked(True)
+        qapp.processEvents()
+        assert "laser1_trigger" in monitor.configuration.display_channels
+        assert tab._trace_curves["trigger"].isVisible()
+        assert "Board trigger" in tuple(
+            entry[0] for entry in tab._trace_legend.entries)
+
+        monitor.sample_ring.write_block(
+            NidaqSignalSampleBlock(
+                wall_time=1.0,
+                perf_time=1.0,
+                sample_rate_hz=1000.0,
+                sample_index=0,
+                channels=monitor.configuration.channels,
+                values={"laser1_trigger": (0.0, 5.0, 0.0)},
+            )
+        )
+        deadline = time.monotonic() + 5.0
+        while len(tab._trace_data["trigger"][0]) < 3 and time.monotonic() < deadline:
+            content._flush_laser_plots()
+            tab.redraw_trace()
+            time.sleep(0.02)
+        assert tab._trace_data["trigger"][1] == pytest.approx([0.0, 5.0, 0.0])
+
+        trigger.setChecked(False)
+        qapp.processEvents()
+        assert "laser1_trigger" not in monitor.configuration.display_channels
+        assert not tab._trace_curves["trigger"].isVisible()
+    finally:
+        content.on_close()
+        content.deleteLater()
+        monitor.close()
+        laser.close()
+
+
+def test_the_board_trigger_status_follows_a_newly_loaded_plan(qapp):
+    # A configuration load and an Edit DAQ Ports save set the laser
+    # configuration first, which rebuilds the tabs against the stream's old
+    # plan, and only then load the new plan. The status line was written
+    # once, at the rebuild, and kept saying the input was not acquired.
+    laser, app_model = _laser_content_with_trigger_readback()
+    monitor = app_model.nidaq_signal_monitor
+    planned = _without_stream_channel(monitor, "laser1_trigger")
+    content = LaserControlContent(app_model)
+    try:
+        tab = content._channel_tabs[0]
+        assert "not in the NI-DAQ acquisition plan" in tab.trigger_status.text()
+        assert not tab._trace_signal_checkboxes["trigger"].isEnabled()
+
+        monitor.load_configuration(planned)
+        qapp.processEvents()
+
+        assert "not in the NI-DAQ acquisition plan" not in tab.trigger_status.text()
+        assert "Dev1/ai7" in tab.trigger_status.text()
+        assert tab._trace_signal_checkboxes["trigger"].isEnabled()
+    finally:
+        content.on_close()
+        content.deleteLater()
+        monitor.close()
+        laser.close()
+
+
+def test_the_board_trigger_status_says_what_the_readback_is_doing(qapp):
+    # It said "Reading X. Enable it under Signals." whatever the stream was
+    # doing and whether or not the box was already ticked, and it was not
+    # rewritten when the stream started or stopped.
+    laser, app_model = _laser_content_with_trigger_readback()
+    monitor = app_model.nidaq_signal_monitor
+    content = LaserControlContent(app_model)
+    try:
+        tab = content._channel_tabs[0]
+        trigger = tab._trace_signal_checkboxes["trigger"]
+        status = tab.trigger_status
+        assert not monitor.is_running
+        assert "Dev1/ai7" in status.text() and "stopped" in status.text()
+        assert "Tick" not in status.text() and "Showing" not in status.text()
+
+        _running(monitor)
+        qapp.processEvents()
+        assert "Reading Dev1/ai7" in status.text()
+        assert "Tick Board trigger readback" in status.text()
+
+        trigger.setChecked(True)
+        qapp.processEvents()
+        assert "Showing Dev1/ai7" in status.text()
+        assert "Tick" not in status.text()
+
+        trigger.setChecked(False)
+        qapp.processEvents()
+        assert "Tick Board trigger readback" in status.text()
+
+        monitor.set_hardware_enabled(False)
+        qapp.processEvents()
+        assert "hardware is disabled" in status.text()
+    finally:
+        content.on_close()
+        content.deleteLater()
+        monitor.close()
+        laser.close()
+
+
+def test_without_a_trigger_readback_the_board_trigger_says_what_to_set(qapp):
+    laser, app_model, content = _laser_content_with_diode_stream()
+    try:
+        tab = content._channel_tabs[0]
+        trigger = tab._trace_signal_checkboxes["trigger"]
+        assert not trigger.isEnabled()
+        assert "laser1_trigger" not in {
+            item.name for item in app_model.nidaq_signal_monitor.configuration.channels
+        }
+        # Edit DAQ Ports has a field for it now: trigger readback input.
+        for text in (tab.trigger_status.text(), trigger.toolTip()):
+            assert "Edit DAQ Ports" in text
+            assert "trigger readback input" in text
+            assert "triggerMonitorInput" not in text
+    finally:
+        content.on_close()
+        content.deleteLater()
+        app_model.nidaq_signal_monitor.close()
+        laser.close()

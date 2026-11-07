@@ -3,7 +3,7 @@ Interface classes that define the capabilities of the mouse gym hardware in a wa
 that hardware can be swapped or emulated.
 
 There is a set of enumerations that define entities of the hardware:
-+ Target - Either the Pellet or Magnet module
++ Target - Pellet module
 + Motor - Motor that can be controlled
 + DigitalOutputs - Set of available digital outputs
 + AnalogOutputs - Set of available analog outputs
@@ -39,7 +39,6 @@ _map_idx_motors = {
 class Target(IntEnum):
     """Target is also known as board"""
     PELLET_DEVICE = 0
-    MAGNET_DEVICE = 1
 
 
 class DigitalOutputs(IntEnum):
@@ -47,6 +46,57 @@ class DigitalOutputs(IntEnum):
     STIMULUS_2 = 2
     STIMULUS_3 = 3
     STIMULUS_4 = 4
+
+
+#: Board stimulus line label to the output that drives it. The pellet board
+#: device tree names its four outputs STIM0..STIM3 while this enum counts from
+#: one, so board STIM2 is STIMULUS_3. This is the only place that off-by-one is
+#: written down; resolve board labels through here rather than restating it.
+#:
+#: STIM0 and STIM1 are deliberately absent. They carry the tone generator's
+#: TTL confirmations, which the NI-DAQ records as tone1 and tone2, so they
+#: cannot also carry a stimulus pulse - the firmware refuses a pulse
+#: addressed to either with -EPERM.
+#:
+#: The confirmation is gated on the exact frequency. The board's devicetree
+#: maps tone-output-frequencies-hz = <5000 6000> onto those two pins, and
+#: the driver asserts a pin only where the requested frequency equals its
+#: mapped one. So 5 kHz raises tone1, 6 kHz raises tone2, and every other
+#: frequency sounds a tone that no line confirms.
+#:
+#: Verified on christielab10 against firmware 2.2.0: 5000 Hz raised
+#: port0/line0, 6000 Hz raised port0/line1, and 8000 Hz raised nothing.
+#: Play a tone at any other frequency and the absence of a confirmation
+#: means the frequency was unmapped, not that the tone failed.
+BOARD_STIM_LINE_OUTPUTS = {
+    2: DigitalOutputs.STIMULUS_3,
+    3: DigitalOutputs.STIMULUS_4,
+}
+
+#: Tone frequency to the configuration field naming the line that confirms
+#: it. The board's devicetree carries tone-output-frequencies-hz against
+#: STIM0 and STIM1, and the tone generator driver asserts a pin only where
+#: the requested frequency equals its mapped one - an exact match, so a tone
+#: at any other frequency sounds with nothing to record it.
+#:
+#: Here rather than wherever it is needed, because it is a fact about the
+#: board and two copies of it would drift the moment the devicetree changes.
+#: If that mapping is edited, this is the line to edit with it.
+TONE_CONFIRMATION_FREQUENCIES_HZ = ((5_000, "tone1"), (6_000, "tone2"))
+
+
+def tone_confirmation_frequency(field: str):
+    """The frequency whose tone raises this confirmation line, or None.
+
+    For the handful of places that need to recognise a tone by its frequency
+    rather than play one. Asking here keeps them agreeing with the board:
+    the mapping is the devicetree's, and a literal copied into a comparison
+    is a copy that stops being true without anything failing.
+    """
+    for frequency, name in TONE_CONFIRMATION_FREQUENCIES_HZ:
+        if name == field:
+            return frequency
+    return None
 
 
 class AnalogOutputs(IntEnum):
@@ -61,6 +111,17 @@ class Source:
     target: Target = None
     timestamp_ns: int = dataclasses.field(init=False, default=0)  # realtime unix timestamp but in integer nanoseconds
     index: int = dataclasses.field(init=False, default=0)  # perf counter in integer nanosecond
+    board_boot_id: Optional[int] = dataclasses.field(init=False, default=None)
+    board_sequence: Optional[int] = dataclasses.field(init=False, default=None)
+    board_time_us: Optional[int] = dataclasses.field(init=False, default=None)
+    board_timestamp_kind: Optional[str] = dataclasses.field(init=False, default=None)
+    board_aligned_perf_time: Optional[float] = dataclasses.field(init=False, default=None)
+    board_clock_model_id: Optional[str] = dataclasses.field(init=False, default=None)
+    board_clock_uncertainty_seconds: Optional[float] = dataclasses.field(init=False, default=None)
+    board_sequence_status: Dict[str, Any] = dataclasses.field(init=False, default_factory=dict)
+    event_perf_time: Optional[float] = dataclasses.field(init=False, default=None)
+    timestamp_method: str = dataclasses.field(init=False, default="host_receive_perf_time")
+    timing_confidence: str = dataclasses.field(init=False, default="host_timestamp")
     # init=False: preserve the original behavior/semantic of constructor with position args
     # for subclasses adding other fields.
 
@@ -80,17 +141,35 @@ class Heartbeat(Source):
 
 
 @dataclass
-class MagnetDigitalInputs(Source):
-    continuity_0: bool = False
-    continuity_1: bool = False
-
-
-@dataclass
 class PelletDigitalInputs(Source):
     stimulus_1: bool = False
     stimulus_2: bool = False
     stimulus_3: bool = False
     stimulus_4: bool = False
+
+
+@dataclass
+class BoardTimeSync(Source):
+    request_id: int = 0
+    request_receive_time_us: int = 0
+    response_queue_time_us: int = 0
+    clock_model: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+@dataclass
+class BoardCapabilities(Source):
+    wire_schema_version: int = 0
+    capabilities: int = 0
+    boot_id: int = 0
+
+
+@dataclass
+class DigitalPulseStatus(Source):
+    # None when the board reported a line that is not a stimulus output.
+    channel: Optional[DigitalOutputs] = None
+    duration_us: int = 0
+    phase: str = ""
+    error: int = 0
 
 
 @dataclass
@@ -345,13 +424,20 @@ class AnalogOutput(Source):
 
 
 @dataclass
-class LoadCellReading(Source):
-    load: float = 0
-
-
-@dataclass
 class PressureReading(Source):
-    pressure: float = 0
+    """
+    One FSR pressure sample from a pellet-board analog input.
+
+    ``pressure`` is the raw 12-bit ADC count, in [0, 4095]; it is *not*
+    millivolts, despite the wording in the firmware's pressure.c.  Convert
+    host-side when a voltage is wanted: ``volts = pressure / 4095.0 * 3.3``.
+
+    ``instance`` selects the connector: 0 = J11 (PA0/ADC1_IN1),
+    1 = J21 (PA6/ADC2_IN3).
+    """
+
+    instance: int = 0
+    pressure: int = 0
 
 
 @dataclass
@@ -364,31 +450,8 @@ class ColorLed(Source):
 
 
 @dataclass
-class AudioData(Source):
-    packet_id: int = 0
-    when: float = 0  # real-time unix timestamp, also in Source (Source.timestamp_ns, so as ns actually)
-    # but keeping here for now, this could become a property, eventually with setter.
-    index: int = 0  # also in Source now, keeping also for now, as it allows to pass in constructor/init
-    magnitudes: List[float] = dataclasses.field(default_factory=list)
-
-
-@dataclass
-class DoorData(Source):
-    door1: bool = False
-    door2: bool = False
-    door3: bool = False
-    ext_button: bool = False
-
-
-@dataclass
 class Status(Source):
     unused: bool = True
-
-
-@dataclass
-class SensorStatus(Source):
-    temperature_c: float = 0
-    humidity_percent: float = 0
 
 
 @dataclass
@@ -399,6 +462,23 @@ class Version(Source):
 @dataclass
 class Acknowledge(Source):
     uuid: int = 0
+    #: The board's return code for the command it is acknowledging. Zero means
+    #: it ran. Negative is a system errno, which is how a board reports that it
+    #: refused: -EPERM for a pulse aimed at a tone confirmation line, -EBUSY for
+    #: a second pulse while one is in flight, -EINVAL for a duration out of
+    #: range, -ENOTSUP for a board with no pulse counter. An acknowledgement is
+    #: not by itself a success, so callers that care must read this.
+    error: int = 0
+
+    @property
+    def is_failure(self) -> bool:
+        return int(self.error) != 0
+
+    @property
+    def failure_reason(self) -> str:
+        if not self.is_failure:
+            return ""
+        return f"the board refused the command with error {int(self.error)}"
 
 
 _zero_position = Offset3DTuple(0, 0, 0)
@@ -427,7 +507,6 @@ class DeviceInterface:
         self._active_motors_drift = _zero_position
         self._max_motor_drift_error_threshold = 2  # mm
         self._motors_drift_error = [False, False, False]
-        self._tunnel_status_perf_c = -math.inf
         self._pellet_status_perf_c = -math.inf
 
     @classmethod
@@ -606,12 +685,6 @@ class DeviceInterface:
     def servo_detach(self, motor: Motor):
         raise NotImplementedError
 
-    def set_tunnel_fan_on(self) -> bool:
-        raise NotImplementedError
-
-    def set_tunnel_fan_off(self) -> bool:
-        raise NotImplementedError
-
     @property
     def pellet_status_perf_c(self) -> float:
         return self._pellet_status_perf_c
@@ -620,10 +693,3 @@ class DeviceInterface:
     def pellet_status_perf_c(self, value):
         self._pellet_status_perf_c = value
 
-    @property
-    def tunnel_status_perf_c(self) -> float:
-        return self._tunnel_status_perf_c
-
-    @tunnel_status_perf_c.setter
-    def tunnel_status_perf_c(self, value):
-        self._tunnel_status_perf_c = value

@@ -39,6 +39,8 @@ class CameraBase:
         self._last_frame_id = -1
         self._last_frame_perf_c = -math.inf
         self._last_frame_time = -math.inf
+        self._last_poll_perf_c = -math.inf
+        self._last_arrival_perf_c = -math.inf
 
     @property
     def name(self) -> str:
@@ -89,11 +91,37 @@ class CameraBase:
     def frame_id(self) -> int:
         """Returns the last frame id (frame counter)"""
         return self._last_frame_id
+
+    @property
+    def is_trigger_synchronized(self) -> bool:
+        """Whether this camera exposes on a hardware trigger shared with the
+        other reach cameras, so that its frame_id names the same exposure as
+        theirs.
+
+        A free-running source counts only its own frames: two of them started a
+        few frames apart never share ids, and pairing their frames by id would
+        hold every batch until the later camera caught up.
+        """
+        return False
     
     @property
     def frame_perf_c(self) -> float:
         """Returns the last frame system perf_counter, as precise as possible"""
         return self._last_frame_perf_c
+
+    @property
+    def frame_poll_perf_c(self) -> float:
+        """perf_counter just before the poll that returned the last frame."""
+        return self._last_poll_perf_c
+
+    @property
+    def frame_arrival_perf_c(self) -> float:
+        """perf_counter when the last frame was handed to the host.
+
+        Not the same as frame_perf_c, which is an estimate fitted to these
+        host poll times; the latency record needs the measured times.
+        """
+        return self._last_arrival_perf_c
 
     @property
     def frame_unix_time(self) -> float:
@@ -134,11 +162,23 @@ class CameraBase:
         self._last_when = time.time_ns()
         self._last_frame_perf_c = get_perf_now()
         self._last_frame_time = time.time()
+        self._last_poll_perf_c = self._last_arrival_perf_c = self._last_frame_perf_c
 
         self._frame_count += 1
         self._last_frame_id += 1
 
         return None, self._last_when
+
+    def latch_clock(self) -> Optional[Tuple[float, int, float, float, float]]:
+        """ Latches the camera's timestamp clock between two host perf_counter reads.
+
+        Returns (perf before, camera timestamp in ns, perf after, RAW before,
+        RAW after), on the clock capture() timestamps come from, or None for a
+        camera with no such clock. The RAW pair is CLOCK_MONOTONIC_RAW taken
+        just inside the perf pair, NaN where the host has none. Must not raise.
+        Called on the capture thread only.
+        """
+        return None
 
     def set_property(self, name: str, value: str) -> bool:
         """ Sets known property values, typically from the camera url.

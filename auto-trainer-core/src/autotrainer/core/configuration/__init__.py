@@ -105,9 +105,25 @@ SystemConfigurationDumper.add_representer(Offset3DTuple, repr_offset3d_tuple)
 # above must be before below
 
 
-from .behavior_configuration import BehaviorConfiguration, ShiftXYZTarget
+from .behavior_configuration import (
+    BehaviorConfiguration,
+    SessionControlConfiguration,
+    ShiftXYZTarget,
+)
 from .camera_configuration import CameraConfiguration, CameraId
 from .hardware_configuration import HardwareConfiguration
 from .inference_configuration import InferenceConfiguration
+from .laser_configuration import LaserChannelConfiguration, LaserChannelId, LaserSystemConfiguration, \
+    normalize_laser_channel_id
+from .nidaq_port_configuration import (
+    NidaqDeviceIdentity,
+    NidaqPortConfiguration,
+    NidaqTimingConfiguration,
+    NidaqTimingPlan,
+    NidaqTimingRoute,
+    NidaqTaskGraph,
+    NidaqTaskSpecification,
+)
+from .nidaq_stream_configuration import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
 from .persistence_configuration import PersistenceConfiguration
 from .system_configuration import SystemConfiguration

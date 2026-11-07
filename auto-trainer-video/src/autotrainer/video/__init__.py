@@ -5,3 +5,11 @@ from .video_capture import CaptureAttrs, CaptureCameraAttrs, CaptureInferenceAtt
 from .video_manager import VideoManager
 from .video_reader import VideoReader
 from .video_record import VideoRecord, VideoRecordProperties, VideoRecordMode
+from .stim_camera import (
+    StimCameraDetectionConfiguration,
+    StimCameraDetector,
+    StimDetectorArm,
+    StimEvidenceWriter,
+    StimRoiDefinition,
+    StimTriggerDecision,
+)
