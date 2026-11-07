@@ -1,0 +1,8 @@
+# Packages the licence check tolerates: name  # reason
+# Two kinds: AGPL/GPL packages, and packages whose licence the metadata does not identify (unknown or missing).
+# The list may only shrink. An entry that no installed AGPL/GPL or unidentified package matches is stale and fails CI.
+auto-trainer-api       # AGPL-3.0-only, scheduled for removal
+auto-trainer-training  # AGPL-3.0-only, scheduled for removal
+ultralytics            # AGPL-3.0, scheduled for removal
+ultralytics-thop       # AGPL-3.0, scheduled for removal
+setuptools             # MIT per its LICENSE file, but 79.0.1 (bundled with CPython 3.10.22) declares no licence in its metadata; 80.3.1 onward declares MIT, so remove this entry once CI's setuptools moves up

@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+
+# Start reachAQ from a terminal, from anywhere, without activating Conda first.
+#
+# The Conda environment already provides a `reachaq` console script, but only
+# once that environment is active; outside it the command does not exist. This
+# wrapper lives on PATH instead and does the activation itself, so `reachaq`
+# means the same thing in every shell.
+#
+# It reads the launcher configuration the desktop installer already writes
+# rather than keeping its own. Two files naming the repository and environment
+# would disagree the first time either moved, and the one that disagreed would
+# be whichever the operator was not looking at.
+#
+# It is deliberately not the desktop launcher. That one pauses with "Press
+# Enter to close" so a double-clicked window does not vanish with its error;
+# in a terminal the error is already on screen and a prompt just blocks a
+# script. Everything else - the configuration, the single-instance lock - is
+# shared, so the two cannot both open the hardware.
+
+set -u
+
+launcher_config=${REACHAQ_LAUNCHER_CONFIG:-$HOME/.config/reachaq/launcher.conf}
+if [ ! -r "$launcher_config" ]; then
+    printf 'reachAQ is not configured: %s is missing.\n' "$launcher_config" >&2
+    printf 'Run tools/install/install-reachaq-desktop.sh, or the portable\n' >&2
+    printf 'installer at tools/install/reachaq-linux-install.sh.\n' >&2
+    exit 2
+fi
+
+conda_bin=
+conda_env=
+repository=
+system_config=
+runtime_env=
+while IFS='=' read -r key value || [ -n "${key:-}" ]; do
+    value=${value%$'\r'}
+    case "$key" in
+        CONDA_BIN) conda_bin=$value ;;
+        CONDA_ENV) conda_env=$value ;;
+        REPOSITORY) repository=$value ;;
+        SYSTEM_CONFIG) system_config=$value ;;
+        RUNTIME_ENV) runtime_env=$value ;;
+    esac
+done < "$launcher_config"
+
+for required in conda_bin conda_env repository system_config; do
+    if [ -z "${!required}" ]; then
+        printf 'reachAQ setting %s is empty in %s\n' "$required" "$launcher_config" >&2
+        exit 2
+    fi
+done
+if [ ! -x "$conda_bin" ]; then
+    printf 'Configured Conda executable is unavailable: %s\n' "$conda_bin" >&2
+    exit 2
+fi
+if [ ! -d "$repository" ]; then
+    printf 'Configured reachAQ repository is unavailable: %s\n' "$repository" >&2
+    exit 2
+fi
+if [ ! -f "$system_config" ]; then
+    printf 'Configured reachAQ system configuration is unavailable: %s\n' \
+        "$system_config" >&2
+    exit 2
+fi
+
+# Runtime files are data-only KEY=VALUE files. Do not source executable shell.
+if [ -n "$runtime_env" ] && [ -r "$runtime_env" ]; then
+    while IFS='=' read -r key value || [ -n "${key:-}" ]; do
+        value=${value%$'\r'}
+        case "$key" in
+            AUTOTRAINER_*|REACHAQ_*) export "$key=$value" ;;
+        esac
+    done < "$runtime_env"
+fi
+
+# The same lock the desktop launcher takes, in the same place, so starting one
+# while the other runs is refused rather than letting two processes open the
+# same cameras and DAQ.
+runtime_root=${XDG_RUNTIME_DIR:-}
+if [ -n "$runtime_root" ] && [ -d "$runtime_root" ] && [ ! -L "$runtime_root" ]; then
+    runtime_owner=$(stat -c '%u' -- "$runtime_root" 2>/dev/null || true)
+    runtime_mode=$(stat -c '%a' -- "$runtime_root" 2>/dev/null || true)
+    if [ "$runtime_owner" != "$UID" ] || [ "$runtime_mode" != "700" ]; then
+        runtime_root=
+    fi
+fi
+if [ -z "$runtime_root" ]; then
+    temporary_root=${TMPDIR:-/tmp}
+    runtime_root="$temporary_root/reachaq-runtime-${UID}"
+    if [ -L "$runtime_root" ]; then
+        printf 'Unsafe reachAQ runtime path is a symbolic link: %s\n' "$runtime_root" >&2
+        exit 2
+    fi
+    if ! mkdir -m 700 -- "$runtime_root" 2>/dev/null && [ ! -d "$runtime_root" ]; then
+        printf 'Unable to create secure reachAQ runtime directory: %s\n' "$runtime_root" >&2
+        exit 2
+    fi
+fi
+
+lock_dir="$runtime_root/reachaq"
+if [ -L "$lock_dir" ]; then
+    printf 'Unsafe reachAQ lock path is a symbolic link: %s\n' "$lock_dir" >&2
+    exit 2
+fi
+if ! mkdir -m 700 -- "$lock_dir" 2>/dev/null && [ ! -d "$lock_dir" ]; then
+    printf 'Unable to create reachAQ lock directory: %s\n' "$lock_dir" >&2
+    exit 2
+fi
+
+exec 9<"$lock_dir"
+if ! flock -n 9; then
+    printf 'reachAQ is already running for this user.\n' >&2
+    exit 3
+fi
+
+cd "$repository" || exit 2
+exec "$conda_bin" run --no-capture-output -n "$conda_env" \
+    python -m reachAQ.app -c "$system_config" "$@"

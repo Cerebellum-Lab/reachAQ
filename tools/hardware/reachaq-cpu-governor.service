@@ -1,0 +1,18 @@
+[Unit]
+Description=Set the CPU frequency governor to performance for reachAQ acquisition
+Documentation=https://www.kernel.org/doc/html/latest/admin-guide/pm/cpufreq.html
+ConditionPathExists=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Written through sysfs rather than cpupower so this does not depend on the
+# versioned linux-tools package matching the running kernel. tee takes the
+# whole glob, so there is no shell variable and therefore nothing for systemd
+# to try to expand.
+ExecStart=/bin/sh -c 'echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null'
+ExecStop=/bin/sh -c 'echo powersave | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null'
+
+[Install]
+WantedBy=multi-user.target

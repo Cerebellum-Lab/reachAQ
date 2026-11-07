@@ -37,10 +37,13 @@ _queue_listener: Optional[logging.handlers.QueueListener] = None
 _queue_handler: Optional[logging.Handler] = None
 _console_handler: Optional[logging.StreamHandler] = None
 _root_handler = None
+_fatal_exception_callbacks = []
+_fatal_exception_callbacks_lock = threading.Lock()
 
 
 DEFAULT_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 MULTIPROC_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s[%(processName)s.%(process)d-%(threadName)s.%(thread_id)s] %(message)s"
+ALWAYS_CONSOLE_LOG_ATTRIBUTE = "always_console"
 
 
 # these loggers can be too verbose:
@@ -109,9 +112,38 @@ class LogConfig:
     stream: str = "sys.stdout"
 
 
+class ConsoleHandler(logging.StreamHandler):
+    """A level-filtered console handler with support for explicit progress records.
+
+    Hardware initialization can take long enough that the application otherwise
+    appears hung.  Those records need to remain visible even when the user's
+    normal terminal threshold is WARNING, while all other INFO/NOTICE records
+    should continue to respect that preference.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._configured_level = logging.NOTSET
+        super().__init__(*args, **kwargs)
+        # Keep the handler's actual level open so both Logger.callHandlers and a
+        # QueueListener deliver tagged records to handle().
+        super().setLevel(logging.NOTSET)
+
+    def setLevel(self, level):
+        self._configured_level = logging._checkLevel(level)
+        super().setLevel(logging.NOTSET)
+
+    def filter(self, record):
+        if (
+            record.levelno < self._configured_level
+            and not getattr(record, ALWAYS_CONSOLE_LOG_ATTRIBUTE, False)
+        ):
+            return False
+        return super().filter(record)
+
+
 def make_console_handler(cfg: LogConfig):
     stream = sys.stdout
-    console_handler = logging.StreamHandler(stream=stream)
+    console_handler = ConsoleHandler(stream=stream)
     console_handler.name = "console_handler"
     console_handler.addFilter(thread_id_filter)
     fmt = ColoredPreciseTimeFormatter(
@@ -276,10 +308,34 @@ class LogQueueListenerProc(Process):
 def main_exception_hook(exc_type, exc_value, exc_traceback):
     logger.exception("Fatal unhandled main-thread exception: %s",
                      exc_value, exc_info=(exc_type, exc_value, exc_traceback))
+    _notify_fatal_exception("main-thread exception", exc_value)
 
 
 def thread_exception_hook(arg):
     logger.exception("Fatal unhandled thread exception: %s", arg.exc_value)
+    _notify_fatal_exception(f"thread exception ({arg.thread.name})", arg.exc_value)
+
+
+def register_fatal_exception_callback(callback):
+    with _fatal_exception_callbacks_lock:
+        if callback not in _fatal_exception_callbacks:
+            _fatal_exception_callbacks.append(callback)
+
+
+def unregister_fatal_exception_callback(callback):
+    with _fatal_exception_callbacks_lock:
+        if callback in _fatal_exception_callbacks:
+            _fatal_exception_callbacks.remove(callback)
+
+
+def _notify_fatal_exception(source, exception):
+    with _fatal_exception_callbacks_lock:
+        callbacks = tuple(_fatal_exception_callbacks)
+    for callback in callbacks:
+        try:
+            callback(source, exception)
+        except Exception:
+            logger.exception("Fatal-exception safety callback failed")
 
 
 def install_log_exception_hook():
@@ -659,9 +715,29 @@ def get_verbose_logger(name: Optional[str] = None) -> VerboseLoggerWithThreadId:
     return obj
 
 
+def log_hardware_initialization(
+    target_logger: logging.Logger,
+    message: str,
+    *args,
+    level: int = logging.INFO,
+    **kwargs,
+) -> None:
+    """Log a hardware-init milestone to every configured logging destination.
+
+    The record is tagged so it is always shown by :class:`ConsoleHandler`, but
+    it remains a normal logging record for the file logger, UI diagnostics, and
+    tests.  Callers should include a state such as START, READY, SKIP, or FAILED
+    in ``message`` so slow operations are easy to identify from a partial log.
+    """
+
+    extra = dict(kwargs.pop("extra", {}) or {})
+    extra[ALWAYS_CONSOLE_LOG_ATTRIBUTE] = True
+    target_logger.log(level, "HARDWARE INIT | " + message, *args, extra=extra, **kwargs)
+
+
 def get_log_file_location(*, log_base_dir: str = "", full_format: str):
     if not log_base_dir:
-        log_base_dir = Path.home().joinpath("Documents/RawDataLocal")
+        log_base_dir = Path.home().joinpath("Documents/rawdatalocal")
     else:
         log_base_dir = Path(log_base_dir)
 

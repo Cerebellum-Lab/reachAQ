@@ -35,7 +35,14 @@ omit =
 parallel = true
 # still needed
 
-sigterm = true
+# Off on purpose. With sigterm = true coverage saves its data from a Python SIGTERM
+# handler. In a child process that handler can deadlock on coverage's own data lock when
+# the signal lands during a traced call (coveragepy issue 2310, fix PR 2317 open on
+# 2026-11-05). Reproduced locally: multiprocessing's exit then joins that child forever and
+# the process never exits. That this caused the CI hang (run 40435350385) is likely, not shown.
+# Cost, measured on the CI suite: 21 more missed statements of 50927, in video_capture.py
+# (17) and nidaq_stream_autostart.py (4), presumably code run in children that SIGTERM kills.
+sigterm = false
 
 [report]
 show_missing = true

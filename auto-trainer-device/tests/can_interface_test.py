@@ -7,17 +7,21 @@ import pytest
 
 pytestmark = pytest.mark.canbus
 
-from autotrainer.device import (CanInterface, Target, Motor, Heartbeat, ServoConfig, StepperConfig,
+from autotrainer.device import (CanInterface, CanTransportConfiguration,
+                                Target, Motor, Heartbeat, ServoConfig, StepperConfig,
                                 DigitalOutputs, PelletDigitalInputs, Tone,
-                                AnalogOutputs, AnalogOutput, LoadCellReading,
-                                ColorLed, AudioData, DoorData, ServoStatus, StepperStatus,
-                                SensorStatus, target_of_motor, is_servo)
+                                AnalogOutputs, AnalogOutput,
+                                ColorLed, ServoStatus, StepperStatus,
+                                target_of_motor, is_servo)
 
 
 @pytest.fixture(scope="module")
 def interface():
     print(f"DEBUG: Loading Interface")
-    interface = CanInterface()
+    # Build the transport explicitly, the way tools/hardware/validate_can_hardware.py
+    # does. A bare CanInterface() takes the pyjerrycan default and cannot open a
+    # SocketCAN rig, whatever AUTOTRAINER_CAN_* says.
+    interface = CanInterface(can_transport=CanTransportConfiguration.from_environment())
 
     if not interface.open():
         pytest.fail("Failed to open CAN interface")
@@ -49,7 +53,6 @@ def test_simple_fixture(interface):
 
 @pytest.mark.parametrize("target", [
     Target.PELLET_DEVICE,
-    Target.MAGNET_DEVICE
 ])
 def test_heartbeat(interface: CanInterface, target: Target):
     print(f"DEBUG: test_heartbeat called with interface={interface}")
@@ -77,8 +80,6 @@ def _read_config(interface: CanInterface, motor: Motor):
 
 
 @pytest.mark.parametrize("motor", [
-    Motor.TUNNEL_MAGNET_SERVO,
-    Motor.TUNNEL_GATE_SERVO,
     Motor.PELLET_X_MOTOR,
     Motor.PELLET_Y_MOTOR,
     Motor.PELLET_Z_MOTOR,
@@ -90,8 +91,6 @@ def test_read_config(interface: CanInterface, motor: Motor):
 
 
 @pytest.mark.parametrize("motor", [
-    Motor.TUNNEL_MAGNET_SERVO,
-    Motor.TUNNEL_GATE_SERVO,
     Motor.PELLET_LOAD_SERVO,
     Motor.PELLET_COVER_SERVO,
 ])
@@ -188,6 +187,10 @@ def test_tone(interface: CanInterface, frequency_hz: int, duration_ms: int):
     assert tone.time_remaining_ms <= duration_ms, f"Tone generation not functional"
 
 
+@pytest.mark.skip(
+    reason="pellet firmware v2.1.0 removed analog_out/dac2; PA6 is now pressure sensor 2, "
+           "so the board neither answers ANALOG_OUT nor publishes analog-out status"
+)
 @pytest.mark.parametrize("value_mv", [
     1000,
     3000,
@@ -198,13 +201,6 @@ def test_analog_out(interface: CanInterface, value_mv: int):
 
     aout = _get_response(interface, AnalogOutput, Target.PELLET_DEVICE, sleep=1.0)
     assert aout.status_out_mv == value_mv, f"Failed to set analog output"
-
-
-def test_tare_load_cell(interface: CanInterface):
-    assert interface.tare_load_cell();
-
-    loadcell = _get_response(interface, LoadCellReading, Target.MAGNET_DEVICE, sleep=2.0)
-    assert abs(loadcell.load) <= 0.1, f"Failed to tare load cell"
 
 
 @pytest.mark.parametrize("red, green, blue", [
@@ -220,12 +216,8 @@ def test_color_led(interface: CanInterface, red: int, green: int, blue: int):
 
 
 @pytest.mark.parametrize("type_of, target", [
-    (AudioData, Target.MAGNET_DEVICE),
-    (DoorData, Target.PELLET_DEVICE),
     (ServoStatus, Target.PELLET_DEVICE),
-    (ServoStatus, Target.MAGNET_DEVICE),
     (StepperStatus, Target.PELLET_DEVICE),
-    (SensorStatus, Target.MAGNET_DEVICE),
 ])
 def test_streaming_data(interface: CanInterface, type_of, target):
     _get_response(interface, type_of, target)

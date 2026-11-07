@@ -1,18 +1,30 @@
 import logging
 import platform
 import sys
-from datetime import date, datetime
 from pathlib import Path
 from typing import Optional, Union
 
-from PySide6.QtCore import QCoreApplication, QSettings
+from PySide6.QtCore import QByteArray, QCoreApplication, QRect, QSettings
 
 from autotrainer.core import ObservableObject
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.configuration import SystemConfiguration
+from tools.acquisition.model.animal_metadata_sync import (
+    DEFAULT_SOFTMOUSE_MANIFEST_PATH,
+)
 
 
 logger = get_verbose_logger(__name__)
+
+
+def _laser_section_key(name: str) -> str:
+    """Where a Laser Control section's fold is saved, beside ui/splitters/."""
+    return f"ui/laser_control/sections/{name}"
+
+
+def _laser_command_output_key(channel_id: int) -> str:
+    """Where a laser's Command output choice is saved."""
+    return f"ui/laser_control/command_output/laser{int(channel_id)}"
 
 
 def get_default_configuration_location() -> Path:
@@ -21,9 +33,6 @@ def get_default_configuration_location() -> Path:
 
 def get_default_animals_location(default_config_location: Path) -> Path:
     return default_config_location.joinpath("animals")
-
-
-_date_format = "%Y%m%d"
 
 
 class UserPreferences(ObservableObject):
@@ -36,12 +45,11 @@ class UserPreferences(ObservableObject):
     SELECTED_ANIMAL = "selected_animal"
     ANIMAL_LOCATION = "animal_location"
     PELLET_PORT = "pellet_port"
-    TUNNEL_PORT = "tunnel_port"
-    REMOVE_RAW_DATA_WHEN_INACTIVE_SESSION = "remove_raw_data_when_inactive_session"
     MEASUREMENT_GRAPH = "measurement_graph"
-    PELLET_LOAD_COUNT_TOTAL = "pellet_load_count_total"
-    PELLET_LOAD_COUNT_DAY = "pellet_load_count_day"
-    CAGE_CLEAN_PREVIOUS_DAY = "cage_clean_previous_day"
+    SOFTMOUSE_MANIFEST_PATH = "softmouse_manifest_path"
+    SOFTMOUSE_NAME_COLUMN = "softmouse_name_column"
+    SOFTMOUSE_NIGHTLY_REFRESH = "softmouse_nightly_refresh"
+    WINDOW_NORMAL_GEOMETRY = "window_normal_geometry"
 
     def __init__(self, *, settings_file_path: Optional[Path] = None):
         super().__init__()
@@ -78,50 +86,129 @@ class UserPreferences(ObservableObject):
             "system/animal_location",
             get_default_animals_location(Path(self._configuration_location)).as_posix())  # noqa
 
-        self._selected_animal: str = settings.value("system/selected_animal", "")  # noqa
+        # Subject selection is session state. Never restore it when reachAQ starts,
+        # and remove the legacy persisted value so older installations also start
+        # with an empty subject.
+        self._selected_animal: str = ""
+        settings.remove("system/selected_animal")
 
         self._log_location: str = settings.value("system/log_location", "")  # noqa
         self._log_level: int = settings.value("system/log_level", logging.WARNING, int)  # noqa
 
-        self._pellet_load_count_total: int = settings.value("system/pellet_load_count_total", 0, int)  # noqa
-        self._pellet_load_count_day: int = settings.value("system/pellet_load_count_day", 0, int)  # noqa
-        today = self._cur_day = date.today()
-        today_str = today.strftime(_date_format)
-        prev_pellet_day = settings.value("system/pellet_load_count_day_date", "", str)
-        if today_str != prev_pellet_day:
-            logger.verbose("auto-setting pellet_load_count_day to 0 given previous day != today: %r",
-                           prev_pellet_day)
-            self._pellet_load_count_day = 0
-            settings.setValue("system/pellet_load_count_day", 0)
-            settings.setValue("system/pellet_load_count_day_date", today_str)
-
-        cage_clean_prev_day_str = settings.value("system/cage_clean_previous_day", "", str)
-        if cage_clean_prev_day_str != "":
-            try:
-                cage_clean_prev_day = datetime.strptime(cage_clean_prev_day_str, _date_format).date()
-            except Exception:
-                logger.verbose("Invalid date for cage_clean_previous_day: %s ; corrected to today", cage_clean_prev_day_str)
-                cage_clean_prev_day = today
-                settings.setValue("system/cage_clean_previous_day", today_str)
-        else:
-            cage_clean_prev_day = today
-            settings.setValue("system/cage_clean_previous_day", today_str)
-        self._cage_clean_prev_day = cage_clean_prev_day
-
         self._live_feed_refresh_rate: int = settings.value("display/refresh_rate", 15, int)  # noqa
         self._measurement_graph: str = settings.value("ui/measurement_graph", "")  # noqa
 
+        self._softmouse_manifest_path: str = (
+            settings.value(
+                "softmouse/manifest_path",
+                DEFAULT_SOFTMOUSE_MANIFEST_PATH.as_posix(),
+                str,
+            ).strip()
+            or DEFAULT_SOFTMOUSE_MANIFEST_PATH.as_posix()
+        )
+        self._softmouse_name_column: str = settings.value(
+            "softmouse/new_animal_name_column", "Physical Tag", str
+        )
+        self._softmouse_nightly_refresh: bool = settings.value(
+            "softmouse/nightly_refresh", True, bool
+        )
+        self._window_normal_geometry = QRect(
+            settings.value("ui/window_normal_geometry", QRect(), QRect)
+        )
         # Transient values that may come from individual configuration files, but are conveniently accessed from
         # the user preferences.
 
-        self._tunnel_port = None
         self._pellet_port = None
-
-        self._remove_raw_data_when_inactive_session: bool = False
 
     def save(self):
         logger.verbose("Saving ini config to %s", self._settings.fileName())
         self._settings.sync()
+
+    def splitter_state(self, name: str) -> QByteArray:
+        value = self._settings.value(f"ui/splitters/{name}", QByteArray())
+        if isinstance(value, QByteArray):
+            return value
+        return QByteArray(value) if value else QByteArray()
+
+    def set_splitter_state(self, name: str, state: QByteArray) -> None:
+        self._settings.setValue(f"ui/splitters/{name}", state)
+
+    def laser_section_expanded(self, name: str) -> Optional[bool]:
+        """Whether Laser Control's section `name` was left open; None if not saved."""
+        return self._saved_flag(_laser_section_key(name))
+
+    def set_laser_section_expanded(self, name: str, expanded: bool) -> None:
+        self._settings.setValue(_laser_section_key(name), bool(expanded))
+
+    def laser_command_output_shown(self, channel_id: int) -> Optional[bool]:
+        """Whether a laser's Command output trace was left shown; None if not saved."""
+        return self._saved_flag(_laser_command_output_key(channel_id))
+
+    def set_laser_command_output_shown(self, channel_id: int, shown: bool) -> None:
+        self._settings.setValue(_laser_command_output_key(channel_id), bool(shown))
+
+    def _saved_flag(self, key: str) -> Optional[bool]:
+        """A saved true or false, or None: nothing saved, or anything else.
+
+        Read untyped and judged here. Parsed from the file, true and false
+        come back as the str they are written as; only a value this process
+        set comes back a bool. A typed read would turn whatever else a
+        damaged or hand-edited file holds into a bool by rules of its own.
+        Never raises, so a bad file cannot stop a panel opening; it opens as
+        it would with nothing saved.
+        """
+        try:
+            value = self._settings.value(key)
+        except Exception as exc:
+            logger.warning("Could not read %s from the preferences: %s", key, exc)
+            return None
+        if isinstance(value, bool):
+            return value
+        text = value.strip().lower() if isinstance(value, str) else None
+        if text in ("true", "false"):
+            return text == "true"
+        if value is not None:
+            logger.warning("Ignoring %s = %r in the preferences: not true or false", key, value)
+        return None
+
+    @property
+    def window_normal_geometry(self) -> QRect:
+        return QRect(self._window_normal_geometry)
+
+    @window_normal_geometry.setter
+    def window_normal_geometry(self, value: QRect) -> None:
+        value = QRect(value)
+        if not value.isValid() or value.width() < 1 or value.height() < 1:
+            return
+        previous = self._window_normal_geometry
+        self._window_normal_geometry = value
+        self._settings.setValue("ui/window_normal_geometry", value)
+        self._on_property_changed(self.WINDOW_NORMAL_GEOMETRY, value, previous)
+
+    @property
+    def right_panel_state(self) -> str:
+        """Where the laser and protocol panel was left: docked, expanded or detached."""
+        value = self._settings.value("ui/panels/right_side_state", "docked")
+        return str(value) if value else "docked"
+
+    @right_panel_state.setter
+    def right_panel_state(self, value: str) -> None:
+        self._settings.setValue("ui/panels/right_side_state", str(value))
+
+    @property
+    def right_panel_detached_geometry(self) -> QRect:
+        value = self._settings.value(
+            "ui/panels/right_side_detached_geometry", QRect()
+        )
+        return QRect(value) if isinstance(value, QRect) else QRect()
+
+    @right_panel_detached_geometry.setter
+    def right_panel_detached_geometry(self, value: QRect) -> None:
+        value = QRect(value)
+        # A zero-size or invalid rectangle would restore an unusable window.
+        if not value.isValid() or value.width() < 1 or value.height() < 1:
+            return
+        self._settings.setValue("ui/panels/right_side_detached_geometry", value)
 
     @property
     def last_configuration(self) -> str:
@@ -177,7 +264,6 @@ class UserPreferences(ObservableObject):
     def selected_animal(self, value: str):
         # set new value first,
         prev, self._selected_animal = self._selected_animal, value
-        self._settings.setValue("system/selected_animal", value)
         # then eventually trigger the on_property_changed event:
         self._on_property_changed(self.SELECTED_ANIMAL, value, prev)
 
@@ -214,24 +300,6 @@ class UserPreferences(ObservableObject):
         self._on_property_changed(self.PELLET_PORT, value, prev)
 
     @property
-    def tunnel_port(self) -> str:
-        return self._tunnel_port
-
-    @tunnel_port.setter
-    def tunnel_port(self, value: str):
-        prev, self._tunnel_port = self._tunnel_port, value
-        self._on_property_changed(self.TUNNEL_PORT, value, prev)
-
-    @property
-    def remove_raw_data_when_inactive_session(self) -> bool:
-        return self._remove_raw_data_when_inactive_session
-
-    @remove_raw_data_when_inactive_session.setter
-    def remove_raw_data_when_inactive_session(self, value):
-        prev, self._remove_raw_data_when_inactive_session = self._remove_raw_data_when_inactive_session, value
-        self._on_property_changed(self.REMOVE_RAW_DATA_WHEN_INACTIVE_SESSION, value, prev)
-
-    @property
     def measurement_graph(self) -> str:
         return self._measurement_graph
 
@@ -242,40 +310,34 @@ class UserPreferences(ObservableObject):
         self._on_property_changed(self.MEASUREMENT_GRAPH, value, prev)
 
     @property
-    def pellet_load_count_total(self) -> int:
-        return self._pellet_load_count_total
+    def softmouse_manifest_path(self) -> str:
+        return self._softmouse_manifest_path
 
-    @pellet_load_count_total.setter
-    def pellet_load_count_total(self, value: int):
-        prev, self._pellet_load_count_total = self._pellet_load_count_total, value
-        self._settings.setValue("system/pellet_load_count_total", value)
-        self._on_property_changed(self.PELLET_LOAD_COUNT_TOTAL, value, prev)
-
-    @property
-    def pellet_load_count_day(self) -> int:
-        today = date.today()
-        if today != self._cur_day:
-            self._cur_day = today
-            self.pellet_load_count_day = 0
-            self._settings.setValue("system/pellet_load_count_day_date", today.strftime(_date_format))
-        return self._pellet_load_count_day
-
-    @pellet_load_count_day.setter
-    def pellet_load_count_day(self, value: int):
-        today = date.today()
-        if today != self._cur_day:
-            self._cur_day = today
-            self._settings.setValue("system/pellet_load_count_day_date", today.strftime(_date_format))
-        prev, self._pellet_load_count_day = self._pellet_load_count_day, value
-        self._settings.setValue("system/pellet_load_count_day", value)
-        self._on_property_changed(self.PELLET_LOAD_COUNT_DAY, value, prev)
+    @softmouse_manifest_path.setter
+    def softmouse_manifest_path(self, value: str) -> None:
+        value = value.strip() or DEFAULT_SOFTMOUSE_MANIFEST_PATH.as_posix()
+        prev, self._softmouse_manifest_path = self._softmouse_manifest_path, value
+        self._settings.setValue("softmouse/manifest_path", self._softmouse_manifest_path)
+        self._on_property_changed(self.SOFTMOUSE_MANIFEST_PATH, self._softmouse_manifest_path, prev)
 
     @property
-    def cage_clean_previous_day(self) -> date:
-        return self._cage_clean_prev_day
+    def softmouse_name_column(self) -> str:
+        return self._softmouse_name_column
 
-    @cage_clean_previous_day.setter
-    def cage_clean_previous_day(self, value: date):
-        prev, self._cage_clean_prev_day = self._cage_clean_prev_day, value
-        self._settings.setValue("system/cage_clean_previous_day", value.strftime(_date_format))
-        self._on_property_changed(self.CAGE_CLEAN_PREVIOUS_DAY, value, prev)
+    @softmouse_name_column.setter
+    def softmouse_name_column(self, value: str) -> None:
+        value = value.strip() or "Physical Tag"
+        prev, self._softmouse_name_column = self._softmouse_name_column, value
+        self._settings.setValue("softmouse/new_animal_name_column", value)
+        self._on_property_changed(self.SOFTMOUSE_NAME_COLUMN, value, prev)
+
+    @property
+    def softmouse_nightly_refresh(self) -> bool:
+        return self._softmouse_nightly_refresh
+
+    @softmouse_nightly_refresh.setter
+    def softmouse_nightly_refresh(self, value: bool) -> None:
+        value = bool(value)
+        prev, self._softmouse_nightly_refresh = self._softmouse_nightly_refresh, value
+        self._settings.setValue("softmouse/nightly_refresh", value)
+        self._on_property_changed(self.SOFTMOUSE_NIGHTLY_REFRESH, value, prev)

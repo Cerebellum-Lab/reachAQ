@@ -10,7 +10,7 @@ from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core import (ObservableObject, SystemMessageHandler, SystemCommandKind, MessageHandler, Motor,
                               EventManager, Offset3DTuple, MotorConfigurations, SystemStatusMessageKind)
 from autotrainer.core.logging import get_verbose_logger
-from autotrainer.device import (CanDevice, MotorConfigurationFile, DeviceConnection, CompoundMovements)
+from autotrainer.device import (CanDevice, MotorConfigurationFile, DeviceConnection, CompoundMovements, Target)
 
 from tools.pellet_delivery.model.user_settings import UserSettings
 
@@ -58,13 +58,6 @@ class AppModel(ObservableObject):
         self._send_z = None
         self._load_arm = None
         self._cover_arm = None
-        self._tunnel_fan = None
-
-        self._front_door = None
-        self._panel_door = None
-        self._spare_door = None
-        self._ext_button = None
-
         self._stimuli = None
         self._color_led = None
         self._config = None
@@ -207,14 +200,6 @@ class AppModel(ObservableObject):
         self._cover_arm = self._on_property_changed("cover_arm", value, self._cover_arm)
 
     @property
-    def tunnel_fan(self):
-        return self._tunnel_fan
-
-    @tunnel_fan.setter
-    def tunnel_fan(self, value):
-        self._tunnel_fan = self._on_property_changed("tunnel_fan", value, self._tunnel_fan)
-
-    @property
     def travel_limits(self):
         return self._travel_limits
 
@@ -231,42 +216,6 @@ class AppModel(ObservableObject):
     def command_pending(self, value):
         self._command_pending = self._on_property_changed("command_pending", value,
                                                           self._command_pending)
-
-    @property
-    def front_door(self):
-        return self._front_door
-
-    @front_door.setter
-    def front_door(self, value):
-        self._front_door = self._on_property_changed(MessageHandler.FRONT_DOOR_PROPERTY, value,
-                                                     self._front_door)
-
-    @property
-    def panel_door(self):
-        return self._panel_door
-
-    @panel_door.setter
-    def panel_door(self, value):
-        self._panel_door = self._on_property_changed(MessageHandler.DRAWER_DOOR_PROPERTY, value,
-                                                     self._panel_door)
-
-    @property
-    def spare_door(self):
-        return self._spare_door
-
-    @spare_door.setter
-    def spare_door(self, value):
-        self._spare_door = self._on_property_changed(MessageHandler.SPARE_DOOR_PROPERTY, value,
-                                                     self._spare_door)
-
-    @property
-    def ext_button(self):
-        return self._ext_button
-
-    @ext_button.setter
-    def ext_button(self, value):
-        self._ext_button = self._on_property_changed(MessageHandler.EXT_BUTTON_PROPERTY, value,
-                                                     self._ext_button)
 
     @property
     def stimuli(self):
@@ -346,7 +295,11 @@ class AppModel(ObservableObject):
             self._device_connection.use_compound_movements(movements)
 
     def connect_to_device(self):
-        self._device_connection = DeviceConnection(CanDevice(), self._message_handler.input_queue, name="pellet-can")
+        self._device_connection = DeviceConnection(
+            CanDevice(required_targets=(Target.PELLET_DEVICE,)),
+            self._message_handler.input_queue,
+            name="pellet-can",
+        )
         self._device_connection.request_connect()
         self._send_command(SystemCommandKind.REQUEST_VERSION)
         #
@@ -429,16 +382,6 @@ class AppModel(ObservableObject):
             self.load_arm = value
         elif name == MessageHandler.COVER_ARM_ANGLE_PROPERTY:
             self.cover_arm = value
-        elif name == MessageHandler.TUNNEL_FAN_PROPERTY:
-            self.tunnel_fan = value
-        elif name == MessageHandler.FRONT_DOOR_PROPERTY:
-            self.front_door = value
-        elif name == MessageHandler.DRAWER_DOOR_PROPERTY:
-            self.panel_door = value
-        elif name == MessageHandler.SPARE_DOOR_PROPERTY:
-            self.spare_door = value
-        elif name == MessageHandler.EXT_BUTTON_PROPERTY:
-            self.ext_button = value
         elif name == MessageHandler.STIMULI_PROPERTY:
             self.stimuli = value
         elif name == MessageHandler.CONFIG_PROPERTY:
@@ -468,8 +411,3 @@ class AppModel(ObservableObject):
         if self._device_connection is not None:
             self._device_connection.send_message(message, data, context)
 
-    def set_tunnel_fan_on(self):
-        return self._send_command(SystemCommandKind.TUNNEL_FAN_ON, context=uuid.uuid4())
-
-    def set_tunnel_fan_off(self):
-        return self._send_command(SystemCommandKind.TUNNEL_FAN_OFF, context=uuid.uuid4())

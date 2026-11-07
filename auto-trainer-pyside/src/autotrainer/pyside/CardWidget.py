@@ -10,7 +10,7 @@ from .CardFooter import CardFooter
 from .CardHeader import CardHeader
 from .StackedContent import StackedWidget
 
-_DEFAULT_STYLE = "border-color: #ddd; border-width: 1px; border-style: solid; border-radius: 6px;"
+_DEFAULT_STYLE = "border-color: #c9cdd3; border-width: 1px; border-style: solid; border-radius: 4px;"
 
 
 class CardWidget(QWidget):

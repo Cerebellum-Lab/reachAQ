@@ -22,11 +22,15 @@ class CoverServoStatus(int, enum.Enum):
 class RecordingEndingReason(str, enum.Enum):
 
     NA = "NA"
+    MANUAL_STOP = "ManualStop"
+    MANUAL_ABORT = "ManualAbort"
+    DURATION_LIMIT = "DurationLimit"
+    TRIAL_LIMIT = "TrialLimit"
+    PROTOCOL_COMPLETE = "ProtocolComplete"
+    STOP_DRAIN_TIMEOUT = "StopDrainTimeout"
+    STORAGE_LIMIT = "StorageLimit"
+    REQUIRED_SOURCE_FAILURE = "RequiredSourceFailure"
     ALGO_PAUSED = "AlgoPaused"
-    EXIT_TUNNEL = "ExitTunnel"
-    PELLET_LOADING = "PelletLoading"
-    MISSING_ANIMAL_ACTIVITY_TIMEOUT = "MissingAnimalActivityTimeout"
-    MOTOR_DRIFT_HOMING = "MotorDriftHoming"
 
 
 class CaptureAnalysisResult(str, enum.Enum):
@@ -144,9 +148,22 @@ class PelletHardwareProtocol(Protocol):
         :return: A token to expect from the device message handler when the request is complete.
         """
 
-    def send_pellet(self) -> Optional[UUID]:
+    def send_pellet(
+        self,
+        *,
+        embedded_tone=None,
+        pre_reveal_stimulus=None,
+    ) -> Optional[UUID]:
         """
         Request a move from the current position to the "send" location stored in the hardware.
+
+        ``embedded_tone`` optionally requests a frequency/duration pair inside
+        the same board-owned compound sequence.
+
+        ``pre_reveal_stimulus`` optionally requests a finite pulse and
+        board-owned delay before pellet reveal in that sequence, as
+        ``(delay_ms, pulse_us, board STIM line)``: the trial laser's own line,
+        STIM2 or STIM3. Two elements, without the line, mean STIM3.
 
         :return: A token to expect from the device message handler when the request is complete.
         """
@@ -178,71 +195,16 @@ class PelletHardwareProtocol(Protocol):
     def set_auto_correct_motor_drift(self, enabled: bool):
         """Set autocorrect motor drift"""
 
-    def set_tunnel_fan_on(self) -> Optional[UUID]:
-        """Turn ON tunnel FAN"""
-
-    def set_tunnel_fan_off(self) -> Optional[UUID]:
-        """Turn OFF tunnel FAN"""
-
 
 class TunnelHardwareProtocol(Protocol):
+    """Empty compatibility type for the installed training package.
+
+    ReachAQ no longer implements or supplies tunnel/head-fix hardware. The
+    external training package still imports this type while accepting ``None``
+    for the corresponding attachment.
     """
-    Defines the expected set of commands and properties from the tunnel device that are used as part of the
-    behavior algorithm and state machine.
-    """
-
-    @property
-    def head_magnet_intensity(self) -> Optional[float]:
-        """
-        Return the current head magnet position.
-        """
-
-    def update_head_magnet_intensity(self, position: float) -> Optional[UUID]:
-        """
-        Request an update to the head magnet position.
-
-        Args:
-            position: The % position [0, 100] to set the head magnet.
-
-        Returns:
-            A token to expect from the device message handler when the request is complete.
-        """
-
-    def open_tunnel_gate(self) -> Optional[UUID]:
-        """
-        Request the tunnel gate to open.
-
-        Returns:
-            A token to expect from the device message handler when the request is complete.
-        """
-
-    def close_tunnel_gate(self) -> Optional[UUID]:
-        """
-        Request the tunnel gate to close.
-
-        Returns:
-            A token to expect from the device message handler when the request is complete.
-        """
-
-    def tare_load_cell(self) -> Optional[UUID]:
-        """
-        Request the load cell perform a tare operation.
-
-        Returns:
-            A token to expect from the device message handler when the request is complete.
-        """
 
 #
-
-class BatchAnalysisStartingEvent:
-    def __call__(self, *, batch_len: int):
-        """When a session batch analysis starts"""
-
-
-class BatchAnalysisEndingEvent:
-    def __call__(self, *, failed_count: int):
-        """When a session batch analysis is finished"""
-
 
 class BehaviorAlgoEvents:
     """Define the behavior algo events and their signature"""
@@ -254,9 +216,6 @@ class BehaviorAlgoEvents:
     session_capture_ending = EventHandler[Callable[[RecordingEndingReason], None]]
 
     session_processing_starting = EventHandler[Callable[[], None]]
-
-    batch_analysis_starting = EventHandler[BatchAnalysisStartingEvent]
-    batch_analysis_ending = EventHandler[BatchAnalysisEndingEvent]
 
     session_ending = EventHandler[Callable[[ProjectInfo, CaptureAnalysisResult], None]]
 
@@ -294,27 +253,6 @@ class BehaviorAlgorithmProtocol(ObservableObjectProtocol, Protocol):
     @pellet_hands_min_distance.setter
     def pellet_hands_min_distance(self, value: float): ...
 
-    # autoclamp / headfix:
-    @property
-    def head_fixation_enabled(self) -> bool: ...
-    @head_fixation_enabled.setter
-    def head_fixation_enabled(self, value: bool): ...
-
-    @property
-    def auto_clamp_no_activity_release_delay(self) -> float: ...
-    @auto_clamp_no_activity_release_delay.setter
-    def auto_clamp_no_activity_release_delay(self, value: float): ...
-
-    @property
-    def auto_clamp_release_load_count(self) -> int: ...
-    @auto_clamp_release_load_count.setter
-    def auto_clamp_release_load_count(self, value: int): ...
-
-    @property
-    def baseline_intensity(self) -> float: ...
-    @baseline_intensity.setter
-    def baseline_intensity(self, value: float): ...
-
     @property
     def trial_reaches(self) -> List[ReachEvent]:
         """The list of reaches of the previously analyzed trial"""
@@ -329,13 +267,13 @@ class BehaviorAlgorithmProtocol(ObservableObjectProtocol, Protocol):
     session_starting_before_record_start: BehaviorAlgoEvents.session_starting_before_record_start
 
     session_starting: BehaviorAlgoEvents.session_starting
-    """Emitted when a new trial recording starts"""
+    """Emitted when a new recording session starts"""
 
     session_capture_ending: BehaviorAlgoEvents.session_capture_ending
-    """Emitted when a new trial recording ends"""
+    """Emitted when recording for the current session ends"""
 
     session_ending: BehaviorAlgoEvents.session_ending
-    """Emitted when a trial "full session" ended, this can have analysis processed or not"""
+    """Emitted when a session and its optional post-session analysis have ended"""
 
     pellets_presented_evt: BehaviorAlgoEvents.pellets_presented_evt
     """When a pellet is "presented" ; i.e: when it's arrived at deliver/send position"""

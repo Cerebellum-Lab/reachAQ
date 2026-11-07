@@ -249,30 +249,52 @@ def score_grid(points):
     return final_score
 
 
-def create_or_clean_directory(directory_path):
-    """
-    Creates the directory if it does not exist. 
-    If the directory exists, it removes all files inside it.
+_GENERATED_CALIBRATION_DIRECTORIES = frozenset(
+    {"corners", "gray", "rejected", "camera_matrix"}
+)
 
-    Args:
-    directory_path (str): The path of the directory to create or clean.
+
+def create_or_clean_directory(directory_path, *, calibration_root=None):
+    """Create or clean one approved generated calibration child directory.
+
+    Source images, configuration, and unrelated children of the selected
+    calibration root are never candidates for deletion.
     """
-    # Check if the directory exists
-    if os.path.exists(directory_path):
-        # If the directory exists, remove all files inside it
-        for filename in os.listdir(directory_path):
-            file_path = os.path.join(directory_path, filename)
-            try:
-                if os.path.isfile(file_path) or os.path.islink(file_path):
-                    os.unlink(file_path)  # Remove the file or symbolic link
-                elif os.path.isdir(file_path):
-                    shutil.rmtree(file_path)  # Remove the directory and its contents
-            except Exception as e:
-                print(f"Failed to delete {file_path}. Reason: {e}")
-    else:
-        # If the directory does not exist, create it
-        os.makedirs(directory_path)
-        print(f"Directory created: {directory_path}")
+
+    target = Path(directory_path).absolute()
+    root = (
+        target.parent
+        if calibration_root is None
+        else Path(calibration_root).absolute()
+    )
+    if root.is_symlink():
+        raise ValueError(f"Calibration source root cannot be a symbolic link: {root}")
+    if target.is_symlink():
+        raise ValueError(f"Generated calibration directory cannot be a symbolic link: {target}")
+    resolved_root = root.resolve(strict=False)
+    resolved_target = target.resolve(strict=False)
+    if target.name not in _GENERATED_CALIBRATION_DIRECTORIES:
+        raise ValueError(f"Refusing to clean unapproved calibration directory: {target}")
+    if resolved_target.parent != resolved_root:
+        raise ValueError(
+            f"Generated calibration directory is outside the selected root: {target}"
+        )
+    if not root.exists() or not root.is_dir():
+        raise ValueError(f"Calibration source root is not a directory: {root}")
+
+    target.mkdir(mode=0o755, exist_ok=True)
+    if target.is_symlink() or target.resolve(strict=True).parent != resolved_root:
+        raise ValueError(f"Generated calibration directory changed unsafely: {target}")
+    for child in tuple(target.iterdir()):
+        # Revalidate the destructive boundary immediately before each removal.
+        if target.is_symlink() or target.resolve(strict=True).parent != resolved_root:
+            raise ValueError(f"Generated calibration directory changed unsafely: {target}")
+        if child.is_symlink() or child.is_file():
+            child.unlink()
+        elif child.is_dir():
+            shutil.rmtree(child)
+        else:
+            raise ValueError(f"Unsupported generated calibration entry: {child}")
 
 def refine_corners(image, initial_corner, window_size):
     
@@ -469,11 +491,11 @@ def create_corner_matrix(src_dir, num_frames: Optional[int] = 50, gamma=1, camer
     
     # Clear directories
     path_corners = os.path.join(src_dir,'corners')
-    create_or_clean_directory(path_corners)
+    create_or_clean_directory(path_corners, calibration_root=src_dir)
     dir_gray = os.path.join(src_dir,'gray')
-    create_or_clean_directory(dir_gray)
+    create_or_clean_directory(dir_gray, calibration_root=src_dir)
     dir_rejected = os.path.join(src_dir,'rejected')
-    create_or_clean_directory(dir_rejected)
+    create_or_clean_directory(dir_rejected, calibration_root=src_dir)
     
     # Termination criteria
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
@@ -667,7 +689,7 @@ def create_corner_matrix(src_dir, num_frames: Optional[int] = 50, gamma=1, camer
     # Perform calibration for each cameras and store the matrices as a pickle file
     if calibrate == True:
         path_camera_matrix = os.path.join(src_dir,'camera_matrix')
-        create_or_clean_directory(path_camera_matrix)
+        create_or_clean_directory(path_camera_matrix, calibration_root=src_dir)
         # Calibrating each camera
         for cam in cam_names:
             ret, mtx, dist, rvec, tvec = cv2.calibrateCamera(

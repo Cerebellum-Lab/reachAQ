@@ -1,0 +1,19 @@
+[Unit]
+Description=Publish a complete SoftMouse animal export for reachAQ
+# Install this user unit on the single designated publisher computer only.
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/isilon
+
+[Service]
+Type=oneshot
+# Support the Anaconda, Miniconda, and Mambaforge locations recognized by the
+# portable installer. /usr/bin/env resolves conda using this explicit path.
+Environment="PATH=%h/anaconda3/bin:%h/miniconda3/bin:%h/mambaforge/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/usr/bin/env conda run --no-capture-output -n reachaq python -m tools.softmouse_sync.cli
+WorkingDirectory=%h/Documents/reachAQ
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -38,7 +38,8 @@ AEF = AlmostEqualFloat
 
 
 def _init_t_presented_released(self: ProjectInfo):
-    self.t_pellet_delivered = self.t_pellet_presented = 0
+    self.first_pellet_delivery_offset = 0
+    self.first_pellet_presentation_offset = 0
 
 
 class _ProjectInfo(ProjectInfo):
@@ -179,6 +180,7 @@ def test_fp_and_xp_not_same(project_info, caplog):
     project_info.root = this_dir.joinpath("fp-and-xp-not-same").as_posix()
     project_info.device_id = "agx001"
     project_info.when = datetime(2025, 6, 23)
+    project_info.camera_names = ("left", "right")
     caplog.set_level(verboselogs.VERBOSE)
     res = intersession_process(
         project_info,
@@ -203,6 +205,7 @@ def test_agx001_20250806_59(project_info, caplog):
     project_info.root = this_dir.joinpath("index_error").as_posix()
     project_info.device_id = "agx001"
     project_info.when = datetime(2025, 8, 6)
+    project_info.camera_names = ("left", "right")
     caplog.set_level(verboselogs.VERBOSE)
     # with pytest.raises(IndexError, match="fp and xp are not of the same length"):
     # previously was raising an index error, but is now fixed.
@@ -253,6 +256,7 @@ def agx001_20251015_15(project_info):
     project_info.session = 15
     project_info.device_id = "agx001"
     project_info.when = datetime(2025, 10, 15)
+    project_info.camera_names = ("left", "right")
     return project_info
 
 
@@ -291,8 +295,7 @@ agx001_20260205_11_project_info = ProjectInfo(
     device_id="agx001",
     session=11,
     when=datetime(2026, 2, 5),
-    camera_1="left",
-    camera_2="right",
+    camera_names=("left", "right"),
 )
 
 
@@ -304,24 +307,7 @@ def test_agx001_20260205_11():
 @pytest.mark.parametrize("frames_per_batch_per_cam,select_frames_method", [
     # (1, "last_one"),
     (2, "all_most_likely"),  # using most likely looks better here
-    pytest.param(2, "last_one", marks=pytest.mark.xfail),
-    # so the second pair of frames give missing L_Hand in locations:
-    #
-    #         elif isinstance(obj1, dict) and isinstance(obj2, dict):
-    # >           assert set(obj1) == set(obj2)
-    # E           AssertionError: assert {'Diamond', 'LH_flat', 'Triangle', 'Mouth', 'Pellet', 'Star', 'Nose'} \
-    #               == {'L_Hand', 'Diamond', 'LH_flat', 'Mouth', 'Star', 'Triangle', 'Nose', 'Pellet'}
-    # E             Full diff:
-    # E               {
-    # E                   'Diamond',
-    # E                   'LH_flat',
-    # E             -     'L_Hand',
-    # E                   'Mouth',
-    # E                   'Nose',
-    # E                   'Pellet',
-    # E                   'Star',
-    # E                   'Triangle',
-    # E               }
+    (2, "last_one"),
 
     # (3, "last_one"),
     (3, "all_most_likely"),

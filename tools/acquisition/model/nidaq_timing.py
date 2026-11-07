@@ -1,0 +1,892 @@
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+from typing import Iterable, Mapping, Optional, Sequence
+
+from autotrainer.core import (
+    NidaqDeviceIdentity,
+    NidaqSignalStreamConfiguration,
+    NidaqTimingConfiguration,
+    NidaqTimingPlan,
+    NidaqTimingRoute,
+    NidaqTaskGraph,
+    NidaqTaskSpecification,
+)
+from autotrainer.core.configuration.laser_configuration import pxi_trig_line
+from autotrainer.core.configuration.nidaq_port_configuration import slave_input_timing
+from tools.acquisition.model.nidaq_discovery import (
+    NidaqDevicePorts,
+    device_name_from_channel,
+)
+from tools.acquisition.model.nidaq_validation import (
+    free_backplane_line,
+    unclockable_digital_input,
+)
+
+
+def build_nidaq_timing_plan(
+    configuration: NidaqSignalStreamConfiguration,
+    timing: NidaqTimingConfiguration,
+    devices: Sequence[NidaqDevicePorts],
+    *,
+    hardware_timed_output_devices: Iterable[str] = tuple(),
+    hardware_timed_output_channels: Iterable[str] = tuple(),
+    laser=None,
+) -> NidaqTimingPlan:
+    """The timing plan for these inputs on these boards.
+
+    `laser`, the laser configuration, is read only for its backplane lines:
+    a refusal for a missing export line suggests one the laser does not take.
+    """
+    discovered = {device.name: device for device in devices}
+    input_devices = tuple(dict.fromkeys(
+        device_name
+        for channel in configuration.channels
+        for device_name in (device_name_from_channel(channel.physical_channel),)
+        if device_name is not None
+    ))
+    output_channels = tuple(dict.fromkeys(
+        str(channel) for channel in hardware_timed_output_channels if channel
+    ))
+    output_devices = tuple(dict.fromkeys(
+        device_name
+        for device_name in (
+            *hardware_timed_output_devices,
+            *(device_name_from_channel(channel) for channel in output_channels),
+        )
+        if device_name
+    ))
+    active_devices = tuple(dict.fromkeys((*input_devices, *output_devices)))
+    if len(active_devices) > 2:
+        return _invalid_plan(
+            timing,
+            "This release supports at most two active NI-DAQ devices in one "
+            f"timing graph; configured devices: {', '.join(active_devices)}",
+        )
+    missing = tuple(name for name in active_devices if name not in discovered)
+    if missing:
+        return _invalid_plan(
+            timing,
+            "Configured NI-DAQ device(s) unavailable: " + ", ".join(missing),
+        )
+    if not active_devices:
+        return _invalid_plan(timing, "No hardware-timed NI-DAQ tasks are configured")
+    channel_error = _validate_channels_and_rates(
+        configuration,
+        discovered,
+    )
+
+    try:
+        master = _select_master(
+            timing.timing_master,
+            active_devices,
+            input_devices,
+            configuration,
+            discovered,
+        )
+    except ValueError as exc:
+        return _invalid_plan(timing, channel_error or str(exc))
+    if channel_error:
+        # With the master a valid plan would have had, so that what reads the
+        # clock's board off a refused plan, Run's laser route check, gets this
+        # choice rather than a guess (nidaq_validation.refused_plan_clock_source).
+        return _invalid_plan(timing, channel_error, master=master)
+
+    slaves = tuple(device for device in active_devices if device != master)
+    task_start_order = (*slaves, master)
+    master_has_analog_input = any(
+        device_name_from_channel(channel.physical_channel) == master
+        for channel in configuration.analog_channels
+    )
+    clock_producer = "ai" if master_has_analog_input else "counter"
+    output_status = (
+        "declared_not_armed" if output_devices else "not_configured"
+    )
+    output_reason = (
+        "Hardware output devices participate in route validation, but no finite "
+        "output waveform is armed by the input-stream timing plan"
+        if output_devices else ""
+    )
+    resolved_devices = _resolved_device_identities(
+        active_devices,
+        discovered,
+    )
+    if not slaves:
+        plan = NidaqTimingPlan(
+            requested_mode=timing.sync_mode,
+            resolved_mode="same_device",
+            is_valid=True,
+            master_device=master,
+            task_start_order=task_start_order,
+            resolved_devices=resolved_devices,
+            synchronization_quality="hardware_same_device",
+            clock_producer=clock_producer,
+            clock_producer_device=master,
+            consumer_devices=input_devices,
+            hardware_output_devices=output_devices,
+            hardware_output_timing_status=output_status,
+            hardware_output_timing_reason=output_reason,
+            reason="All sampled tasks use one NI-DAQ device",
+        )
+        return _with_task_graph(plan, configuration, timing, output_devices, output_channels)
+
+    if timing.sync_mode == "independent":
+        # Always valid now. Asking for independent boards while requiring
+        # hardware synchronization is refused where it is written, so it
+        # cannot arrive here to be turned into an invalid plan with a reason
+        # three layers from its cause.
+        valid = True
+        plan = NidaqTimingPlan(
+            requested_mode=timing.sync_mode,
+            resolved_mode="independent",
+            is_valid=valid,
+            master_device=master,
+            slave_devices=slaves,
+            task_start_order=task_start_order,
+            resolved_devices=resolved_devices,
+            synchronization_quality="independent_host_estimated",
+            clock_producer=clock_producer,
+            clock_producer_device=master,
+            consumer_devices=input_devices,
+            hardware_output_devices=output_devices,
+            hardware_output_timing_status=output_status,
+            hardware_output_timing_reason=output_reason,
+            reason=(
+                "Independent device clocks are diagnostic-only"
+                if not valid
+                else "Independent device clocks explicitly allowed"
+            ),
+        )
+        return _with_task_graph(plan, configuration, timing, output_devices, output_channels)
+
+    active_capabilities = tuple(discovered[name] for name in active_devices)
+    common_pxi_backplane = _has_common_pxi_backplane(active_capabilities)
+    requested = timing.sync_mode
+    if requested == "backplane" and not common_pxi_backplane:
+        return _invalid_plan(
+            timing,
+            "Backplane synchronization requested, but active devices do not "
+            "share a discoverable PXI chassis",
+            master=master,
+            slaves=slaves,
+        )
+    if common_pxi_backplane and any(
+        device.digital_trigger_supported is False
+        for device in active_capabilities
+    ):
+        return _invalid_plan(
+            timing,
+            "Backplane synchronization requires digital trigger support on "
+            "every active NI-DAQ device",
+            master=master,
+            slaves=slaves,
+        )
+
+    use_external = requested == "external"
+    if requested == "auto":
+        use_external = not common_pxi_backplane
+    if use_external and not (
+        timing.start_trigger_source and timing.sample_clock_source
+    ):
+        return _invalid_plan(
+            timing,
+            "No deterministic shared NI-DAQ timing route is available; configure "
+            "external start-trigger and sample-clock terminals",
+            master=master,
+            slaves=slaves,
+        )
+
+    if use_external:
+        reference_clock = timing.reference_clock_source
+        start_trigger = timing.start_trigger_source
+        sample_clock = timing.sample_clock_source
+        resolved_mode = "external"
+        quality = "hardware_external"
+        clock_producer = "external"
+    else:
+        # C6. Derived rather than a constant. PXI_CLK10 exists because a
+        # PXI backplane distributes it; on boards that share no backplane
+        # there is no such terminal to name, and naming it anyway was the
+        # defect this started from - a PXI-6713 with no Clk10 at all, failing
+        # at -200452 and taking the signal stream with it. An explicit value
+        # is still honoured and still validated the same way.
+        reference_clock = timing.reference_clock_source or (
+            "PXI_CLK10" if common_pxi_backplane else None)
+        start_trigger = timing.start_trigger_source or (
+            f"/{master}/ai/StartTrigger" if master_has_analog_input else None
+        )
+        sample_clock = timing.sample_clock_source or (
+            f"/{master}/ai/SampleClock"
+            if master_has_analog_input
+            else f"/{master}/Ctr0InternalOutput"
+        )
+        resolved_mode = "backplane"
+        quality = "hardware_backplane"
+
+    unavailable_terminal = next(
+        (
+            terminal
+            for terminal in (
+                reference_clock,
+                start_trigger,
+                sample_clock,
+            )
+            if terminal
+            and not _terminal_is_discoverable(
+                terminal,
+                active_capabilities,
+                allow_pxi_clock=common_pxi_backplane,
+            )
+        ),
+        None,
+    )
+    if unavailable_terminal is not None:
+        return _invalid_plan(
+            timing,
+            f"Configured NI-DAQ timing terminal is not exposed by discovery: "
+            f"{unavailable_terminal}",
+            master=master,
+            slaves=slaves,
+        )
+    line_refusal = (
+        _backplane_line_refusal(
+            configuration, timing, master, slaves, master_has_analog_input, laser)
+        if resolved_mode == "backplane" else None
+    )
+    if line_refusal is not None:
+        return _invalid_plan(timing, line_refusal, master=master, slaves=slaves)
+
+    routes = tuple(
+        NidaqTimingRoute(signal, source, destinations)
+        for signal, source, destinations in (
+            (
+                "reference_clock",
+                reference_clock,
+                tuple(f"/{slave}/ReferenceClock" for slave in slaves),
+            ),
+            (
+                "start_trigger",
+                start_trigger,
+                tuple(f"/{slave}/StartTrigger" for slave in slaves),
+            ),
+            (
+                "sample_clock",
+                sample_clock,
+                tuple(f"/{slave}/SampleClock" for slave in slaves),
+            ),
+        )
+        if source and destinations
+    ) + tuple(timing.external_routes)
+    plan = NidaqTimingPlan(
+        requested_mode=requested,
+        resolved_mode=resolved_mode,
+        is_valid=True,
+        master_device=master,
+        slave_devices=slaves,
+        reference_clock_source=reference_clock,
+        reference_clock_rate_hz=10_000_000.0 if reference_clock == "PXI_CLK10" else None,
+        # The clock named above is the stream's own, so its rate is the
+        # stream's too, and anything clocked by it runs at this rate.
+        sample_clock_rate_hz=configuration.sample_rate_hz,
+        sample_clock_source=sample_clock,
+        start_trigger_source=start_trigger,
+        sample_clock_export_terminal=timing.sample_clock_export_terminal,
+        start_trigger_export_terminal=timing.start_trigger_export_terminal,
+        routes=routes,
+        task_start_order=task_start_order,
+        resolved_devices=resolved_devices,
+        synchronization_quality=quality,
+        clock_producer=clock_producer,
+        clock_producer_device=(None if clock_producer == "external" else master),
+        consumer_devices=input_devices,
+        hardware_output_devices=output_devices,
+        hardware_output_timing_status=output_status,
+        hardware_output_timing_reason=output_reason,
+        reason=(
+            "Resolved shared PXI reference/start/sample timing"
+            if resolved_mode == "backplane"
+            else "Resolved explicitly configured external start/sample timing"
+        ),
+    )
+    return _with_task_graph(plan, configuration, timing, output_devices, output_channels)
+
+
+def _with_task_graph(plan, configuration, timing, output_devices, output_channels):
+    """Attach a stable, exact input-task graph to an already valid plan."""
+    tasks = []
+    device_order = tuple(plan.task_start_order)
+    transfer = dict(timing.transfer_mechanism_overrides)
+    for device in device_order:
+        analog = tuple(
+            channel.physical_channel
+            for channel in configuration.analog_channels
+            if device_name_from_channel(channel.physical_channel) == device
+        )
+        digital = tuple(
+            channel.physical_channel
+            for channel in configuration.digital_channels
+            if device_name_from_channel(channel.physical_channel) == device
+        )
+        # A slave's own names for the master's clock and trigger: the
+        # backplane lines in backplane mode (slave_input_timing). A slave
+        # whose tasks a multidevice task takes over may have none, and records
+        # the master's, as before.
+        if device == plan.master_device:
+            clock_source = trigger_source = None
+            digital_clock = (plan.sample_clock_source if analog
+                             else f"/{device}/Ctr0InternalOutput")
+        else:
+            own_clock, own_trigger = slave_input_timing(plan, device)
+            clock_source = own_clock or plan.sample_clock_source
+            trigger_source = own_trigger or plan.start_trigger_source
+            # Beside an analog task on its own board, a slave's digital task
+            # runs on that task's clock, as the stream clocks it. Only for a
+            # slave that takes its timing over a configured backplane line,
+            # where the slave's names are new; any other keeps the shared
+            # clock the graph always recorded (pinned).
+            digital_clock = (
+                f"/{device}/ai/SampleClock"
+                if analog and plan.resolved_mode == "backplane" and own_clock
+                else clock_source)
+        if analog:
+            tasks.append(NidaqTaskSpecification(
+                task_id=f"{device}.ai",
+                device=device,
+                subsystem="ai",
+                channels=analog,
+                mode="continuous_input",
+                sample_clock_source=clock_source,
+                start_trigger_source=trigger_source,
+                reference_clock_source=plan.reference_clock_source,
+                transfer_mechanism=transfer.get(f"{device}.ai"),
+            ))
+        if digital:
+            tasks.append(NidaqTaskSpecification(
+                task_id=f"{device}.di",
+                device=device,
+                subsystem="di",
+                channels=digital,
+                mode="continuous_input",
+                sample_clock_source=digital_clock,
+                start_trigger_source=trigger_source,
+                reference_clock_source=plan.reference_clock_source,
+                transfer_mechanism=transfer.get(f"{device}.di"),
+            ))
+        if device == plan.clock_producer_device and plan.clock_producer == "counter":
+            tasks.append(NidaqTaskSpecification(
+                task_id=f"{device}.counter-clock",
+                device=device,
+                subsystem="counter",
+                channels=(f"/{device}/ctr0",),
+                mode="continuous_clock_output",
+                reference_clock_source=plan.reference_clock_source,
+                resources=(f"/{device}/ctr0",),
+            ))
+    for device in output_devices:
+        tasks.append(NidaqTaskSpecification(
+            task_id=f"{device}.ao-reservation",
+            device=device,
+            subsystem="ao",
+            channels=tuple(
+                channel for channel in output_channels
+                if device_name_from_channel(channel) == device
+            ),
+            mode="finite_output_declared",
+            sample_clock_source=plan.sample_clock_source,
+            start_trigger_source=plan.start_trigger_source,
+            reference_clock_source=plan.reference_clock_source,
+        ))
+    identifiers = tuple(task.task_id for task in tasks)
+    effective_routes = tuple(dict.fromkeys((*plan.routes, *timing.external_routes)))
+    graph_payload = json.dumps(
+        {
+            "strategy": timing.task_strategy,
+            "tasks": [dataclasses.asdict(task) for task in tasks],
+            "routes": [dataclasses.asdict(route) for route in effective_routes],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    graph = NidaqTaskGraph(
+        graph_id=hashlib.sha256(graph_payload).hexdigest()[:16],
+        strategy=timing.task_strategy,
+        tasks=tuple(tasks),
+        routes=effective_routes,
+        create_order=identifiers,
+        start_order=tuple(
+            task.task_id
+            for device in device_order
+            for task in tasks
+            if task.device == device
+        ),
+        shutdown_order=tuple(reversed(identifiers)),
+    )
+    probe_status = (
+        "pending_exact_probe"
+        if timing.task_strategy in {"auto_multidevice", "forced_multidevice"}
+        else "not_requested"
+    )
+    return dataclasses.replace(
+        plan,
+        routes=effective_routes,
+        sample_clock_export_terminal=timing.sample_clock_export_terminal,
+        start_trigger_export_terminal=timing.start_trigger_export_terminal,
+        task_graph=graph,
+        multidevice_probe_status=probe_status,
+    )
+
+
+def resolve_nidaq_multidevice_probe(
+    plan: NidaqTimingPlan,
+    status: str,
+) -> NidaqTimingPlan:
+    """Freeze the exact task graph selected by the disposable probe."""
+    status = str(status)
+    graph = plan.task_graph
+    if graph is None or status != "verified":
+        return dataclasses.replace(plan, multidevice_probe_status=status)
+    master = plan.master_device
+    combined = []
+    for subsystem in ("ai", "di"):
+        members = tuple(sorted(
+            (task for task in graph.tasks if task.subsystem == subsystem),
+            key=lambda task: task.device != master,
+        ))
+        if len({task.device for task in members}) <= 1:
+            continue
+        template = members[0]
+        combined.append(dataclasses.replace(
+            template,
+            task_id=f"{master}.{subsystem}",
+            device=master,
+            channels=tuple(
+                channel for task in members for channel in task.channels
+            ),
+            sample_clock_source=None,
+            start_trigger_source=None,
+            resources=tuple(
+                resource for task in members for resource in task.resources
+            ),
+        ))
+    combined_subsystems = {task.subsystem for task in combined}
+
+    def kept(task):
+        # A slave's digital task whose board's analog task went into the
+        # master's has no analog task beside it any more: the stream clocks
+        # it as any slave's, over the backplane line (slave_input_timing).
+        if (task.subsystem == "di" and task.device != master
+                and "ai" in combined_subsystems):
+            clock = slave_input_timing(plan, task.device)[0]
+            if clock:
+                return dataclasses.replace(task, sample_clock_source=clock)
+        return task
+
+    tasks = tuple(
+        kept(task) for task in graph.tasks
+        if task.subsystem not in combined_subsystems
+    ) + tuple(combined)
+    task_ids = tuple(task.task_id for task in tasks)
+    selected = dataclasses.replace(
+        graph,
+        tasks=tasks,
+        create_order=task_ids,
+        start_order=tuple(dict.fromkeys((
+            *(task_id for task_id in graph.start_order if task_id in task_ids),
+            *(task.task_id for task in combined),
+        ))),
+        shutdown_order=tuple(reversed(task_ids)),
+    )
+    return dataclasses.replace(
+        plan,
+        task_graph=selected,
+        multidevice_probe_status=status,
+    )
+
+
+def _select_master(
+    override: Optional[NidaqDeviceIdentity],
+    active_devices: tuple[str, ...],
+    input_devices: tuple[str, ...],
+    configuration: NidaqSignalStreamConfiguration,
+    discovered: Mapping[str, NidaqDevicePorts],
+) -> str:
+    if override is not None:
+        candidates = tuple(
+            device
+            for device in discovered.values()
+            if (
+                override.serial_number is None
+                or device.serial_number == override.serial_number
+            )
+            and (
+                override.product_type is None
+                or device.product_type == override.product_type
+            )
+            and (
+                override.serial_number is not None
+                or override.runtime_name is None
+                or device.name == override.runtime_name
+            )
+        )
+        active_candidates = tuple(
+            device for device in candidates if device.name in active_devices
+        )
+        if len(active_candidates) != 1:
+            raise ValueError(
+                f"Timing master {override.logical_name!r} did not resolve to "
+                "exactly one active device with the configured identity"
+            )
+        selected = active_candidates[0].name
+        if not _device_can_master(
+            selected,
+            configuration,
+            discovered[selected],
+        ):
+            raise ValueError(
+                f"Timing master {override.logical_name!r} cannot export a "
+                "sample clock for the configured task topology"
+            )
+        return selected
+
+    for channel in configuration.channels:
+        if channel.name == "cam_frames":
+            device = device_name_from_channel(channel.physical_channel)
+            if (
+                device in active_devices
+                and _device_can_master(
+                    device,
+                    configuration,
+                    discovered[device],
+                )
+            ):
+                return device
+    if input_devices:
+        analog_device = next(
+            (
+                device_name_from_channel(channel.physical_channel)
+                for channel in configuration.analog_channels
+                if device_name_from_channel(channel.physical_channel) in active_devices
+            ),
+            None,
+        )
+        if analog_device:
+            return analog_device
+    compatible = tuple(
+        device
+        for device in active_devices
+        if _device_can_master(
+            device,
+            configuration,
+            discovered[device],
+        )
+    )
+    if not compatible:
+        raise ValueError(
+            "No active NI-DAQ device can export the sample clock required by "
+            "the configured task topology"
+        )
+    return sorted(compatible)[0]
+
+
+def resolve_nidaq_device_aliases(
+    identities: Sequence[NidaqDeviceIdentity],
+    devices: Sequence[NidaqDevicePorts],
+) -> Mapping[str, str]:
+    aliases = {}
+    for identity in identities:
+        candidates = tuple(
+            device
+            for device in devices
+            if (
+                identity.serial_number is None
+                or device.serial_number == identity.serial_number
+            )
+            and (
+                identity.product_type is None
+                or device.product_type == identity.product_type
+            )
+            and (
+                identity.serial_number is not None
+                or identity.runtime_name is None
+                or device.name == identity.runtime_name
+            )
+        )
+        if len(candidates) != 1:
+            raise ValueError(
+                f"Configured NI-DAQ device {identity.logical_name!r} did not "
+                "resolve to exactly one discovered device with the expected "
+                "model/serial identity"
+            )
+        runtime_name = candidates[0].name
+        aliases[identity.logical_name] = runtime_name
+        if identity.runtime_name:
+            aliases[identity.runtime_name] = runtime_name
+    return aliases
+
+
+def resolve_nidaq_stream_configuration(
+    configuration: NidaqSignalStreamConfiguration,
+    aliases: Mapping[str, str],
+) -> NidaqSignalStreamConfiguration:
+    channels = tuple(
+        dataclasses.replace(
+            channel,
+            physical_channel=remap_nidaq_physical_channel(
+                channel.physical_channel,
+                aliases,
+            ),
+        )
+        for channel in configuration.channels
+    )
+    return dataclasses.replace(configuration, channels=channels)
+
+
+def resolve_nidaq_device_names(
+    names: Iterable[str],
+    aliases: Mapping[str, str],
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(aliases.get(str(name), str(name)) for name in names)
+    )
+
+
+def _has_common_pxi_backplane(
+    devices: Sequence[NidaqDevicePorts],
+) -> bool:
+    if not devices:
+        return False
+    if not all("PXI" in device.bus_type.upper() for device in devices):
+        return False
+    chassis = {device.pxi_chassis_number for device in devices}
+    return len(chassis) == 1 and None not in chassis
+
+
+def _slaves_keeping_input_tasks(configuration, slaves, strategy) -> tuple[str, ...]:
+    """The slaves with an input task of their own, in plan order.
+
+    A multidevice strategy puts each subsystem that is on both boards into
+    one task on the master (resolve_nidaq_multidevice_probe), which takes no
+    line, so only a subsystem on a slave alone stays a slave task and needs
+    one; the merged task is left as it was. When auto_multidevice's probe
+    fails, it falls back to per-device tasks, and a slave task with no line
+    is refused there by the stream, naming the field
+    (NidaqSignalStreamController._no_backplane_line); forced_multidevice
+    fails instead. Per device, every slave input counts.
+    """
+    subsystems = {}
+    for subsystem, channels in (("ai", configuration.analog_channels),
+                                ("di", configuration.digital_channels)):
+        for channel in channels:
+            device = device_name_from_channel(channel.physical_channel)
+            subsystems.setdefault(device, set()).add(subsystem)
+
+    def merged(device, subsystem):
+        return strategy in {"auto_multidevice", "forced_multidevice"} and any(
+            other != device and subsystem in theirs
+            for other, theirs in subsystems.items())
+
+    return tuple(
+        device for device in slaves
+        if any(not merged(device, subsystem)
+               for subsystem in subsystems.get(device, ()))
+    )
+
+
+def _backplane_line_refusal(
+    configuration, timing, master, slaves, master_has_analog_input, laser,
+) -> Optional[str]:
+    """Why a slave input task has no backplane line for its timing, or None.
+
+    A slave names the master's sample clock and start trigger as its own view
+    of the lines the master exports them onto (slave_input_timing), so those
+    lines have to be configured: the start trigger's only when the master has
+    an analog input, the only task that exports one. None is chosen by
+    default, since a default could collide with backplane wiring nothing
+    here can see (Ben, 2026-09-30); the reason names the field and suggests
+    a line nothing in the timing or `laser` takes (free_backplane_line).
+    Whether the configured lines are free of each other and the laser's is
+    checked where both configurations are seen (validate_export_lines).
+    """
+    devices = _slaves_keeping_input_tasks(configuration, slaves, timing.task_strategy)
+    if not devices:
+        return None
+    fields = [("timing sampleClockExportTerminal", "sample clock",
+               timing.sample_clock_export_terminal)]
+    if master_has_analog_input:
+        fields.append(("timing startTriggerExportTerminal", "start trigger",
+                       timing.start_trigger_export_terminal))
+    for field, signal, value in fields:
+        board = device_name_from_channel(value)
+        if not value:
+            problem = "is unset"
+        elif pxi_trig_line(value) is None:
+            problem = f"{value!r} is not a PXI_Trig line"
+        elif board is not None and board != master:
+            problem = f"{value!r} names {board}, and {master} drives the line"
+        else:
+            continue
+        example = free_backplane_line(timing, laser, ignoring=value) or "PXI_Trig4"
+        return (
+            f"NI-DAQ inputs on {', '.join(devices)} take {master}'s {signal} "
+            f"over a PXI backplane line, and {field} {problem}: set it to a "
+            f"PXI_Trig line on {master} that nothing else drives, such as "
+            f"/{master}/{example}"
+        )
+    return None
+
+
+def _validate_channels_and_rates(configuration, discovered) -> Optional[str]:
+    analog_counts = {}
+    for channel in configuration.channels:
+        device_name = device_name_from_channel(channel.physical_channel)
+        device = discovered.get(device_name)
+        if device is None:
+            continue
+        normalized = channel.physical_channel.strip("/")
+        if channel.kind == "analog":
+            available = {
+                name.strip("/")
+                for name in device.analog_inputs
+            }
+            # A board's internal channels are real analog inputs and the
+            # driver does not list them among the physical ones, so checking
+            # against that list alone refuses the only way there is to see an
+            # analog output: PXI1Slot5/_ao0_vs_aognd.
+            available |= {
+                internal.strip("/")
+                for _output, internal in (
+                    getattr(device, "analog_output_readbacks", ()) or ())
+            }
+            if available and normalized not in available:
+                return (
+                    f"Configured analog input {channel.physical_channel} is not "
+                    f"available on {device_name}"
+                )
+            analog_counts[device_name] = analog_counts.get(device_name, 0) + 1
+        else:
+            available = {
+                name.strip("/")
+                for name in device.digital_inputs
+            }
+            if available and normalized not in available:
+                return (
+                    f"Configured digital input {channel.physical_channel} is not "
+                    f"available on {device_name}"
+                )
+            # Every start builds this plan from its own discovery, Idle's
+            # included, so this is where a line the board cannot clock is
+            # refused before the preflight meets it as -200452. Run and the
+            # DAQ Monitor refuse it through the same check.
+            refusal = unclockable_digital_input(device, channel)
+            if refusal is not None:
+                return refusal.describe()
+    for device_name, channel_count in analog_counts.items():
+        device = discovered[device_name]
+        maximum = (
+            device.analog_input_max_single_channel_rate
+            if channel_count == 1
+            else device.analog_input_max_multi_channel_rate
+        )
+        if maximum is not None and configuration.sample_rate_hz > maximum:
+            return (
+                f"Configured sample rate {configuration.sample_rate_hz:g} Hz "
+                f"exceeds {device_name} capability {maximum:g} Hz"
+            )
+    return None
+
+
+def _resolved_device_identities(active_devices, discovered):
+    return tuple(
+        NidaqDeviceIdentity(
+            logical_name=name,
+            runtime_name=name,
+            product_type=discovered[name].product_type or None,
+            serial_number=discovered[name].serial_number,
+        )
+        for name in active_devices
+    )
+
+
+def _device_can_master(device_name, configuration, device) -> bool:
+    has_analog_input = any(
+        channel.kind == "analog"
+        and device_name_from_channel(channel.physical_channel) == device_name
+        for channel in configuration.channels
+    )
+    if has_analog_input:
+        return True
+    has_digital_input = any(
+        channel.kind == "digital"
+        and device_name_from_channel(channel.physical_channel) == device_name
+        for channel in configuration.channels
+    )
+    if has_digital_input:
+        if device.counter_outputs:
+            return True
+        # Some simulated/older discovery providers do not expose counter
+        # capability. Let task construction be the final validation only when
+        # the capability inventory is entirely absent.
+        return not (
+            device.analog_inputs
+            or device.analog_outputs
+            or device.digital_inputs
+            or device.digital_outputs
+            or device.counter_inputs
+        )
+    return device.analog_output_sample_clock_supported is True
+
+
+def _terminal_is_discoverable(
+    terminal: str,
+    devices: Sequence[NidaqDevicePorts],
+    *,
+    allow_pxi_clock: bool,
+) -> bool:
+    normalized = terminal.strip().lower()
+    if normalized in {"pxi_clk10", "pxiclk10", "/pxi_clk10", "/pxiclk10"}:
+        return allow_pxi_clock
+    device_name = device_name_from_channel(terminal)
+    if device_name is None:
+        return True
+    device = next(
+        (candidate for candidate in devices if candidate.name == device_name),
+        None,
+    )
+    if device is None or not device.terminals:
+        return True
+    available = {item.strip("/").lower() for item in device.terminals}
+    return terminal.strip("/").lower() in available
+
+
+def remap_nidaq_physical_channel(
+    physical_channel: str,
+    aliases: Mapping[str, str],
+) -> str:
+    leading_slash = physical_channel.startswith("/")
+    parts = physical_channel.strip("/").split("/", 1)
+    if len(parts) != 2:
+        return physical_channel
+    mapped = aliases.get(parts[0], parts[0])
+    result = f"{mapped}/{parts[1]}"
+    return f"/{result}" if leading_slash else result
+
+
+def _invalid_plan(
+    timing: NidaqTimingConfiguration,
+    reason: str,
+    *,
+    master: Optional[str] = None,
+    slaves: tuple[str, ...] = tuple(),
+) -> NidaqTimingPlan:
+    return NidaqTimingPlan(
+        requested_mode=timing.sync_mode,
+        resolved_mode="unavailable",
+        is_valid=False,
+        master_device=master,
+        slave_devices=slaves,
+        task_start_order=(*slaves, *((master,) if master else tuple())),
+        synchronization_quality="unavailable",
+        reason=reason,
+    )

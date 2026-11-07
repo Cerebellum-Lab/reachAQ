@@ -58,17 +58,15 @@ def create_servo_panel():
 
     load_arm = QLabel(_NO_UPDATES)
     cover_arm = QLabel(_NO_UPDATES)
-    tunnel_fan = QLabel(_NO_UPDATES)
 
     layout.addRow("Load Arm (\u00b0):", load_arm)
     layout.addRow("Cover Arm (\u00b0):", cover_arm)
-    layout.addRow("Tunnel Fan (%):", tunnel_fan)
 
     layout.setContentsMargins(8, 8, 8, 8)
 
     panel = CardWidget(title="Servos", content_layout=layout)
 
-    return load_arm, cover_arm, tunnel_fan, panel
+    return load_arm, cover_arm, panel
 
 
 class PelletStatus(QWidget):
@@ -87,7 +85,7 @@ class PelletStatus(QWidget):
         self._send_xyz_device, self._send_xyz_diamond, panel = create_send_position_panel()
         layout.addWidget(panel)
 
-        self._load_arm, self._cover_arm, self._tunnel_fan, panel = create_servo_panel()
+        self._load_arm, self._cover_arm, panel = create_servo_panel()
         layout.addWidget(panel)
 
         self.setLayout(layout)
@@ -101,13 +99,11 @@ class PelletStatus(QWidget):
                 reset_prop("send_xyz", app_model.send_xyz, None)
                 reset_prop("load_arm", app_model.load_arm, None)
                 reset_prop("cover_arm", app_model.cover_arm, None)
-                reset_prop("tunnel_fan", app_model.tunnel_fan, None)
             else:
                 for xyz_label in self._xyz_device, self._xyz_diamond, self._send_xyz_device, self._send_xyz_diamond:
                     xyz_label.setText(_NO_UPDATES)
                 self._load_arm.setText(_NO_UPDATES)
                 self._cover_arm.setText(_NO_UPDATES)
-                self._tunnel_fan.setText(_NO_UPDATES)
             return
 
         if app_model.is_connected:
@@ -137,5 +133,3 @@ class PelletStatus(QWidget):
             elif name == "cover_arm":
                 self._cover_arm.setText(opt_float_to_txt(value))
 
-            elif name == "tunnel_fan":
-                self._tunnel_fan.setText(opt_float_to_txt(value))

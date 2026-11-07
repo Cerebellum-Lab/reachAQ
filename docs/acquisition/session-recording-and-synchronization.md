@@ -1,0 +1,945 @@
+# Session recording, synchronization, and hardware isolation
+
+This document defines the reachAQ recording contract implemented by the
+acquisition application. It is the operator and developer reference for manual
+session control, recording readiness, persisted streams, timing metadata,
+NI-DAQ synchronization, and degraded hardware operation.
+
+## Implemented change inventory
+
+- Replaced load-cell and automatic recording triggers with explicit Record,
+  Stop, and Abort controls.
+- Replaced Behavior System-state and day/total count UI with four compact
+  session counts.
+- Moved Hardware Refresh to the Hardware Status title bar and made it retry only
+  failed domains while acquisition is running.
+- Separated camera, reach synchronization, inference, CAN/pellet, NI-DAQ, laser,
+  session-log, and intertrial-analysis lifecycle state and failure propagation.
+- Preserved independent camera preview while requiring all enabled reach cameras
+  to form a valid synchronization topology before Record.
+- Made every enabled persistence source part of the recording-readiness and
+  writer-finalization contract, independent of plot visibility.
+- Replaced block-arrival NI timestamps with a continuous sample-index timeline
+  and added camera-edge and tone-confirmation correlation.
+- Added portable NI device identity, capability and terminal discovery,
+  validated timing-master selection, multi-device route planning, and
+  slave-before-master startup.
+- Added continuous decoded device/CAN event capture and exact event-buffer
+  overrun reporting.
+- Added session-scoped NI-DAQ, device, laser, and log files plus a finalized
+  source manifest.
+- Unified camera, stream, JSON, YAML, and API metadata around one canonical
+  session boundary and rejected incomplete finalization.
+- Added scoped watchdog/runtime-loss handling and stale-worker-generation
+  rejection so old callbacks cannot revive failed or aborted state.
+- Preserved live inference computation and frame-queue behavior while making
+  its startup and failure state explicit.
+- Added explicit acquisition, recording-session, pellet-cycle, pellet
+  automation, presence, shift-recommendation, and coordinate-validation
+  controllers while retaining the proven camera writer, inference, pellet
+  state-machine, calibration, and transform implementations.
+
+## Acquisition and recording are separate
+
+Selecting System Mode **Running** starts enabled camera acquisition and preview,
+the configured live-inference pipeline, CAN/pellet communication, the NI-DAQ
+input stream, laser control, and session-output validation. It does not create a
+session directory or write session video frames.
+
+The Behavior panel owns the session controls:
+
+| Control | Available state | Result |
+|---|---|---|
+| **Record** | System Mode is Running, recording state is Ready, and every required source is Ready | Creates a session and begins the existing camera/video-writing path |
+| **Stop** | Recording | Selects the final synchronized camera boundary, closes all writers, retains the session, and drains already-closed pellet-trial analyses |
+| **Abort** | Arming, Recording, Stopping, or Analyzing | Cancels the intertrial-analysis generation, waits for writers to close, deletes the entire session directory, and resets session counts |
+
+The recording state progresses through `Ready`, `Arming`, `Recording`,
+`Stopping`, and `Analyzing`. Record stays disabled until all already-closed
+pellet windows and stopped-session finalization finish. Intertrial analysis uses
+the existing live inference outputs while Recording; it does not switch the
+shared pipeline to offline video inference. Abort invalidates the session
+generation, so queued/running results cannot publish after deletion.
+
+The four Behavior counters are session-scoped: Presented, Reaches, Success, and
+Consumed. They reset when Record is pressed, remain visible after Stop and
+analysis, and return to zero after Abort. The previous System state controls and
+day/total pellet counters are not part of the UI or current persistence model.
+Animal v4, v5, and v6 JSON is accepted only for one-way migration to v7. Each
+migration archives the original bytes. V4 migration preserves identity, pellet
+coordinates, limits, and selected protocol, resets non-convertible
+recording-based protocol progress, and removes day/lifetime count fields.
+
+Subject and protocol selection are locked from Arming through analysis, while
+Notes remains editable. Stop writes the current Notes value; later edits update
+the stopped session's JSON/YAML metadata atomically until the next Record clears
+the field. The ordered Trial Protocol authoring, row locking, execution, and
+evidence contracts are defined in
+[Recording sessions, pellet trials, protocols, and schema migration](session-trials-protocols.md).
+
+The load-cell acquisition, tare, configuration, UI, and automatic recording
+triggers have been removed. System configuration v58 rejects obsolete schemas
+and fields rather than creating a compatibility runtime. Alarm, emergency,
+tunnel, head-fix, magnet, and webcam/top-camera behavior is removed. Pellet
+presence, pellet misplacement, watchdog liveness, structured errors, and safe
+hardware shutdown remain.
+
+## Required sources and failure domains
+
+Each runtime domain has an independent state, generation, initialization,
+cleanup, and retry path. A failure does not stop unrelated healthy hardware.
+
+| Domain | Required for Record when | Important dependency |
+|---|---|---|
+| Camera | Preview is enabled and the camera is record-enabled, or it participates in a multi-camera reach synchronization topology | Enabled reach secondaries depend on the reach primary trigger |
+| Reach synchronization | A record-enabled reach camera exists, or multiple reach cameras are enabled | All enabled reach cameras must form one valid primary-to-secondary topology |
+| Live inference and pose | Live inference is configured | Requires ready synchronized reach cameras |
+| CAN/pellet device | The configured hardware requires the connection | Independent of cameras and NI-DAQ |
+| NI-DAQ stream | NI-DAQ hardware and the input stream are enabled | Its timing plan must be valid for aligned recording |
+| Laser | The laser backend is enabled | Feedback inputs may share the NI-DAQ acquisition task |
+| Session logs | Always | The session output location must be writable |
+
+With one enabled reach camera, reachAQ temporarily uses a standalone/free-run
+role for preview. With multiple enabled reach cameras, exactly one effective
+primary drives the trigger-dependent secondaries. A secondary failure leaves a
+healthy primary previewing, but blocks reach synchronization, inference, and
+Record. A primary failure marks its dependent secondaries Blocked while
+unrelated cameras and hardware continue.
+
+The refresh icon is at the far right of the **Hardware Status** title bar. While
+idle it performs discovery and refreshes bindings. While System Mode is Running
+and the session state is Ready, it retries failed domains without restarting
+healthy domains. It is disabled during recording, stopping, abort cleanup, and
+analysis. Stale callbacks from an older worker generation cannot overwrite the
+state of a newer retry.
+
+If a required source is unavailable, Record is disabled and its tooltip lists
+the exact blockers. Subsystem-specific policy applies if a source is lost
+during Recording. NI or secondary-camera loss preserves the remaining streams
+and marks the session incomplete. Primary-camera/writer loss requests normal
+Stop and preserves partial data. CAN loss fails the in-flight operation, pauses
+new pellet cycles, and attempts bounded recovery while other writers continue.
+No source-loss path automatically deletes a retained session.
+
+CAN teardown follows the same isolation rule. Ordinary Stop, Close, or
+application exit closes only the process-owned device worker and socket; a
+generic fatal callback from another domain cannot reset the shared kernel
+interface. A confirmed CAN reader/acknowledgement failure marks CAN Failed,
+marks an active session's CAN stream incomplete, and runs a bounded recovery
+sequence without stopping camera, NI-DAQ, laser, or log acquisition. Recovery
+closes the failed socket, reopens the transport,
+rediscovers the pellet board, requests firmware, reloads motor/move
+configuration, and restarts status streaming before publishing Ready. An
+in-flight motor operation is finalized as unknown and is never replayed across
+the reconnect boundary.
+
+Explicit System Mode stop still attempts to stop every domain even when one cleanup
+operation fails.
+
+## Canonical session boundary
+
+Record reuses the existing camera acquisition and video-writing implementation.
+The trigger changed; frame acquisition, synchronized-frame selection, the
+depth-one live-inference queue, inference computation, and video encoding did
+not.
+
+The first frame actually recorded by the effective primary reach camera defines
+one immutable `SessionBoundary`:
+
+- primary camera and frame ID;
+- `time.perf_counter()` start time;
+- wall-clock start time;
+- camera-provided time;
+- final primary-camera performance and wall times after Stop;
+- matched NI-DAQ sample index when a `cam_frames` input is available.
+
+Synchronized reach cameras retain the shared camera frame-index behavior. Pose
+data follows recorded frame-index categories. An unsynchronized record-enabled
+camera uses its first written frame at or after the canonical start and reports
+its boundary offset; it cannot claim the same physical exposure edge without a
+hardware trigger.
+
+Non-camera sources run continuously into timestamped rolling buffers. Once the
+primary camera commits the boundary, each writer keeps its first datum at or
+after the start and its last datum at or before the stop boundary. This avoids
+losing early auxiliary samples while the application waits for the camera's
+first recorded-frame notification.
+
+The same finite boundary is required in:
+
+- `streams/alignment.json`;
+- final JSON and YAML `boundary`;
+- stream slicing and camera-timing merge;
+- the API/session metadata path.
+
+Small critical outputs use a session-local `.staging/<generation>/` area,
+file/directory `fsync` where supported, and atomic replacement. JSON and YAML
+are serialized from the same in-memory object, and metadata, alignment, trial
+files, and the manifest share one generation ID. The authoritative metadata
+reference is published last. Large video and pose stores are not duplicated in
+staging. A missing alignment file, non-finite boundary,
+boundary mismatch, primary timing mismatch, missing enabled source, writer
+failure, acquisition gap, or buffer overrun prevents the session from being
+reported as fully saved.
+
+The recorder retains both its immutable finalization snapshot and the associated
+project identity until publication succeeds. A later Record attempt first retries
+that exact generation and republishes its authoritative metadata; it cannot start a
+new session while the previous one remains incomplete. Successful generations remove
+only now-empty staging directories. Failed staged files are never recursively cleaned
+and remain available for diagnosis and retry.
+
+### Camera frame and closed-video validation
+
+Camera timing rows are keyed by the vendor's actual integer frame ID, not row
+position. Finalization checks uniqueness and strict monotonicity, merges enabled
+synchronized cameras onto the primary frame-ID timeline, and explicitly records
+missing, duplicate, out-of-order, early, and late IDs. These synchronization
+diagnostics never delete a stopped session.
+
+After all enabled writers acknowledge closure, ReachAQ validates camera videos in
+parallel. Each `ffprobe` count has a 30-second deadline; a timeout becomes a retained
+source failure rather than entering an unbounded decoder fallback. ReachAQ compares
+the decoded frame count with both the writer-reported count and timestamp rows. A
+count mismatch is a structured warning containing the camera role/serial and
+all three counts. The first writer exception and total writer-error count are
+preserved. An unreadable or zero-frame video marks the source and session
+incomplete, but every file and diagnostic is retained.
+
+Stop also starts a 30-second writer-acknowledgement watchdog. Expiry reports a
+persistent lifecycle/data diagnostic but does not delete files, disconnect hardware,
+or issue movement. The session remains in Stopping and can still complete when a late
+acknowledgement arrives. Abort remains available; deletion waits until the recorder
+and camera writers have actually closed.
+
+## Persisted session files
+
+Every session-owned file is below the `sessionNNN` directory. Exact
+camera, pose, and metadata names continue to follow the existing project naming
+conventions.
+
+```text
+sessionNNN/
+├── <camera videos and camera timing files>
+├── <live/offline pose and analysis files>
+├── <session metadata>.json
+├── <session metadata>.yaml
+├── streams/
+│   ├── nidaq.h5
+│   ├── device.csv
+│   ├── events.csv
+│   ├── laser.csv
+│   ├── tracking/
+│   │   └── trial_<id>_attempt_<id>.json
+│   ├── trials.jsonl
+│   ├── trial_summary.json
+│   └── alignment.json
+└── logs/
+    └── session.log
+```
+
+Files for disabled sources are not required. A camera with `isEnabled: true`
+and `isRecordEnabled: false` previews but does not create session video.
+
+### `nidaq.h5`
+
+The HDF5 file contains all configured acquisition channels, sample indices,
+sample-index-derived performance timestamps, wall-time anchoring, channel
+definitions, and timing-plan metadata. Display selection never removes a
+channel from acquisition or persistence. At 10 kHz, the nominal timestamp
+resolution is 0.1 ms.
+
+The primary datasets are `sample_index`, `perf_time`, `offset_seconds`,
+`wall_time`, `epoch`, `values`, `block_observation_perf_time`,
+`block_observation_wall_time` and `block_observation_raw_time`. `values` is
+channel-by-sample and follows the `channel_names` attribute. File attributes
+include the recording boundaries, sample rate, epoch, gap/overrun counts,
+source clock, and serialized timing plan. `perf_time` is derived from the
+sample-index epoch and carries the epoch's offset and the NI clock's drift.
+The block-observation times are the stamps taken before each NI read:
+`block_observation_perf_time` on `time.perf_counter` and
+`block_observation_raw_time` on `CLOCK_MONOTONIC_RAW` (NaN where the host has
+no such clock, or the file predates it). The NI-to-host fit (NI sample time to
+host `perf_counter`) is built from these two columns, not from `perf_time`; it
+is what `alignment.json` stores as `cameraNidaqAlignment.niToHost`, and the
+host times that file derives from NI samples go through it.
+
+The NI-DAQ epoch is anchored once. Later block delivery time does not reconstruct
+each block independently, so host scheduling jitter cannot create backward
+timestamp corrections. Sample indices must be continuous and timestamps must be
+strictly increasing. Gaps and overruns are recorded explicitly.
+
+Session NI data is appended incrementally to HDF5 through a bounded writer; the
+live polling path reuses a preallocated scratch buffer rather than retaining an
+unbounded list of chunks. Diagnostics preserve the first/last collection
+exception, exception count, gaps, overruns, epochs, sample/time range, and
+expected session boundary. Recovered gaps and isolated copy errors are warnings.
+Zero samples, worker/persistence failure, or an effectively absent stream is
+critical when NI is enabled. Start/end coverage shortfall up to five seconds is
+a warning; more than five seconds marks the NI source incomplete while
+preserving partial samples.
+
+### `device.csv`
+
+This is a general decoded device/CAN ledger, not a pressure-only measurement
+file. It contains timestamped inbound messages, outbound commands, command
+acknowledgements, decoded target/kind/payload data, context identifiers, device
+timestamps, and device indices. Events buffer continuously before Record and
+are sliced at the canonical boundary. Raw byte-for-byte CAN frame capture is not
+part of this format.
+
+Rows are in host receive-time order (`perf_time`); rows received at the same
+time keep their arrival order. Sessions recorded before 2026-09-24 can have
+rows out of order, and fail `events.alignment` and `events.frames` with
+`nonmonotonic performance timestamp`.
+
+Every row also records the first actual written primary-camera frame beginning
+at or after the event, its zero-based video index, frame-start performance/wall/
+relative times, event-to-frame delay, relation, alignment method, and confidence.
+Device/CAN association uses its preserved source or host performance timestamp
+and is labeled `host_timestamp`; it is not hardware timing unless a separately
+wired NI confirmation exists.
+
+Pellet-board tone events are stored here. Electrical tone confirmations wired to
+NI-DAQ are separate signals in `nidaq.h5`; `alignment.json` correlates the two.
+An embedded tone step inside a compound pellet sequence is also written as an
+outbound `PLAY_TONE` row with the parent operation context. The pellet board's
+immediate `TONE_STATUS` report is retained separately from the older, periodic
+`STIMULUS_INPUTS` GPIO report. Their raw receipt times are preserved; post-hoc
+alignment never overwrites transport timing.
+
+### `events.csv`
+
+Every accepted structured application/API event is copied into the session at
+post time, before the existing dispatcher can delay or coalesce repeats. This
+includes mode, property, detector, pellet lifecycle, protocol, and session
+events. Each occurrence remains a separate row with its event name/ID, original
+performance index, context, real and recording-relative timestamps, timestamp
+method, and the same recorded-frame association columns as `device.csv`.
+
+The capture hook only performs a bounded, nonblocking in-memory queue insertion.
+Conversion, frame association, and file I/O occur during stopped-session
+finalization, so they do not run in camera acquisition, preview, or
+video-writing paths. Queue overruns make the session incomplete rather than
+silently dropping data. The legacy hourly event file and API/plugin delivery
+remain unchanged.
+
+### `trials.jsonl` and `trial_summary.json`
+
+`trials.jsonl` is the authoritative pellet-delivery attempt ledger for the
+session. It separates logical trial ID, physical attempt ID, operation/context
+ID, send request, successful presentation acknowledgement, terminal outcome,
+retry policy, and explicit hardware errors. Hardware, command, transport, and
+acknowledgement failures remain visible but never count toward trial or protocol
+progress. `trial_summary.json` stores derived counts for the configured trial
+count basis. See
+[Recording sessions, pellet trials, protocols, and schema migration](session-trials-protocols.md)
+for the full accounting contract.
+
+Each `streams/tracking/` JSON preserves one immutable tone-2-to-cycle-completion
+live tracking slice, source frame identities, coverage/missing-frame
+diagnostics, synchronous pellet-state evidence, and resulting analysis metrics.
+It supports stopped-session verification/repair without reopening video or
+performing novel inference.
+Finalization adds the same wall/relative/frame/method contract to both tracking
+window boundaries. Individual pose samples already contain their source frame
+IDs and frame performance times and are not duplicated as synthetic events.
+
+### `laser.csv`
+
+The laser event ledger records commands, output/state changes, source, channel,
+command voltage, measured diode/command-copy values when available, and generic
+named output values. Physical diode and command-copy inputs are also persisted
+continuously in `nidaq.h5` when configured.
+Every discrete laser row receives the same recorded-frame association columns as
+`device.csv`. Continuous NI samples retain native sample indices and timestamps
+instead of being expanded into duplicate event rows.
+
+Rows are in `perf_time` order; rows at the same time keep the order they were
+told. Sessions recorded before 2026-09-30 have them in the order told.
+`nidaq_sample_index` names the NI-DAQ sample each row's `perf_time` landed
+within, looked up in the NI timeline as for `pressure.csv`. It is empty for a
+row before the first NI sample, or more than one sample period after the last,
+as at the end of a session or after an NI stream that stopped early. It maps a
+host time onto the NI clock; it is not an NI-timed event.
+
+A **Run Pulse** fired while a session records is kept as a manual laser event:
+two rows with source `manual pulse` and one `operation_id` starting `manual-`,
+which no protocol operation's does. Nothing is kept of one fired while no
+session records, and a pulse that spans Record or Stop can keep only one row.
+
+- `requested`, timed just before the laser controller is called. The output
+  starts at or after it: the controller has still to write and start the
+  train, and an external trigger starts it later still (`timing_confidence`
+  `before_output_start`).
+- How it ended: `completed` once the waited-for train has returned
+  (`after_output_end`); `failed` (`operation_failure`); `cancelled`
+  (`operation_cancelled`), stopped as it ran by System Mode's Stop or another
+  close of the laser controller; or `refused` (`operation_refused`), which
+  drove nothing. Only a completed pulse has waveform rows.
+
+Both have `timestamp_method` `manual_pulse_call_perf_counter`, and a
+`context_json` holding `manual: true`, `laser_channel_id`, `profile_id` (the
+saved id, or `builder draft`), `profile_revision` (null for the draft),
+`amplitude_volts`, `trigger_mode` (`internal` or `external`) and `route`:
+`trigger_terminal` and `trigger_edge` for an external trigger, empty and null
+for an internal one, and `stim_line` null, since Run Pulse never pulses a board
+STIM line. The outcome row adds `last_command_volts`, what the laser model
+keeps as the laser's last command: its minimum once completed, the amplitude
+its output may still hold once failed or cancelled, the command before once
+refused. A failed, cancelled or refused row also has `error_class` and
+`error`. An internal Run Pulse is armed while its button is held and started
+on the click (2026-10-05), so its `requested` row also has `fallback` and
+`click_perf_time`: `fallback` false when the click started an output already
+armed, true when the click came before the arm finished and the arming thread
+started it once armed; `click_perf_time` is the click's own time, which on a
+fallback is earlier than the row's `perf_time`.
+
+A completed pulse's waveform rows (`internal pulse` or `external pulse`, with
+no operation id) start at its `requested` row's `perf_time`, so the two join on
+it. They are drawn from that time, so each point was output at or after its
+row's time: `timestamp_method` `manual_pulse_call_perf_counter`,
+`timing_confidence` `before_output`. Before 2026-09-30 a Run Pulse was kept only
+as those rows, unmarked, and timed from after the train had ended. The event's
+time is host time only: the `requested` row's `nidaq_sample_index` is the NI
+sample during which the host called the controller, not the one the output
+started on; that onset is in `nidaq.h5` where the command-copy or diode input is
+recorded. `events.laser` reports how many manual Run Pulse events it found and
+how each ended, such as *2 manual Run Pulse event(s) (1 completed, 1 refused)*;
+one with no outcome row is counted *with no outcome*, and not warned of.
+`trials.protocol` never takes one as a trial's laser evidence.
+
+### `session.log`
+
+The session log contains only messages within the canonical session boundary,
+with offsets from the start. The acquisition-wide diagnostic log remains
+outside the session and is retained after Abort so hardware failures can still be
+diagnosed. Low-level `can.bus` frame dumps below Warning are excluded from the
+session log because the decoded events are already persisted in `device.csv`;
+CAN warnings and errors remain in both logs.
+
+### `alignment.json` and final metadata
+
+`alignment.json` contains:
+
+- `canonicalBoundary`;
+- first/last offsets for auxiliary streams;
+- the requested and resolved `nidaqTiming` topology;
+- `cameraNidaqAlignment` (schemaVersion 4), including matched edge/sample,
+  signed offset, resolution, confidence, and ambiguity, plus how the anchor
+  was chosen (`anchorMethod`: `camera_latch` from the primary camera's clock
+  latches, `host_arrival` from when its frames reached the host,
+  `first_frame_stamp` from the first frame's own host stamp,
+  `epoch_nearest_edge` when no NI-to-host fit could be made), the fit itself
+  (`niToHost`: a knot table from NI seconds to `time.perf_counter`, built from
+  the NI read stamps, `piecewise_envelope` or `raw_bridged` through
+  `CLOCK_MONOTONIC_RAW`), the exposure, the implied lag, and the evidence of
+  both measured matches (`latch`, `arrival`, `arrivalSampleIndex`,
+  `anchorsAgree`); every host time derived from an NI sample (frame edges,
+  tone onsets, NI sample indices of host events) goes through that fit, and
+  the post-analysis trial ledger reuses the stored table;
+- `toneConfirmation`, including canonical NI pulse onsets, grouped outbound
+  command/immediate status/periodic GPIO observations, unmatched valid events
+  and pulses, and separately classified short-pulse artifacts;
+- `enabledSources`, including source role/binding, runtime state, actual paths,
+  sample/frame count, first/last offsets, gap and overrun counts, failure, and
+  `persistenceStatus`;
+- `deviceEventOverruns`, `sessionComplete`, and `incompleteReasons`.
+
+How schemaVersion 4 chooses the first recorded frame's transition on the
+fitted timeline. No lag value is an input; both matches are measured over
+the primary camera's latency stream:
+
+- `latch` pairs each frame's camera timestamp, placed on a host clock by the
+  clock latches, with the nearest transition on that clock; the shift most
+  frames agree on wins (transition number = frame ID - `shift`). `arrival`
+  pairs each frame with the latest transition at or before its host arrival
+  (`perf_counter`), by the same majority.
+  Each records `status` (`unavailable`, `paired`, `ambiguous`, `outside` when
+  the first frame's transition lies outside the spool, or `failed`), `shift`,
+  `agreement`, `ambiguous`, `reason`, `frames`, `limitSeconds` and `slip`;
+  `latch` adds `medianResidualSeconds`, `latches`, `usableLatches`, `clock`,
+  `uncertaintySeconds` and `dropped`, and `arrival` adds `medianLagSeconds`,
+  the median time from the paired transition to the frame's arrival; evidence
+  of a match that could not run is `unavailable` or `failed` and carries little
+  more than `status` and `reason`. `limitSeconds`, `slip`, `clock`,
+  `uncertaintySeconds` and `dropped` were added within schemaVersion 4, so
+  earlier schema-4 files lack them; read them with a default.
+  `arrivalSampleIndex` is the NI sample the arrival match names for the first
+  recorded frame (null without one). `latch.frames` and `arrival.frames` count
+  only the latency frames that arrived while the spool held transitions; the
+  camera runs on before the NI task starts and after it stops, and those frames
+  are left out of both pairings.
+- `latch.clock` is `raw` when both sides carry `CLOCK_MONOTONIC_RAW`: the NI fit
+  is `raw_bridged`, whose RAW view places the transitions, and every latch
+  usable on perf has a usable RAW bracket too (`raw_before`, `raw_after`), the
+  rule `clocks.latch_clock` holds for the recorder and the latency finalizer
+  alike. RAW is never slewed, so one straight latch map holds for the whole
+  session. Otherwise it is `perf`: the map is a straight line over
+  `perf_counter`, which timesyncd slews, and it ignores the slews (simulated,
+  one line misses by 1.9-4.3 ms p95 after an hour). `usableLatches` counts on
+  that clock.
+- The latch map is a straight line through every latch's bracket (the host
+  times before and after the camera clock was read, widened by the clock's
+  resolution). Latches no such line passes through together with the rest are
+  left out, the largest consistent set kept; `dropped` lists their latch row
+  numbers and `reason` names them. Kept latches spanning no more than 10 s
+  give an offset at drift 1 instead. `uncertaintySeconds` is how far any map
+  of the same kind through the kept brackets can sit from the one used, over
+  the latched span.
+- The limits are measured, with one constant: `FALSE_ALARM_PROBABILITY`
+  (1e-6, per check and per session, in `tools/latency/clocks.py`), which gives
+  k = 4.89 standard errors (the two-sided Gaussian quantile; on a robust
+  spread, 1.4826 × MAD, an approximation). σ_NI is `niToHost.residual_rms`
+  and P is `framePeriodSeconds`.
+  - The latch match is trusted only while `uncertaintySeconds + k·σ_NI` is
+    under P/4. Otherwise it is `ambiguous`, its shift still recorded, and
+    `reason` reads *latch mapping uncertainty X ms plus 4.89 NI residuals (Y ms)
+    exceeds a quarter frame period (Z ms)*.
+  - `latch.limitSeconds` is the residual tolerance, min(P/4, 2 ms): a
+    `medianResidualSeconds` beyond it is `ambiguous`. The 2 ms cap stays until
+    the NI delivery delay is measured.
+  - `arrival.limitSeconds` is the margin k·√(σ_NI² + (1.2533·MAD_lag/√n)²),
+    MAD_lag the robust spread of the per-frame lags and n the frames counted:
+    a `medianLagSeconds` within it of 0 or of P is `ambiguous`.
+  - `slip` is null, or where the votes change shift: `frameId`, `frames` (the
+    run's length), `fromShift`, `toShift` and `reverts`. In frame-ID order the
+    stray rate is p̂ = (votes off the majority + 1) / (n + 2), and a run of L
+    frames voting one other shift is a slip when n·p̂^L is under
+    `FALSE_ALARM_PROBABILITY`. `frameId` is the run's first frame, or, for a
+    run that opens the session, the frame after it. `reverts` is true only for
+    a run that looks like a delivery backlog (frames a host stall held and
+    delivered late): it is interior, the votes on both sides of it are the
+    majority, and it votes below the majority (late delivery can only move a
+    frame's candidate transition later, so its vote only falls). Every other
+    run that passes is tried first and the longest of those is reported; only
+    if none passes, the longest run with `reverts` true, so a long backlog
+    cannot hide a real slip. A lost or spurious NI transition puts every later
+    frame on the next shift, so its run reaches an end of the session or leads
+    to another shift, and does not revert. A run with `reverts` true does not
+    make the arrival pairing ambiguous; the camera-clock pairing flags any
+    slip. The rule has three limits. A spurious transition later cancelled by
+    a lost one votes below the majority and reads as a backlog to the arrival
+    pairing (the camera-clock pairing still flags it; a session with no
+    latches does not). A stall holding the first or last frames reaches a
+    session end and reads as a lost transition, which errs on the side of
+    flagging. A backlog that grows past one period (votes s, s−1, s−2, s−1, s)
+    is not flanked by the majority, so it is flagged, which errs on the side
+    of flagging too. `agreement` stays as a diagnostic.
+  - These replace the fixed 0.95 agreement, 0.1 ms arrival margin and 2 ms
+    latch bracket cap.
+- `anchorMethod` is the first that yields a transition: `camera_latch` when the
+  latch match is `paired`, else `host_arrival` when the arrival match is, else
+  `first_frame_stamp`, the latest transition at or before the first recorded
+  frame's host stamp (`cameraPerfTime`), which counts only within one frame
+  period of that transition (when the period is known). With none of them the
+  alignment is `unmatched` at `none` confidence, and `reason` gives each
+  method's reason.
+- `confidence` is `hardware_edge` only when both measured matches exist and
+  name the same transition, which is what `anchorsAgree` compares (null when
+  either match is missing). Every other matched anchor is
+  `ambiguous_hardware_edge`: one method alone, or the two disagreeing. A
+  disagreement keeps the camera-clock anchor and names both sample indices in
+  `reason`; a missing match is noted there as *camera-clock match not
+  available* or *arrival match not available*, with its status and reason.
+- The arrival match makes one assumption: a frame reaches the host within one
+  frame period of its exposure edge. A longer lag pairs every frame with a
+  later transition, and shows as a disagreement with the camera clock rather
+  than as an agreement. `impliedLagSeconds` (the first frame's host stamp
+  less the anchor transition) and `arrival.medianLagSeconds` are measurements,
+  never compared with an expected value.
+- `exposureSeconds` is the exposure the app was given (null when unknown or
+  not a finite number). It is recorded and moves no anchor.
+- schemaVersion 3 files differ here. They carry `expectedLagSeconds`,
+  `lagGateSeconds` and `expectedLagSampleIndex`, which schema 4 drops; their
+  `anchorMethod` is `camera_latch` or `expected_lag`, the transition nearest
+  the first frame's stamp less the exposure and a fixed 1.1 ms, with the
+  implied lag gated to within 1 ms of that expectation; they have no
+  `arrival` or `arrivalSampleIndex`; and their `latch.frames` counts every
+  frame of the latency stream. They are not rewritten.
+
+Three things to know when reading `cameraNidaqAlignment`:
+
+- `niToHost.valid` says whether the fit was used; readers key on it, never on
+  `reason`. A valid fit can carry a non-empty `reason`, which then names what was
+  left out of it and is not a failure: *RAW on 40 stamps, need 100*, *RAW covers
+  62% of the 90 s of stamps, need 90%* or *RAW stamps unusable (…)* mean the fit
+  is `piecewise_envelope` on the perf stamps alone.
+- `ambiguitySeconds` depends on the anchor method. On the fitted timeline
+  (`camera_latch`, `host_arrival`, `first_frame_stamp`) it is
+  `min(arrival.medianLagSeconds, framePeriodSeconds - arrival.medianLagSeconds)`:
+  how far the arrival match's median lag is from the nearest transition
+  boundary, so how much margin it has before it would name a neighbouring
+  transition. It describes the arrival match whichever method anchored, and is
+  only meaningful when `arrival.status` is `paired`; it is null without a
+  median lag, and `latch.medianResidualSeconds` against `latch.limitSeconds`,
+  with `latch.uncertaintySeconds`, is the latch's own margin. The epoch
+  fallback (`epoch_nearest_edge`) records how much
+  nearer the chosen transition is than the runner-up, both measured to
+  `start_perf`. schemaVersion 3 measured the runner-up distance to the expected
+  edge (`start_perf` less the expected lag) on the fitted path.
+- `latency.h5` (`clock/ni_to_host`) and `alignment.json` (`niToHost`) are
+  separate fits of the same stamps: the first from the published, boundary-trimmed
+  `nidaq.h5`, the second from the spool's stamps up to the last frame: the spool
+  runs on through Stop, and a copy delayed there can cost a long session its whole
+  fit. `nidaq.h5` is cut on the epoch timeline, so their `knotCount`, `x_min` and
+  `x_max` can differ, and neither is derived from the other.
+
+The latency finalizer's own `cameraToNi` record (`latency.h5`
+`clock/camera_to_ni`, and `clocks.cameraToNi` in its status) carries the
+pairing it used under `pairing`, and, when latches paired the frames, the
+host-arrival cross-check under `arrivalPairing`; each holds the `slip` above,
+`reverts` included. `latchDropped` lists the latch row numbers the latch map
+left out (an empty list when none), and those latches are named in `reason`,
+which on a valid record is a note and not a failure: read `valid`.
+
+Final session JSON/YAML uses `metadataSchemaVersion: 2`. It records the animal
+snapshot, `counts`, recording completion, stop policy/result, compact hardware
+state at Record, and only hardware entries that changed by finalization. The
+`artifacts` section references the authoritative `alignment.json`,
+and `trial_summary.json` by path and SHA-256 instead of embedding those records
+again. The complete `system_configuration.yaml` key/value snapshot remains
+embedded under `configuration` so each recording is independently reproducible.
+`boundary.durationSeconds` is the final camera-bounded duration. Non-finite
+values are normalized to JSON/YAML null; finalized metadata is never written
+with non-standard `NaN` tokens.
+
+The pinned `auto-trainer-api` 0.11.0 lifecycle supports explicit session and
+pellet-attempt events. ReachAQ's status schema contains no alarm, emergency,
+tunnel, head-fix, or magnet placeholders. Session events identify the continuous
+recording boundary; trial events identify pellet attempts, never recordings.
+Session metadata, analysis outputs, and the pellet-trial ledger remain the
+authoritative persisted records.
+
+## Controller ownership
+
+The acquisition application uses explicit responsibility boundaries:
+
+- `AcquisitionController` owns acquisition start/stop flags, independent
+  subsystem states, blockers, retries, and derived reach-synchronization
+  readiness.
+- `RecordingSessionController` owns Ready/Arming/Recording/Stopping/Analyzing/
+  Aborting state, generation/session identity, canonical boundary, writer
+  completeness, enabled-source results, and analysis timing. Delayed callbacks
+  must match both generation and session ID. Record, Stop, and Abort enter through
+  one re-entrant command boundary, so simultaneous UI/API commands cannot allocate
+  or close the same session twice. Abort atomically invalidates its generation and
+  returns to Ready before observers may start another session.
+- `PelletCycleController` owns the session ledger, send/acknowledgement/error
+  mutation paths, attempt closure, per-trial result application, protocol outcomes,
+  lifecycle publication, persistence updates, and the authoritative count
+  projection.
+- `IntertrialAnalysisCoordinator` owns the bounded worker queue, cancellation
+  generation, immutable requests/results, and measured throughput estimate.
+- `PelletAutomationController` owns the established load/send/retract/cover/
+  release state machine; `TrialProtocolRunner` owns protocol progress.
+- `PelletPresenceTracker`, `ShiftRecommendationController`, and
+  `CoordinateModel` own presence history, shift recommendation/application
+  state, and live diamond-coordinate validation respectively.
+- `PelletMisplacedDetector`, `WatchdogMonitor`, and core diamond/triangle
+  calibration/transform objects retain their existing focused ownership.
+
+`AppModel` routes UI, process, hardware, and analysis events between these
+owners. It does not implement camera acquisition, video encoding, inference
+calculation, or the mutable state owned by those controllers.
+
+Physical pellet attempt IDs and their protocol settings are immutable after SEND.
+Late analysis may attach diagnostics and results, but cannot reorder attempts or
+change a row already used by a subsequent SEND. Analysis-dependent retry/protocol
+effects are applied only when the result can still control the next physical trial.
+The future-row edit check and SEND snapshot share one lock, and composite ledger,
+public-event, protocol, and persistence mutations are serialized by the pellet-cycle
+controller.
+
+Camera/NI matching puts every `cam_frames` transition on the host clock through
+the NI-to-host fit built from the NI read stamps, then takes the first recorded
+frame's transition from two measured matches over the primary camera's latency
+stream, the camera's clock latches and the frames' host arrival, with no lag
+value as an input. The latch match anchors, and `hardware_edge` needs the arrival match to
+name the same transition; with one match the anchor is that one, and with
+neither it is the transition at or before the first frame's own host stamp, at
+`ambiguous_hardware_edge` confidence. The alignment records whether the
+transition was rising or falling. Without a fit the transition nearest the stamp
+on the epoch timeline is used, also at `ambiguous_hardware_edge` confidence. The
+current camera output is a square wave whose alternating peaks and troughs each
+identify one frame. Alignment reports `host_estimated` when the line is not configured,
+and `unmatched` when no plausible transition exists. For configured Tone 1 and
+Tone 2 inputs, the NI pulse onset is the canonical physical time. Pulses shorter
+than 2 ms are classified as electrical artifacts and do not become tone events.
+Both valid pulses and artifacts are clipped to the camera Record/Stop boundary,
+so rolling-buffer activity outside the saved session is not reported as an
+unmatched session edge.
+
+Tone matching groups the embedded outbound `PLAY_TONE`, immediate pellet-board
+`TONE_STATUS`, and legacy periodic `STIMULUS_INPUTS` observation for the same
+valid NI pulse within 250 ms. `eventPerfTime` and per-observation latency retain
+the raw host/CAN timing, while `alignedEventPerfTime` is the physical NI onset
+used to compare the event with camera frames. A command whose frequency does
+not identify Tone 1 or Tone 2 remains explicitly unmatched.
+
+Alignment schema version 3 materializes that comparison for every valid matched
+tone. Each entry records the physical NI performance timestamp, Unix/UTC wall
+timestamp, offset from Record, and the first recorded primary-camera frame whose
+exposure-counter transition occurs at or after the tone onset. The frame record
+also contains its zero-based video index, frame-start timestamps, event-to-frame
+delay, nearest frame, confidence, NI resolution, and the explicit method
+`nidaq_same_task_tone_edge_to_primary_camera_exposure_counter_transition`.
+Individual CAN observations retain their own raw wall and recording-relative
+timestamps. This annotation is vectorized stopped-session finalization; it does
+not run in the camera capture, preview, video writer, or live-analysis path.
+
+This contract applies to all discrete structured session events, not only
+tones. API/application events are stored in `events.csv`; device/CAN and laser
+CSV rows carry flattened association columns; each
+trial record contains `event_alignment` for send, acknowledgement, capture end,
+finalization, and analysis-window boundaries; and tracking files contain
+`eventAlignment` for window start/end. `eventAlignmentContract` declares this
+scope. Hardware-confirmed NI events and host-timestamped events use different
+method/confidence values so CAN receipt time cannot be mistaken for a physical
+edge. Free-form diagnostic logs remain logs, while continuous NI and pose
+samples keep their native sample/frame timelines.
+
+During recording, a validated NI Tone 2 pulse opens the live tracking window at
+that exact sampled onset. This removes CAN polling latency from the behavioral
+boundary. If the configured NI tone stream is unavailable, the immediate CAN
+`TONE_STATUS` is the fallback; the periodic GPIO status is used only for legacy
+firmware that supplies neither source. NI pulse validation and the live callback
+carry state across acquisition blocks so a pulse is emitted once, only after its
+duration is known to be at least 2 ms.
+
+The pellet board supplies the first two decoded confirmation lines: physical
+`STIM0` is `tone1` and physical `STIM1` is `tone2`. `STIM2` and `STIM3` remain
+unassigned.
+
+## NI-DAQ acquisition and synchronization
+
+`nidaqPorts` assigns physical inputs to semantic roles: camera frames, barcode,
+and tone lines. Configured laser diode and command-copy feedback inputs, and a
+laser's board-trigger readback (`triggerMonitorInput`), are added to the same
+acquisition plan as `laserN_diode`, `laserN_command_copy` and `laserN_trigger`.
+The trigger readbacks come last, after every other input. Adding one moves no
+channel already acquired in the scan when it takes nothing over, or when what
+it takes over came last, as christielab10's two `*_trigger_readback` custom
+channels did; a channel taken over from the middle moves the ones after it up
+by one. `displayChannels` controls only which curves are plotted.
+
+Existing `nidaqStream.channels` not claimed by a named role remain custom
+acquired inputs. A stored channel on an input that a role now names is taken
+over by the role, under the role's name. What the new channel keeps from the
+stored one depends on the role:
+
+| Role | Kind and unit | Scale | Offset | Minimum, maximum |
+|---|---|---|---|---|
+| Camera frames, barcode, tones | digital, `logic` | kept | kept | dropped |
+| `laserN_diode`, `laserN_command_copy` | analog, unit kept | from the laser's `feedbackScale` or `commandCopyScale` | kept | kept |
+| `laserN_trigger` | analog for `aiN`, digital for `port0/lineN`; unit kept | kept | kept | kept |
+
+The readback keeps these only from a custom channel, or from its own
+`laserN_trigger` entry; from another role's entry left on its input, an old
+command copy's for one, it takes the defaults. With nothing it may keep, the
+unit is `V` for an analog input and `logic` for a digital line, the scale is 1
+(or the laser's scale), and the offset is 0. A stored channel under a role's
+name but on another input is that role's previous input, left there when the
+role was moved; it is dropped rather than kept as a custom input, and the log
+says so. A role claims its name whether or not it is set, so clearing one -
+a port role such as tone1 or camFrames, or a laser's trigger readback with
+*(none)* - stops its channel being acquired and recorded, and drops it from
+`displayChannels`. Every port role claims its name always. A laser's
+`laserN_diode`, `laserN_command_copy` and `laserN_trigger` are claimed for
+every laser, configured or not, while the laser backend is enabled. With it
+disabled the plan adds no laser role, and the names of every laser that is
+not configured are claimed: a cleared laser's stored channels are dropped,
+and the log says so, while a configured laser's stay custom inputs, which its
+laser tab still shows. Channels whose names no role owns are never touched.
+
+The DAQ Ports dialog discovers device identity and capabilities, including
+model, serial, bus/chassis, AI/AO/DI/DO channels, counters, terminals, maximum
+rates, timed AO support, and digital-trigger support. It rejects unavailable or
+duplicate channels, incompatible sample rates, invalid timing terminals, and a
+manual master that cannot drive the active topology before starting tasks.
+Configuration cannot be edited while acquisition is active.
+
+Saved `deviceIdentities` let a logical device resolve by product and serial when
+NI-DAQmx changes its runtime alias. An absent, replaced, ambiguous, or
+serial-mismatched device is never silently rebound.
+
+`nidaqPorts.timing.syncMode` has four modes:
+
+| Mode | Behavior |
+|---|---|
+| `auto` | Uses one device when possible, otherwise a discovered common PXI backplane, otherwise requires explicit external routes |
+| `backplane` | Requires active devices on a discoverable common PXI chassis |
+| `external` | Requires explicit start-trigger and sample-clock terminal sources |
+| `independent` | Uses independent clocks; diagnostic-only when hardware synchronization is required |
+
+The optional timing master is a device/task role, not a channel flag. Automatic
+selection prefers the device owning the canonical sampled inputs, including
+`cam_frames` and analog inputs. With one sampled device, no slave topology is
+created. With multiple synchronized devices, slave tasks are armed before the
+master and the resolved topology is written to session metadata. One or two
+active NI devices are supported in the first release; an AO laser card counts.
+Three or more fail preflight with an actionable error.
+
+For compatible PXI cards, the plan uses `PXI_CLK10` as the shared reference, a
+shared backplane start trigger, and a routed master sample clock. A finite
+hardware-timed laser AO task can be prepared as a synchronized slave: common
+reference when available, verified sample/start route, prewritten waveform, and
+future trial-local trigger. Nonblocking handles own Prepared/Armed/Triggered/
+Completed/Failed/Cancelled state, resource exclusion, timeout, safe-voltage
+reset, and PMT pulse-train lead/lag. Calibration ramps still reject nonzero PMT
+delay.
+
+When the inputs themselves span two PXI boards, the slave board's tasks do not
+name the master's clock and start trigger terminals, a cross-board route DAQmx
+refuses on an unidentified chassis (-89125). The master exports them onto the
+PXI_Trig lines in `nidaqPorts.timing.sampleClockExportTerminal` and, when it has
+an analog input, `startTriggerExportTerminal`, required then and with no
+default, and the slave names each line on its own board. The persisted task
+graph records those names in the slave's task specifications, so its
+`graph_id` differs from an earlier build's only for a backplane configuration
+with an input task on a slave board and the export fields set; every plan
+without them, christielab10's included, is byte-identical. The plan's
+`sample_clock_source` and `start_trigger_source` keep the master's terminals,
+which the laser reads.
+See [NI-DAQ PXI](../linux-install/ni-daq-pxi.md) for the fields and the lines
+they must not share. This is not yet verified on hardware: christielab10 has
+no stream input on its second board.
+
+No card model, PXI slot, alias, or route is a universal default. The current rig
+uses a PXI-6221 input device as the natural acquisition master and a PXI-6713
+for laser analog output, but every rig must resolve and validate its own devices
+and routes through discovery.
+
+Digital-only multi-device plans use a routed counter sample clock and never
+claim an AI start trigger when no AI task exists. The resolved descriptor names
+the actual clock producer, consumers, start/reference/sample routes, and output
+tasks. Hardware-timed finite laser output is synchronized only when its task
+applies that descriptor and is armed before the master. On-demand laser pulses
+remain explicitly independent.
+
+`taskStrategy` defaults to auditable per-device tasks. `auto_multidevice` first
+constructs and Verify/Commits the exact combined disposable task. Success uses
+that expanded task; rejection constructs and Verify/Commits the per-device graph
+and records `fallback_per_device`. `forced_multidevice` fails instead of falling
+back. Long-lived tasks independently recreate the selected verified graph.
+
+Input reads use preallocated NI stream-reader buffers. An all-task availability
+barrier requires the common chunk before copying, then verifies equal counts and
+publishes one shared sample-index block. Wait/read durations, short reads, gaps,
+overruns, and the exact task graph are persisted for diagnosis.
+
+The stim camera has one frozen mode per session. Any selected row requiring
+First Reach uses cropped 900 Hz detection/evidence mode: no continuous stim
+video, batched HDF5 evidence for every acquired frame, decimated bounded preview,
+and 0.5 s pre/post clips around emitted triggers. Otherwise it is a full-frame
+150 Hz synchronized camera recorded continuously with the behavioral group.
+The frozen runtime mode is derived from, but never written back over, the
+operator's saved camera configuration. Interrupted arming/session boundaries
+retain a truncated clip with an explicit completeness warning instead of
+silently discarding its pre-trigger evidence.
+
+## Storage, discovery, and safe hardware boundaries
+
+Record preflight performs a real write, flush, `fsync`, and removal probe on the
+target session filesystem. It reports free bytes and projected maximum recording
+minutes from configured camera/NI demand; configured duration is capped at two
+hours. Recording monitors free space and observed write rate at low cadence,
+warns once below 30 and 10 projected minutes, and requests normal Stop below one
+minute. Low space never invokes Abort.
+
+Camera discovery runs in a disposable process with a deadline. SDK/import/load
+failure is reported separately from a successful discovery that found zero
+cameras and includes the first exception, backend/stage, and elapsed time.
+Discovery failure affects only camera state. Animal JSON loading is likewise
+isolated per file: valid animals remain available, malformed/unsupported files
+are listed as skipped without modification, and duplicate UUIDs remain a hard
+conflict.
+
+Pellet-board connection and CAN recovery apply acknowledged motor configuration,
+home X/Y/Z, then detach both pellet servos. Connection never attaches/releases
+the cover or pellet mechanism. Normal LOAD/COVER/RELEASE operations retain their
+on-demand servo behavior. Stop, automatic Stop, and Abort request home after the
+stream boundary when the board is Ready; failure is logged but cannot prevent
+save/deletion.
+
+CAN recovery retains the first diagnostic failure, but only transport and
+acknowledgement domains own recovery. Every run has a generation; a stale run
+cannot publish Ready or replace a reader still alive. Recovery never replays a
+non-idempotent in-flight motor command. Each command retains an explicit pending,
+acknowledged, failed, unknown, cancelled, or timed-out outcome; transport loss marks
+an in-flight non-idempotent operation unknown rather than treating disappearance from
+the pending map as success. Generic unhandled exceptions do not
+reset CAN, command motion, stop an active recording, or disconnect unrelated
+hardware.
+
+Preferences/configuration is locked outside session `Ready`, including an
+already-open dialog. SoftMouse/RFID cache refreshes share one model-owned,
+debounced background path; refresh requested during a session is deferred once,
+and all widget updates return through the Qt thread. The event manager preserves
+its public plugin/API contract while bounding its queue, producer wait, and
+shutdown, and reports pending/failed delivery instead of hanging indefinitely.
+Configuration mutations and subject/protocol selection also share the lifecycle
+command boundary, preventing a Record preflight/allocation race while the public
+state is still Ready. Future inactive protocol rows remain independently editable.
+
+The desktop launcher locks through a user-owned mode-0700 runtime directory and
+does not truncate a predictable file under `/tmp`. Calibration cleanup accepts
+only resolved, non-symlink generated child directories under the selected
+calibration root. Repeated Ctrl-C targets only reachAQ and explicitly registered
+child processes; it never signals a presumed process group.
+
+Event saturation retains exact-once session/trial lifecycle events in a bounded
+publisher outbox. If shutdown times out inside a plugin, the existing manager remains
+the singleton until its worker actually exits; reachAQ never creates a second manager
+that could reorder delivery against the live worker.
+
+## Operator verification
+
+1. Start with the PXI chassis powered and select System Mode Running.
+2. Confirm all enabled domains are Ready and both reach previews are live.
+3. Record for 30–60 seconds while generating several tone, laser, and CAN events.
+   Plot only one NI-DAQ signal during this test.
+4. Stop and wait for analysis. Confirm every enabled source exists in the source
+   manifest, all configured NI-DAQ channels are present, and the session is
+   complete.
+5. Confirm reach cameras share the committed frame boundaries; NI sample indices
+   are continuous; NI timestamps are strictly increasing; and camera/NI and
+   tone/NI correlations are present and unambiguous where the corresponding
+   physical lines are wired.
+6. Confirm JSON, YAML, and `alignment.json` contain the same finite start
+   boundary. Repeat three times and compare camera/NI offset stability.
+7. Start a session and Abort. Confirm the session directory is removed, counts are
+   zero, analysis does not run, and healthy previews remain active.
+8. Stop System Mode, power off only the PXI chassis, and start again. Cameras
+   should report their own results and continue preview if their physical
+   trigger path is available; NI-DAQ/laser should fail independently and block
+   Record. Power the chassis on and use the Hardware Status refresh/retry button;
+   healthy cameras must not restart.
+
+If cameras do not receive frames only while the chassis is off, inspect and
+document the actual trigger, power, and ground wiring. NI-DAQ software
+initialization does not itself trigger a camera. Camera timeout diagnostics
+preserve the first PySpin exception, incomplete-image status, configured role,
+serial, and effective trigger-node values; a later watchdog timeout must not be
+treated as the root cause.
+
+## Software verification
+
+From the repository root:
+
+```bash
+conda run -n reachaq python -m pytest -q \
+  tests/nidaq_channel_plan_test.py \
+  tests/nidaq_sample_timeline_test.py \
+  tests/nidaq_timing_test.py \
+  tests/nidaq_port_configuration_dialog_test.py \
+  tests/session_data_recorder_test.py \
+  tests/subsystem_status_test.py \
+  tests/test_app_model.py
+
+conda run -n reachaq python -m pytest -q
+```
+
+Software tests validate the state machine, persistence and metadata schemas,
+synthetic timing topologies, failure isolation, and queue behavior. They do not
+replace the physical wiring and chassis acceptance steps above.

@@ -1,20 +1,14 @@
 from __future__ import annotations
 
 import json
-import shutil
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Optional, Union, ClassVar, TextIO, Type, Any
 from typing_extensions import Self
 import yaml
 
-import humps
-
 from autotrainer.core.logging import get_verbose_logger
-from . import GenericSafeLoader, SystemConfigurationLoader, SystemConfigurationDumper, SystemConfigurationSafeLoader
-from .alarm_detector import AlarmDetectorConfig
-from .autoclamp_evasion_config import AnimalEvasionAlarmConfig, AutoClampEvasionDetectorConfig
+from . import GenericSafeLoader, SystemConfigurationLoader, SystemConfigurationDumper
 from .watchdog_config import WatchdogConfig
 from .. import make_camelize_representer, make_decamelize_constructor
 from .behavior_configuration import BehaviorConfiguration, add_behavior_configuration_representers, \
@@ -22,8 +16,10 @@ from .behavior_configuration import BehaviorConfiguration, add_behavior_configur
 from .camera_configuration import CameraConfiguration, CameraId
 from .hardware_configuration import HardwareConfiguration
 from .inference_configuration import InferenceConfiguration
+from .laser_configuration import LaserChannelConfiguration, LaserSystemConfiguration
+from .nidaq_port_configuration import NidaqPortConfiguration
+from .nidaq_stream_configuration import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
 from .persistence_configuration import PersistenceConfiguration
-from ..project.project_info import DATE_FORMAT, TIME_FORMAT
 
 logger = get_verbose_logger(__name__)
 
@@ -42,11 +38,14 @@ class SystemConfiguration:
 
     DEFAULT_PATH: ClassVar[Path] = DEFAULT_CONFIG_DIR.joinpath(f"{DEFAULT_NAME}.yaml")  # caller/user must expanduser() on it
 
-    version: int = 51
+    version: int = 58
 
     cameras: List[CameraConfiguration] = field(default_factory=list)
     hardware: HardwareConfiguration = field(default_factory=HardwareConfiguration)
     inference: InferenceConfiguration = field(default_factory=InferenceConfiguration)
+    laser: LaserSystemConfiguration = field(default_factory=LaserSystemConfiguration)
+    nidaq_ports: NidaqPortConfiguration = field(default_factory=NidaqPortConfiguration)
+    nidaq_stream: NidaqSignalStreamConfiguration = field(default_factory=NidaqSignalStreamConfiguration)
     behavior: BehaviorConfiguration = field(default_factory=BehaviorConfiguration)
     persistence: PersistenceConfiguration = field(default_factory=PersistenceConfiguration)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
@@ -61,38 +60,12 @@ class SystemConfiguration:
         raw_content: Dict[str, Any] = yaml.load(data, GenericSafeLoader)
         data.seek(0)
         version = raw_content.get("version", 0)
-        if version == SystemConfiguration.version:
-            # easy case
-            configuration: Self = yaml.load(data, SystemConfigurationLoader)
-        elif version < SystemConfiguration.version:
-            content = humps.decamelize(raw_content)
-            configuration = cls()
-            if version == 0:
-                configuration._deserialize_version_zero(content)
-            elif version == 1:
-                configuration._deserialize_version_one(content)
-            else:
-                configuration: Self = yaml.load(data, SystemConfigurationSafeLoader)
-        else:
-            assert version > SystemConfiguration.version
-            logger.warning("Loading configuration version %s while SystemConfiguration.version == %s, "
-                           "only considering known config attributes/properties.",
-                           version, SystemConfiguration.version)
-            configuration: Self = yaml.load(data, SystemConfigurationSafeLoader)
-
-        if version != SystemConfiguration.version and file_path is not None:
-            now = datetime.now()
-            now_str = now.strftime(f"{DATE_FORMAT}_{TIME_FORMAT}")
-            new_p = file_path.parent.joinpath(
-                f"{file_path.stem}_v{version}_{now_str}{file_path.suffix}")
-            logger.notice("Detected config version change/mismatch, saving old config to %s,"
-                          " and replacing with new after.", new_p)
-            shutil.copy2(file_path, new_p)
-            configuration.version = SystemConfiguration.version
-            # and save new one over previous:
-            configuration.save_file(file_path.with_suffix(""), as_yaml=True)
-
-        return configuration
+        if version != SystemConfiguration.version:
+            raise ValueError(
+                f"Unsupported system configuration version {version}; "
+                f"reachAQ requires version {SystemConfiguration.version}"
+            )
+        return yaml.load(data, SystemConfigurationLoader)
 
     @classmethod
     def load_yaml_file(cls: Type[Self], path: Union[Path, str], *, save_backup: bool = False) -> Self:
@@ -150,41 +123,6 @@ class SystemConfiguration:
 
         return self._camera_map.get(camera_id, None)
 
-    def _deserialize_version_zero(self, content: Dict):
-        self.cameras.clear()
-
-        self._try_append_version_zero_camera("camera1", content)
-        self._try_append_version_zero_camera("camera2", content)
-        self._try_append_version_zero_camera("camera3", content)
-
-        self.hardware = HardwareConfiguration.from_version_zero(content)
-
-        # Typo from earlier version of the file.
-        self.inference = InferenceConfiguration.from_version_zero(content.get("pellet", {}))
-
-        self.behavior = BehaviorConfiguration.from_version_zero(content)
-        self.persistence = PersistenceConfiguration.from_version_zero(content)
-
-    def _try_append_version_zero_camera(self, entry: str, content: Dict) -> bool:
-        if entry in content:
-            camera = CameraConfiguration.from_version_zero(entry, content[entry])
-            if camera is not None:
-                self.cameras.append(camera)
-                return True
-
-        return False
-
-    def _deserialize_version_one(self, content: Dict):
-        self.cameras = [
-            CameraConfiguration(**kw)
-            for kw in content.get("cameras", [])
-        ]
-        self.hardware = HardwareConfiguration(**content.get("hardware", {}))
-        self.inference = InferenceConfiguration(**content.get("inference", {}))
-        self.behavior = BehaviorConfiguration.from_version_one(content.get("behavior", {}))
-        self.persistence = PersistenceConfiguration(**content.get("persistence", {}))
-
-
 #
 
 system_configuration_representer = make_camelize_representer("!SystemConfiguration")
@@ -194,10 +132,12 @@ _tag_2_cls = dict(
     HardwareConfiguration=HardwareConfiguration,
     CameraConfiguration=CameraConfiguration,
     InferenceConfiguration=InferenceConfiguration,
+    LaserChannelConfiguration=LaserChannelConfiguration,
+    LaserSystemConfiguration=LaserSystemConfiguration,
+    NidaqPortConfiguration=NidaqPortConfiguration,
+    NidaqSignalChannelConfiguration=NidaqSignalChannelConfiguration,
+    NidaqSignalStreamConfiguration=NidaqSignalStreamConfiguration,
     WatchdogConfig=WatchdogConfig,
-    AlarmDetectorConfig=AlarmDetectorConfig,
-    AnimalEvasionAlarmConfig=AnimalEvasionAlarmConfig,
-    AutoClampEvasionDetectorConfig=AutoClampEvasionDetectorConfig,
     PersistenceConfiguration=PersistenceConfiguration,
 )
 

@@ -1,4 +1,3 @@
-import enum
 from dataclasses import dataclass
 from typing import Protocol, Optional
 
@@ -48,15 +47,20 @@ class IntersessionDetection:
     configuration: DetectionConfiguration
 
 
-class TrainingMode(str, enum.Enum):  # todo: eventually find better place
-    MANUAL = "Manual"
-    MANUAL_WITH_PROTOCOL = "Manual with Protocol"
-    AUTOMATIC = "Automatic"
-
-
 # Protocol first (less strict)
 from .inference_protocol import InferenceProtocol
 from .pellet_device_protocol import PelletDeviceProtocol
+from .pellet_trial import (
+    AttemptAssignmentPolicy,
+    HardwareErrorKind,
+    PelletTrialAttempt,
+    PelletTrialLedger,
+    RetrySettingsPolicy,
+    TrialAccountingConfiguration,
+    TrialCountBasis,
+    TrialOutcome,
+)
+from .pellet_presence_tracker import PelletPresenceTracker
 
 from .intersession import IntersessionState
 from .intersession.intersession_machine import IntersessionMachine
@@ -64,4 +68,3 @@ from .behavior_algorithm import BehaviorAlgorithm
 
 from .system_machine import SystemMachine
 from .system_machine_state import SystemState
-from .tunnel_device_protocol import TunnelDeviceProtocol

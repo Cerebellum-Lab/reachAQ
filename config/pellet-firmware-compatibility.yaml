@@ -1,0 +1,144 @@
+schema_version: 1
+board_type: pellet_module
+versions:
+  - version: 2.3.0
+    wire_schema_version: 1
+    required_capabilities:
+      - finite_stim3_pulse
+    optional_capabilities:
+      - timing_trailer
+      - time_sync
+    hardware_release: v2.3.0
+    tested_reachaq_release: pre-release-devel
+    qualification_status: rollout_pending
+    qualification_date: null
+    limitations:
+      - >-
+        First firmware to answer CAPABILITIES_REQUEST (0x23). Every release
+        through 2.2.0 dropped it silently, which is why finite_stim3_pulse is
+        optional in those entries: requiring a bit from a board that reports
+        no bits at all would reject every real board. A 2.3.0 board reports
+        what it has, so the requirement is now meaningful and is enforced.
+      - >-
+        Verified on christielab10 on 2026-09-23 against the released bundle,
+        both MCUboot slots carrying 2.3.0: CAPABILITIES_RESPONSE on 0x480
+        carries wire_schema_version 1 and capabilities 0x00000004, identical
+        across repeated requests within a boot, and the boot id changes across
+        a reboot with the other fields unchanged.
+      - >-
+        timing_trailer and time_sync stay optional and are never reported.
+        Nothing in this firmware appends a timing trailer and nothing in this
+        host reads one; TIME_SYNC_REQUEST (0x1F) has no handler on the board
+        and no entry in its command enum. They are reserved names on both
+        sides rather than features awaiting a flag.
+      - >-
+        Capability reporting says what a board can do, not whether it is
+        wired correctly. finite_stim3_pulse means the board will serve a
+        pulse, not that anything is connected to the pin; the wiring test
+        remains the only thing that answers that.
+      - >-
+        Rig evidence, christielab10, 2026-09-23, from
+        tools/hardware/qualify_pellet_firmware.py: 19 of 19 checks after a
+        rollback to 2.2.0 (also 19 of 19) and back, with both MCUboot slots on
+        2.3.0 (pellet-2.3.0-20260924T000947Z.json under
+        ~/Autotrainer/pellet_firmware_qualification). Tones map 5 kHz to tone1
+        and 6 kHz to tone2 only, 8 kHz to neither; STIM2 and STIM3 500 ms
+        pulses rise about 1.3 ms after send and return low unaided at about
+        498.9 ms; pulses on STIM0/STIM1 are refused with -EPERM and nothing
+        moves; 50 of 50 short pulses are acknowledged, reported asserted and
+        completed, and counted at the NI; a reboot changes the boot id and
+        nothing else. Still outstanding before this entry is qualified: a
+        recorded session passing reachaq-validate-session.
+  - version: 2.2.0
+    wire_schema_version: 1
+    required_capabilities: []
+    optional_capabilities:
+      - timing_trailer
+      - time_sync
+      - finite_stim3_pulse
+    hardware_release: v2.2.0
+    tested_reachaq_release: pre-release-devel
+    qualification_status: rollout_pending
+    qualification_date: null
+    limitations:
+      - >-
+        First firmware to implement JERRYCAN_CMD_GPIO_PULSE (0x21) and
+        GPIO_PULSE_STATUS (0x22). Every release through 2.1.0 dropped the pulse
+        frame: no handler, and no acknowledgement either, so the hardware_stim3
+        laser route could not fire the board at all. Verified on christielab10
+        on 2026-09-17: board STIM3 and STIM2 each pulsed 500 ms within 170 us of
+        the request, returned low unaided, and a pulse addressed to a tone
+        confirmation line was refused with -EPERM.
+      - >-
+        Capability reporting is still not implemented. This firmware answers no
+        CAPABILITIES_REQUEST (0x23), so it reports no capability bits and
+        finite_stim3_pulse stays optional here rather than required. Requiring
+        it would reject every real 2.2.0 board, which is the same trap the 2.1.0
+        entry below records. Move it to required_capabilities only once a
+        firmware that answers the request ships.
+      - >-
+        The tone confirmation is gated on an exact frequency match. The board
+        devicetree maps tone-output-frequencies-hz = <5000 6000> onto STIM0
+        and STIM1, and the tone generator driver asserts a pin only where the
+        requested frequency equals its mapped one, so a tone at any other
+        frequency sounds with no TTL to record it. Verified on christielab10
+        on 2026-09-23 against 2.2.0: 5000 Hz raised port0/line0, 6000 Hz
+        raised port0/line1, 8000 Hz raised nothing. This is not a defect, but
+        it is invisible from the host - a protocol that plays a tone at an
+        unmapped frequency gets no confirmation and no error.
+      - >-
+        Pulse width is verified only at the long end. Two status frames for a
+        100 us pulse arrive about 3 us apart at the host, which only proves both
+        were queued, so the short end of the 100 us..5 s range stays unmeasured
+        until someone puts a scope on the BNC.
+  - version: 2.1.0
+    wire_schema_version: 1
+    required_capabilities: []
+    optional_capabilities:
+      - timing_trailer
+      - time_sync
+      - finite_stim3_pulse
+    hardware_release: v2.1.0
+    tested_reachaq_release: pre-release-devel
+    qualification_status: rollout_pending
+    qualification_date: null
+    limitations:
+      - Physical rig qualification and retained acceptance evidence are pending.
+      - >-
+        Firmware v2.1.0 implements no capability-report or time-sync command.
+        Verified against the release source (commit 161b635): its command set
+        is CFG/GPIO/SERVO/STEPPER/TONE/AUDIO/DOOR_SENSOR/PRESSURE_READ and
+        friends, with no counterpart to the host's CAPABILITIES_REQUEST (0x23)
+        or TIME_SYNC_REQUEST (0x1F), and the board answers neither on the bus.
+        These three were listed as required in anticipation of a firmware that
+        reports them; requiring them rejected every real 2.1.0 board. They are
+        optional here for the same reason they are optional on 2.0.0, and a
+        2.1.0 board therefore runs with host-receive timestamp confidence -
+        the same behaviour 2.0.0 boards already have. Restore them to
+        required_capabilities when a firmware that implements the commands
+        ships, so the policy starts protecting again rather than predicting.
+  - version: 2.0.0
+    wire_schema_version: 1
+    required_capabilities: []
+    optional_capabilities:
+      - timing_trailer
+      - time_sync
+      - finite_stim3_pulse
+    hardware_release: v2.0.0
+    tested_reachaq_release: pre-release-devel
+    qualification_status: rollout_pending
+    qualification_date: null
+    limitations:
+      - Board timing and finite STIM3 require the board-time-sync firmware rollout.
+      - Legacy v2.0.0 images remain usable with host-receive timestamp confidence.
+  - version: 0.1.0
+    board_type: pellet_emulator
+    wire_schema_version: 0
+    required_capabilities: []
+    optional_capabilities: []
+    hardware_release: emulator
+    tested_reachaq_release: pre-release-devel
+    qualification_status: automated_tests
+    qualification_date: null
+    limitations:
+      - Emulation only; never accepted as physical hardware.

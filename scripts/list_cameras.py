@@ -1,22 +1,7 @@
-import os
-
-# Must precede import cv2
-os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
-
-# noinspection PyPep8
 from autotrainer.video import VideoManager
 
 print("Random Image Generator")
 print("\tCamera 0: random://0")
-
-usb_cameras = VideoManager.list_usb_cameras()
-print("USB Cameras")
-
-if len(usb_cameras) == 0:
-    print("\tNo cameras")
-else:
-    for i, sn in enumerate(usb_cameras):
-        print(f"\tCamera {i}: opencv://{sn}")
 
 flir_cameras = VideoManager.list_spin_cameras()
 

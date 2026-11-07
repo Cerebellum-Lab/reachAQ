@@ -1,0 +1,441 @@
+from __future__ import annotations
+
+import dataclasses
+import json
+import logging
+import os
+import subprocess
+import sys
+import time
+from typing import List, Optional, Tuple
+
+from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization
+
+
+logger = get_verbose_logger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class NidaqDevicePorts:
+    name: str
+    product_type: str = ""
+    product_number: Optional[int] = None
+    serial_number: Optional[int] = None
+    analog_outputs: Tuple[str, ...] = tuple()
+    analog_inputs: Tuple[str, ...] = tuple()
+    digital_outputs: Tuple[str, ...] = tuple()
+    digital_inputs: Tuple[str, ...] = tuple()
+    counter_outputs: Tuple[str, ...] = tuple()
+    counter_inputs: Tuple[str, ...] = tuple()
+    bus_type: str = ""
+    pxi_chassis_number: Optional[int] = None
+    #: Slot within the chassis. Reads 4294967295 alongside the chassis number
+    #: when PXI Platform Services has not identified the chassis, which is
+    #: also when DAQmx refuses to route timing between slots.
+    pxi_slot_number: Optional[int] = None
+    product_category: str = ""
+    #: Whether the board has an analog trigger circuit at all. The driver
+    #: answers this outright, and a day was spent tracing a stimulus line to
+    #: an APFI connector on a board where it reads False.
+    analog_trigger_supported: Optional[bool] = None
+    #: Terminal configurations each analog input accepts, as (channel, modes)
+    #: pairs. Per channel rather than per board because they differ within
+    #: one: a PXI-6221 offers DIFF on ai0-ai7, which pair with ai8-ai15, and
+    #: only RSE and NRSE above that. A single board-wide answer says DIFF is
+    #: available and is wrong for half the range.
+    analog_input_terminal_configs: Tuple[Tuple[str, Tuple[str, ...]], ...] = tuple()
+    #: Trigger roles each subsystem supports, as (subsystem, roles) pairs -
+    #: a tuple rather than a mapping so the record survives the JSON round
+    #: trip through the isolated discovery process.
+    trigger_usages: Tuple[Tuple[str, Tuple[str, ...]], ...] = tuple()
+    terminals: Tuple[str, ...] = tuple()
+    analog_output_sample_clock_supported: Optional[bool] = None
+    digital_trigger_supported: Optional[bool] = None
+    analog_input_max_single_channel_rate: Optional[float] = None
+    analog_input_max_multi_channel_rate: Optional[float] = None
+    analog_output_max_rate: Optional[float] = None
+    #: Maximum clocked digital input rate, or None when the board does not
+    #: support the property at all - which is the driver's way of saying it
+    #: has no correlated digital input. A PXI-6713's digital lines are static
+    #: I/O: they hold a level and cannot be sampled against a clock, and
+    #: putting them in a buffered task fails at -200452 on DI_DataXferMech.
+    digital_input_max_rate: Optional[float] = None
+    #: Internal channels that read an analog output back through the board's
+    #: own input multiplexer, as (analog output, internal channel) pairs. An
+    #: analog output cannot be read directly - DAQmx refuses it as the wrong
+    #: I/O type - and these are the only way to see one without a cable back
+    #: into an input. The driver does not enumerate them, so they are probed
+    #: by NI's documented name and kept only where the probe answers.
+    analog_output_readbacks: Tuple[Tuple[str, str], ...] = tuple()
+
+
+def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str]]:
+    started = time.perf_counter()
+    log_hardware_initialization(
+        logger,
+        "START | NI-DAQ discovery | isolated_process=true timeout=10s",
+    )
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import dataclasses, json; "
+            "from tools.acquisition.model.nidaq_discovery import _discover_nidaq_devices_direct; "
+            "devices, error = _discover_nidaq_devices_direct(); "
+            "print(json.dumps({'devices': [dataclasses.asdict(device) for device in devices], 'error': error}))"
+        ),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            # An explicit environment, which looks redundant and is not.
+            # Once the NI-DAQmx runtime is resident in a Qt process - which
+            # it is as soon as the laser loads - starting a child with the
+            # inherited environment fails at exec with "[Errno 14] Bad
+            # address" naming the Python executable. Measured on
+            # christielab10: default run fails, env=os.environ.copy()
+            # succeeds, in the same process moments apart. Passing an
+            # environment makes CPython build a fresh envp rather than hand
+            # the child the one NI has been in.
+            env=os.environ.copy(),
+        )
+    except subprocess.TimeoutExpired:
+        error = "NI-DAQmx discovery timed out while probing devices."
+        _log_discovery_result(tuple(), error, started)
+        return tuple(), error
+
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        detail = (
+            f"signal {-completed.returncode}"
+            if completed.returncode < 0
+            else f"exit code {completed.returncode}"
+        )
+        if stderr:
+            detail = f"{detail}: {stderr}"
+        error = (
+            "NI-DAQmx discovery failed in an isolated probe process "
+            f"({detail}). The NI-DAQmx native runtime may be installed but unusable in this OS environment."
+        )
+        _log_discovery_result(tuple(), error, started)
+        return tuple(), error
+
+    json_line = _last_stdout_line(completed.stdout)
+    if not json_line:
+        error = "NI-DAQmx discovery returned no device data."
+        _log_discovery_result(tuple(), error, started)
+        return tuple(), error
+
+    try:
+        payload = json.loads(json_line)
+    except json.JSONDecodeError as exc:
+        error = f"NI-DAQmx discovery returned invalid device data: {exc}"
+        _log_discovery_result(tuple(), error, started)
+        return tuple(), error
+
+    devices = tuple(
+        NidaqDevicePorts(
+            name=str(device["name"]),
+            product_type=str(device.get("product_type", "")),
+            product_number=device.get("product_number"),
+            serial_number=device.get("serial_number"),
+            analog_outputs=tuple(device.get("analog_outputs", tuple())),
+            analog_inputs=tuple(device.get("analog_inputs", tuple())),
+            digital_outputs=tuple(device.get("digital_outputs", tuple())),
+            digital_inputs=tuple(device.get("digital_inputs", tuple())),
+            counter_outputs=tuple(device.get("counter_outputs", tuple())),
+            counter_inputs=tuple(device.get("counter_inputs", tuple())),
+            bus_type=str(device.get("bus_type", "")),
+            pxi_chassis_number=device.get("pxi_chassis_number"),
+            pxi_slot_number=device.get("pxi_slot_number"),
+            product_category=str(device.get("product_category", "")),
+            analog_trigger_supported=_optional_bool(
+                device.get("analog_trigger_supported")
+            ),
+            analog_input_terminal_configs=tuple(
+                (str(channel), tuple(modes))
+                for channel, modes in device.get(
+                    "analog_input_terminal_configs", tuple())
+            ),
+            # JSON gives back lists; the record holds tuples of tuples.
+            trigger_usages=tuple(
+                (str(subsystem), tuple(roles))
+                for subsystem, roles in device.get("trigger_usages", tuple())
+            ),
+            terminals=tuple(device.get("terminals", tuple())),
+            analog_output_sample_clock_supported=_optional_bool(
+                device.get("analog_output_sample_clock_supported")
+            ),
+            digital_trigger_supported=_optional_bool(
+                device.get("digital_trigger_supported")
+            ),
+            analog_input_max_single_channel_rate=_optional_float(
+                device.get("analog_input_max_single_channel_rate")
+            ),
+            analog_input_max_multi_channel_rate=_optional_float(
+                device.get("analog_input_max_multi_channel_rate")
+            ),
+            digital_input_max_rate=_optional_float(
+                device.get("digital_input_max_rate")
+            ),
+            analog_output_readbacks=tuple(
+                (str(output), str(internal))
+                for output, internal in (
+                    device.get("analog_output_readbacks") or ())
+            ),
+            analog_output_max_rate=_optional_float(
+                device.get("analog_output_max_rate")
+            ),
+        )
+        for device in payload.get("devices", tuple())
+        if device.get("name")
+    )
+    error = payload.get("error")
+    error = str(error) if error else None
+    _log_discovery_result(devices, error, started)
+    return devices, error
+
+
+def _log_discovery_result(
+    devices: Tuple[NidaqDevicePorts, ...],
+    error: Optional[str],
+    started: float,
+) -> None:
+    state = "UNAVAILABLE" if error else "READY"
+    log_hardware_initialization(
+        logger,
+        "%s | NI-DAQ discovery | count=%d devices=%s elapsed=%.3fs%s",
+        state,
+        len(devices),
+        tuple(device.name for device in devices),
+        time.perf_counter() - started,
+        "" if error is None else f" error={error}",
+        level=logging.INFO,
+    )
+
+
+def _discover_nidaq_devices_direct() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str]]:
+    try:
+        from nidaqmx.system import PhysicalChannel, System
+        from nidaqmx.errors import DaqError, DaqNotFoundError
+    except ModuleNotFoundError:
+        return tuple(), (
+            "NI-DAQmx discovery is unavailable because the nidaqmx Python package is not installed."
+        )
+
+    try:
+        system = System.local()
+        devices = []
+        for device in system.devices:
+            name = getattr(device, "name", None)
+            if not name:
+                continue
+            devices.append(
+                NidaqDevicePorts(
+                    name=name,
+                    product_type=str(getattr(device, "product_type", "") or ""),
+                    product_number=_optional_int(getattr(device, "product_num", None)),
+                    serial_number=_optional_int(getattr(device, "serial_num", None)),
+                    analog_outputs=_channel_names(getattr(device, "ao_physical_chans", tuple())),
+                    analog_inputs=_channel_names(getattr(device, "ai_physical_chans", tuple())),
+                    digital_outputs=_channel_names(
+                        getattr(device, "do_lines", tuple()),
+                        getattr(device, "do_physical_chans", tuple()),
+                    ),
+                    digital_inputs=_channel_names(
+                        getattr(device, "di_lines", tuple()),
+                        getattr(device, "di_physical_chans", tuple()),
+                    ),
+                    counter_outputs=_channel_names(
+                        getattr(device, "co_physical_chans", tuple()),
+                    ),
+                    counter_inputs=_channel_names(
+                        getattr(device, "ci_physical_chans", tuple()),
+                    ),
+                    bus_type=str(getattr(device, "bus_type", "") or ""),
+                    pxi_chassis_number=_optional_int(
+                        getattr(device, "pxi_chassis_num", None)
+                    ),
+                    pxi_slot_number=_optional_int(
+                        getattr(device, "pxi_slot_num", None)
+                    ),
+                    product_category=_enum_name(
+                        _optional_device_property(
+                            device, "product_category", DaqError)),
+                    analog_trigger_supported=_optional_bool(
+                        _optional_device_property(
+                            device, "anlg_trig_supported", DaqError)),
+                    analog_input_terminal_configs=_terminal_configs(device),
+                    trigger_usages=_trigger_usages(device, DaqError),
+                    terminals=tuple(
+                        str(terminal)
+                        for terminal in (getattr(device, "terminals", tuple()) or tuple())
+                    ),
+                    analog_output_sample_clock_supported=_optional_bool(
+                        _optional_device_property(device, "ao_samp_clk_supported", DaqError)
+                    ),
+                    digital_trigger_supported=_optional_bool(
+                        _optional_device_property(device, "dig_trig_supported", DaqError)
+                    ),
+                    analog_input_max_single_channel_rate=_optional_float(
+                        _optional_device_property(device, "ai_max_single_chan_rate", DaqError)
+                    ),
+                    analog_input_max_multi_channel_rate=_optional_float(
+                        _optional_device_property(device, "ai_max_multi_chan_rate", DaqError)
+                    ),
+                    digital_input_max_rate=_optional_float(
+                        _optional_device_property(device, "di_max_rate", DaqError)
+                    ),
+                    analog_output_readbacks=_analog_output_readbacks(
+                        PhysicalChannel, device),
+                    analog_output_max_rate=_optional_float(
+                        _optional_device_property(device, "ao_max_rate", DaqError)
+                    ),
+                )
+            )
+        return tuple(devices), None
+    except DaqNotFoundError as exc:
+        return tuple(), (
+            "NI-DAQmx discovery is unavailable because the NI-DAQmx runtime/C driver is not installed "
+            f"or not loadable by this OS environment: {exc}"
+        )
+    except Exception as exc:
+        return tuple(), f"NI-DAQmx discovery failed: {exc}"
+
+
+def _analog_output_readbacks(physical_channel_class, device
+                             ) -> Tuple[Tuple[str, str], ...]:
+    """Which analog outputs this board can read back through its own input.
+
+    NI names the internal channel `<device>/_ao<n>_vs_aognd`, and does not
+    list it among the physical channels, so the only way to know whether one
+    exists is to name it and see. Measured on christielab10: a PXI-6221
+    answers for ao0 and ao1, and a PXI-6713 answers for none of its eight -
+    it has no analog input subsystem to route them through, so its outputs
+    can only be seen by a cable back into another board.
+    """
+    found = []
+    for channel in getattr(device, "ao_physical_chans", ()) or ():
+        name = getattr(channel, "name", "")
+        tail = str(name).rsplit("/", 1)[-1]
+        if not tail.startswith("ao"):
+            continue
+        internal = f"{device.name}/_{tail}_vs_aognd"
+        try:
+            if tuple(physical_channel_class(internal).ai_term_cfgs):
+                found.append((str(name), internal))
+        except Exception:
+            continue
+    return tuple(found)
+
+
+def _enum_name(value) -> str:
+    """An enum's name, or its string form, so it survives JSON."""
+    if value is None:
+        return ""
+    return str(getattr(value, "name", value))
+
+
+def _terminal_configs(device) -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
+    """Terminal configurations each analog input accepts, per channel.
+
+    The property lives on the physical channel, and reading one channel and
+    generalising is wrong: on a PXI-6221, ai0-ai7 report DIFF because each
+    pairs with ai8-ai15, and ai8 upwards report only RSE and NRSE. A board
+    that says "DIFF is supported" is telling the truth about half its inputs.
+    """
+    configs = []
+    for channel in getattr(device, "ai_physical_chans", tuple()) or tuple():
+        try:
+            configs.append((
+                str(channel.name),
+                tuple(_enum_name(item) for item in channel.ai_term_cfgs),
+            ))
+        except Exception:
+            continue
+    return tuple(configs)
+
+
+def _trigger_usages(device, daq_error_type) -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
+    """Which trigger roles each subsystem supports.
+
+    An empty list is a real answer, not a missing one: this board's digital
+    input reports no trigger usage at all.
+    """
+    usages = []
+    for subsystem, attribute in (
+        ("ai", "ai_trig_usage"),
+        ("ao", "ao_trig_usage"),
+        ("di", "di_trig_usage"),
+        ("do", "do_trig_usage"),
+        ("ci", "ci_trig_usage"),
+        ("co", "co_trig_usage"),
+    ):
+        value = _optional_device_property(device, attribute, daq_error_type)
+        if value is None:
+            continue
+        usages.append((subsystem, tuple(_enum_name(item) for item in value)))
+    return tuple(usages)
+
+
+def device_name_from_channel(channel_name: Optional[str]) -> Optional[str]:
+    if not channel_name:
+        return None
+    parts = channel_name.strip().lstrip("/").split("/")
+    if len(parts) < 2 or not parts[0]:
+        return None
+    return parts[0]
+
+
+def _channel_names(*collections) -> Tuple[str, ...]:
+    names: List[str] = []
+    for collection in collections:
+        try:
+            iterator = iter(collection)
+        except TypeError:
+            continue
+        for channel in iterator:
+            name = getattr(channel, "name", None)
+            if name is None:
+                name = str(channel)
+            if name and name not in names:
+                names.append(name)
+    return tuple(names)
+
+
+def _last_stdout_line(stdout: str) -> str:
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def _optional_int(value) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_bool(value) -> Optional[bool]:
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _optional_device_property(device, attribute_name: str, daq_error_type):
+    try:
+        return getattr(device, attribute_name, None)
+    except daq_error_type as exc:
+        if getattr(exc, "error_code", None) == -200197:
+            return None
+        raise

@@ -1,0 +1,851 @@
+from __future__ import annotations
+
+import dataclasses
+import logging
+import math
+import queue
+import signal
+import threading
+import time
+from typing import Callable, Iterable, Optional
+
+from autotrainer.core import (
+    NidaqSignalChannelConfiguration,
+    NidaqSignalStreamConfiguration,
+    NidaqDeviceIdentity,
+    NidaqTimingConfiguration,
+    NidaqTimingPlan,
+    ObservableObject,
+    ProjectInfo,
+)
+from autotrainer.core.logging import (
+    ALWAYS_CONSOLE_LOG_ATTRIBUTE,
+    get_verbose_logger,
+    install_log_exception_hook,
+    log_hardware_initialization,
+)
+from autotrainer.core.multiproc import get_nidaq_mp_ctx
+from autotrainer.core.project import ProjectDependentProtocol
+from autotrainer.device import NidaqSignalStreamController
+from tools.acquisition.model.nidaq_sample_ring import SharedNidaqSampleRing
+from tools.acquisition.model.nidaq_channel_plan import with_display_channels
+from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
+from tools.acquisition.model.nidaq_timing import build_nidaq_timing_plan
+from tools.acquisition.model.nidaq_timing import (
+    resolve_nidaq_multidevice_probe,
+    resolve_nidaq_device_aliases,
+    resolve_nidaq_device_names,
+    resolve_nidaq_stream_configuration,
+)
+from tools.acquisition.model.nidaq_preflight import run_isolated_nidaq_preflight
+from tools.acquisition.model.nidaq_validation import validate_export_lines
+
+
+logger = get_verbose_logger(__name__)
+
+
+def _resolve_physical_channel_device(channel: str, aliases) -> str:
+    parts = str(channel).strip("/").split("/", 1)
+    if len(parts) != 2:
+        return str(channel)
+    return f"{aliases.get(parts[0], parts[0])}/{parts[1]}"
+
+
+_WORKER_READY = "ready"
+_WORKER_ERROR = "error"
+_WORKER_STOPPED = "stopped"
+_WORKER_LOG = "log"
+_DEFAULT_STARTUP_TIMEOUT_SECONDS = 10.0
+_PAUSED_STATUS = "NI-DAQ signal stream paused"
+#: How a stopped stream the application holds back says so (show_held_back).
+_HELD_BACK_STATUS = "NI-DAQ input stream held back"
+
+
+def _put_worker_message(message_queue, message) -> None:
+    """Best-effort child-to-parent delivery without letting a full queue hang NI cleanup."""
+    try:
+        message_queue.put(message, timeout=0.5)
+    except (BrokenPipeError, EOFError, OSError, queue.Full):
+        pass
+
+
+class _NidaqWorkerLogHandler(logging.Handler):
+    """Relay child logs over its disposable stream queue, not the global log queue."""
+
+    def __init__(self, message_queue):
+        super().__init__(logging.NOTSET)
+        self._message_queue = message_queue
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            payload = (
+                record.levelno,
+                record.name,
+                self.format(record),
+                bool(getattr(record, ALWAYS_CONSOLE_LOG_ATTRIBUTE, False)),
+            )
+            _put_worker_message(self._message_queue, (_WORKER_LOG, payload))
+        except Exception:
+            self.handleError(record)
+
+
+def _nidaq_signal_stream_worker(
+    configuration,
+    timing_plan,
+    message_queue,
+    sample_ring,
+    stop_event,
+    log_dict_config,
+) -> None:
+    """Own every NI-DAQmx call in a disposable process.
+
+    Loading the NI Linux runtime can hang or terminate the interpreter.  Keeping
+    that native boundary out of the Qt process ensures either failure is reported
+    without taking the application UI with it.
+    """
+    del log_dict_config  # retained in the worker signature for injected test workers
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    root_logger = logging.getLogger()
+    root_logger.handlers = [_NidaqWorkerLogHandler(message_queue)]
+    root_logger.setLevel(logging.NOTSET)
+    install_log_exception_hook()
+
+    controller = None
+    try:
+        controller = NidaqSignalStreamController(
+            configuration,
+            timing_plan=timing_plan,
+        )
+        controller.start()
+        _put_worker_message(message_queue, (_WORKER_READY, None))
+        while not stop_event.is_set():
+            block = controller.read_chunk()
+            if block.sample_count > 0:
+                sample_ring.write_block(block)
+    except BaseException as exc:
+        message = str(exc) or exc.__class__.__name__
+        logger.exception("NI-DAQ signal stream worker failed")
+        _put_worker_message(message_queue, (_WORKER_ERROR, message))
+    finally:
+        if controller is not None:
+            try:
+                controller.close()
+            except BaseException as exc:
+                message = str(exc) or exc.__class__.__name__
+                logger.exception("Failed to close NI-DAQ signal stream worker")
+                _put_worker_message(message_queue, (_WORKER_ERROR, message))
+        _put_worker_message(message_queue, (_WORKER_STOPPED, None))
+
+
+class NidaqSignalMonitorModel(ObservableObject, ProjectDependentProtocol):
+    CONFIGURATION = "configuration"
+    HARDWARE_ENABLED = "hardware_enabled"
+    IS_STARTING = "is_starting"
+    IS_RUNNING = "is_running"
+    STATUS_MESSAGE = "status_message"
+    ERROR_MESSAGE = "error_message"
+    TIMING_PLAN = "timing_plan"
+
+    def __init__(
+        self,
+        *,
+        mp_ctx=None,
+        worker_target=_nidaq_signal_stream_worker,
+        device_discovery=discover_nidaq_devices,
+        startup_timeout_seconds: float = _DEFAULT_STARTUP_TIMEOUT_SECONDS,
+        exact_preflight=None,
+        restart_allowed: Optional[Callable[[], bool]] = None,
+    ):
+        super().__init__()
+        self._configuration = NidaqSignalStreamConfiguration()
+        self._hardware_enabled = False
+        self._project: Optional[ProjectInfo] = None
+        self._mp_ctx = get_nidaq_mp_ctx() if mp_ctx is None else mp_ctx
+        self._worker_target = worker_target
+        self._device_discovery = device_discovery
+        self._startup_timeout_seconds = startup_timeout_seconds
+        self._exact_preflight = (
+            run_isolated_nidaq_preflight
+            if exact_preflight is None and worker_target is _nidaq_signal_stream_worker
+            else exact_preflight
+        )
+        self._display_refresh_rate_hz = 60.0
+        #: Asked before a display refresh-rate change restarts a running
+        #: stream; None always allows it. See set_display_refresh_rate.
+        self._restart_allowed = restart_allowed
+        self._process = None
+        self._message_queue = None
+        self._process_stop_event = None
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.RLock()
+        self._is_starting = False
+        self._is_running = False
+        self._status_message = "NI-DAQ signal stream disabled"
+        self._error_message = ""
+        self._timing_configuration = NidaqTimingConfiguration()
+        self._hardware_timed_output_devices = tuple()
+        self._hardware_timed_output_channels = tuple()
+        self._device_identities: tuple[NidaqDeviceIdentity, ...] = tuple()
+        #: The laser configuration, read for its backplane lines alone
+        #: (configure_timing).
+        self._laser = None
+        self._runtime_device_aliases = {}
+        self._timing_plan: Optional[NidaqTimingPlan] = None
+        self._sample_ring = SharedNidaqSampleRing(self._configuration, mp_ctx=self._mp_ctx)
+
+    @property
+    def configuration(self) -> NidaqSignalStreamConfiguration:
+        return self._configuration
+
+    @property
+    def hardware_enabled(self) -> bool:
+        return self._hardware_enabled
+
+    @property
+    def project(self) -> Optional[ProjectInfo]:
+        return self._project
+
+    @project.setter
+    def project(self, value: Optional[ProjectInfo]):
+        with self._lock:
+            self._project = value
+
+    @property
+    def is_running(self) -> bool:
+        return self._is_running
+
+    @property
+    def is_starting(self) -> bool:
+        return self._is_starting
+
+    @property
+    def status_message(self) -> str:
+        return self._status_message
+
+    @property
+    def error_message(self) -> str:
+        return self._error_message
+
+    @property
+    def stream_state(self) -> str:
+        """One word for the stream, as the Analysis card and laser tabs show it."""
+        if not (self._hardware_enabled and self._configuration.is_enabled):
+            return "disabled"
+        if self._is_starting:
+            return "starting"
+        if self._is_running:
+            return "running"
+        if self._error_message:
+            return "error"
+        return "stopped"
+
+    @property
+    def timing_plan(self) -> Optional[NidaqTimingPlan]:
+        return self._timing_plan
+
+    @property
+    def runtime_device_aliases(self):
+        return dict(self._runtime_device_aliases)
+
+    @property
+    def display_refresh_rate_hz(self) -> float:
+        return self._display_refresh_rate_hz
+
+    def _ring_fits(self, ring, configuration) -> bool:
+        required_capacity = max(
+            configuration.read_chunk_size * 4,
+            int(math.ceil(
+                configuration.sample_rate_hz
+                * configuration.rolling_window_seconds
+            )),
+        )
+        return (
+            ring.channel_names == tuple(channel.name for channel in configuration.channels)
+            and math.isclose(ring.sample_rate_hz, configuration.sample_rate_hz)
+            and ring.capacity >= required_capacity
+        )
+
+    @property
+    def sample_ring(self) -> SharedNidaqSampleRing:
+        # Checked without the lock first. start() holds the lock through
+        # device discovery and the exact-task preflight, which take seconds,
+        # and the graphs read this at the display refresh rate on the Qt
+        # thread. Now that the stream starts by itself in the background,
+        # waiting on the lock here would freeze every graph for as long as
+        # each start takes. The ring only needs replacing when the
+        # configuration changed, and that path still takes the lock.
+        ring = self._sample_ring
+        if self._ring_fits(ring, self._configuration):
+            return ring
+        with self._lock:
+            ring = self._sample_ring
+            if not self._ring_fits(ring, self._configuration):
+                if self._process is not None:
+                    raise RuntimeError("cannot replace NI-DAQ sample ring while stream is active")
+                ring = SharedNidaqSampleRing(self._configuration, mp_ctx=self._mp_ctx)
+                self._sample_ring = ring
+            return ring
+
+    @property
+    def effective_read_chunk_size(self) -> int:
+        return max(
+            1,
+            int(round(self._configuration.sample_rate_hz / self._display_refresh_rate_hz)),
+        )
+
+    def set_display_refresh_rate(self, refresh_rate_hz: float) -> None:
+        refresh_rate_hz = float(refresh_rate_hz)
+        if not math.isfinite(refresh_rate_hz) or refresh_rate_hz < 1.0:
+            refresh_rate_hz = 60.0
+        previous_chunk_size = self.effective_read_chunk_size
+        if math.isclose(refresh_rate_hz, self._display_refresh_rate_hz, rel_tol=0.001):
+            return
+        was_active = self._is_running or self._is_starting
+        self._display_refresh_rate_hz = refresh_rate_hz
+        if was_active and self.effective_read_chunk_size != previous_chunk_size:
+            if self._restart_allowed is not None and not self._restart_allowed():
+                # The rate follows the window's screen, so moving the window
+                # to another screen while recording restarted the stream: a
+                # silent gap, a reset ring and a new timing anchor mid-session.
+                # start() reads the chunk from this rate, and every Run and
+                # every Stop starts the stream again, so the chunk waits.
+                logger.info(
+                    "Display refresh rate is now %g Hz; the NI-DAQ read chunk "
+                    "becomes %d samples when the stream next starts",
+                    refresh_rate_hz,
+                    self.effective_read_chunk_size,
+                )
+                return
+            self.stop()
+            self.start()
+
+    def load_configuration(self, configuration: NidaqSignalStreamConfiguration) -> None:
+        self.stop()
+        prev = self._configuration
+        self._configuration = configuration
+        self._on_property_changed(self.CONFIGURATION, configuration, prev)
+        if configuration.is_enabled and self._hardware_enabled:
+            self._set_status("NI-DAQ signal stream stopped")
+            self._set_error("")
+            log_hardware_initialization(
+                logger,
+                "SKIP | NI-DAQ signal stream | configured; loading does not start it",
+            )
+        elif configuration.is_enabled:
+            self._set_status("NI-DAQ hardware disabled; signal stream stopped")
+            self._set_error("")
+            log_hardware_initialization(logger, "SKIP | NI-DAQ signal stream | NI-DAQ hardware disabled")
+        else:
+            self._set_status("NI-DAQ signal stream disabled")
+            self._set_error("")
+            log_hardware_initialization(logger, "SKIP | NI-DAQ signal stream | disabled")
+
+    def set_hardware_enabled(self, enabled: bool, *, auto_start: bool = False) -> None:
+        enabled = bool(enabled)
+        previous = self._hardware_enabled
+        if enabled == previous:
+            return
+        self._hardware_enabled = enabled
+        self._on_property_changed(self.HARDWARE_ENABLED, enabled, previous)
+        if not enabled:
+            self.stop()
+            self._set_status("NI-DAQ hardware disabled; signal stream stopped")
+            self._set_error("")
+        elif auto_start and self._configuration.is_enabled:
+            self.start()
+
+    def save_configuration(self) -> NidaqSignalStreamConfiguration:
+        return self._configuration
+
+    def _timing_matches(
+        self,
+        configuration,
+        hardware_timed_output_devices,
+        hardware_timed_output_channels,
+        device_identities,
+    ) -> bool:
+        """Whether this request is the timing already in force.
+
+        Compared field by field rather than by identity: the caller has
+        usually just rebuilt these objects from the same file, so they are
+        equal without being the same object.
+        """
+        def normalise(devices, channels):
+            return (
+                tuple(dict.fromkeys(str(d) for d in devices if d)),
+                tuple(dict.fromkeys(str(c) for c in channels if c)),
+            )
+
+        wanted = normalise(hardware_timed_output_devices,
+                           hardware_timed_output_channels)
+        current = (self._hardware_timed_output_devices,
+                   self._hardware_timed_output_channels)
+        return (configuration == self._timing_configuration
+                and wanted == current
+                and tuple(device_identities) == self._device_identities)
+
+    def configure_timing(
+        self,
+        configuration: NidaqTimingConfiguration,
+        *,
+        hardware_timed_output_devices: Iterable[str] = tuple(),
+        hardware_timed_output_channels: Iterable[str] = tuple(),
+        device_identities: Iterable[NidaqDeviceIdentity] = tuple(),
+        laser=None,
+    ) -> None:
+        # The laser's backplane lines, which every start checks the export
+        # lines against (validate_export_lines). Not timing: the running
+        # stream is unchanged by them, so they are taken while it runs too,
+        # for the next start, rather than compared.
+        self._laser = laser
+        if self._is_running or self._is_starting:
+            # Reloading the configuration re-applies the timing it already
+            # has, and demo mode is toggled by reloading the configuration:
+            # entering demo while acquiring therefore raised here, the toggle
+            # reported "Could not change demo mode", and the clip never
+            # played - so Next/Previous trial stayed dead with nothing on
+            # screen to say why. Re-applying what is already in force is not
+            # a change, so it is allowed; only a real change is refused.
+            if self._timing_matches(configuration,
+                                    hardware_timed_output_devices,
+                                    hardware_timed_output_channels,
+                                    device_identities):
+                return
+            raise RuntimeError("cannot change NI-DAQ timing while acquisition is active")
+        self._timing_configuration = configuration
+        self._hardware_timed_output_devices = tuple(dict.fromkeys(
+            str(device) for device in hardware_timed_output_devices if device
+        ))
+        self._hardware_timed_output_channels = tuple(dict.fromkeys(
+            str(channel) for channel in hardware_timed_output_channels if channel
+        ))
+        self._device_identities = tuple(device_identities)
+        self._runtime_device_aliases = {}
+        self._set_timing_plan(None)
+
+    def set_stream_channels(
+        self,
+        channels: Iterable[NidaqSignalChannelConfiguration],
+    ) -> None:
+        channels = tuple(channels)
+        if channels == self._configuration.channels:
+            return
+        was_running = self._is_running or self._is_starting
+        self.stop()
+        previous = self._configuration
+        self._configuration = dataclasses.replace(
+            previous,
+            channels=channels,
+            is_enabled=bool(channels),
+        )
+        self._on_property_changed(self.CONFIGURATION, self._configuration, previous)
+        self._set_error("")
+        if was_running and self._hardware_enabled and channels:
+            self.start()
+        elif not channels:
+            self._set_status("NI-DAQ signal stream has no selected signals")
+        else:
+            self._set_status("NI-DAQ signal stream stopped")
+
+    def set_display_channels(self, channel_names: Iterable[str]) -> None:
+        previous = self._configuration
+        configuration = with_display_channels(previous, channel_names)
+        if configuration == previous:
+            return
+        self._configuration = configuration
+        self._on_property_changed(self.CONFIGURATION, configuration, previous)
+
+    def start(self) -> bool:
+        with self._lock:
+            if self._is_running or self._is_starting:
+                return True
+            configuration = dataclasses.replace(
+                self._configuration,
+                read_chunk_size=self.effective_read_chunk_size,
+            )
+            if not self._hardware_enabled:
+                self._set_status("NI-DAQ hardware disabled; signal stream stopped")
+                self._set_error("")
+                log_hardware_initialization(logger, "SKIP | NI-DAQ signal stream | NI-DAQ hardware disabled")
+                return False
+            if not configuration.is_enabled:
+                self._set_status("NI-DAQ signal stream disabled")
+                self._set_error("")
+                log_hardware_initialization(logger, "SKIP | NI-DAQ signal stream | disabled")
+                return False
+            started = time.perf_counter()
+            log_hardware_initialization(
+                logger,
+                "START | NI-DAQ signal stream | sample_rate=%s channels=%s",
+                configuration.sample_rate_hz,
+                tuple(channel.physical_channel for channel in configuration.channels),
+            )
+            try:
+                # Every start, Idle's included, refuses an export line another
+                # signal takes, as Run does (validate_export_lines). Before
+                # discovery, since it needs no board: a start that finds none
+                # refuses it too.
+                clashes = validate_export_lines(self._timing_configuration, self._laser)
+                if clashes:
+                    raise RuntimeError("; ".join(issue.describe() for issue in clashes))
+                devices, discovery_error = self._device_discovery()
+                if discovery_error:
+                    raise RuntimeError(discovery_error)
+                aliases = resolve_nidaq_device_aliases(
+                    self._device_identities,
+                    devices,
+                )
+                configuration = resolve_nidaq_stream_configuration(
+                    configuration,
+                    aliases,
+                )
+                hardware_timed_output_devices = resolve_nidaq_device_names(
+                    self._hardware_timed_output_devices,
+                    aliases,
+                )
+                hardware_timed_output_channels = tuple(
+                    _resolve_physical_channel_device(channel, aliases)
+                    for channel in self._hardware_timed_output_channels
+                )
+                timing_plan = build_nidaq_timing_plan(
+                    configuration,
+                    self._timing_configuration,
+                    devices,
+                    hardware_timed_output_devices=hardware_timed_output_devices,
+                    hardware_timed_output_channels=hardware_timed_output_channels,
+                    laser=self._laser,
+                )
+                self._set_timing_plan(timing_plan)
+                if not timing_plan.is_valid:
+                    raise RuntimeError(timing_plan.reason)
+                if self._exact_preflight is not None:
+                    preflight = self._exact_preflight(configuration, timing_plan)
+                    if not preflight.is_valid:
+                        raise RuntimeError(
+                            "NI-DAQ exact task preflight failed at "
+                            f"{preflight.stage}: {preflight.error}. "
+                            f"{preflight.corrective_action}"
+                        )
+                    timing_plan = resolve_nidaq_multidevice_probe(
+                        timing_plan,
+                        getattr(
+                            preflight,
+                            "multidevice_probe_status",
+                            timing_plan.multidevice_probe_status,
+                        ),
+                    )
+                    self._set_timing_plan(timing_plan)
+                self._runtime_device_aliases = dict(aliases)
+                message_queue = self._mp_ctx.Queue(maxsize=16)
+                stop_event = self._mp_ctx.Event()
+                sample_ring = self.sample_ring
+                sample_ring.reset()
+                process = self._mp_ctx.Process(
+                    target=self._worker_target,
+                    name="nidaq-signal-stream",
+                    args=(
+                        configuration,
+                        timing_plan,
+                        message_queue,
+                        sample_ring,
+                        stop_event,
+                        None,
+                    ),
+                    daemon=True,
+                )
+                process.start()
+            except Exception as exc:
+                logger.exception("Failed to launch NI-DAQ signal stream worker")
+                log_hardware_initialization(
+                    logger,
+                    "FAILED | NI-DAQ signal stream | elapsed=%.3fs error=%s",
+                    time.perf_counter() - started,
+                    str(exc) or exc.__class__.__name__,
+                    level=logging.ERROR,
+                )
+                self._process = None
+                self._message_queue = None
+                self._process_stop_event = None
+                self._set_starting(False)
+                self._set_running(False)
+                self._set_status("NI-DAQ signal stream stopped")
+                self._announce_error(str(exc) or exc.__class__.__name__)
+                return False
+
+            self._process = process
+            self._message_queue = message_queue
+            self._process_stop_event = stop_event
+            self._set_error("")
+            self._set_status("Starting NI-DAQ signal stream...")
+            self._set_starting(True)
+            thread = threading.Thread(
+                target=self._run,
+                args=(process, message_queue, stop_event, started),
+                name="nidaq_signal_monitor",
+                daemon=True,
+            )
+            self._thread = thread
+            thread.start()
+            return True
+
+    def stop(self) -> None:
+        with self._lock:
+            thread = self._thread
+            process = self._process
+            stop_event = self._process_stop_event
+            was_starting = self._is_starting
+            if process is None:
+                self._set_starting(False)
+                self._set_running(False)
+                return
+            self._set_status("Stopping NI-DAQ signal stream...")
+            if stop_event is not None:
+                stop_event.set()
+            # A worker still loading NI-DAQmx cannot observe the event.  Stop it
+            # immediately instead of making the Qt caller wait on the driver.
+            if was_starting and process.is_alive():
+                process.terminate()
+
+        if thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        if process.is_alive():
+            logger.warning("NI-DAQ signal stream worker did not stop; terminating it")
+            process.terminate()
+            process.join(timeout=0.5)
+        self._finalize_worker(process)
+
+    def close(self) -> None:
+        self.stop()
+
+    def show_paused(self, reason: str) -> None:
+        """Say why a stopped stream is being kept stopped, or stop saying it."""
+        with self._lock:
+            if self._process is not None:
+                return
+            if reason:
+                self._set_status(f"{_PAUSED_STATUS}: {reason}")
+            elif self._status_message.startswith(_PAUSED_STATUS):
+                self._set_status("NI-DAQ signal stream stopped")
+
+    def show_held_back(self, reason: str) -> None:
+        """Say why the application holds a stopped stream back, or stop saying it.
+
+        As show_paused does for a holder. The application holds the idle
+        stream back while a laser close given up on is still inside the
+        driver (AppModel._nidaq_stream_may_start), and says so here.
+
+        Asked with no reason on every stream request, on the Qt thread: with
+        no such text shown it returns without the lock, which start() holds
+        through discovery and the preflight, for seconds.
+        """
+        if not reason and not self._status_message.startswith(_HELD_BACK_STATUS):
+            return
+        with self._lock:
+            if self._process is not None:
+                return
+            if reason:
+                self._set_status(f"{_HELD_BACK_STATUS}: {reason}")
+            elif self._status_message.startswith(_HELD_BACK_STATUS):
+                self._set_status("NI-DAQ signal stream stopped")
+
+    def show_blocked(self, reason: str) -> None:
+        """Say why a stream with nothing to acquire is held back.
+
+        The application holds it when its NI-DAQ plan is refused. The stream
+        then has no channels and would say only that it is disabled, as one
+        switched off does. The next load_configuration says otherwise.
+        """
+        with self._lock:
+            if self._process is None and reason:
+                self._set_status(reason)
+
+    def _run(self, process, message_queue, stop_event, started: float) -> None:
+        worker_error = ""
+        ready = False
+        unexpected_exit = False
+        try:
+            while True:
+                if (
+                    process.is_alive()
+                    and not ready
+                    and time.perf_counter() - started >= self._startup_timeout_seconds
+                ):
+                    worker_error = (
+                        f"NI-DAQmx runtime did not become ready within "
+                        f"{self._startup_timeout_seconds:g} seconds; its isolated worker was stopped"
+                    )
+                    self._log_worker_message(process, "%s", worker_error)
+                    stop_event.set()
+                    process.terminate()
+                    process.join(timeout=0.5)
+                    break
+                try:
+                    kind, payload = message_queue.get(timeout=0.01)
+                except queue.Empty:
+                    if not process.is_alive():
+                        unexpected_exit = not stop_event.is_set()
+                        process.join(timeout=0)
+                        break
+                    continue
+                if kind == _WORKER_READY:
+                    ready = True
+                    with self._lock:
+                        if process is not self._process:
+                            break
+                        self._set_error("")
+                        # Both flags settle before anyone is told. Clearing
+                        # and announcing "starting" before setting "running"
+                        # left a moment with neither set, and a Run polling
+                        # them without the lock (AppModel.
+                        # _finish_nidaq_domain_start) failed and stopped a
+                        # worker that had just come up. Announcing "running"
+                        # first instead showed both set to the Hardware
+                        # panel, which reads is_starting when told.
+                        was_running, self._is_running = self._is_running, True
+                        self._set_starting(False)
+                        self._on_property_changed(
+                            self.IS_RUNNING, True, was_running)
+                        self._set_status("NI-DAQ signal stream running")
+                    log_hardware_initialization(
+                        logger,
+                        "READY | NI-DAQ signal stream | elapsed=%.3fs worker_pid=%s",
+                        time.perf_counter() - started,
+                        process.pid,
+                    )
+                elif kind == _WORKER_ERROR:
+                    message = str(payload)
+                    if not worker_error:
+                        worker_error = message
+                    self._log_worker_message(
+                        process, "NI-DAQ signal stream worker error: %s", message)
+                elif kind == _WORKER_LOG:
+                    level, logger_name, message, always_console = payload
+                    extra = {ALWAYS_CONSOLE_LOG_ATTRIBUTE: True} if always_console else None
+                    label = "NI-DAQ worker pid=%s | %s"
+                    with self._lock:
+                        current = process is self._process
+                    if not current and level > logging.WARNING:
+                        # A replaced worker's failure, as when it fails to
+                        # close its tasks, is not the running stream's: at
+                        # most a warning, as its other messages are
+                        # (_log_worker_message).
+                        level = logging.WARNING
+                        label = "NI-DAQ worker pid=%s, stopped or replaced | %s"
+                    logging.getLogger(logger_name).log(
+                        level,
+                        label,
+                        process.pid,
+                        message,
+                        extra=extra,
+                    )
+                elif kind == _WORKER_STOPPED:
+                    process.join(timeout=0.5)
+                    break
+        except Exception as exc:
+            worker_error = str(exc) or exc.__class__.__name__
+            logger.exception("Failed while monitoring NI-DAQ signal stream worker")
+        finally:
+            if process.is_alive():
+                stop_event.set()
+                process.terminate()
+                process.join(timeout=0.5)
+            exitcode = process.exitcode
+            if not worker_error and exitcode not in (0, None) and unexpected_exit:
+                if exitcode < 0:
+                    try:
+                        signal_name = signal.Signals(-exitcode).name
+                    except ValueError:
+                        signal_name = f"signal {-exitcode}"
+                    worker_error = (
+                        f"NI-DAQ signal stream worker crashed with {signal_name} "
+                        f"(exit code {exitcode}); check the NI-DAQmx driver and selected device channels"
+                    )
+                else:
+                    worker_error = f"NI-DAQ signal stream worker exited unexpectedly (exit code {exitcode})"
+            if worker_error:
+                # Only while this is still the monitor's worker, checked under
+                # the lock as the READY block and _finalize_worker check it.
+                # stop() lets this thread go after two seconds, and a newer
+                # start may be running by the time it gets here: its error was
+                # posted over that healthy stream, which then read FAILED.
+                with self._lock:
+                    if process is self._process:
+                        log_hardware_initialization(
+                            logger,
+                            "FAILED | NI-DAQ signal stream | elapsed=%.3fs worker_pid=%s error=%s",
+                            time.perf_counter() - started,
+                            process.pid,
+                            worker_error,
+                            level=logging.ERROR,
+                        )
+                        self._set_error(worker_error)
+                    else:
+                        logger.warning(
+                            "NI-DAQ signal stream worker pid=%s ended after the "
+                            "monitor stopped or replaced it; its error is not "
+                            "the current stream's: %s",
+                            process.pid,
+                            worker_error,
+                        )
+            self._finalize_worker(process)
+
+    def _finalize_worker(self, process) -> None:
+        with self._lock:
+            if process is not self._process:
+                return
+            self._process = None
+            self._message_queue = None
+            self._process_stop_event = None
+            self._thread = None
+            self._set_starting(False)
+            self._set_running(False)
+            if self._configuration.is_enabled:
+                self._set_status("NI-DAQ signal stream stopped")
+
+    def _set_running(self, value: bool) -> None:
+        prev, self._is_running = self._is_running, value
+        self._on_property_changed(self.IS_RUNNING, value, prev)
+
+    def _set_starting(self, value: bool) -> None:
+        prev, self._is_starting = self._is_starting, value
+        self._on_property_changed(self.IS_STARTING, value, prev)
+
+    def _set_status(self, value: str) -> None:
+        prev, self._status_message = self._status_message, value
+        self._on_property_changed(self.STATUS_MESSAGE, value, prev)
+
+    def _set_error(self, value: str) -> None:
+        prev, self._error_message = self._error_message, value
+        self._on_property_changed(self.ERROR_MESSAGE, value, prev)
+
+    def _announce_error(self, value: str) -> None:
+        """Set the error and say so even when it is the one already held.
+
+        A refused start is news each time: nothing clears the error between
+        two refusals of the same plan, and announced only on a change, the
+        second went unsaid. Stop wrote "stopped" in between, and so did a
+        refresh or a settings save, and NI-DAQ read so while every start was
+        refused.
+        """
+        prev, self._error_message = self._error_message, value
+        self.property_changed(self.ERROR_MESSAGE, value, prev)
+
+    def _log_worker_message(self, process, message: str, *args) -> None:
+        """A worker's error, at ERROR while it is the monitor's, else WARNING.
+
+        With its pid either way. A thread its stop let go of can still read
+        its worker's messages after a newer worker came up healthy, and put
+        them on the status bar as that stream's.
+        """
+        with self._lock:
+            current = process is self._process
+        if current:
+            logger.error("NI-DAQ worker pid=%s | " + message, process.pid, *args)
+        else:
+            logger.warning(
+                "NI-DAQ worker pid=%s, stopped or replaced | " + message,
+                process.pid, *args)
+
+    def _set_timing_plan(self, value: Optional[NidaqTimingPlan]) -> None:
+        previous, self._timing_plan = self._timing_plan, value
+        self._on_property_changed(self.TIMING_PLAN, value, previous)

@@ -1,0 +1,20 @@
+[Unit]
+Description=Bring up reachAQ SocketCAN interfaces
+Documentation=man:ip-link(8)
+Wants=network-pre.target
+Wants=systemd-udev-settle.service
+After=systemd-udev-settle.service
+Before=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/reachaq-can
+ExecStartPre=/usr/bin/systemd-tmpfiles --create /etc/tmpfiles.d/reachaq-can.conf
+ExecStart=/usr/local/sbin/reachaq-bring-up-can
+ExecStop=/usr/local/sbin/reachaq-bring-down-can
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 name = "auto-trainer"
 description = "Autotrainer full application and libs"
 license = { text = "MIT" }
-requires-python = ">= 3.8"
+requires-python = ">= 3.10"
 dynamic = ["version", "dependencies"]
 # see setup.py
 #dependencies = [
@@ -28,15 +28,11 @@ test = [
     "coverage-enable-subprocess ~= 1.0",
 ]
 
-# can probably be removed
-old_platform = [
-    'pyserial == 3.5',
-]
-
-
 [project.scripts]
 auto-trainer-local = "tools.acquisition.gui:main"
 auto-trainer-headless = "tools.acquisition.headless:main"
+reachaq = "reachAQ.app:main"
+reachaq-validate-session = "tools.session_validation.cli:main"
 # etc... but is same than:
 # python -m tools.acquisition.headless   # for instance.
 #
@@ -61,6 +57,8 @@ where = [
 include = [
     "autotrainer.*",
     "tools",
+    "reachAQ",
+    "reachAQ.*",
 ]
 namespaces = true
 

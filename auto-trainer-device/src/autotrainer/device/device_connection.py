@@ -1,10 +1,11 @@
 import contextlib
+import errno
 import logging
 import math
 import time
 import uuid
 from queue import Queue, Empty
-from threading import Thread
+from threading import Event, Lock, Thread
 from typing import Callable, Union, Optional, Any, Set
 
 
@@ -20,6 +21,7 @@ from autotrainer.core.event import post_api_event_content
 
 import autotrainer.device
 from .can_device import HAVE_CAN_DEVICE
+from .can_failure import CanFailure, CanFailureKind
 from .device import Device
 from .device_api import DeviceApi
 from .device_interface import DeviceInterface, ServoConfig, StepperConfig
@@ -52,7 +54,8 @@ class DeviceConnection(DeviceConnectionProtocol):
                  device: Device,
                  message_queue: Queue,
                  message_callback: Callable[[int, object], None] = None,
-                 name="device-connection"):
+                 name="device-connection",
+                 failure_callback: Optional[Callable[[CanFailure], None]] = None):
 
         super().__init__()
 
@@ -70,14 +73,25 @@ class DeviceConnection(DeviceConnectionProtocol):
         self._device.api = self._api
 
         self._name = name
+        self._failure_callback = failure_callback
 
-        self._read_limit: int = 50 if HAVE_CAN_DEVICE else 2000
+        # Drain sizeable bursts on both legacy JerryCAN and SocketCAN. The old
+        # 50-frame cap could leave a busy adapter's kernel queue perpetually
+        # behind even though the reader itself remained alive.
+        self._read_limit: int = 512 if HAVE_CAN_DEVICE else 2000
         self._collect_ms: int = 5  # so freq == 200 Hz
 
         # The means of providing non-blocking access to the device.
         self._current_thread: Optional[Thread] = None
         self._current_thread_watchdog_perf_c = math.nan
         # NB: this is simply the dedicated CAN bus reader thread
+        self._intentional_shutdown = Event()
+        self._failure_lock = Lock()
+        self._first_failure: Optional[CanFailure] = None
+
+    @property
+    def first_failure(self) -> Optional[CanFailure]:
+        return self._first_failure
 
     @property
     def watchdog_reader_perf_c(self) -> float:
@@ -109,7 +123,12 @@ class DeviceConnection(DeviceConnectionProtocol):
     def read_limit(self, value: int):
         self._read_limit = value
 
-    def join(self):
+    @property
+    def reader_thread_alive(self) -> bool:
+        thread = self._current_thread
+        return thread is not None and thread.is_alive()
+
+    def join(self) -> bool:
         # TODO this is for legacy compatibility when the connection was exposed directly as a thread for clients that
         #  wanted to know when the connection was guaranteed to be terminated.  This should be accommodated a different
         #  way - see TODOs in request_(dis)connect.
@@ -118,8 +137,10 @@ class DeviceConnection(DeviceConnectionProtocol):
             logger.debug("joining %s", thread)
             thread.join(3)
             if thread.is_alive():
-                logger.warning("thread %s still alive, but continuing", thread)
+                logger.error("thread %s is still alive; ownership is retained", thread)
+                return False
             self._current_thread = None
+        return True
 
     def request_connect(self):
         """
@@ -129,10 +150,30 @@ class DeviceConnection(DeviceConnectionProtocol):
         """
         # TODO provide a mechanism for the caller to be notified when a connection attempt succeeds or fails.  Could be
         #  an optional callback provided in this call, a dedicated callback, an observable property, etc.
+        self._intentional_shutdown.clear()
+        with self._failure_lock:
+            self._first_failure = None
         self._start()
 
         if self._cmd_queue is not None:
             self._cmd_queue.put((_REQUEST_CONNECT, None, None))
+
+    def wait_connected(self, *, timeout: float = 3):
+        """Wait for a requested connection without consuming command timeout."""
+        started = time.perf_counter()
+        deadline = started + timeout
+        while not self._device.connected:
+            thread = self._current_thread
+            if thread is not None and not thread.is_alive():
+                raise RuntimeError(
+                    f"device connection failed after {time.perf_counter() - started:.3f}s: "
+                    "connection worker stopped before device.connected"
+                )
+            if time.perf_counter() >= deadline:
+                raise TimeoutError(
+                    f"device connection timeout after {timeout:.3f}s waiting for device.connected"
+                )
+            time.sleep(0.01)
 
     def request_disconnect(self):
         """
@@ -141,6 +182,7 @@ class DeviceConnection(DeviceConnectionProtocol):
         allocated with be terminated and disposed.
         """
         # TODO provide a mechanism for the caller to be notified when disconnection is complete.
+        self._intentional_shutdown.set()
         cmd_queue = self._cmd_queue
         if cmd_queue is not None:
             logger.debug("requesting disconnect")
@@ -170,8 +212,8 @@ class DeviceConnection(DeviceConnectionProtocol):
             while len(tokens) > 0:
                 if time.perf_counter() > perf_timeout:
                     if raise_on_timeout:
-                        raise RuntimeError(f"timeout waiting tokens acknowledge: {tokens}")
-                    logger.warning("timeout waiting tokens acknowledge, but continuing. tokens: %s", tokens)
+                        raise RuntimeError(f"command timeout waiting for acknowledge tokens: {tokens}")
+                    logger.warning("command timeout waiting for acknowledge tokens, but continuing: %s", tokens)
                     break
                 time.sleep(0.001)
             if len(tokens) == 0:
@@ -216,11 +258,10 @@ class DeviceConnection(DeviceConnectionProtocol):
             data.y_config,
             data.z_config,
             data.load_config,
-            data.magnet_config,
             data.cover_config,
-            data.gate_config,
-            data.tunnel_fan_config,
         ):
+            if not self._motor_configuration_is_required(conf[0]):
+                continue
             with self.await_acknowledge(tokens, timeout=3):
                 send(conf)
 
@@ -253,14 +294,60 @@ class DeviceConnection(DeviceConnectionProtocol):
     def _run(self) -> None:
         logger.debug(f"<{self._name}> thread started")
 
-        while True:
-            if not self._run_unconnected():
-                break
+        try:
+            while True:
+                if not self._run_unconnected():
+                    break
 
-            if not self._run_connected():
-                break
+                if not self._run_connected():
+                    break
+        except BaseException as err:
+            logger.exception("<%s> CAN transport worker failed: %s", self._name, err)
+            failure = self._failure_from_exception(err)
+            if (
+                failure.error_code == errno.ENETDOWN
+                and self._intentional_shutdown.is_set()
+            ):
+                logger.info(
+                    "Suppressing expected ENETDOWN after this process requested CAN shutdown"
+                )
+            else:
+                self._report_first_failure(failure)
+        finally:
+            if self._interface.is_open:
+                try:
+                    self._device.disconnect()
+                finally:
+                    self._interface.close()
 
         logger.debug(f"<{self._name}> thread terminated")
+
+    def _failure_from_exception(self, err: BaseException) -> CanFailure:
+        original = err.__cause__ or err
+        return CanFailure(
+            CanFailureKind.TRANSPORT,
+            str(err) or err.__class__.__name__,
+            category=getattr(err, "category", None),
+            error_code=getattr(err, "error_code", getattr(original, "errno", None)),
+            exception_type=original.__class__.__name__,
+            diagnostics=dict(getattr(err, "diagnostics", {}) or {}),
+        )
+
+    def _report_first_failure(self, failure: CanFailure) -> None:
+        with self._failure_lock:
+            if self._first_failure is not None:
+                logger.error(
+                    "Preserving first CAN reader failure; suppressed later error: %s",
+                    failure.error,
+                )
+                return
+            self._first_failure = failure
+        callback = self._failure_callback
+        if callback is not None:
+            try:
+                callback(failure)
+            except Exception:
+                logger.exception("Failed to report CAN transport failure")
 
     def _run_unconnected(self) -> bool:
         logger.info("running unconnected")
@@ -302,14 +389,28 @@ class DeviceConnection(DeviceConnectionProtocol):
     def _run_connected(self) -> bool:
         logger.info("running connected")
         t_next_cmd_queue_read = time.perf_counter()
+        idle_poll_period = max(0.001, self._collect_ms / 1000.0)
         while True:
             self._current_thread_watchdog_perf_c = time.perf_counter()
 
             # Data from the device for the device listener to process.
+            read_started = time.perf_counter()
+            messages = []
             if self._interface.can_read():
                 messages = self._interface.read(self._read_limit, collect_ms=self._collect_ms)
                 if len(messages) > 0:
                     self._device.notify_data(messages)
+
+            # Some CAN backends return immediately when no frame is available even
+            # when ``collect_ms`` is requested.  Without an explicit idle wait this
+            # loop consumes an entire CPU core and can starve the Qt thread of the
+            # GIL.  Preserve the requested collection cadence while still draining
+            # bursts without delay.
+            if not messages:
+                read_elapsed = time.perf_counter() - read_started
+                idle_wait = idle_poll_period - read_elapsed
+                if idle_wait > 0:
+                    time.sleep(idle_wait)
 
             perf_now = get_perf_now()
             if perf_now > t_next_cmd_queue_read:

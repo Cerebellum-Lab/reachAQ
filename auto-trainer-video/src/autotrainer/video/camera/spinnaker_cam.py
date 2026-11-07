@@ -12,11 +12,18 @@ import numpy
 import PySpin
 
 from autotrainer.core import get_perf_now
+from autotrainer.core.latency.raw_clock import monotonic_raw_time
 from autotrainer.core.logging import get_verbose_logger
 
 from .camera_base import CameraBase
 
 logger = get_verbose_logger(__name__)
+
+# The __debug__ self-check in SpinCam.capture compares each of the first 150
+# frames against every earlier one. Above 256x256 that costs seconds of
+# capture-thread time at startup (about 24 GB of comparisons at 1024x1024),
+# so it is skipped there.
+_BUFFER_SELF_CHECK_MAX_PIXELS = 256 * 256
 
 def is_truthy_str_value(value: str):
     return value.lower() in {"true", "yes", "on", "1"}
@@ -72,6 +79,9 @@ class SpinCamDefaultParams:
 class SpinCam(CameraBase):
 
     _cameras: Dict[str, "SpinCam"] = {}  # class level cache
+    # A latch that raised is logged once per process: the latch is diagnostic,
+    # taken a few times per recording, and nothing in the recording waits on it.
+    _latch_error_logged = False
 
     default_params = dataclasses.asdict(SpinCamDefaultParams())
 
@@ -279,6 +289,13 @@ class SpinCam(CameraBase):
         self._set_bounded_bool_property_node(cam.AcquisitionFrameRateEnable, True)
         self._set_bounded_float_property_node(cam.AcquisitionFrameRate, self._fps)
 
+        # offsets to zero before anything is resized: the maximum width and height are
+        # what the sensor has left after the current offset, so a camera left at a larger
+        # offset by an earlier configuration would clamp the new size (and the readback
+        # below would refuse the start). The real offsets are set after the size.
+        self._set_bounded_int_property_node(cam.OffsetX, 0)
+        self._set_bounded_int_property_node(cam.OffsetY, 0)
+
         # binning first
         self._set_bounded_int_property_node(cam.BinningHorizontal, self._horizontal_binning)
         self._set_bounded_int_property_node(cam.BinningVertical, self._vertical_binning)
@@ -291,6 +308,11 @@ class SpinCam(CameraBase):
         self._set_bounded_int_property_node(cam.OffsetX, self._offset_x)
         self._set_bounded_int_property_node(cam.OffsetY, self._offset_y)
 
+        # FPS again, now that the geometry is final: the maximum frame rate
+        # depends on binning and height, and the first set above was clamped
+        # against whatever geometry the camera was left in.
+        self._set_bounded_float_property_node(cam.AcquisitionFrameRate, self._fps)
+
         if self._gain is not None:
             self._set_bounded_float_property_node(cam.Gain, self._gain)
 
@@ -300,6 +322,53 @@ class SpinCam(CameraBase):
             self._set_bounded_float_property_node(cam.Gamma, gamma)
         else:
             self._set_bounded_bool_property_node(cam.GammaEnable, False)
+
+        self._verify_applied_settings(cam)
+
+    # A requested frame rate within this fraction of the camera's maximum
+    # passes: the camera reports 149.987 for a requested 150.
+    _FPS_TOLERANCE = 0.005
+
+    def _verify_applied_settings(self, cam) -> None:
+        """Refuse settings the camera silently clamped.
+
+        _set_bounded_property clamps every value to the node's maximum and logs
+        that only at debug level. A clamped width or offset shrinks or moves
+        the field of view, a clamped gain changes brightness, and a frame rate
+        the camera cannot reach leaves everything downstream assuming a rate it
+        is not getting. Exposure is not checked: the camera rounds it to its
+        own step (175 requested reads back 176), which is expected.
+        """
+        problems = []
+        for node, requested in (
+            (cam.BinningHorizontal, self._horizontal_binning),
+            (cam.BinningVertical, self._vertical_binning),
+            (cam.Width, self._width),
+            (cam.Height, self._height),
+            (cam.OffsetX, self._offset_x),
+            (cam.OffsetY, self._offset_y),
+        ):
+            if requested is None:
+                continue
+            applied = node.GetValue()
+            if int(applied) != int(requested):
+                problems.append(
+                    f"{node.GetDisplayName()} requested {requested} applied {applied} (max {node.GetMax()})")
+        if self._gain is not None:
+            applied = float(cam.Gain.GetValue())
+            if abs(applied - float(self._gain)) > 0.1:
+                problems.append(
+                    f"Gain requested {float(self._gain):.2f} dB applied {applied:.2f} dB "
+                    f"(max {float(cam.Gain.GetMax()):.2f})")
+        if self._fps is not None:
+            fps_max = float(cam.AcquisitionFrameRate.GetMax())
+            if fps_max < float(self._fps) * (1 - self._FPS_TOLERANCE):
+                problems.append(
+                    f"frame rate requested {float(self._fps):.1f} fps but at {self._width}x{self._height} "
+                    f"bin {self._horizontal_binning}x{self._vertical_binning} and exposure "
+                    f"{self._exposure} us the camera's maximum is {fps_max:.1f} fps")
+        if problems:
+            raise RuntimeError(f"<{self._name}> camera did not accept its settings: " + "; ".join(problems))
 
     def prepare_capture(self):
         super().prepare_capture()
@@ -314,6 +383,13 @@ class SpinCam(CameraBase):
         elif self._is_secondary:
             self._configure_as_secondary(self._camera)
             logger.info(f"<{self.name}> configured as secondary")
+
+    @property
+    def is_trigger_synchronized(self) -> bool:
+        # Every Spinnaker camera is the primary, which emits the trigger, or a
+        # secondary exposing on it (prepare_capture above), and the secondaries
+        # are armed before the primary starts, so all count the same triggers.
+        return True
 
     def end_capture(self):
         super().end_capture()
@@ -333,24 +409,79 @@ class SpinCam(CameraBase):
         self._camera = None
 
     def _capture(self):
-        p_timeout = time.perf_counter() + 15  # eventual todo: allow config
+        # Keep the backend timeout below the application camera watchdog. A
+        # fifteen-second block made capture shutdown lag well behind the
+        # five-second watchdog after a trigger/camera failure.
+        capture_timeout = 4
+        p_timeout = time.perf_counter() + capture_timeout
         try_count = 0
+        exception_count = 0
+        timeout_exception_count = 0
+        incomplete_count = 0
+        first_exception = None
+        first_non_timeout_exception = None
+        first_incomplete = None
         t_prev_after = p_prev_after = -math.inf
         while True:
             try_count += 1
             if time.perf_counter() > p_timeout:
-                raise RuntimeError("Failed capture a frame in time")
+                role = "primary" if self._is_primary else "secondary"
+                node_values = self._effective_trigger_node_values()
+                if first_non_timeout_exception is not None:
+                    failure_hint = "non_timeout_spinnaker_error"
+                elif first_incomplete is not None:
+                    failure_hint = "incomplete_images_received"
+                else:
+                    failure_hint = "only_polling_timeouts_no_complete_images"
+                details = [
+                    f"camera={self._name}",
+                    f"serial={self._serial_number}",
+                    f"role={role}",
+                    f"attempts={try_count - 1}",
+                    f"failure_hint={failure_hint}",
+                    f"effective_nodes=[{node_values}]",
+                ]
+                if first_exception is not None:
+                    details.append(
+                        f"spinnaker_exceptions={exception_count} "
+                        f"timeout_exceptions={timeout_exception_count} "
+                        f"first_spinnaker_exception=[{first_exception}]"
+                    )
+                if first_non_timeout_exception is not None:
+                    details.append(
+                        "first_non_timeout_spinnaker_exception="
+                        f"[{first_non_timeout_exception}]"
+                    )
+                if first_incomplete is not None:
+                    details.append(
+                        f"incomplete_images={incomplete_count} "
+                        f"first_incomplete_image=[{first_incomplete}]"
+                    )
+                raise RuntimeError(
+                    f"Failed to capture a frame within {capture_timeout} seconds; "
+                    + "; ".join(details)
+                )
             t_before = time.time()
             p_before = time.perf_counter()
             try:
                 image_result = self._camera.GetNextImage(1)  # 1 millisecond timeout
                 p_after = time.perf_counter()
                 t_after = time.time()
-            except PySpin.SpinnakerException:
+            except PySpin.SpinnakerException as err:
+                exception_count += 1
+                if first_exception is None:
+                    first_exception = self._format_spinnaker_exception(err)
+                if getattr(err, "errorcode", None) == PySpin.SPINNAKER_ERR_TIMEOUT:
+                    timeout_exception_count += 1
+                elif first_non_timeout_exception is None:
+                    first_non_timeout_exception = self._format_spinnaker_exception(err)
                 t_prev_after = t_before
                 p_prev_after = p_before
                 continue
             if image_result.IsIncomplete():
+                incomplete_count += 1
+                if first_incomplete is None:
+                    first_incomplete = self._format_incomplete_image(image_result)
                 image_result.Release()
                 t_prev_after = t_after
                 p_prev_after = p_after
@@ -382,8 +513,78 @@ class SpinCam(CameraBase):
                     logger.warning("very long running late acquires ; frame=%s when=%.3f perf_c=%.3f late_delay=%.1f",
                                    self._frame_count, frame_when_sec, estimated_frame_perf_c, late_delay)
                     self._consecutive_late_acquire = 0
+            # Kept as measured, beside the fitted estimate: the latency record
+            # times exposure-to-host from these, not from the fit.
+            self._last_poll_perf_c = p_before
+            self._last_arrival_perf_c = p_after
             return image_result, frame_when, estimated_frame_perf_c, estimated_frame_time
         # end while True.
+
+    @staticmethod
+    def _format_spinnaker_exception(err: PySpin.SpinnakerException) -> str:
+        message = str(err).strip() or getattr(err, "message", "") or err.__class__.__name__
+        parts = [f"code={getattr(err, 'errorcode', 'unknown')}", f"message={message}"]
+        full_message = str(getattr(err, "fullmessage", "") or "").strip()
+        if full_message and full_message != message:
+            parts.append(f"full_message={full_message}")
+        return " ".join(parts)
+
+    @staticmethod
+    def _format_incomplete_image(image_result) -> str:
+        try:
+            status = image_result.GetImageStatus()
+        except Exception as err:
+            return f"status_unavailable={err}"
+        try:
+            description = PySpin.Image_GetImageStatusDescription(status)
+        except Exception as err:
+            description = f"description unavailable: {err}"
+        return f"status={status} description={description}"
+
+    @staticmethod
+    def _read_node_value(node) -> str:
+        if node is None:
+            return "<unavailable>"
+        try:
+            get_current_entry = getattr(node, "GetCurrentEntry", None)
+            if callable(get_current_entry):
+                entry = get_current_entry()
+                if entry is not None:
+                    get_symbolic = getattr(entry, "GetSymbolic", None)
+                    if callable(get_symbolic):
+                        return str(get_symbolic())
+            get_value = getattr(node, "GetValue", None)
+            if callable(get_value):
+                return str(get_value())
+            return "<unreadable>"
+        except Exception as err:
+            return f"<unreadable:{err.__class__.__name__}>"
+
+    def _effective_trigger_node_values(self) -> str:
+        """Return best-effort diagnostics without changing camera node state."""
+        camera = self._camera
+        node_names = (
+            "AcquisitionMode",
+            "AcquisitionFrameRateEnable",
+            "TriggerMode",
+            "TriggerSelector",
+            "TriggerSource",
+            "TriggerActivation",
+            "TriggerOverlap",
+        )
+        if self._is_primary:
+            node_names += (
+                "LineSelector",
+                "LineSource",
+                "LineInverter",
+                "CounterSelector",
+                "CounterEventSource",
+                "CounterTriggerSource",
+            )
+        return ", ".join(
+            f"{name}={self._read_node_value(getattr(camera, name, None))}"
+            for name in node_names
+        )
 
     def capture(self) -> Tuple[numpy.ndarray, int]:
         first_capture = False
@@ -428,7 +629,11 @@ class SpinCam(CameraBase):
 
         if __debug__:
             # ensure no frame in the first 150, shares its internal buffer with any of the other first 150 of them:
-            if self._frame_count < 150:
+            if self._frame_count < 150 and orig_frame.size > _BUFFER_SELF_CHECK_MAX_PIXELS:
+                if self._frame_count == 0:
+                    logger.info("skipping the shared-buffer self-check for %sx%s frames",
+                                orig_frame.shape[1], orig_frame.shape[0])
+            elif self._frame_count < 150:
                 logger.spam("frame-%s: shape=%s dtype=%s",
                              self._frame_count, orig_frame.shape, orig_frame.dtype)
                 self._start_frames.append((orig_frame, orig_frame.copy()))
@@ -446,6 +651,45 @@ class SpinCam(CameraBase):
         self._frame_count += 1
 
         return frame, self._last_when
+
+    def latch_clock(self) -> Optional[Tuple[float, int, float, float, float]]:
+        """The camera clock latched between two perf_counter reads, or None.
+
+        TimestampLatch copies the clock that image timestamps (GetTimeStamp)
+        come from into TimestampLatchValue, in ns. The copy happens somewhere
+        between the two perf reads, which places the camera clock on the host's
+        to within half their gap; the value is read after the second read, so
+        that transfer stays out of the bracket. CLOCK_MONOTONIC_RAW is read
+        just inside the perf pair, so the latch sits in both brackets and a
+        reader may use whichever clock it maps NI time to. Never raises: a
+        camera without the nodes returns None, and so does one that fails,
+        logged once.
+        """
+        try:
+            node_map = self._node_map
+            if node_map is None:
+                return None
+            latch_node = node_map.GetNode("TimestampLatch")
+            value_node = node_map.GetNode("TimestampLatchValue")
+            if latch_node is None or value_node is None:
+                return None
+            latch = PySpin.CCommandPtr(latch_node)
+            value = PySpin.CIntegerPtr(value_node)
+            if not (PySpin.IsAvailable(latch) and PySpin.IsWritable(latch)
+                    and PySpin.IsAvailable(value) and PySpin.IsReadable(value)):
+                return None
+            perf_before = time.perf_counter()
+            raw_before = monotonic_raw_time()
+            latch.Execute()
+            raw_after = monotonic_raw_time()
+            perf_after = time.perf_counter()
+            return perf_before, int(value.GetValue()), perf_after, raw_before, raw_after
+        except Exception as err:
+            if not SpinCam._latch_error_logged:
+                SpinCam._latch_error_logged = True
+                logger.warning("<%s> camera clock latch failed (further failures are not logged): %s",
+                               self._name, err)
+            return None
 
     def set_property(self, name: str, value: str) -> bool:
         if name == "primary":

@@ -38,6 +38,7 @@ class LivePoseResultProcessWorker(multiprocessing.Process):
         monitored_parts_offsets: List[Tuple[str, str]],
         input_q: multiprocessing.Queue,
         output_q: multiprocessing.Queue,
+        camera_count: int = 2,
         generation: int,
         log_config: Optional[Dict] = None,
     ):
@@ -51,6 +52,7 @@ class LivePoseResultProcessWorker(multiprocessing.Process):
         self._pose_algo = pose_algo
         self._monitored_parts_offsets = monitored_parts_offsets
         self._output_q = output_q
+        self._camera_count = camera_count
         self._generation = generation
 
     @property
@@ -105,12 +107,42 @@ class LivePoseResultProcessWorker(multiprocessing.Process):
                 count_processed = count_out_full = 0
                 p_next_log_info = p_now + log_every_delay
             try:
-                pose_data, seq_nr = self._input_q.get(timeout=0.1)
+                payload = self._input_q.get(timeout=0.1)
             except queue.Empty:
                 continue
+            received = time.perf_counter()
+            if len(payload) == 2:
+                # Compatibility with callers/tests that predate source-frame
+                # propagation. New monitor processes always send four items.
+                pose_data, seq_nr = payload
+                source_frame_ids = source_frame_perf_times = ()
+            elif len(payload) == 3:
+                pose_data, seq_nr, source_frame_ids = payload
+                source_frame_perf_times = ()
+            else:
+                pose_data, seq_nr, source_frame_ids, source_frame_perf_times = payload
             count_processed += 1
             rsp = self._pose_algo.process(
-                pose_data, pairs_3d_offsets=self._monitored_parts_offsets, sequence=seq_nr)
+                pose_data,
+                pairs_3d_offsets=self._monitored_parts_offsets,
+                sequence=seq_nr,
+                camera_count=self._camera_count,
+            )
+            rsp = dataclasses.replace(
+                rsp,
+                source_frame_ids=tuple(
+                    tuple(int(frame_id) for frame_id in camera_ids)
+                    for camera_ids in source_frame_ids
+                ),
+                source_frame_perf_times=tuple(
+                    tuple(float(frame_perf) for frame_perf in camera_perf)
+                    for camera_perf in source_frame_perf_times
+                ),
+                # The latency record: when this worker took the pose, and when
+                # it hands the result on (perf_c already marks triangulation).
+                live_recv_perf_c=received,
+                live_put_perf_c=time.perf_counter(),
+            )
             data = (
                 InferenceMonitorDataMsg.POSE_RESULT_READY,  # cmd
                 ((rsp,), None)  # args, kwargs

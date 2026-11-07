@@ -24,11 +24,11 @@ def intersession_inference(pose_data: ndarray, part_names: List[str], project: P
     left = pose_data[::2, :]
     indices = range(left.shape[0])
     df_xyp = pandas.DataFrame(left, columns=columns, index=indices)
-    df_xyp.to_hdf(project.get_intersession_pose_path(name=project.camera_1), "df_with_missing", format="table",
+    df_xyp.to_hdf(project.get_intersession_pose_path(name=project.camera_names[0]), "df_with_missing", format="table",
                   mode="w")
 
     right = pose_data[1::2, :]
     indices = range(right.shape[0])
     df_xyp = pandas.DataFrame(right, columns=columns, index=indices)
-    df_xyp.to_hdf(project.get_intersession_pose_path(name=project.camera_2), "df_with_missing", format="table",
+    df_xyp.to_hdf(project.get_intersession_pose_path(name=project.camera_names[1]), "df_with_missing", format="table",
                   mode="w")

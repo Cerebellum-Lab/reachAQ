@@ -1,0 +1,47 @@
+laser: !LaserSystemConfiguration
+  channels:
+  - !LaserChannelConfiguration
+    channelId: 1
+    analogOutput: PXI1Slot4/ao0
+    diodeInput: PXI1Slot5/ai8
+    shutterOutput: PXI1Slot5/port0/line4
+    auxiliaryOutput: null
+    commandCopyInput: PXI1Slot5/ai3
+    triggerMonitorInput: null
+    triggerSource: /PXI1Slot4/PXI_Trig0
+    triggerRouteSource: /PXI1Slot5/PFI0
+    boardStimLine: 3
+    boardTriggerPulseUs: 1000
+    triggerOutput: null
+    timingTriggerOutput: null
+    minimumCommandVolts: 0.0
+    maximumCommandVolts: 5.0
+    feedbackScale: 1.0
+    commandCopyScale: 1.0
+  - !LaserChannelConfiguration
+    channelId: 2
+    analogOutput: PXI1Slot4/ao1
+    diodeInput: PXI1Slot5/ai4
+    shutterOutput: PXI1Slot5/port0/line5
+    auxiliaryOutput: null
+    commandCopyInput: PXI1Slot5/ai5
+    triggerMonitorInput: null
+    triggerSource: /PXI1Slot4/PXI_Trig2
+    triggerRouteSource: /PXI1Slot5/PFI1
+    boardStimLine: 2
+    boardTriggerPulseUs: 1000
+    triggerOutput: null
+    timingTriggerOutput: null
+    minimumCommandVolts: 0.0
+    maximumCommandVolts: 5.0
+    feedbackScale: 1.0
+    commandCopyScale: 1.0
+  hardwareTimed: true
+  sampleRateHz: 100000.0
+  backend: nidaq
+  pmtShutterOutput: null
+  triggerListenerInputs:
+  - /PXI1Slot4/PXI_Trig0
+  - /PXI1Slot4/PXI_Trig2
+  backplaneClockLine: PXI_Trig1
+  pulseClockLine: PXI_Trig3

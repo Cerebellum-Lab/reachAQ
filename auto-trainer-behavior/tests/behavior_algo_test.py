@@ -21,9 +21,16 @@ def algo(monkeypatch, mock_get_perf_now, project_info) -> BehaviorAlgorithm:
     algo = BehaviorAlgorithm(project_info=project_info)
     algo.active_config.pellet_delivery.pellet_send_wait_delay = 0
     algo.pellet_delivery_enabled = algo.pellet_cover_enabled = True
-    algo.status = BehaviorAlgoStatus.ANIMAL_IN_TRAINING
+    algo.status = BehaviorAlgoStatus.RUNNING
     return algo
     # in case need cleanup
+
+
+def _start_automatic_recording(algo: BehaviorAlgorithm) -> None:
+    algo.active_config.session_control.automatic_pellet_cycles_enabled = True
+    algo.active_config.pellet_delivery.pellet_send_wait_delay = math.inf
+    assert algo.start_session(reason="test") is True
+    algo.set_capture_status(CaptureProcessStatus.RECORDING)
 
 
 def test_project_info(algo):
@@ -32,19 +39,6 @@ def test_project_info(algo):
     algo.project = new_prj
     assert prj != algo.project
     assert algo.project is new_prj
-
-
-def test_auto_clamp_release_tone_freq(algo):
-    prev = algo.auto_clamp_release_tone_freq
-    assert prev \
-            == algo.auto_clamp_release_tone_freq \
-            == algo.head_clamp_config.auto_clamp_release_tone_freq \
-            == algo.active_config.head_clamp.auto_clamp_release_tone_freq
-    algo.auto_clamp_release_tone_freq += 42
-    assert prev + 42 \
-           == algo.auto_clamp_release_tone_freq \
-           == algo.head_clamp_config.auto_clamp_release_tone_freq \
-           == algo.active_config.head_clamp.auto_clamp_release_tone_freq
 
 
 def test_cover_servo_status(algo):
@@ -98,25 +92,6 @@ def test_pellet_missing_time(algo):
            == algo.pellet_missing_time \
            == algo.pellet_delivery_config.max_pellet_missing_seconds \
            == algo.active_config.pellet_delivery.max_pellet_missing_seconds
-
-
-def test_auto_clamp_intensity(algo):
-    prev = algo.auto_clamp_intensity
-    assert prev \
-           == algo.auto_clamp_intensity \
-           == algo.head_clamp_config.auto_clamp_intensity \
-           == algo.active_config.head_clamp.auto_clamp_intensity
-    algo.auto_clamp_intensity += 5
-    assert prev + 5 \
-           == algo.auto_clamp_intensity \
-           == algo.head_clamp_config.auto_clamp_intensity \
-           == algo.active_config.head_clamp.auto_clamp_intensity
-
-
-def test_auto_clamp_before_reengage_delay(algo):
-    prev = algo.auto_clamp_before_reengage_delay
-    algo.auto_clamp_before_reengage_delay += 5
-    assert prev + 5 == algo.auto_clamp_before_reengage_delay == algo.active_config.head_clamp.before_reengage_delay
 
 
 def test_default_diamond_triangle_offset_config_path(algo):
@@ -189,12 +164,12 @@ def test_set_put_func_call_mode(algo):
 def test_reset_config(algo, count):
     algo.reset_configuration()
     config = BehaviorConfiguration()
-    config.head_clamp.auto_clamp_release_load_count = count
+    config.pellet_delivery.max_pellet_missing_seconds = count
     algo.load_configuration(config)
-    assert algo.auto_clamp_release_load_count == count
-    algo.auto_clamp_release_load_count = 2 * count
+    assert algo.pellet_missing_time == count
+    algo.pellet_missing_time = 2 * count
     algo.reset_configuration()
-    assert algo.auto_clamp_release_load_count == count
+    assert algo.pellet_missing_time == count
 
 
 def test_start_twice_session_fails(algo):
@@ -220,6 +195,7 @@ def test_delivery_disabled_defaults(algo):
     assert algo.can_cover_pellet() is False
     #
     algo.pellet_delivery_enabled = True
+    _start_automatic_recording(algo)
     #
     assert algo.can_send_pellet() is False
     assert algo.can_load_pellet() is False
@@ -235,14 +211,34 @@ def test_delivery_disabled_defaults(algo):
     assert algo.can_cover_pellet() is False
     #
     algo.active_config.pellet_delivery.pellet_send_wait_delay = 1
-    algo.start_session(reason="manual")
-    algo.set_capture_status(CaptureProcessStatus.RECORDING)
     assert algo.can_send_pellet() is False
     increase_simulate_perf_now(algo.active_config.pellet_delivery.pellet_send_wait_delay)
     assert algo.can_send_pellet() is True
 
+    algo.pellet_send_block_reason = "waiting for trial analysis"
+    assert algo.can_send_pellet() is False
+    algo.pellet_send_block_reason = ""
+    assert algo.can_send_pellet() is True
+
+
+def test_recorded_session_can_enable_pellet_cycles_without_training_mode(algo):
+    algo.active_config.session_control.automatic_pellet_cycles_enabled = True
+    algo.update_triangle_seen(True)
+
+    assert algo.can_load_pellet() is False
+    assert algo.start_session(reason="manual") is True
+    assert algo.can_load_pellet() is False
+
+    algo.set_capture_status(CaptureProcessStatus.RECORDING)
+    assert algo.can_load_pellet() is True
+
+    algo.pellet_automation_stop_requested = True
+    assert algo.can_load_pellet() is False
+    assert algo.can_send_pellet() is False
+
 
 def test_algo_paused(algo):
+    _start_automatic_recording(algo)
     algo.algo_paused = True
     assert algo.can_send_pellet() is False
     assert algo.can_release_pellet() is False
@@ -298,6 +294,7 @@ def test_release_pellet_offset(algo):
 @pytest.mark.parametrize("use_dist_too_far", [False, True])
 @pytest.mark.parametrize("bad_dist", [0, math.inf, None])  # 0 == too close, inf == far too far
 def test_can_load_when_pellet_triangle_too_far(algo, use_dist_too_far, bad_dist):
+    _start_automatic_recording(algo)
     algo.pellet_delivery_enabled = True
     algo.pellet_cover_enabled = False
     #

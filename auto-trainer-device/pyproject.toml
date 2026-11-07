@@ -14,15 +14,22 @@ namespaces = true
 name = "auto-trainer-device"
 description = "Device implementations for autotrainer"
 license = { text = "MIT" }
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
     "auto-trainer-core",
 
+    # FTDI-backed RFID reader transport. Imported lazily by the reader service.
+    'pyserial >= 3.5, < 4',
+
     'pyyaml >= 6.0.2, < 7',
 
-    # CAN communication with pellet/tunnel boards:
+    # CAN communication with the pellet board:
     'pyjerrycan >= 1.2.5, < 2 ; platform_machine == "aarch64"',
+    'python-can >= 4.5, < 5 ; platform_system == "Linux"',
+
+    # NI-DAQ laser control:
+    'nidaqmx >= 1.0, < 2 ; platform_system == "Linux"',
 ]
 
 [tool.setuptools_scm]

@@ -1,0 +1,966 @@
+from __future__ import annotations
+
+import dataclasses
+from collections import Counter
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QScrollArea,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from autotrainer.core import (
+    LaserChannelConfiguration,
+    LaserChannelId,
+    LaserSystemConfiguration,
+    NidaqDeviceIdentity,
+    NidaqPortConfiguration,
+    NidaqTimingConfiguration,
+    SystemConfiguration,
+)
+from autotrainer.core.configuration.laser_configuration import clock_line_clashes
+from autotrainer.core.logging import get_verbose_logger
+from tools.acquisition.model.nidaq_breakout import (
+    breakout_for_device,
+    describe_terminal,
+    is_panel_terminal,
+)
+from tools.acquisition.model.nidaq_channel_plan import (
+    laser_output_lines,
+    port_role_field,
+    port_role_refusal,
+    trigger_readback_refusal,
+)
+from tools.acquisition.model.nidaq_monitor_survey import (
+    clocks_digital_input,
+    is_streamable_line,
+)
+from tools.acquisition.model.nidaq_discovery import (
+    NidaqDevicePorts,
+    device_name_from_channel,
+    discover_nidaq_devices,
+)
+
+
+_GENERAL_ROLES: Tuple[Tuple[str, str, str], ...] = (
+    ("tone1", "tone1 confirmation", "di"),
+    ("tone2", "tone2 confirmation", "di"),
+    ("tone3_r", "tone3R confirmation", "di"),
+    ("tone3_l", "tone3L confirmation", "di"),
+    ("cam_frames", "cam_frames", "di"),
+    ("barcode", "barcode", "di"),
+)
+
+_LASER_ROLES: Tuple[Tuple[str, str, str], ...] = (
+    ("laser_out", "laser_out", "ao"),
+    ("diode", "diode", "ai"),
+    ("shutter", "shutter", "do"),
+    ("laser_copy", "laser_copy", "ai"),
+    ("trigger_listener", "hardware trigger input", "trigger"),
+    # The board STIM line wired back into an input, trigger_monitor_input:
+    # acquired as laserN_trigger for the laser tab's Board trigger graph. It
+    # had no field here, so it could only be set in the file, and a pin it
+    # held was still offered to the other inputs.
+    ("trigger_readback", "trigger readback input", "readback"),
+)
+
+
+logger = get_verbose_logger(__name__)
+
+
+class NidaqPortConfigurationDialog(QDialog):
+    """Edit reachAQ DAQ role/channel assignments from discovered NI-DAQ devices."""
+
+    def __init__(
+        self,
+        configuration: SystemConfiguration,
+        parent: Optional[QWidget] = None,
+        *,
+        devices: Optional[Sequence[NidaqDevicePorts]] = None,
+        discovery_error: Optional[str] = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Edit DAQ Ports")
+        self.setMinimumSize(640, 560)
+
+        self._configuration = configuration
+        if devices is None:
+            devices, discovery_error = discover_nidaq_devices()
+        self._devices = {device.name: device for device in devices}
+        self._discovery_error = discovery_error
+        self._nidaq_ports = configuration.nidaq_ports
+        self._laser_configuration = configuration.laser
+        self._timing_configuration = configuration.nidaq_ports.timing
+        self._general_combos: Dict[str, QComboBox] = {}
+        self._laser_combos: Dict[int, Dict[str, QComboBox]] = {}
+        self._combo_kinds: Dict[QComboBox, str] = {}
+        self._combo_role_names: Dict[QComboBox, str] = {}
+        self._combo_selections: Dict[QComboBox, Optional[str]] = {}
+        self._refreshing_channel_options = False
+        # Resolved once per device. A device with no block named gets None,
+        # and every label below quietly becomes the terminal name again.
+        self._breakouts: Dict[str, object] = {}
+
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(10, 10, 10, 10)
+        root_layout.setSpacing(8)
+
+        device_row = QHBoxLayout()
+        device_row.addWidget(QLabel("Channel source:"))
+        self._device_combo = QComboBox()
+        self._device_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        for device_name in sorted(self._devices):
+            self._device_combo.addItem(device_name, device_name)
+        device_row.addWidget(self._device_combo, stretch=1)
+        root_layout.addLayout(device_row)
+
+        self._status_label = QLabel()
+        self._status_label.setWordWrap(True)
+        root_layout.addWidget(self._status_label)
+
+        timing_group = QGroupBox("Timing and synchronization")
+        timing_layout = QFormLayout(timing_group)
+        self._sync_mode_combo = QComboBox()
+        for label, value in (
+            ("Automatic (recommended)", "auto"),
+            ("PXI/backplane", "backplane"),
+            ("External clock/trigger", "external"),
+            ("Independent (diagnostic only)", "independent"),
+        ):
+            self._sync_mode_combo.addItem(label, value)
+        timing_layout.addRow("Synchronization:", self._sync_mode_combo)
+        self._timing_master_combo = QComboBox()
+        self._timing_master_combo.addItem("Automatic (recommended)", None)
+        for device in sorted(self._devices.values(), key=lambda item: item.name):
+            if not self._can_be_timing_master(device):
+                continue
+            identity = self._device_identity(device)
+            detail = device.product_type or "unknown model"
+            if device.serial_number is not None:
+                detail += f", serial {device.serial_number}"
+            self._timing_master_combo.addItem(
+                f"{device.name} — {detail}",
+                identity,
+            )
+        timing_layout.addRow("Timing master:", self._timing_master_combo)
+        self._reference_clock_edit = QLineEdit(
+            self._timing_configuration.reference_clock_source or ""
+        )
+        self._start_trigger_edit = QLineEdit(
+            self._timing_configuration.start_trigger_source or ""
+        )
+        self._sample_clock_edit = QLineEdit(
+            self._timing_configuration.sample_clock_source or ""
+        )
+        timing_layout.addRow("Reference clock override:", self._reference_clock_edit)
+        timing_layout.addRow("Start trigger override:", self._start_trigger_edit)
+        timing_layout.addRow("Sample clock override:", self._sample_clock_edit)
+        self._timing_status_label = QLabel()
+        self._timing_status_label.setWordWrap(True)
+        timing_layout.addRow(self._timing_status_label)
+        root_layout.addWidget(timing_group)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(10)
+
+        general_group = QGroupBox("DAQ Roles")
+        general_layout = QFormLayout(general_group)
+        general_layout.setContentsMargins(10, 8, 10, 10)
+        general_layout.setSpacing(8)
+        for attr_name, label, kind in _GENERAL_ROLES:
+            combo = QComboBox()
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+            self._general_combos[attr_name] = combo
+            self._register_channel_combo(combo, kind, label)
+            general_layout.addRow(f"{label}:", combo)
+        scroll_layout.addWidget(general_group)
+
+        self._laser_tabs = QTabWidget()
+        self._laser_tabs.setDocumentMode(True)
+        self._laser_tabs.setUsesScrollButtons(True)
+        for laser_index in range(1, 5):
+            tab = QWidget()
+            tab_layout = QFormLayout(tab)
+            tab_layout.setContentsMargins(10, 10, 10, 10)
+            tab_layout.setSpacing(8)
+            combos = {}
+            for attr_name, label, kind in _LASER_ROLES:
+                combo = QComboBox()
+                combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+                combos[attr_name] = combo
+                self._register_channel_combo(combo, kind, f"laser{laser_index}.{label}")
+                tab_layout.addRow(f"{label}:", combo)
+            self._laser_combos[laser_index] = combos
+            self._laser_tabs.addTab(tab, f"Laser {laser_index}")
+        self._load_configured_channel_selections()
+        scroll_layout.addWidget(self._laser_tabs)
+        scroll_layout.addStretch(1)
+        scroll.setWidget(scroll_content)
+        root_layout.addWidget(scroll, stretch=1)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        root_layout.addWidget(self._buttons)
+
+        self._device_combo.currentTextChanged.connect(self._populate_port_combos)
+        self._sync_mode_combo.currentIndexChanged.connect(
+            self._update_timing_controls
+        )
+        self._timing_master_combo.currentIndexChanged.connect(
+            self._update_timing_controls
+        )
+        sync_index = self._sync_mode_combo.findData(
+            self._timing_configuration.sync_mode
+        )
+        self._sync_mode_combo.setCurrentIndex(max(0, sync_index))
+        self._select_configured_timing_master()
+        self._select_initial_device()
+        self._populate_port_combos()
+        self._update_timing_controls()
+
+    @property
+    def nidaq_ports(self) -> NidaqPortConfiguration:
+        return self._nidaq_ports
+
+    @property
+    def laser_configuration(self) -> LaserSystemConfiguration:
+        return self._laser_configuration
+
+    @property
+    def timing_configuration(self) -> NidaqTimingConfiguration:
+        return self._timing_configuration
+
+    def accept(self) -> None:
+        try:
+            device = self._selected_device()
+            if device is None:
+                raise RuntimeError("No NI-DAQ device is available for port configuration")
+            self._validate_selected_channel_assignments(device)
+            self._timing_configuration = self._build_timing_configuration()
+            self._nidaq_ports = self._build_nidaq_port_configuration(device.name)
+            self._laser_configuration = self._build_laser_configuration()
+        except Exception as exc:
+            logger.error("Invalid DAQ port configuration: %s", str(exc) or exc.__class__.__name__)
+            return
+        super().accept()
+
+    def _select_initial_device(self) -> None:
+        if not self._devices:
+            return
+        configured_name = self._configuration.nidaq_ports.device_name
+        if configured_name is None:
+            configured_name = self._infer_configured_device_name()
+        index = self._device_combo.findData(configured_name)
+        if index < 0:
+            index = 0
+        self._device_combo.setCurrentIndex(index)
+
+    def _populate_port_combos(self) -> None:
+        device = self._selected_device()
+        if device is None:
+            self._set_all_combos_enabled(False)
+            self._set_ok_enabled(False)
+            self._status_label.setText("NI-DAQ devices available: 0")
+            self._status_label.setStyleSheet("")
+            return
+
+        self._set_all_combos_enabled(True)
+        for attr_name, _label, kind in _GENERAL_ROLES:
+            combo = self._general_combos[attr_name]
+            current_value = self._combo_selections[combo]
+            self._set_combo_options(
+                combo,
+                self._options_with_current(device, kind, current_value),
+                current_value,
+            )
+        for laser_index, combos in self._laser_combos.items():
+            for attr_name, _label, kind in _LASER_ROLES:
+                combo = combos[attr_name]
+                current_value = self._combo_selections[combo]
+                self._set_combo_options(
+                    combo,
+                    self._options_with_current(device, kind, current_value),
+                    current_value,
+                )
+
+        self._refresh_channel_options()
+        self._update_status_label()
+
+    def _register_channel_combo(self, combo: QComboBox, kind: str, role_name: str) -> None:
+        self._combo_kinds[combo] = kind
+        self._combo_role_names[combo] = role_name
+        self._combo_selections[combo] = None
+        combo.currentIndexChanged.connect(self._on_channel_combo_changed)
+
+    def _on_channel_combo_changed(self, _index: int) -> None:
+        if self._refreshing_channel_options:
+            return
+        combo = self.sender()
+        if isinstance(combo, QComboBox) and combo in self._combo_selections:
+            self._combo_selections[combo] = self._combo_value(combo)
+        self._refresh_channel_options()
+        self._update_status_label()
+        self._update_timing_controls()
+
+    def _refresh_channel_options(self) -> None:
+        device = self._selected_device()
+        if device is None or self._refreshing_channel_options:
+            return
+
+        self._refreshing_channel_options = True
+        try:
+            for combo, kind in self._combo_kinds.items():
+                current_value = self._combo_selections[combo]
+                used_elsewhere = {
+                    value
+                    for other_combo, value in self._combo_selections.items()
+                    if other_combo is not combo
+                    if value is not None
+                }
+                all_options = self._options_for_kind(device, kind)
+                options = tuple(
+                    option
+                    for option in all_options
+                    if option == current_value or option not in used_elsewhere
+                )
+                display_options = self._include_current_option(options, current_value)
+                self._set_combo_options(combo, display_options, current_value)
+                has_selectable_channel = len(display_options) > 0
+                combo.setEnabled(has_selectable_channel)
+                current_device_name = device_name_from_channel(current_value)
+                if current_value is not None and current_device_name != device.name:
+                    combo.setToolTip(
+                        f"Assigned to {current_value}. Select a {device.name} channel to replace it."
+                    )
+                elif len(all_options) == 0:
+                    combo.setToolTip(self._no_channels_reason(device, kind))
+                elif not has_selectable_channel:
+                    combo.setToolTip(f"All {kind.upper()} channels on this device are already assigned.")
+                else:
+                    combo.setToolTip("")
+        finally:
+            self._refreshing_channel_options = False
+
+    def _update_status_label(self) -> None:
+        device = self._selected_device()
+        if device is None:
+            return
+        status = (
+            f"Channels available from {device.name}: "
+            f"AO {len(device.analog_outputs)}, AI {len(device.analog_inputs)}, "
+            f"DO {len(device.digital_outputs)}, DI {len(device.digital_inputs)}"
+        )
+        retained_device_names = sorted(
+            {
+                channel_device_name
+                for _role_name, _kind, value in self._selected_channel_entries()
+                for channel_device_name in (device_name_from_channel(value),)
+                if channel_device_name is not None and channel_device_name != device.name
+            }
+        )
+        if retained_device_names:
+            status += "\nAssignments retained from other device(s): " + ", ".join(retained_device_names)
+        warnings = []
+        unsupported = self._unsupported_selected_channels(device)
+        if unsupported:
+            warnings.append(
+                "Selected channel(s) not supported by a discovered device/type: "
+                + ", ".join(unsupported)
+            )
+        duplicates = self._duplicate_selected_channels()
+        if duplicates:
+            warnings.append("Duplicate channel assignment(s): " + ", ".join(duplicates))
+        readback_refusals = self._stream_line_refusals()
+        warnings.extend(readback_refusals)
+        clock_line_refusals = self._clock_line_refusals()
+        warnings.extend(clock_line_refusals)
+        # Not an error - the 68-pin connector reaches everything - but worth
+        # one line, because the alternative is hunting the front panel for a
+        # label that was never printed on it.
+        off_block = self._selected_channels_off_the_block()
+        if off_block:
+            warnings.append(
+                "Not brought out on the named breakout: " + ", ".join(off_block)
+                + " (reachable only through the 68-pin connector)")
+        unavailable_kinds = [
+            kind.upper()
+            for kind, options in (
+                ("ao", device.analog_outputs),
+                ("ai", device.analog_inputs),
+                ("do", device.digital_outputs),
+                ("di", device.digital_inputs),
+            )
+            if len(options) == 0
+        ]
+        if unavailable_kinds:
+            warnings.append("Unsupported channel type(s) on selected device: " + ", ".join(unavailable_kinds))
+        if warnings:
+            status += "\n" + "\n".join(warnings)
+            self._status_label.setStyleSheet("color: #9a6700;")
+        else:
+            self._status_label.setStyleSheet("")
+        self._set_ok_enabled(
+            not unsupported and not duplicates and not readback_refusals
+            and not clock_line_refusals)
+        self._status_label.setText(status)
+
+    def _selected_channels_off_the_block(self) -> Tuple[str, ...]:
+        """Configured channels their device's block does not bring out."""
+        found = []
+        for _role_name, _kind, value in self._selected_channel_entries():
+            if not value:
+                continue
+            model = self._breakout_for(device_name_from_channel(value))
+            if model is None or not is_panel_terminal(self._terminal_of(value)):
+                continue
+            if not self._breakout_label(value):
+                found.append(value)
+        return tuple(sorted(set(found)))
+
+    def _build_nidaq_port_configuration(self, device_name: str) -> NidaqPortConfiguration:
+        values = {
+            attr_name: self._combo_selections[combo]
+            for attr_name, combo in self._general_combos.items()
+        }
+        selected_device_names = tuple(dict.fromkeys(
+            device_name_from_channel(value)
+            for _role, _kind, value in self._selected_channel_entries()
+            if device_name_from_channel(value)
+        ))
+        return NidaqPortConfiguration(
+            device_name=device_name,
+            device_identities=tuple(
+                self._device_identity(self._devices[name])
+                for name in selected_device_names
+                if name in self._devices
+            ),
+            timing=self._timing_configuration,
+            **values,
+        )
+
+    def _build_timing_configuration(self) -> NidaqTimingConfiguration:
+        current = self._timing_configuration
+        return NidaqTimingConfiguration(
+            sync_mode=self._sync_mode_combo.currentData(),
+            timing_master=self._timing_master_combo.currentData(),
+            require_hardware_synchronization=True,
+            reference_clock_source=self._optional_text(self._reference_clock_edit),
+            start_trigger_source=self._optional_text(self._start_trigger_edit),
+            sample_clock_source=self._optional_text(self._sample_clock_edit),
+            task_strategy=current.task_strategy,
+            require_distinct_start_trigger=current.require_distinct_start_trigger,
+            sample_clock_export_terminal=current.sample_clock_export_terminal,
+            start_trigger_export_terminal=current.start_trigger_export_terminal,
+            external_routes=current.external_routes,
+            transfer_mechanism_overrides=current.transfer_mechanism_overrides,
+        )
+
+    def _select_configured_timing_master(self) -> None:
+        configured = self._timing_configuration.timing_master
+        if configured is None:
+            self._timing_master_combo.setCurrentIndex(0)
+            return
+        for index in range(1, self._timing_master_combo.count()):
+            candidate = self._timing_master_combo.itemData(index)
+            if not isinstance(candidate, NidaqDeviceIdentity):
+                continue
+            if (
+                configured.serial_number is not None
+                and configured.serial_number == candidate.serial_number
+                and (
+                    configured.product_type is None
+                    or configured.product_type == candidate.product_type
+                )
+            ) or (
+                configured.serial_number is None
+                and configured.runtime_name == candidate.runtime_name
+            ):
+                self._timing_master_combo.setCurrentIndex(index)
+                return
+
+    def _update_timing_controls(self, *_args) -> None:
+        mode = self._sync_mode_combo.currentData()
+        is_external = mode == "external"
+        for edit in (
+            self._reference_clock_edit,
+            self._start_trigger_edit,
+            self._sample_clock_edit,
+        ):
+            edit.setEnabled(is_external)
+        selected_devices = {
+            device_name_from_channel(value)
+            for _role, _kind, value in self._selected_channel_entries()
+            if device_name_from_channel(value)
+        }
+        self._timing_master_combo.setEnabled(len(selected_devices) > 1)
+        if len(selected_devices) <= 1:
+            explanation = (
+                "One active NI-DAQ device: all sampled channels share its "
+                "hardware timeline."
+            )
+        elif mode == "independent":
+            explanation = (
+                "Independent clocks are diagnostic-only and block aligned "
+                "session recording."
+            )
+        elif mode == "external":
+            explanation = (
+                "External mode requires validated sample-clock and start-trigger "
+                "wiring on every participating rig."
+            )
+        else:
+            explanation = (
+                "The runtime discovers compatible routes, arms slaves first, "
+                "and starts the resolved master last."
+            )
+        self._timing_status_label.setText(explanation)
+
+    @staticmethod
+    def _device_identity(device: NidaqDevicePorts) -> NidaqDeviceIdentity:
+        return NidaqDeviceIdentity(
+            logical_name=device.name,
+            runtime_name=device.name,
+            product_type=device.product_type or None,
+            serial_number=device.serial_number,
+        )
+
+    @staticmethod
+    def _can_be_timing_master(device: NidaqDevicePorts) -> bool:
+        return bool(
+            device.analog_inputs
+            or device.counter_outputs
+            or (
+                device.analog_outputs
+                and device.analog_output_sample_clock_supported is not False
+            )
+        )
+
+    @staticmethod
+    def _optional_text(edit: QLineEdit) -> Optional[str]:
+        return edit.text().strip() or None
+
+    def _build_laser_configuration(self) -> LaserSystemConfiguration:
+        existing = {
+            int(channel.channel_id): channel
+            for channel in self._configuration.laser.channels
+        }
+        channels = []
+        for laser_index in range(1, 5):
+            values = {
+                attr_name: self._combo_selections[combo]
+                for attr_name, combo in self._laser_combos[laser_index].items()
+            }
+            if not any(values.values()):
+                continue
+            missing = [
+                attr_name
+                for attr_name in ("laser_out", "diode", "shutter", "laser_copy")
+                if values[attr_name] is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"Laser {laser_index} has incomplete DAQ mapping: missing {', '.join(missing)}"
+                )
+            previous = existing.get(laser_index)
+            mapped = dict(
+                analog_output=values["laser_out"],
+                diode_input=values["diode"],
+                shutter_output=values["shutter"],
+                command_copy_input=values["laser_copy"],
+                trigger_monitor_input=values["trigger_readback"],
+            )
+            # Only the roles this dialog edits. Rebuilding the channel field by
+            # field dropped every field it did not list, so each save erased
+            # trigger_route_source and the board trigger wiring.
+            channels.append(
+                LaserChannelConfiguration(channel_id=LaserChannelId(laser_index), **mapped)
+                if previous is None
+                else dataclasses.replace(previous, **mapped)
+            )
+
+        current = self._configuration.laser
+        backend = current.backend
+        if backend != "disabled" and not channels:
+            raise ValueError(f"laser backend '{backend}' requires at least one complete laser mapping")
+        # Every field the dialog does not edit is kept. Rebuilt from its
+        # channels, the configuration lost backplaneClockLine: a save moved
+        # the shared clock back onto PXI_Trig1.
+        return dataclasses.replace(
+            current,
+            channels=tuple(channels),
+            trigger_listener_inputs=self._selected_trigger_listener_inputs(),
+        )
+
+    def _selected_trigger_listener_inputs(self) -> Tuple[str, ...]:
+        return tuple(
+            value
+            for combos in self._laser_combos.values()
+            for value in (self._combo_selections[combos["trigger_listener"]],)
+            if value is not None
+        )
+
+    def _clock_line_refusals(self) -> List[str]:
+        """A trigger picked here on a clock line, as the load says it.
+
+        backplaneClockLine or pulseClockLine. The configuration refuses one
+        when it is built, so without this the dialog could not close, and
+        would not say why. The channels' own trigger sources are not fields
+        here, and are taken as configured.
+        """
+        laser = self._configuration.laser
+        mapped = {
+            laser_index
+            for laser_index, combos in self._laser_combos.items()
+            if any(self._combo_selections[combo] for combo in combos.values())
+        }
+        clashes = clock_line_clashes(
+            laser.backplane_clock_line,
+            laser.pulse_clock_line,
+            (channel for channel in laser.channels if int(channel.channel_id) in mapped),
+            self._selected_trigger_listener_inputs(),
+        )
+        return ["; ".join(clashes)] if clashes else []
+
+    def _set_all_combos_enabled(self, enabled: bool) -> None:
+        for combo in self._general_combos.values():
+            combo.setEnabled(enabled)
+        for combos in self._laser_combos.values():
+            for combo in combos.values():
+                combo.setEnabled(enabled)
+
+    def _set_ok_enabled(self, enabled: bool) -> None:
+        button = self._buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if button is not None:
+            button.setEnabled(enabled)
+
+    def _selected_device(self) -> Optional[NidaqDevicePorts]:
+        return self._devices.get(self._device_combo.currentData())
+
+    @staticmethod
+    def _no_channels_reason(device: NidaqDevicePorts, kind: str) -> str:
+        """Why `device` offers nothing for a field of `kind`.
+
+        A PXI-6713 has eight DI lines, so "has no DI channels" was wrong: the
+        board cannot clock digital input, which the stream needs.
+        """
+        if (
+            kind in ("di", "readback")
+            and device.digital_inputs
+            and not clocks_digital_input(device)
+        ):
+            if kind == "readback":
+                return (
+                    f"{device.name} has no analog input and cannot clock "
+                    "digital input, so nothing on it can be sampled with the "
+                    "stream."
+                )
+            return (
+                f"{device.name} cannot clock digital input, so none of its "
+                "lines can be sampled with the stream."
+            )
+        return f"The selected device has no {kind.upper()} channels."
+
+    def _options_for_kind(self, device: NidaqDevicePorts, kind: str) -> Tuple[str, ...]:
+        if kind == "ao":
+            return device.analog_outputs
+        if kind == "ai":
+            return device.analog_inputs
+        if kind == "do":
+            return device.digital_outputs
+        if kind == "di":
+            # The port roles are all sampled in the stream's clocked DI task.
+            # Offered every line, a port1/port2 PFI pin or a PXI-6713 line
+            # took every NI input down (-200452).
+            return self._streamable_lines(device)
+        if kind == "readback":
+            # What the input stream can sample: every analog input, and the
+            # lines a port role could have.
+            return tuple(dict.fromkeys(device.analog_inputs + self._streamable_lines(device)))
+        if kind == "trigger":
+            # DAQmx spells the backplane lines PXI_Trig0-7. Looking for
+            # "pxitrig" alone never matched one, so the lines christielab10's
+            # trigger inputs use were never offered, only kept when stored.
+            return tuple(
+                terminal
+                for terminal in device.terminals
+                if any(
+                    marker in terminal.lower()
+                    for marker in ("pfi", "pxitrig", "pxi_trig", "rtsi")
+                )
+            )
+        raise ValueError(f"Unsupported NI-DAQ channel kind: {kind}")
+
+    def _options_with_current(
+        self,
+        device: NidaqDevicePorts,
+        kind: str,
+        current_value: Optional[str],
+    ) -> Tuple[str, ...]:
+        return self._include_current_option(self._options_for_kind(device, kind), current_value)
+
+    @staticmethod
+    def _include_current_option(
+        options: Iterable[str],
+        current_value: Optional[str],
+    ) -> Tuple[str, ...]:
+        options = tuple(options)
+        if current_value is not None and current_value not in options:
+            return (current_value,) + options
+        return options
+
+    def _breakout_for(self, device_name: Optional[str]):
+        """The block cabled to this device, per the saved configuration."""
+        if not device_name:
+            return None
+        if device_name not in self._breakouts:
+            self._breakouts[device_name] = breakout_for_device(
+                self._configuration.nidaq_ports, device_name)
+        return self._breakouts[device_name]
+
+    @staticmethod
+    def _terminal_of(channel: Optional[str]) -> str:
+        """A channel name with its device prefix removed."""
+        text = str(channel or "").strip("/")
+        return text.split("/", 1)[-1] if "/" in text else text
+
+    def _breakout_label(self, channel: Optional[str]) -> str:
+        """`PXI1Slot5/ai3` as the thing somebody can find on the bench."""
+        if not channel:
+            return ""
+        model = self._breakout_for(device_name_from_channel(channel))
+        if model is None:
+            return ""
+        return describe_terminal(model, self._terminal_of(channel))
+
+    def _option_text(self, channel: str) -> Tuple[str, str]:
+        """How an option reads, and what to say about it on hover.
+
+        A terminal the block does not bring out is still selectable - a 68-pin
+        cable to something else reaches it - but saying nothing would leave
+        somebody looking for a label that is not printed anywhere.
+        """
+        model = self._breakout_for(device_name_from_channel(channel))
+        if model is None:
+            return channel, ""
+        label = self._breakout_label(channel)
+        if label:
+            return f"{channel} — {label}", ""
+        if not is_panel_terminal(self._terminal_of(channel)):
+            # A backplane or internal route. No block brings it out and none
+            # could, so there is nothing to say about connectors.
+            return channel, ""
+        return (f"{channel} — not on the {model.name}",
+                f"{model.name} does not bring {channel} out on any connector. "
+                "It is still reachable through the 68-pin connector.")
+
+    def _set_combo_options(
+        self,
+        combo: QComboBox,
+        options: Iterable[str],
+        current_value: Optional[str],
+    ) -> None:
+        options = tuple(options)
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            # Optional, and most rigs leave it unset, so the empty entry says
+            # so rather than looking like a field nobody filled in.
+            combo.addItem("(none)" if self._combo_kinds.get(combo) == "readback" else "", None)
+            for option in options:
+                text, hint = self._option_text(option)
+                combo.addItem(text, option)
+                if hint:
+                    combo.setItemData(combo.count() - 1, hint,
+                                      Qt.ItemDataRole.ToolTipRole)
+            index = combo.findData(current_value)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+        finally:
+            combo.blockSignals(False)
+
+    def _combo_value(self, combo: QComboBox) -> Optional[str]:
+        value = combo.currentData()
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return None
+
+    def _selected_channel_entries(self) -> Tuple[Tuple[str, str, str], ...]:
+        entries = []
+        for combo, kind in self._combo_kinds.items():
+            value = self._combo_selections[combo]
+            if value is not None:
+                entries.append((self._combo_role_names[combo], kind, value))
+        return tuple(entries)
+
+    def _unsupported_selected_channels(self, _device: NidaqDevicePorts) -> List[str]:
+        unsupported = []
+        for role_name, kind, value in self._selected_channel_entries():
+            channel_device = self._devices.get(device_name_from_channel(value))
+            if channel_device is None or value not in self._options_for_kind(channel_device, kind):
+                unsupported.append(f"{role_name}={value}")
+        return unsupported
+
+    def _duplicate_selected_channels(self) -> List[str]:
+        entries = self._selected_channel_entries()
+        counts = Counter(value for _role_name, _kind, value in entries)
+        duplicates = []
+        for value, count in counts.items():
+            if count <= 1:
+                continue
+            roles = [
+                role_name
+                for role_name, _kind, channel_value in entries
+                if channel_value == value
+            ]
+            duplicates.append(f"{value} ({', '.join(roles)})")
+        return duplicates
+
+    def _trigger_readback_refusals(self) -> List[str]:
+        """The acquisition plan's own refusals of the readbacks picked here.
+
+        The other laser inputs and the shutters are fields of this dialog, so
+        its duplicate check covers them; the output lines it does not edit
+        are taken from the configuration.
+        """
+        outputs = laser_output_lines(self._configuration.laser, shutters=False)
+        refusals = []
+        for laser_index, combos in self._laser_combos.items():
+            terminal = self._combo_selections[combos["trigger_readback"]]
+            if terminal is None:
+                continue
+            refusal = (
+                trigger_readback_refusal(laser_index, terminal, outputs)
+                or self._unclocked_line_refusal(
+                    f"Laser {laser_index} trigger readback input", terminal)
+            )
+            if refusal:
+                refusals.append(refusal)
+        return refusals
+
+    def _stream_line_refusals(self) -> List[str]:
+        """Why a line picked here cannot be sampled with the stream.
+
+        The acquisition plan's own rules, which a load would refuse, for the
+        port roles and the trigger readbacks; and, since only this dialog
+        knows the boards, a line on one that cannot clock digital input. A
+        stored value that fails them is kept on its field and named here,
+        with OK disabled, rather than dropped where nobody sees it.
+        """
+        refusals = []
+        for attr_name, _label, _kind in _GENERAL_ROLES:
+            terminal = self._combo_selections[self._general_combos[attr_name]]
+            if terminal is None:
+                continue
+            refusal = (
+                port_role_refusal(attr_name, terminal)
+                or self._unclocked_line_refusal(
+                    f"nidaqPorts.{port_role_field(attr_name)}", terminal)
+            )
+            if refusal:
+                refusals.append(refusal)
+        refusals.extend(self._trigger_readback_refusals())
+        return refusals
+
+    def _streamable_lines(self, device: NidaqDevicePorts) -> Tuple[str, ...]:
+        """The digital input lines of `device` the stream can sample.
+
+        Port0 only, on a board that clocks digital input at all: port1 and
+        port2 are the static PFI pins (STIM3's PFI0 is port1/line0), and a
+        PXI-6713's lines cannot be clocked - the driver has no DI rate for
+        it, and a buffered task on them fails at -200452.
+        """
+        if not clocks_digital_input(device):
+            return ()
+        return tuple(line for line in device.digital_inputs if is_streamable_line(line))
+
+    def _unclocked_line_refusal(self, subject: str, terminal: str) -> str:
+        device = self._devices.get(device_name_from_channel(terminal))
+        if (
+            device is None
+            or clocks_digital_input(device)
+            or terminal not in device.digital_inputs
+        ):
+            return ""
+        return (
+            f"{subject} {terminal!r} is not streamable: {device.name} cannot "
+            "clock digital input, so its lines cannot be sampled with the stream"
+        )
+
+    def _validate_selected_channel_assignments(self, device: NidaqDevicePorts) -> None:
+        unsupported = self._unsupported_selected_channels(device)
+        if unsupported:
+            raise ValueError(
+                "Selected channel(s) are not available for their required type on this device: "
+                + ", ".join(unsupported)
+            )
+        duplicates = self._duplicate_selected_channels()
+        if duplicates:
+            raise ValueError("Duplicate channel assignment(s) are not allowed: " + ", ".join(duplicates))
+        stream_refusals = self._stream_line_refusals()
+        if stream_refusals:
+            raise ValueError("; ".join(stream_refusals))
+        # Before the configuration is built, which refuses it too, unnamed.
+        clock_line_refusals = self._clock_line_refusals()
+        if clock_line_refusals:
+            raise ValueError("; ".join(clock_line_refusals))
+
+    def _infer_configured_device_name(self) -> Optional[str]:
+        channels = []
+        ports = self._configuration.nidaq_ports
+        for attr_name, _label, _kind in _GENERAL_ROLES:
+            channels.append(getattr(ports, attr_name))
+        for channel in self._configuration.laser.channels:
+            channels.extend(
+                (
+                    channel.analog_output,
+                    channel.diode_input,
+                    channel.shutter_output,
+                    channel.command_copy_input,
+                )
+            )
+        for channel_name in channels:
+            device_name = device_name_from_channel(channel_name)
+            if device_name in self._devices:
+                return device_name
+        return None
+
+    def _load_configured_channel_selections(self) -> None:
+        ports = self._configuration.nidaq_ports
+        for attr_name, _label, _kind in _GENERAL_ROLES:
+            self._combo_selections[self._general_combos[attr_name]] = getattr(ports, attr_name)
+
+        existing_channels = {
+            int(channel.channel_id): channel
+            for channel in self._configuration.laser.channels
+        }
+        trigger_inputs = iter(self._configuration.laser.trigger_listener_inputs)
+        for laser_index, combos in self._laser_combos.items():
+            channel = existing_channels.get(laser_index)
+            values = {
+                "laser_out": None if channel is None else channel.analog_output,
+                "diode": None if channel is None else channel.diode_input,
+                "shutter": None if channel is None else channel.shutter_output,
+                "laser_copy": None if channel is None else channel.command_copy_input,
+                "trigger_listener": next(trigger_inputs, None),
+                "trigger_readback": None if channel is None else channel.trigger_monitor_input,
+            }
+            for attr_name, value in values.items():
+                self._combo_selections[combos[attr_name]] = value

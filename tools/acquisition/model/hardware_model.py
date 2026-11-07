@@ -1,5 +1,9 @@
+import dataclasses
+import logging
 import math
+import os
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -10,14 +14,19 @@ from typing import Optional, Tuple, Dict, Union, List
 
 from autotrainer.api import ApiEventKind, ApiDetectorKind
 from autotrainer.core import (ObservableObject, SystemCommandKind, MessageHandler, AnimalSubject, Offset3DTuple,
-                              get_verbose_logger, Motor, SensorAnalysis, EventManager, HardwareConfiguration,
+                              get_verbose_logger, Motor, EventManager, HardwareConfiguration,
                               get_perf_now, SystemStatusMessageKind)
+from autotrainer.core.logging import log_hardware_initialization
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core.event import post_api_detector_event_content
 from autotrainer.core.message import SystemDataArgsKwargs
-from autotrainer.device import (DeviceConnectionProtocol, HAVE_CAN_DEVICE, DeviceConnection, CanDevice,
-                                StepperConfig, ServoConfig, Device, ColorLed)
-from autotrainer.behavior import TunnelDeviceProtocol, PelletDeviceProtocol
+from autotrainer.device import (CanTransportConfiguration, CanTransportKind, DeviceConnectionProtocol, HAVE_CAN_DEVICE,
+                                DeviceConnection, CanDevice, CanFailure, CanFailureKind,
+                                StepperConfig, ServoConfig, Device, ColorLed, Target, EmulationInterface,
+                                capture_can_diagnostics)
+from autotrainer.device.device_interface import BOARD_STIM_LINE_OUTPUTS
+from autotrainer.behavior import PelletDeviceProtocol
+from tools.acquisition.model.firmware_compatibility import FirmwareCompatibilityPolicy
 
 logger = get_verbose_logger(__name__)
 
@@ -25,26 +34,21 @@ _nans_offset3dTuple = Offset3DTuple.get_nan()
 
 
 _reg_pellet_version_clean = re.compile("pellet ?:? *")
-_reg_tunnel_version_clean = re.compile("tunnel ?:? *")
-_reg_magnet_version_clean = re.compile("magnet ?:? *")
+class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
-
-class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol):
-
-    TUNNEL_VERSION_PROPERTY = "tunnel_version"
     PELLET_VERSION_PROPERTY = "pellet_version"
+    FIRMWARE_COMPATIBILITY_PROPERTY = "firmware_compatibility"
 
-    TUNNEL_IDENTIFIER_PROPERTY = "tunnel_identifier"
     PELLET_IDENTIFIER_PROPERTY = "pellet_identifier"
+    CAN_ENABLED = "can_enabled"
+    PELLET_CONTROLLER_ENABLED = "pellet_controller_enabled"
+    NIDAQ_ENABLED = "nidaq_enabled"
 
     PENDING_COMMAND_PROPERTY = "pending_command"
-
-    FRONT_DOOR_PROPERTY = "front_door"
-    SLIDE_DOOR_PROPERTY = "slide_door"
+    CAN_CONNECTION_STATE_PROPERTY = "can_connection_state"
 
     DEVICE_ACK_TIMEOUT_ENGAGED = "device_ack_timeout_engaged"
     DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED = "device_pellet_status_timeout_engaged"
-    DEVICE_TUNNEL_STATUS_TIMEOUT_ENGAGED = "device_tunnel_status_timeout_engaged"
 
     # POS_X = "pos_x"
     # POS_Y = "pos_y"
@@ -60,57 +64,67 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
     SET_Y = "set_y"
     SET_Z = "set_z"
 
-    HEAD_MAGNET_INTENSITY = "head_magnet_intensity"
-    TUNNEL_GATE_POSITION = "tunnel_gate_position"
-    TUNNEL_GATE_OPEN_STATUS = "tunnel_gate_open_status"
-
     def __init__(
         self,
         message_handler: MessageHandler,
-        sensor_analysis: SensorAnalysis,
     ):
-        super().__init__()
+        super().__init__(event_names=("device_event", "command_failed"))
 
         self._lock = threading.RLock()  # **required** re-entrant lock !!
+        self._can_lifecycle_lock = threading.RLock()
+        self._safety_shutdown_lock = threading.Lock()
+        self._safety_shutdown_started = False
+        self._safety_shutdown_thread: Optional[threading.Thread] = None
         self._connect_count = 0
+        self._command_queue: Optional[Queue] = None
+        self._can_recovery_lock = threading.Lock()
+        self._can_recovery_thread: Optional[threading.Thread] = None
+        self._can_recovery_cancel = threading.Event()
+        self._first_can_failure: Optional[CanFailure] = None
+        self._can_recovery_failure: Optional[CanFailure] = None
+        self._can_recovery_generation = 0
+        self._can_connection_state = {"state": "stopped", "error": ""}
 
         self._event_manager = EventManager.default()
         self._board_status_timeout: Optional[float] = None
         self._device_ack_timeout_delay: Optional[float] = None
         self._device_conn: Optional[DeviceConnectionProtocol] = None
         self._can_device: Optional[CanDevice] = None
-        self._sensor_analysis = sensor_analysis
+        self._can_latency_observer = None
         self._device_uuid_ack_timeout_engaged = False
         self._device_pellet_status_timeout_engaged = False
-        self._device_tunnel_status_timeout_engaged = False
-        self._device_stream_started = False
+        self._device_initialization_complete = False
+        self._can_enabled = True
+        self._pellet_controller_enabled = True
+        self._nidaq_enabled = False
 
         self._pending_tokens: Dict[UUID, Tuple[SystemCommandKind, float]] = {}
+        self._command_outcomes: Dict[UUID, Tuple[str, str]] = {}
 
         message_handler.property_changed += self._message_handler_property_changed
         message_handler.ack_received += self._ack_received
-
-        self._head_magnet_position: Optional[float] = None
-        self._tunnel_gate_position: float = math.nan
-        self._tunnel_gate_open_status: bool = False
+        message_handler.decoded_message_received += self._decoded_device_message
 
         self._dcs_config: Optional[DiamondTriangleOffsetConfig] = None
-        # Support for relative x, y, z movements and whether they are persistent as the Send position various between
-        # hardware implementations. One the Alogus hardware is used exclusively, it should be possible to remove these
-        # and rely on SET_X/Y/Z commands with the extra arguments that support relative and/or movements that should
-        # not affect the Send position.
+        # Cache physical and requested coordinates separately so relative moves
+        # cannot silently overwrite the saved pellet-send position.
         self._last_motor_coordinates = _nans_offset3dTuple
         # what the motors report they've been SET (with possible drift corrected):
         self._last_motor_send_coordinates = _nans_offset3dTuple
         # What we've SET as coordinates:
         self._last_requested_set_coordinates: Offset3DTuple = _nans_offset3dTuple
 
-        self._front_door_open: bool = False
-        self._slide_door_open: bool = False
-
         self._cover_arm_position: float = math.nan
         self._load_arm_position: float = math.nan
 
+        self._pellet_version = ""
+        self._board_wire_schema_version = None
+        self._board_capabilities = 0
+        self._board_capabilities_received = threading.Event()
+        self._firmware_version_received = threading.Event()
+        self._can_is_emulation = False
+        self._firmware_policy = FirmwareCompatibilityPolicy.load()
+        self._firmware_compatibility = self._firmware_policy.evaluate("")
         self._color_led: Optional[ColorLed] = None
 
         self._device_ack_timeout_engaged = False
@@ -157,6 +171,11 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
                         expired_tokens.add(pending_token)
                 for expired in expired_tokens:
                     self._pending_tokens.pop(expired, None)
+                    self._remember_command_outcome(
+                        expired,
+                        "timed_out",
+                        "command acknowledgement was not received within 30 seconds",
+                    )
                 after_commands = list(self._pending_tokens.values())
             if len(expired_tokens) > 0:
                 self._refresh_cmd_in_progress(after_commands)
@@ -216,6 +235,10 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
     def device_ack_timeout_engaged(self):
         return self._device_ack_timeout_engaged
 
+    @property
+    def pellet_status_timeout_engaged(self) -> bool:
+        return self._device_pellet_status_timeout_engaged
+
     @device_ack_timeout_engaged.setter
     def device_ack_timeout_engaged(self, value):
         prev, self._device_ack_timeout_engaged = self._device_ack_timeout_engaged, value
@@ -268,57 +291,32 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         return self._color_led
 
     @property
-    def front_door_open(self):
-        return self._front_door_open
-
-    @front_door_open.setter
-    def front_door_open(self, value: bool):
-        prev, self._front_door_open = self._front_door_open, value
-        self._on_property_changed(HardwareModel.FRONT_DOOR_PROPERTY, value, prev)
+    def pellet_version(self) -> str:
+        return self._pellet_version
 
     @property
-    def slide_door_open(self):
-        return self._slide_door_open
-
-    @slide_door_open.setter
-    def slide_door_open(self, value: bool):
-        prev, self._slide_door_open = self._slide_door_open, value
-        self._on_property_changed(HardwareModel.SLIDE_DOOR_PROPERTY, value, prev)
+    def firmware_compatibility(self) -> dict:
+        return self._firmware_compatibility.to_record()
 
     @property
-    def head_magnet_intensity(self) -> Optional[float]:
-        """
-        This value is stored because there are other operations that depend on the current magnet intensity.  In most
-        other cases, the only action is to update the UI with the current value.
-        :return intensity in percent:
-        """
-        return self._head_magnet_position
-
-    def update_head_magnet_intensity(self, value: Optional[float]) -> Optional[UUID]:
-        if value is None:  # caller should not call instead eventually
-            return
-        if isinstance(value, str):
-            value = float(value)
-        if value != self._head_magnet_position:
-            logger.verbose("sending move magnet to %.3f", value)
-            # self._head_magnet_position = value  # this is set from reading the hardware status
-            return self._send_with_token(self._device_conn, SystemCommandKind.MOVE_MAGNET_SERVO,
-                                         value)
-        logger.debug("head magnet currently already at pos %.3f", value)
-        return None
+    def pellet_commands_allowed(self) -> bool:
+        return self._firmware_compatibility.commands_allowed
 
     @property
-    def tunnel_gate_open_status(self) -> bool:
-        return self._tunnel_gate_open_status
+    def can_enabled(self) -> bool:
+        return self._can_enabled
 
-    def open_tunnel_gate(self) -> Optional[UUID]:
-        return self._send_with_token(self._device_conn, SystemCommandKind.OPEN_TUNNEL_GATE)
+    @property
+    def pellet_controller_enabled(self) -> bool:
+        return self._pellet_controller_enabled
 
-    def close_tunnel_gate(self) -> Optional[UUID]:
-        return self._send_with_token(self._device_conn, SystemCommandKind.CLOSE_TUNNEL_GATE)
+    @property
+    def nidaq_enabled(self) -> bool:
+        return self._nidaq_enabled
 
-    def tare_load_cell(self) -> Optional[UUID]:
-        return self._send_with_token(self._device_conn, SystemCommandKind.UPDATE_SCALE_TARE)
+    @property
+    def requires_connection(self) -> bool:
+        return self._can_enabled and self._pellet_controller_enabled
 
     def _set_axis(self, value: float, *, absolute: bool = True,
                   system_set_cmd: SystemCommandKind, coord_idx: int, sender: str="NA") -> Optional[UUID]:
@@ -404,11 +402,32 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
     def send_home(self) -> Optional[UUID]:
         return self._send_with_token(self._device_conn, SystemCommandKind.SEND_HOME)
 
+    def send_home_and_wait(self, *, timeout: float = 15.0) -> UUID:
+        token = self.send_home()
+        if token is None:
+            raise RuntimeError("pellet home command was not queued")
+        self.wait_pending_command_acked(token, timeout=timeout)
+        return token
+
     def load_pellet(self) -> Optional[UUID]:
         return self._send_with_token(self._device_conn, SystemCommandKind.LOAD_PELLET)
 
-    def send_pellet(self) -> Optional[UUID]:
-        return self._send_with_token(self._device_conn, SystemCommandKind.SEND_PELLET)
+    def send_pellet(
+        self,
+        *,
+        embedded_tone=None,
+        pre_reveal_stimulus=None,
+    ) -> Optional[UUID]:
+        data = {}
+        if embedded_tone is not None:
+            data["embedded_tone"] = embedded_tone
+        if pre_reveal_stimulus is not None:
+            data["pre_reveal_stimulus"] = pre_reveal_stimulus
+        return self._send_with_token(
+            self._device_conn,
+            SystemCommandKind.SEND_PELLET,
+            data or None,
+        )
 
     def release_pellet(self) -> Optional[UUID]:
         return self._send_with_token(self._device_conn, SystemCommandKind.RELEASE_PELLET)
@@ -430,22 +449,52 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         duration_ms = int(duration * 1000)
         return self._send_with_token(self._device_conn, SystemCommandKind.PLAY_TONE, (frequency, duration_ms))
 
+    def pulse_stim(self, duration_us: int, stim_line: int = 3) -> Optional[UUID]:
+        """Pulse a pellet-board stimulus line, named as the board names it.
+
+        Board STIM2 and STIM3 only; STIM0 and STIM1 carry the firmware tone
+        confirmations. BOARD_STIM_LINE_OUTPUTS holds the off-by-one between the
+        board's labels and the host's DigitalOutputs.
+        """
+        output = BOARD_STIM_LINE_OUTPUTS.get(int(stim_line))
+        if output is None:
+            raise ValueError(
+                f"Board STIM{stim_line} cannot carry a stimulus pulse; use "
+                "board STIM2 or STIM3"
+            )
+        return self._send_with_token(
+            self._device_conn,
+            SystemCommandKind.PULSE_DIGITAL_OUTPUT,
+            (int(output.value), int(duration_us)),
+        )
+
+    def pulse_stim3(self, duration_us: int) -> Optional[UUID]:
+        """Pulse physical pellet-board STIM3, the line available before STIM2."""
+        return self.pulse_stim(duration_us, stim_line=3)
+
     def delay(self, amount: float) -> Optional[UUID]:
         return self._send_with_token(self._device_conn, SystemCommandKind.DELAY, amount)
-
-    def set_tunnel_fan_on(self) -> Optional[UUID]:
-        return self._send_with_token(self._device_conn, SystemCommandKind.TUNNEL_FAN_ON)
-
-    def set_tunnel_fan_off(self) -> Optional[UUID]:
-        return self._send_with_token(self._device_conn, SystemCommandKind.TUNNEL_FAN_OFF)
 
     def set_color_led(self, r: int, g: int, b: int):
         """0 -> 100"""
         return self._send_with_token(self._device_conn, SystemCommandKind.SET_RGB_LED, (r, g, b))
 
     def load_config(self, config: HardwareConfiguration):
+        self._set_boolean_config(self.CAN_ENABLED, "_can_enabled", config.can_enabled)
+        self._set_boolean_config(
+            self.PELLET_CONTROLLER_ENABLED,
+            "_pellet_controller_enabled",
+            config.pellet_controller_enabled,
+        )
+        self._set_boolean_config(self.NIDAQ_ENABLED, "_nidaq_enabled", config.nidaq_enabled)
         self.set_device_ack_timeout(config.min_ack_timeout)
         self.set_board_status_timeout(config.board_status_timeout)
+
+    def _set_boolean_config(self, property_name: str, attr_name: str, value: bool) -> None:
+        prev = getattr(self, attr_name)
+        value = bool(value)
+        setattr(self, attr_name, value)
+        self._on_property_changed(property_name, value, prev)
 
     def set_board_status_timeout(self, timeout: Optional[float]):
         self._board_status_timeout = timeout
@@ -473,60 +522,212 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         dev_dev = None if dev is None else dev.device
         return dev_dev is not None and dev_dev.connected
 
-    def connect(self, cmd_queue: Queue):
+    def connect(
+        self,
+        cmd_queue: Queue,
+        *,
+        _recovery: bool = False,
+        _generation: Optional[int] = None,
+    ):
+        with self._can_lifecycle_lock:
+            return self._connect_locked(
+                cmd_queue,
+                _recovery=_recovery,
+                _generation=_generation,
+            )
+
+    def _connect_locked(
+        self,
+        cmd_queue: Queue,
+        *,
+        _recovery: bool,
+        _generation: Optional[int],
+    ):
+        if not self._can_enabled:
+            logger.notice("Skipping hardware connection because CAN bus is disabled in configuration")
+            log_hardware_initialization(logger, "SKIP | CAN/pellet controller | CAN disabled")
+            return
+        if not self._pellet_controller_enabled:
+            logger.notice("Skipping hardware connection because pellet controller is disabled in configuration")
+            log_hardware_initialization(logger, "SKIP | CAN/pellet controller | pellet controller disabled")
+            return
+        if not _recovery:
+            self._can_recovery_cancel.clear()
+            with self._can_recovery_lock:
+                self._can_recovery_generation += 1
+                self._first_can_failure = None
+                self._can_recovery_failure = None
+        self._command_queue = cmd_queue
+        if (
+            _generation is not None
+            and not self._can_recovery_is_current(_generation)
+        ):
+            return False
+        self._set_can_connection_state("connecting", generation=_generation)
+        connect_started = time.perf_counter()
+        self._emit_device_event("state", "connect_start")
+        transport = CanTransportConfiguration.from_environment()
+        self._firmware_version_received.clear()
+        self._board_wire_schema_version = None
+        self._board_capabilities = 0
+        self._can_is_emulation = transport.kind is CanTransportKind.EMULATION
+        self._update_firmware_compatibility("")
+        log_hardware_initialization(
+            logger,
+            "START | CAN/pellet controller | transport=%s channel=%s required_target=%s",
+            transport.kind.value,
+            transport.channel,
+            Target.PELLET_DEVICE.name,
+        )
         logger.notice("%s: connect with %s", self, cmd_queue)
         self._disconnect_event.clear()
 
         prev_device = self._device_conn
         if prev_device is not None:
             logger.warning("auto-disconnecting from device before (re-)connect")
-            self.disconnect()
+            self._disconnect_transport()
+        with self._safety_shutdown_lock:
+            self._safety_shutdown_started = False
+            self._safety_shutdown_thread = None
 
         self._connect_count += 1
         self._last_motor_coordinates = \
         self._last_requested_set_coordinates = \
         self._last_motor_send_coordinates = _nans_offset3dTuple
+        self._device_pellet_status_timeout_engaged = False
 
         # This is specific to wanting to be able to test UI changes w/the emulation interface, which is not
         # configured to generate messages as frequently as the real device.
         buffer_size = 10 if HAVE_CAN_DEVICE else 1
         #
-        can_device = self._can_device = CanDevice(buffer_size=buffer_size)
+        can_device = self._can_device = CanDevice(
+            buffer_size=buffer_size,
+            required_targets=(Target.PELLET_DEVICE,),
+            can_transport=transport,
+            failure_callback=self._on_can_failure,
+            operation_callback=self._on_internal_device_operation,
+        )
+        log_hardware_initialization(
+            logger,
+            "READY | CAN adapter created | transport=%s channel=%s elapsed=%.3fs",
+            transport.kind.value,
+            transport.channel,
+            time.perf_counter() - connect_started,
+        )
+        self._emit_device_event("state", "transport_created")
         self.set_device_ack_timeout(self._device_ack_timeout_delay)  # ensure it's used
         self.set_board_status_timeout(self._board_status_timeout)
 
         can_device.property_changed += self._can_device_property_changed
+        can_device.latency_observer = self._can_latency_observer
 
-        device_conn = self._device_conn = DeviceConnection(can_device, cmd_queue, name="can-device")
+        device_conn = self._device_conn = DeviceConnection(
+            can_device,
+            cmd_queue,
+            name="can-device",
+            failure_callback=self._on_can_failure,
+        )
+        self._can_is_emulation = isinstance(
+            can_device.device_interface, EmulationInterface,
+        )
+        log_hardware_initialization(logger, "START | CAN connection worker | name=can-device")
         device_conn.request_connect()
+        connection_started = time.perf_counter()
+        connection_timeout = 3.0
+        log_hardware_initialization(
+            logger,
+            "START | CAN connection readiness | timeout=%.1fs",
+            connection_timeout,
+        )
+        try:
+            device_conn.wait_connected(timeout=connection_timeout)
+        except Exception as exc:
+            log_hardware_initialization(
+                logger,
+                "FAILED | CAN connection readiness | elapsed=%.3fs error=%s",
+                time.perf_counter() - connection_started,
+                str(exc) or exc.__class__.__name__,
+                level=logging.ERROR,
+            )
+            raise
+        if (
+            _generation is not None
+            and not self._can_recovery_is_current(_generation)
+        ):
+            self._disconnect_transport_locked(command_outcome="cancelled")
+            return False
+        log_hardware_initialization(
+            logger,
+            "READY | CAN connection readiness | elapsed=%.3fs",
+            time.perf_counter() - connection_started,
+        )
 
         send_dev_cmd = partial(self._send_command, device_conn)
         def send_dev_ack_cmd(kind, data=None):
+            command_started = time.perf_counter()
+            log_hardware_initialization(logger, "START | pellet command | command=%s", kind.name)
             tok = str(uuid.uuid4())
-            with device_conn.await_acknowledge({tok}):
-                send_dev_cmd(kind, data, context=tok)
+            try:
+                with device_conn.await_acknowledge(
+                    {tok},
+                    timeout=can_device.default_command_ack_timeout_duration,
+                ):
+                    send_dev_cmd(kind, data, context=tok)
+            except Exception as exc:
+                log_hardware_initialization(
+                    logger,
+                    "FAILED | pellet command | command=%s elapsed=%.3fs error=%s",
+                    kind.name,
+                    time.perf_counter() - command_started,
+                    str(exc) or exc.__class__.__name__,
+                    level=logging.ERROR,
+                )
+                raise
+            log_hardware_initialization(
+                logger,
+                "READY | pellet command acknowledged | command=%s elapsed=%.3fs",
+                kind.name,
+                time.perf_counter() - command_started,
+            )
 
         send_dev_ack_cmd(SystemCommandKind.REQUEST_VERSION)
+        if not self._firmware_version_received.wait(2.0):
+            raise RuntimeError(
+                "Pellet firmware version was not reported; motor initialization is blocked"
+            )
+        self._request_board_capabilities(can_device)
+        if not self.pellet_commands_allowed:
+            raise RuntimeError(
+                "Pellet firmware compatibility check failed: "
+                f"{self._firmware_compatibility.reason} "
+                f"(detected={self._pellet_version or 'unknown'})"
+            )
 
         # load and set motors and move configs
         # 1)
-        motors_config = device_conn.load_default_motor_config()
+        config_started = time.perf_counter()
+        log_hardware_initialization(logger, "START | pellet motor configuration")
+        device_conn.load_default_motor_config()
+        log_hardware_initialization(
+            logger,
+            "READY | pellet motor configuration | elapsed=%.3fs",
+            time.perf_counter() - config_started,
+        )
         # 2)
+        config_started = time.perf_counter()
+        log_hardware_initialization(logger, "START | pellet move configuration")
         device_conn.load_default_move_config()
-        # 3)
-        if self._connect_count == 1:
-            logger.notice("Doing cover attach-release-detach on first connect")
-            send_dev_ack_cmd(SystemCommandKind.SERVO_ATTACH, Motor.PELLET_COVER_SERVO)
-            send_dev_ack_cmd(SystemCommandKind.RELEASE_PELLET)
-            send_dev_ack_cmd(SystemCommandKind.SERVO_DETACH, Motor.PELLET_COVER_SERVO)
-            send_dev_ack_cmd(SystemCommandKind.WRITE_MOTOR_CONFIGURATION, motors_config.cover_config)
-            # also need to re-apply the config
+        log_hardware_initialization(
+            logger,
+            "READY | pellet move configuration | elapsed=%.3fs",
+            time.perf_counter() - config_started,
+        )
+        # Every initial connection and recovery establishes one deterministic,
+        # non-presenting mechanical state. Motor configuration is acknowledged
+        # above before homing because its limits and velocities govern HOME.
+        self._home_and_detach_pellet(send_dev_ack_cmd)
 
-        send_dev_ack_cmd(SystemCommandKind.STREAM_START)
-        logger.success("STREAM_START acknowledged")
-        self._device_stream_started = True
-
-        send_dev_cmd(SystemCommandKind.UPDATE_SCALE_TARE)
+        self._device_initialization_complete = True
 
         prev_thread = self._check_timedout_commands_thread
         if prev_thread is None or not prev_thread.is_alive():
@@ -536,26 +737,174 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
                 name="check-timedout-commands",
             )
             thread.start()
+        log_hardware_initialization(
+            logger,
+            "READY | CAN/pellet controller | elapsed=%.3fs",
+            time.perf_counter() - connect_started,
+        )
+        if not self._set_can_connection_state("ready", generation=_generation):
+            self._disconnect_transport_locked(command_outcome="cancelled")
+            return False
+        return True
 
-    def disconnect(self):
+    @staticmethod
+    def _home_and_detach_pellet(send_acknowledged_command) -> None:
+        log_hardware_initialization(logger, "START | pellet XYZ home")
+        send_acknowledged_command(SystemCommandKind.SEND_HOME)
+        log_hardware_initialization(logger, "READY | pellet XYZ home")
+        for servo in (
+            Motor.PELLET_LOAD_SERVO,
+            Motor.PELLET_COVER_SERVO,
+        ):
+            log_hardware_initialization(
+                logger,
+                "START | pellet servo detach | motor=%s",
+                servo.name,
+            )
+            send_acknowledged_command(SystemCommandKind.SERVO_DETACH, servo)
+            log_hardware_initialization(
+                logger,
+                "READY | pellet servo detach | motor=%s",
+                servo.name,
+            )
+
+    def _disconnect_transport(self, *, command_outcome: str = "cancelled"):
+        with self._can_lifecycle_lock:
+            return self._disconnect_transport_locked(
+                command_outcome=command_outcome,
+            )
+
+    def _disconnect_transport_locked(self, *, command_outcome: str):
         logger.verbose("disconnecting ..")
+        self._emit_device_event("state", "disconnect_start")
         self._disconnect_event.set()
+        with self._lock:
+            for token in self._pending_tokens:
+                self._remember_command_outcome(
+                    token,
+                    command_outcome,
+                    "CAN transport closed before acknowledgement",
+                )
+            self._pending_tokens.clear()
         can_dev = self._can_device
         dev = self._device_conn
         if dev is not None:
             dev.request_disconnect()
-            dev.join()
+            if dev.join() is False:
+                raise RuntimeError(
+                    "failed CAN reader is still alive; refusing replacement transport"
+                )
             self._device_conn = None
         if can_dev is not None:
             can_dev.property_changed -= self._can_device_property_changed
             self._can_device = None
-        self._on_property_changed(self.TUNNEL_VERSION_PROPERTY, "", None)
-        self._on_property_changed(self.PELLET_VERSION_PROPERTY, "", None)
+        prev, self._pellet_version = self._pellet_version, ""
+        self._on_property_changed(self.PELLET_VERSION_PROPERTY, "", prev)
+        self._firmware_version_received.clear()
+        self._update_firmware_compatibility("")
         prev_thread = self._check_timedout_commands_thread
         if prev_thread is not None:
             logger.debug("joining checktimedout commands thread")
             prev_thread.join()
-        self._device_stream_started = False
+        with self._lock:
+            self._pending_tokens.clear()
+        self._refresh_cmd_in_progress([])
+        self._device_initialization_complete = False
+        self._emit_device_event("state", "disconnected")
+
+    def _reset_socketcan(self, transport: Optional[CanTransportConfiguration]) -> None:
+        if transport is None:
+            return
+        if transport.kind != CanTransportKind.SOCKETCAN:
+            return
+
+        if os.environ.get("REACHAQ_PROHIBIT_PRIVILEGED_CAN_RESET") == "1" or \
+                "PYTEST_CURRENT_TEST" in os.environ:
+            raise RuntimeError("privileged CAN reset is prohibited under automated tests")
+
+        helper = "/usr/local/sbin/reachaq-reset-can"
+        helper_args = [helper, transport.channel]
+        command = helper_args if os.geteuid() == 0 else ["sudo", "-n", *helper_args]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            logger.error("Could not reset SocketCAN after safety shutdown: %s", exc)
+            return
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
+            logger.error("SocketCAN safety reset failed: %s", detail)
+        else:
+            logger.notice("SocketCAN safety reset completed")
+
+    def _run_safety_shutdown(self, reason: str) -> None:
+        logger.critical("Starting CAN safety shutdown: %s", reason)
+        self._emit_device_event(
+            "state",
+            "safety_shutdown_start",
+            data={"reason": reason},
+        )
+        can_dev = self._can_device
+        if can_dev is not None:
+            transport = can_dev.can_transport_configuration
+        else:
+            try:
+                transport = CanTransportConfiguration.from_environment()
+            except Exception:
+                logger.exception("Could not determine CAN transport for safety reset")
+                transport = None
+        try:
+            self._disconnect_transport()
+        except Exception:
+            logger.exception("Failed to close CAN transport during safety shutdown")
+        finally:
+            self._reset_socketcan(transport)
+        logger.notice("CAN safety shutdown finished")
+        self._emit_device_event(
+            "state",
+            "safety_shutdown_finished",
+            data={"reason": reason},
+        )
+
+    def safety_shutdown(self, reason: str, *, wait: bool = True) -> None:
+        """Recover after a confirmed CAN-domain failure.
+
+        This is intentionally not the generic application shutdown path: it
+        may restart the shared SocketCAN network interface.
+        """
+        self._can_recovery_cancel.set()
+        with self._can_recovery_lock:
+            self._can_recovery_generation += 1
+        with self._safety_shutdown_lock:
+            thread = self._safety_shutdown_thread
+            if not self._safety_shutdown_started:
+                self._safety_shutdown_started = True
+                thread = threading.Thread(
+                    target=self._run_safety_shutdown,
+                    args=(reason,),
+                    name="CanSafetyShutdown",
+                    daemon=False,
+                )
+                self._safety_shutdown_thread = thread
+                thread.start()
+
+        if wait and thread is not None and thread is not threading.current_thread():
+            thread.join(20)
+            if thread.is_alive():
+                logger.error("CAN safety shutdown did not finish within 20 seconds")
+
+    def disconnect(self):
+        """Close only this application's device worker and CAN socket."""
+        self._can_recovery_cancel.set()
+        with self._can_recovery_lock:
+            self._can_recovery_generation += 1
+        self._disconnect_transport()
+        self._set_can_connection_state("stopped")
 
     def _can_device_property_changed(self, name: str, value, prev_value):
         logger.debug("_device_property_changed: %s : %s -> %s", name, prev_value, value)
@@ -575,40 +924,16 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
             self._device_pellet_status_timeout_engaged = value
             self.property_changed(self.DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED, value, prev_value)
             is_dev_comm_err_possible = True
-        elif name == props.TUNNEL_STATUS_TIMEOUT_ENGAGED:
-            post_api_detector_event_content(
-                self._event_manager,
-                ApiDetectorKind.tunnelStatusMessageInterruption,
-                value,
-                True,
-            )
-            self._device_tunnel_status_timeout_engaged = value
-            self.property_changed(self.DEVICE_TUNNEL_STATUS_TIMEOUT_ENGAGED, value, prev_value)
-            is_dev_comm_err_possible = True
         #
         if is_dev_comm_err_possible:
             engaged = any((
                 self._device_uuid_ack_timeout_engaged,
-                self._device_tunnel_status_timeout_engaged,
                 self._device_pellet_status_timeout_engaged,
             ))
-            self._sensor_analysis.device_comm_alarm.is_engaged = engaged
 
     def _message_handler_property_changed(self, name: str, value, old_value):
         props = MessageHandler
-        if name == props.HEAD_MAGNET_INTENSITY_PROPERTY:
-            prev, self._head_magnet_position = self._head_magnet_position, value
-            self._on_property_changed(self.HEAD_MAGNET_INTENSITY, value, prev)
-
-        elif name == props.HEAD_GATE_PROPERTY:
-            # logger.verbose("HEAD_GATE_PROPERTY: %s ; old=%s", value, old_value)
-            prev, self._tunnel_gate_position = self._tunnel_gate_position, value
-            self._on_property_changed(self.TUNNEL_GATE_POSITION, value, prev)
-
-        elif name == props.TUNNEL_GATE_OPEN_STATUS:
-            prev, self._tunnel_gate_open_status = self._tunnel_gate_open_status, value
-
-        elif name == props.STEPPER_X_PROPERTY:
+        if name == props.STEPPER_X_PROPERTY:
             prev = self._last_motor_coordinates
             new = prev.replace(x=value.position)
             self._last_motor_coordinates = new
@@ -629,12 +954,6 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
             self.send_z = value.send_position
             self._on_property_changed(self.POS_XYZ, new, prev)
 
-        elif name == props.FRONT_DOOR_PROPERTY:
-            self.front_door_open = value
-
-        elif name == props.DRAWER_DOOR_PROPERTY:
-            self.slide_door_open = value
-
         elif name == props.COVER_ARM_ANGLE_PROPERTY:
             self._cover_arm_position = value
 
@@ -647,16 +966,71 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
                 version = version.replace("module", "").strip()
             if version.find("pellet") != -1:
                 clean_v = _reg_pellet_version_clean.sub("", version).strip()
-                self._on_property_changed(self.PELLET_VERSION_PROPERTY, clean_v, old_value)
-            elif version.find("magnet") != -1:
-                clean_v = _reg_magnet_version_clean.sub("", version).strip()
-                self._on_property_changed(self.TUNNEL_VERSION_PROPERTY, clean_v, old_value)
-            elif version.find("tunnel") != -1:
-                clean_v = _reg_tunnel_version_clean.sub("", version).strip()
-                self._on_property_changed(self.TUNNEL_VERSION_PROPERTY, clean_v, old_value)
-
+                prev, self._pellet_version = self._pellet_version, clean_v
+                self._on_property_changed(self.PELLET_VERSION_PROPERTY, clean_v, prev)
+                self._update_firmware_compatibility(clean_v)
+                self._firmware_version_received.set()
         elif name == props.COLOR_LED:
             self._color_led = value
+
+    def _request_board_capabilities(self, can_device) -> None:
+        """Ask the board what it can do, before judging it on the answer.
+
+        The compatibility check runs at connect and reads a bitmask the board
+        has never been asked for, so a required capability could never be
+        satisfied: the mask was still zero when it was evaluated. A firmware
+        that answers (2.3.0 and later) fills it in here; one that does not
+        (2.2.0 and earlier) leaves it zero, which is exactly why those
+        versions list their capabilities as optional.
+
+        Not reaching the board is not fatal. Silence is what older firmware
+        does, and the policy for those versions expects it.
+        """
+        interface = getattr(getattr(can_device, "device_interface", None),
+                            "request_capabilities", None)
+        if interface is None:
+            return
+        self._board_capabilities_received.clear()
+        try:
+            if not interface():
+                return
+        except Exception as error:
+            logger.debug("capabilities request was not sent: %s", error)
+            return
+        if not self._board_capabilities_received.wait(1.0):
+            logger.info(
+                "pellet board did not answer the capabilities request; "
+                "treating it as a firmware that cannot")
+
+    def _decoded_device_message(self, kind, data, perf_time, wall_time) -> None:
+        if kind != SystemStatusMessageKind.BOARD_CAPABILITIES:
+            return
+        self._board_wire_schema_version = int(data.wire_schema_version)
+        self._board_capabilities = int(data.capabilities)
+        self._board_capabilities_received.set()
+        self._update_firmware_compatibility(self._pellet_version)
+
+    def _update_firmware_compatibility(self, version: str) -> None:
+        previous = self._firmware_compatibility
+        current = self._firmware_policy.evaluate(
+            version,
+            wire_schema_version=self._board_wire_schema_version,
+            capabilities=self._board_capabilities,
+            emulation=self.__dict__.get("_can_is_emulation", False),
+        )
+        self._firmware_compatibility = current
+        self._on_property_changed(
+            self.FIRMWARE_COMPATIBILITY_PROPERTY,
+            current.to_record(),
+            previous.to_record(),
+        )
+
+    def set_can_latency_observer(self, observer) -> None:
+        """Route CAN command latency stages to the session's latency record."""
+        self._can_latency_observer = observer
+        device = getattr(self, "_can_device", None)
+        if device is not None:
+            device.latency_observer = observer
 
     def _send_with_token(self, device: Optional[DeviceConnectionProtocol], cmd: SystemCommandKind, data=None) -> Optional[UUID]:
         with self._lock:
@@ -670,15 +1044,288 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
             self._refresh_cmd_in_progress(commands_tuple)
         return tok
 
+    def _on_can_failure(self, failure: CanFailure) -> None:
+        if (
+            failure.kind in {
+                CanFailureKind.TRANSPORT,
+                CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT,
+            }
+            and not failure.diagnostics
+        ):
+            try:
+                can_device = self._can_device
+                transport = (
+                    can_device.can_transport_configuration
+                    if can_device is not None
+                    else CanTransportConfiguration.from_environment()
+                )
+                if transport.kind is CanTransportKind.SOCKETCAN:
+                    failure = dataclasses.replace(
+                        failure,
+                        diagnostics=capture_can_diagnostics(transport.channel),
+                    )
+            except Exception:
+                logger.exception("Could not capture CAN counters before recovery")
+        logger.error(
+            "Terminal CAN failure: kind=%s command=%s context=%s error=%s",
+            failure.kind.value,
+            failure.command,
+            failure.context,
+            failure.error,
+        )
+        recoverable = failure.kind in {
+            CanFailureKind.TRANSPORT,
+            CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT,
+        }
+        with self._can_recovery_lock:
+            if self._first_can_failure is None:
+                self._first_can_failure = failure
+            else:
+                logger.error(
+                    "Preserving first CAN diagnostic failure (%s); later failure: %s",
+                    self._first_can_failure.error,
+                    failure.error,
+                )
+            if recoverable and self._can_recovery_failure is not None:
+                logger.error(
+                    "CAN recovery already owned by %s; suppressed duplicate recovery: %s",
+                    self._can_recovery_failure.error,
+                    failure.error,
+                )
+                return
+            if recoverable:
+                self._can_recovery_failure = failure
+
+        with self._lock:
+            pending = tuple(self._pending_tokens.items())
+        if pending and failure.kind is CanFailureKind.TRANSPORT:
+            for token, (command, _started) in pending:
+                with self._lock:
+                    self._remember_command_outcome(
+                        token,
+                        "unknown",
+                        "CAN connection was lost before acknowledgement",
+                    )
+                self.command_failed(CanFailure(
+                    CanFailureKind.OPERATION_UNKNOWN,
+                    f"CAN connection was lost while {command.name} was in flight; "
+                    "the operation was not replayed and its physical outcome is unknown",
+                    command=command,
+                    context=str(token),
+                    category=failure.category,
+                    error_code=failure.error_code,
+                    exception_type=failure.exception_type,
+                    diagnostics=failure.diagnostics,
+                ))
+        else:
+            if failure.context:
+                try:
+                    failed_token = UUID(str(failure.context))
+                except (TypeError, ValueError):
+                    failed_token = None
+                if failed_token is not None:
+                    with self._lock:
+                        if failed_token in self._pending_tokens:
+                            self._remember_command_outcome(
+                                failed_token,
+                                "failed",
+                                failure.error,
+                            )
+            self.command_failed(failure)
+
+        self._emit_device_event(
+            "state",
+            "can_failure",
+            data={
+                "kind": failure.kind.value,
+                "error": failure.error,
+                "category": failure.category,
+                "error_code": failure.error_code,
+                "exception_type": failure.exception_type,
+                "diagnostics": failure.diagnostics,
+            },
+            context=failure.context,
+        )
+        if not recoverable:
+            return
+        self._set_can_connection_state("failed", error=failure.error)
+        with self._can_recovery_lock:
+            self._can_recovery_generation += 1
+            generation = self._can_recovery_generation
+        thread = threading.Thread(
+            target=self._run_can_recovery,
+            args=(failure, generation),
+            name="CanRecovery",
+            daemon=True,
+        )
+        with self._can_recovery_lock:
+            self._can_recovery_thread = thread
+        thread.start()
+
+    def report_can_watchdog_failure(self, error: str) -> None:
+        self._on_can_failure(CanFailure(
+            CanFailureKind.TRANSPORT,
+            str(error),
+            category="watchdog_timeout",
+            exception_type="WatchdogTimeout",
+        ))
+
+    def _run_can_recovery(
+        self,
+        failure: CanFailure,
+        generation: Optional[int] = None,
+    ) -> None:
+        if generation is None:
+            with self._can_recovery_lock:
+                self._can_recovery_generation += 1
+                generation = self._can_recovery_generation
+                self._can_recovery_failure = failure
+        try:
+            command_queue = self._command_queue
+            if command_queue is None:
+                logger.error("CAN recovery cannot start without the original command queue")
+                return
+            if not self._can_recovery_is_current(generation):
+                return
+            self._set_can_connection_state(
+                "recovering", error=failure.error, generation=generation,
+            )
+            self._emit_device_event(
+                "state", "recovery_start",
+                data={"error": failure.error, "generation": generation},
+            )
+            transport = (
+                self._can_device.can_transport_configuration
+                if self._can_device is not None
+                else CanTransportConfiguration.from_environment()
+            )
+            delays = (0.0, 0.5, 1.5)
+            last_error = failure.error
+            for attempt, delay in enumerate(delays, start=1):
+                if self._can_recovery_cancel.wait(delay):
+                    logger.info("CAN recovery cancelled during application shutdown")
+                    return
+                if not self._can_recovery_is_current(generation):
+                    return
+                try:
+                    self._disconnect_transport(command_outcome="unknown")
+                except Exception as exc:
+                    last_error = str(exc) or exc.__class__.__name__
+                    logger.exception(
+                        "Failed to close failed CAN socket before recovery attempt %s; "
+                        "replacement transport will not be opened",
+                        attempt,
+                    )
+                    continue
+                if attempt == 2 and transport.kind is CanTransportKind.SOCKETCAN:
+                    try:
+                        self._reset_socketcan(transport)
+                    except Exception as exc:
+                        last_error = str(exc) or exc.__class__.__name__
+                        logger.exception("SocketCAN reset before recovery attempt failed")
+                try:
+                    connected = self.connect(
+                        command_queue,
+                        _recovery=True,
+                        _generation=generation,
+                    )
+                except Exception as exc:
+                    last_error = str(exc) or exc.__class__.__name__
+                    logger.exception("CAN recovery attempt %s/%s failed", attempt, len(delays))
+                    self._emit_device_event(
+                        "state",
+                        "recovery_attempt_failed",
+                        data={
+                            "attempt": attempt,
+                            "error": last_error,
+                            "generation": generation,
+                        },
+                    )
+                    continue
+                if not connected:
+                    return
+                if not self._can_recovery_is_current(generation):
+                    self._disconnect_transport()
+                    return
+
+                logger.notice("CAN recovery completed on attempt %s", attempt)
+                self._emit_device_event(
+                    "state",
+                    "recovery_ready",
+                    data={"attempt": attempt, "generation": generation},
+                )
+                self._set_can_connection_state("ready", generation=generation)
+                with self._can_recovery_lock:
+                    if generation == self._can_recovery_generation:
+                        self._can_recovery_failure = None
+                return
+
+            error = f"CAN recovery exhausted after {len(delays)} attempts: {last_error}"
+            logger.error("%s", error)
+            self._emit_device_event(
+                "state", "recovery_exhausted",
+                data={"error": error, "generation": generation},
+            )
+            self._set_can_connection_state(
+                "failed", error=error, generation=generation,
+            )
+        finally:
+            with self._can_recovery_lock:
+                if generation == self._can_recovery_generation:
+                    self._can_recovery_thread = None
+
+    def _can_recovery_is_current(self, generation: int) -> bool:
+        with self._can_recovery_lock:
+            return generation == self._can_recovery_generation
+
+    def _set_can_connection_state(
+        self,
+        state: str,
+        *,
+        error: str = "",
+        generation: Optional[int] = None,
+    ) -> bool:
+        with self._can_recovery_lock:
+            if (
+                generation is not None
+                and generation != self._can_recovery_generation
+            ):
+                logger.warning(
+                    "Ignoring stale CAN state %s from generation %s",
+                    state,
+                    generation,
+                )
+                return False
+            previous = self._can_connection_state
+            value = {"state": str(state), "error": str(error or "")}
+            self._can_connection_state = value
+        self._on_property_changed(self.CAN_CONNECTION_STATE_PROPERTY, value, previous)
+        return True
+
     def __send_with_token(self, device: DeviceConnectionProtocol, cmd: SystemCommandKind, data=None) -> Optional[UUID]:
         token = uuid4()
         perf_now = get_perf_now()
+        observer = self._can_latency_observer
+        if observer is not None:
+            try:
+                observer("token", {"token": str(token), "kind": cmd.name, "perf": perf_now})
+            except Exception:
+                logger.exception("CAN latency observer failed")
         logger.debug("send_command cmd=%s token=%s nbr=%s", cmd, token, len(self._pending_tokens))
         if self._send_command(device, cmd, data, token):
             self._pending_tokens[token] = (cmd, perf_now)
+            self._remember_command_outcome(token, "pending", "")
             return token
         else:
             logger.verbose("send_command failed, device not setup yet: cmd=%s token=%s", cmd, token)
+            if cmd is SystemCommandKind.SEND_PELLET:
+                self._on_can_failure(CanFailure(
+                    kind=CanFailureKind.COMMAND,
+                    error=f"Command {cmd.name} could not be queued",
+                    command=cmd,
+                    context=str(token),
+                    perf_time=perf_now,
+                ))
             return None
 
     # noinspection PyMethodMayBeStatic
@@ -687,30 +1334,88 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
                       cmd: SystemCommandKind,
                       data=None,
                       context=None) -> bool:
-        if device is not None:
-            device.send_message(cmd, data, context)
-            return True
+        with self._safety_shutdown_lock:
+            if self._safety_shutdown_started:
+                logger.warning("Ignoring %s because CAN safety shutdown is active", cmd)
+                return False
+            if device is not None:
+                self._emit_device_event(
+                    "outbound",
+                    cmd,
+                    data=data,
+                    context=context,
+                )
+                device.send_message(cmd, data, context)
+                return True
         return False
+
+    def _emit_device_event(
+        self,
+        direction,
+        kind,
+        *,
+        data=None,
+        context=None,
+        target=None,
+        perf_time=None,
+        wall_time=None,
+    ) -> None:
+        try:
+            self.device_event(
+                direction,
+                kind,
+                data,
+                context,
+                target,
+                time.perf_counter() if perf_time is None else float(perf_time),
+                time.time() if wall_time is None else float(wall_time),
+            )
+        except Exception:
+            logger.exception("Unable to publish structured device event")
+
+    def _on_internal_device_operation(
+        self, kind, data, context, target, perf_time, wall_time,
+    ) -> None:
+        """Persist commands executed inside a configured compound movement."""
+        self._emit_device_event(
+            "outbound",
+            kind,
+            data=data,
+            context=context,
+            target=target,
+            perf_time=perf_time,
+            wall_time=wall_time,
+        )
 
     def set_motors_drift(self, drift: Offset3DTuple):
         """Apply the pellet motor drift"""
-        dev = self._device_conn
-        if dev is None:
+        if self._device_conn is None:
             return
-        dev.send_message(SystemCommandKind.SET_MOTOR_DRIFT, drift)
+        self._send_with_token(self._device_conn, SystemCommandKind.SET_MOTOR_DRIFT, drift)
         # this ensure the next send_to_fixed_pos command will get the corrected position:
         for cmd_kind in (SystemCommandKind.SET_X, SystemCommandKind.SET_Y, SystemCommandKind.SET_Z):
-            dev.send_message(cmd_kind, SystemDataArgsKwargs(0, relative=True))
+            self._send_with_token(
+                self._device_conn,
+                cmd_kind,
+                SystemDataArgsKwargs(0, relative=True),
+            )
 
     def set_auto_correct_motor_drift(self, enabled: bool):
-        dev = self._device_conn
-        if dev is None:
+        if self._device_conn is None:
             return
-        dev.send_message(SystemCommandKind.SET_AUTO_CORRECT_DRIFT, enabled)
+        self._send_with_token(
+            self._device_conn,
+            SystemCommandKind.SET_AUTO_CORRECT_DRIFT,
+            enabled,
+        )
         if not enabled:
             logger.verbose("Doing SET_X/Y/Z relative=0 to clear possible motors drift")
             for cmd_kind in (SystemCommandKind.SET_X, SystemCommandKind.SET_Y, SystemCommandKind.SET_Z):
-                dev.send_message(cmd_kind, SystemDataArgsKwargs(0, relative=True))
+                self._send_with_token(
+                    self._device_conn,
+                    cmd_kind,
+                    SystemDataArgsKwargs(0, relative=True),
+                )
 
     def _refresh_cmd_in_progress(self, commands_tuple: List[Tuple[SystemCommandKind, float]]):
         if len(commands_tuple) == 0:
@@ -725,10 +1430,12 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
     def _ack_received(self, token: UUID, *, perf_c: Optional[float]=None):
         with self._lock:
             popped = self._pending_tokens.pop(token, None)
+            if popped is not None:
+                self._remember_command_outcome(token, "acknowledged", "")
             commands_in_prog = list(self._pending_tokens.values())
         if popped is None:
             # this can happen at device connection
-            (logger.debug if not self._device_stream_started else logger.warning)(
+            (logger.debug if not self._device_initialization_complete else logger.warning)(
                 "Received unexpected ack token: %s", token)
         else:
             self._refresh_cmd_in_progress(commands_in_prog)
@@ -745,14 +1452,43 @@ class HardwareModel(ObservableObject, TunnelDeviceProtocol, PelletDeviceProtocol
         logger.verbose("Waiting ack pending command %s", token)
         while True:
             with self._lock:
-                if token not in self._pending_tokens:
+                outcome, error = self._command_outcomes.get(
+                    token,
+                    ("unknown_token", "command token is not known"),
+                )
+                if outcome == "acknowledged":
                     logger.debug("Got ack for token=%s ; delay=%.6f",
                                  token, time.perf_counter() - p_start)
                     return
+                if outcome not in {"pending"}:
+                    raise RuntimeError(
+                        f"command token={token} ended as {outcome}: {error}"
+                    )
             p_now = time.perf_counter()
             if p_now > p_timeout:
                 break
             time.sleep(0.0025)  # 2.5 ms
+        with self._lock:
+            pending = self._pending_tokens.pop(token, None)
+            if pending is not None:
+                self._remember_command_outcome(
+                    token,
+                    "timed_out",
+                    f"acknowledgement was not received within {timeout} seconds",
+                )
+            commands_in_progress = list(self._pending_tokens.values())
+        if pending is not None:
+            self._refresh_cmd_in_progress(commands_in_progress)
         if raise_on_timeout:
             raise RuntimeError(f"timeout waiting ack of pending token={token}")
         logger.warning("timeout waiting ack token %s, but continuing", token)
+
+    def _remember_command_outcome(
+        self,
+        token: UUID,
+        outcome: str,
+        error: str,
+    ) -> None:
+        self._command_outcomes[token] = (str(outcome), str(error or ""))
+        while len(self._command_outcomes) > 1024:
+            self._command_outcomes.pop(next(iter(self._command_outcomes)))

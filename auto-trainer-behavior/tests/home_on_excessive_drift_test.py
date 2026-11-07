@@ -8,7 +8,6 @@ import pytest
 
 from autotrainer.core import get_perf_now, Offset3DTuple
 from autotrainer.core.pose_elements import SceneElement
-from autotrainer.core.video_detection import PresenceDetectionAttrs
 
 from autotrainer.behavior import SystemMachine, SystemState
 from autotrainer.core.interfaces import RecordingEndingReason
@@ -64,7 +63,7 @@ class TestHomeOnExcessiveDrift(MockSystemMachine):
     def _make_to_monitoring(self):
         self.mock_pose_response(pellet_seen=True)
         self.mock_pellet_ack(until_none=True)
-        self.start_session_in_tunnel(set_recording_status=True)
+        self.start_recording_session(set_recording_status=True)
         self.mock_pose_response(pellet_seen=True)
         self.mock_pellet_ack(until_none=True)
 
@@ -92,7 +91,7 @@ class TestHomeOnExcessiveDrift(MockSystemMachine):
         cfg = self.algo.home_on_excessive_drift_distance_config
         cfg.enabled = enabled
         cfg.min_samples = min_samples
-        self.make_load_cell_active()
+        self.algo.start_session(reason="manual")
         self.mock_pellet_ack(until_none=True)
         diam_cfg = self.algo.diamond_triangle_config
         dist_thresh = cfg.excessive_distance_threshold
@@ -126,10 +125,10 @@ class TestHomeOnExcessiveDrift(MockSystemMachine):
         # algo.update_pellet_seen(True)
         algo.active_config.pellet_delivery.pellet_send_wait_delay = 0
         algo.record_prebuffer_duration = 0
-        self.start_session_in_tunnel(set_recording_status=True)
+        self.start_recording_session(set_recording_status=True)
         self.mock_pellet_ack(until_none=True)
         assert algo.is_in_session
         self._execute_pose_responses(rsp, min_samples)
         assert self.pellet_dev.send_home.call_args_list == [mock.call()], "pellet.send_home() should have been called"
-        assert not algo.is_in_session, "capture session should have been ended"
-        assert ended_reasons == [RecordingEndingReason.MOTOR_DRIFT_HOMING]
+        assert algo.is_in_session, "manual recording must not be stopped by drift handling"
+        assert ended_reasons == []

@@ -3,13 +3,14 @@ from __future__ import annotations
 import logging.config
 import multiprocessing
 import math
+import pathlib
 import queue
+from collections import deque
 import signal
 import threading
 import time
 from dataclasses import dataclass
 from enum import IntEnum
-from functools import partial
 from multiprocessing import Process
 from multiprocessing.synchronize import Semaphore as SemaphoreType
 from multiprocessing.sharedctypes import Synchronized, SynchronizedArray, SynchronizedString
@@ -18,18 +19,55 @@ from typing import Callable, Dict, Union, Optional, List, Tuple
 import numpy
 
 from autotrainer.core import FixedArrayMultiQueue, FixedArrayQueue, ProjectInfo, SystemStatusMessageKind, get_perf_now
-from autotrainer.core.logging import get_verbose_logger, set_logger_level, make_log_dict_config, setup_logging, install_log_exception_hook
+from autotrainer.core.logging import (
+    get_verbose_logger,
+    install_log_exception_hook,
+    log_hardware_initialization,
+    make_log_dict_config,
+    set_logger_level,
+    setup_logging,
+)
 from autotrainer.core.frame_index import FrameIndexCategory
 from autotrainer.core.fixed_array_queue import BufferResult
-from autotrainer.core.video_detection import PresenceDetectionAttrs
-from autotrainer.video.video_detection import VideoDetection
 from autotrainer.core.capture import CaptureProcessStatus
+from autotrainer.core.latency import (
+    LatencyStreamWriter,
+    latency_recording_enabled,
+    latency_stream_path,
+)
+from autotrainer.core.latency.schema import (
+    CAMERA_FRAME_DTYPE,
+    CLOCK_LATCH_DTYPE,
+    POSE_PUT_NOT_ATTEMPTED,
+    POSE_PUT_OK,
+    POSE_PUT_OVERFLOW,
+    RECORD_BATCH_DTYPE,
+)
 from .camera.camera_base import CameraBase
 
 from .video_manager import VideoManager
+from .frame_fit import QueueFit
+from .record_backlog import RecordBacklog
 from .video_record import VideoRecord, VideoRecordProperties, VideoRecordMode
+from .stim_camera import StimCameraDetectionConfiguration, StimCameraDetector, StimEvidenceWriter
+from .realtime_priority import apply_realtime_priority
 
 logger = get_verbose_logger(__name__)
+
+# How often the capture process reports frame accounting to the UI. Twice a
+# second is fast enough that an operator sees a drop while the animal is still
+# in the box, and slow enough to be invisible against a 150 fps capture loop.
+FRAME_STATS_REPORT_PERIOD = 0.5
+
+# Camera clock latches taken back to back when a latency stream opens and again
+# when it closes. The finalizer fits a line through every usable latch when they
+# span more than 10 s (a recording's opening and closing marks), and otherwise
+# uses the tightest one alone. Three cost well under a frame period (each is a
+# USB round trip, about 0.2 ms on a Blackfly S).
+CLOCK_LATCHES_PER_MARK = 3
+# A mark ends early once it has taken this long: a stalled USB control transfer
+# must not cost the loop three transport timeouts.
+CLOCK_LATCH_MARK_BUDGET_SECONDS = 0.005
 
 
 # Always keep that extra more nbr of frames for cameras recording sync purpose:
@@ -57,6 +95,9 @@ class CaptureCommandKind(IntEnum):
 
     SET_LOGGER_LEVEL = 6
     """Set a logger log level"""
+
+    ARM_STIM_DETECTOR = 7
+    DISARM_STIM_DETECTOR = 8
 
 
 @dataclass
@@ -106,7 +147,7 @@ class CaptureAttrs:
     image_queue: Optional[Union[queue.Queue, FixedArrayQueue]]
     """Queue for camera frame output"""
 
-    frame: Synchronized[int]  # actually unused
+    frame: Synchronized[int]
     """Current frame index - value is read-only to callers"""
 
     camera: CaptureCameraAttrs
@@ -124,14 +165,20 @@ class CaptureAttrs:
     synced_cam_frame_index: Optional[Synchronized[int]] = None
     """Multiprocessing int value for communicating synced frame index between cameras"""
 
+    record_start_perf: Optional[Synchronized[float]] = None
+    """Canonical primary-camera recording start on the perf-counter clock."""
+
+    record_generation: Optional[Synchronized[int]] = None
+    """Application session generation copied into recording lifecycle messages."""
+
+    align_record_start_perf: bool = False
+    """Delay this unsynchronized camera until its first frame at/after record_start_perf."""
+
     inference: Optional[CaptureInferenceAttrs] = None
     """Inference attributes for the capture process (optional)"""
 
     fps_image_queue: Optional[float] = 15
     """Desired write FPS for the image_queue, if None then default to capture FPS"""
-
-    presence_detection_attrs: Optional[PresenceDetectionAttrs] = None
-    """Optional Presence detection"""
 
     is_primary: bool = False
 
@@ -145,6 +192,10 @@ class CaptureAttrs:
     record_stop_sema: Optional[SemaphoreType] = None
     """Use by record thread to signal when it has closed its video file,
     so that offline reader thread can know when it can open the files for offline processing"""
+
+    stim_detection: Optional[StimCameraDetectionConfiguration] = None
+    stim_trigger_queue: Optional[multiprocessing.Queue] = None
+    """Bounded direct stim-camera-to-laser trigger channel."""
 
 
 class VideoCapture(Process):
@@ -201,9 +252,35 @@ class VideoCapture(Process):
         self._record_queue_list: List[
                   # frame_id , frame, frame_when, frame_perf
             Tuple[int, numpy.ndarray, float, float]] = []
-
-        self._detection_attrs = attrs.presence_detection_attrs
-        self._video_detection: Optional[VideoDetection] = None
+        self._stim_detector = (
+            None
+            if attrs.stim_detection is None or not attrs.stim_detection.enabled
+            else StimCameraDetector(attrs.stim_detection)
+        )
+        self._stim_evidence_writer = None
+        self._stim_session_active = False
+        self._stim_clip_prebuffer = deque(
+            maxlen=(
+                0
+                if attrs.stim_detection is None
+                else attrs.stim_detection.pre_event_frames + 1
+            )
+        )
+        self._stim_pending_clip = None
+        # Per-recording latency stream (streams/latency/camera_<name>.h5).
+        # Opened by the command thread on Record; closed by the capture loop
+        # once the recording has really ended, or once capture is disabled
+        # with a close pending, so its last frames are kept.
+        self._latency: Optional[LatencyStreamWriter] = None
+        self._latency_close_requested = False
+        # Writers whose close is still running on a LatencyClose thread. Only
+        # the capture loop adds to it; the command thread and process exit
+        # wait on it so no file is still open past them.
+        self._latency_closers: List[threading.Thread] = []
+        # The stream still owed the clock latches taken after its first frame.
+        # Set by the command thread as a stream opens; only the capture loop
+        # latches, because it is the thread that talks to the camera.
+        self._latency_latch_pending: Optional[LatencyStreamWriter] = None
 
         self._command_handlers: Dict[CaptureCommandKind, Callable] = {
             CaptureCommandKind.TERMINATE: self._user_terminate,
@@ -212,6 +289,8 @@ class VideoCapture(Process):
             CaptureCommandKind.ENABLE_RECORDING: self._enable_record,
             CaptureCommandKind.DISABLE_RECORDING: self._disable_record,
             CaptureCommandKind.SET_LOGGER_LEVEL: set_logger_level,
+            CaptureCommandKind.ARM_STIM_DETECTOR: self._arm_stim_detector,
+            CaptureCommandKind.DISARM_STIM_DETECTOR: self._disarm_stim_detector,
         }
 
         self._set_status(CaptureProcessStatus.INITIALIZED)
@@ -228,6 +307,13 @@ class VideoCapture(Process):
         logger.info("%s: started running ; name=%s cam_index=%s primary=%s log_dict=%s",
                     self, self._attrs.camera.name, self._camera_idx, self._attrs.is_primary,
                     log_dict_config)
+        log_hardware_initialization(
+            logger,
+            "START | camera child process | name=%s index=%s primary=%s",
+            self._name,
+            self._camera_idx,
+            self._attrs.is_primary,
+        )
         if not self._prepare_to_run():
             return
 
@@ -249,9 +335,12 @@ class VideoCapture(Process):
 
     def _set_error(self, error: str):
         logger.error("set_error: %s", error)
-        self._set_status(CaptureProcessStatus.FAILED)
+        # The text goes in before FAILED: the parent polls the status every
+        # millisecond and reads the text the moment it sees FAILED, so the
+        # other order can show the generic "did not become ready" message.
         if self._errors:
             self._errors.value = f"{error}"[:len(self._errors)].encode()
+        self._set_status(CaptureProcessStatus.FAILED)
 
     def _prepare_to_run(self) -> bool:
         logger.info("<%s> process started: %s", self._name, self._attrs.inference)
@@ -262,14 +351,47 @@ class VideoCapture(Process):
                 return False
 
             try:
+                camera_started = time.perf_counter()
+                log_hardware_initialization(
+                    logger,
+                    "START | camera backend initialization | name=%s url=%s",
+                    self._name,
+                    self._camera_url,
+                )
                 camera = self._camera = VideoManager.create_camera(self._camera_url, self._name)
                 if camera is None:
                     raise RuntimeError("VideoManager returned None")
             except BaseException as err:
+                log_hardware_initialization(
+                    logger,
+                    "FAILED | camera backend initialization | name=%s elapsed=%.3fs error=%s",
+                    self._name,
+                    time.perf_counter() - camera_started,
+                    str(err) or err.__class__.__name__,
+                    level=logging.ERROR,
+                )
                 self._set_error(f"Could not create camera {self._name}: {err}")
                 return False
 
+            log_hardware_initialization(
+                logger,
+                "READY | camera backend initialization | name=%s type=%s width=%s height=%s fps=%s elapsed=%.3fs",
+                self._name,
+                camera.__class__.__name__,
+                camera.width,
+                camera.height,
+                camera.fps,
+                time.perf_counter() - camera_started,
+            )
+            prepare_started = time.perf_counter()
+            log_hardware_initialization(logger, "START | camera prepare_capture | name=%s", self._name)
             camera.prepare_capture()
+            log_hardware_initialization(
+                logger,
+                "READY | camera prepare_capture | name=%s elapsed=%.3fs",
+                self._name,
+                time.perf_counter() - prepare_started,
+            )
 
             rec_queue = queue.Queue(maxsize=128)
             # NB: we put batch per batch (of self._record_batch_size) into the queue,
@@ -288,23 +410,28 @@ class VideoCapture(Process):
             )
             vid_rec.start()
 
-            det_attrs = self._attrs.presence_detection_attrs
-            if project is None or det_attrs is None:
-                self._video_detection = None
-            else:
-                vid_det = self._video_detection = VideoDetection(project, det_attrs)
-                vid_det.start()
-
-            logger.verbose("%s: video_detection: %s", self._name, self._video_detection)
-
             # only start command handler thread after others before, given it's checking alive of them.
             thread = self._command_thread = threading.Thread(
                 target=self._command_handler, daemon=True, name="CommandHandler")
             thread.start()
 
+            log_hardware_initialization(
+                logger,
+                "READY | camera child process | name=%s recorder_alive=%s",
+                self._name,
+                vid_rec.is_alive(),
+            )
+
             return True
         except Exception as err:
             logger.exception("%s: Error during prepare to run: %s", self, err)
+            log_hardware_initialization(
+                logger,
+                "FAILED | camera child process | name=%s error=%s",
+                self._name,
+                str(err) or err.__class__.__name__,
+                level=logging.ERROR,
+            )
             self._set_error(str(err))
             return False
 
@@ -315,12 +442,6 @@ class VideoCapture(Process):
                 logger.warning("VideoRecord not alive, terminating")
                 self._user_terminate()
                 self._set_error("video_record thread dead")
-                break
-            vid_det = self._video_detection
-            if vid_det is not None and not vid_det.is_alive():
-                logger.warning("Video Detection not alive, terminating")
-                self._user_terminate()
-                self._set_error("video_detection thread dead")
                 break
             try:
                 raw = self._command_queue.get(timeout=1)
@@ -335,6 +456,13 @@ class VideoCapture(Process):
                 logger.exception("Failure executing cmd %s: %s", raw, err)
 
     def _run_capture_loop(self, camera: CameraBase) -> None:
+        if self._stim_detector is not None:
+            # Only the stim camera: this is the 900 Hz closed loop, and it is
+            # the one whose wake-up latency has a 5 ms deadline. Making every
+            # camera process real-time would buy nothing and take CPU from the
+            # ones that only need throughput. Returns False and logs when the
+            # rig has no rtprio allowance, and the loop then runs as before.
+            apply_realtime_priority()
         log_cam_frame_info_delay_frame_count = camera.fps * 5
         fault_count = 0
         cnt_net_q_put = 0
@@ -344,19 +472,55 @@ class VideoCapture(Process):
         when_secs = math.nan
         attrs = self._attrs
         is_primary = attrs.is_primary
+        record_start_perf = attrs.record_start_perf
+        record_generation = attrs.record_generation
+        align_record_start_perf = attrs.align_record_start_perf
         frame_period = 1 / camera.fps
         prim_cam_record_enabled = attrs.synced_cam_record_enabled
         prim_cam_synced_frame_idx = attrs.synced_cam_frame_index
         synced_frame_idx: Optional[int] = None
         msg_q = attrs.msg_queue  # message queue to main process
+        # Session totals for the live telemetry panel. Reported as absolutes on
+        # a timer rather than per frame: at 150 fps a message per frame would
+        # cost more than the accounting, and an absolute total corrects itself
+        # if one is dropped where a delta would corrupt the running sum.
+        total_missed_frames = 0
+        next_frame_stats_perf = 0.0
         record_start_stop_frame_idx: Optional[int] = None
+        last_recorded_frame_id = -1
+        last_recorded_frame_perf = math.nan
         next_t_image_q = time.perf_counter()
         img_q = self._image_queue  # image queue to main/GUI process view
         record_q_list = self._record_queue_list
         record_q = self._record_queue  # record queue to file
         if record_q is None:
             raise RuntimeError("supposed be created")
-        rec_q_put = partial(record_q.put, timeout=3)
+        record_backlog = RecordBacklog(record_q.maxsize, self._record_batch_size, camera.width * camera.height)
+
+        def rec_q_put(batch):
+            latency = self._latency
+            entry = time.perf_counter()
+            try:
+                record_q.put(batch, timeout=3)
+            except queue.Full:
+                # Recorded here as well as raised: the loop's fault handler
+                # only counts a generic error, and a lost batch is a fact the
+                # recording should keep.
+                if latency is not None and batch:
+                    latency.append("record_batches", (
+                        batch[0][0], batch[-1][0], len(batch), entry,
+                        time.perf_counter(), record_q.qsize(), True,
+                    ))
+                raise
+            depth = record_q.qsize()
+            if latency is not None and batch:
+                latency.append("record_batches", (
+                    batch[0][0], batch[-1][0], len(batch), entry,
+                    time.perf_counter(), depth, False,
+                ))
+            warning = record_backlog.observe(depth)
+            if warning is not None:
+                logger.warning("<%s> %s", self._name, warning)
         # using a ~small timeout on record_q put, to prevent deadlock if queue is full, given it has a maxsize.
         # but the size is quite large + we write batch of frames, and command handler is supposed to detect possible
         # exit of the record thread, and then trigger a full exit of the capture process.
@@ -370,9 +534,29 @@ class VideoCapture(Process):
             net_q_put = net_q.put
             net_q_idx = inference.index
             # although is same than self._camera_idx
+        # The inference queue pairs the cameras' frames by frame id, which only
+        # names the exposure when the cameras share a hardware trigger. Other
+        # sources leave it out and keep pairing by arrival.
+        net_q_shares_frame_ids = camera.is_trigger_synchronized
         image_queue_delay = self._image_queue_frame_delay
         empty_frame = numpy.zeros((camera.height, camera.width), dtype=numpy.uint8)
-        vid_detection = self._video_detection
+        # The inference and display queues may be smaller than the camera frame
+        # by a whole factor: a capture at less binning than the consumers were
+        # sized for. They get each frame area-averaged to fit; recording keeps
+        # the full frame. Checked here so a mismatch fails the start once
+        # rather than every frame.
+        frame_shape = (camera.height, camera.width)
+        net_fit = None if net_q is None else QueueFit(frame_shape, net_q.shape)
+        img_fit = None if img_q is None else QueueFit(frame_shape, getattr(img_q, "shape", None))
+        # Padding and end-of-recording markers go to the inference queue, so
+        # they have its size, not the camera's.
+        net_empty_frame = empty_frame if net_fit is None else numpy.zeros(net_fit.shape, dtype=numpy.uint8)
+        if any(fit is not None and fit.factor > 1 for fit in (net_fit, img_fit)):
+            logger.info(
+                "<%s> %sx%s camera frames are area-averaged for consumers: inference=%s display=%s",
+                self._name, camera.width, camera.height,
+                None if net_fit is None else net_fit.shape,
+                None if img_fit is None else img_fit.shape)
         p_prev_watchdog = -math.inf
         if attrs.watchdog_perf_c is not None:
             def set_watchdog(value):
@@ -446,7 +630,7 @@ class VideoCapture(Process):
 
         def perform_stop_recording(force: bool=False):
             nonlocal record_start_stop_frame_idx, synced_frame_idx, record_q_list
-            nonlocal cnt_net_q_put
+            nonlocal cnt_net_q_put, last_recorded_frame_id, last_recorded_frame_perf
             if force:
                 synced_frame_idx = cam_frame_id
             if cam_frame_id >= synced_frame_idx:
@@ -463,36 +647,55 @@ class VideoCapture(Process):
             if idx >= 0:
                 logger.debug("cutted record_q_list at %s, len=%s", idx, len(record_q_list))
                 del record_q_list[idx:]
+            final_frame_id = last_recorded_frame_id
+            final_frame_perf = last_recorded_frame_perf
             if len(record_q_list) > 0:
+                final_frame_id = record_q_list[-1][0]
+                final_frame_perf = record_q_list[-1][3]
                 rec_q_put(record_q_list)
                 record_q_list = self._record_queue_list = []
             if cam_frame_id <= synced_frame_idx:
                 # don't miss this one too
                 rec_q_put([(cam_frame_id, frame, when, frame_perf_c)])
+                final_frame_id = cam_frame_id
+                final_frame_perf = frame_perf_c
             rec_q_put([])  # empty list is mark for EOR for recorder thread
+            logger.info("<%s> recorder backlog peak for this recording: %s/%s batches",
+                        self._name, record_backlog.take_peak(), record_q.maxsize)
 
             synced_frame_idx = None  # don't forget now.
 
             if net_q is not None:
-                # we might eventually have written some extra frame(s) vs the other camera(s) used in
-                # the net_q, so this pad_to_batch_size :
-                net_q.pad_to_batch_size(net_q_idx, empty_frame, cnt_net_q_put, timeout=5)
+                # Live inference is told here that the recording has ended.
+                # Failing to tell it must not end this loop: the recording is
+                # complete, the report below has not been sent yet, and a dead
+                # loop takes the camera with it. On the rig, a pose queue whose
+                # reader had died timed this hand-off out after 5 s on every Stop.
+                try:
+                    # we might eventually have written some extra frame(s) vs the other camera(s) used in
+                    # the net_q, so this pad_to_batch_size :
+                    net_q.pad_to_batch_size(net_q_idx, net_empty_frame, cnt_net_q_put, timeout=5)
+                    # now
+                    logger.info(
+                        "sending EOF_RECORDING batch frame indices to signify eof recording. "
+                        "last frame_id: %s when=%.4f perf=%.4f",
+                        cam_frame_id, when_secs, frame_perf_c)
+                    net_q.put_frame_index_category(net_empty_frame, FrameIndexCategory.EOF_RECORDING,
+                                                   cam_idx=net_q_idx, timeout=5)
+                except Exception as err:
+                    logger.exception("<%s> could not hand the end of recording to live inference: %s",
+                                     self._name, err)
                 # required: must set back to 0 given will now be same in all cams,
                 # and also aligned with frames_per_camera_per_batch
                 cnt_net_q_put = 0
-                # now
-                logger.info(
-                    "sending EOF_RECORDING batch frame indices to signify eof recording. "
-                    "last frame_id: %s when=%.4f perf=%.4f",
-                    cam_frame_id, when_secs, frame_perf_c)
-                net_q.put_frame_index_category(empty_frame, FrameIndexCategory.EOF_RECORDING,
-                                               cam_idx=net_q_idx, timeout=5)
 
             self._set_status(CaptureProcessStatus.RUNNING)
 
             if msg_q is not None:
                 msg_q.put((SystemStatusMessageKind.CAMERA_STATUS_CHANGE,
-                           (self._camera_idx, CaptureProcessStatus.RUNNING)))
+                           (self._camera_idx, CaptureProcessStatus.RUNNING,
+                            final_frame_perf, final_frame_id,
+                            active_record_generation)))
 
         logger.notice("starting capture loop ..")
         self._set_status(CaptureProcessStatus.RUNNING)
@@ -503,6 +706,7 @@ class VideoCapture(Process):
         frame_perf_c = math.nan
         frame_time = time.time()
         save_err = None
+        active_record_generation = 0
 
         while True:
 
@@ -531,13 +735,12 @@ class VideoCapture(Process):
                 is_record_active = self._is_record_active
                 # secondary cam reads this value from the primary cam shared flag below.
 
-            perf_now = time.perf_counter()
-            set_watchdog(perf_now)
-
             if not self._is_capturing:
+                set_watchdog(time.perf_counter())
                 if record_start_stop_frame_idx is not None:
                     synced_frame_idx = cam_frame_id  # ensure immediate stop
                     perform_stop_recording(force=True)
+                self._end_latency_if_requested(camera)
                 time.sleep(0.001)
                 frame_time = time.time()
                 continue
@@ -545,7 +748,21 @@ class VideoCapture(Process):
             try:
                 # this eventually set/unset recording enabled on the primary cam, or on non-synced cam(s):
                 # + 1 because next frame will have that frame_id
-                if is_record_active and record_start_stop_frame_idx is None and synced_frame_idx is None:
+                if (
+                    is_record_active
+                    and record_start_stop_frame_idx is None
+                    and synced_frame_idx is None
+                    and (
+                        not align_record_start_perf
+                        or record_start_perf is None
+                        or (
+                            math.isfinite(record_start_perf.value)
+                            and isinstance(prev_frame_perf_now, (int, float))
+                            and math.isfinite(prev_frame_perf_now)
+                            and prev_frame_perf_now >= record_start_perf.value
+                        )
+                    )
+                ):
                     # prev_frame_id is normally a valid acquired frame,
                     # which should always allow to have one valid for start-recording, even in case of heavy drops.
                     primary_acquire(prev_frame_id, enabled=True)
@@ -564,6 +781,11 @@ class VideoCapture(Process):
                 perf_now = time.perf_counter()
 
                 cam_frame_id = camera.frame_id
+                attrs.frame.value = cam_frame_id
+                # A camera watchdog measures delivery of real frames. Updating it
+                # before a blocking capture attempt can make retry activity look
+                # healthy even when the camera is no longer producing frames.
+                set_watchdog(perf_now)
                 # NB: the frame 'when' can be in different clock than what we can assume,
                 # using time.time() and .perf_counter() for precision :
                 frame_perf_c = camera.frame_perf_c
@@ -583,6 +805,22 @@ class VideoCapture(Process):
                             start=1,
                         )
                     )
+                if count_missed_frames > 0:
+                    total_missed_frames += count_missed_frames
+                if msg_q is not None and perf_now >= next_frame_stats_perf:
+                    next_frame_stats_perf = perf_now + FRAME_STATS_REPORT_PERIOD
+                    msg_q.put((
+                        SystemStatusMessageKind.CAMERA_FRAME_STATS,
+                        (self._camera_idx, count_frames_received,
+                         total_missed_frames),
+                    ))
+                self._process_stim_frame(
+                    frame,
+                    cam_frame_id,
+                    int(when),
+                    frame_perf_c,
+                    count_missed_frames=count_missed_frames,
+                )
                 # perf_frame_dropped = (
                 #     0
                 #     if not math.isfinite(prev_frame_perf_now)
@@ -618,16 +856,6 @@ class VideoCapture(Process):
                     ):
                         logger.debug("got frame_id=%s frame_when=%.4f frame_perf=%.4f delay=%.4f",
                                      cam_frame_id, when_secs, frame_perf_c, frame_late_delay)
-
-                if img_q is not None:
-                    # image queue goes to GUI video reader frame, currently FixedArrayQueue
-                    if perf_now >= next_t_image_q:
-                        if image_queue_delay is not None:
-                            next_t_image_q = perf_now + image_queue_delay
-                        if len(numpy.shape(frame)) < 3:
-                            img_q.put(frame)
-                        else:
-                            img_q.put(frame[:, :, 0])
 
                 if prim_cam_record_enabled is not None and not is_primary:
                     # for secondary synced cams we don't have other choice than to read
@@ -684,23 +912,40 @@ class VideoCapture(Process):
                         self._record.first_frame_id = first_frame_id
                         self._record.first_frame_time = first_frame_time
                         #
+                        if (
+                            is_primary
+                            and not align_record_start_perf
+                            and record_start_perf is not None
+                        ):
+                            record_start_perf.value = first_frame_p_now
                         if len(frames_prebuffer_list) > 0:
                             rec_q_put(
                                 [(fix, f, fw, p) for f, fw, _, p, fix in frames_prebuffer_list]
                             )
+                            last_recorded_frame_id = frames_prebuffer_list[-1][-1]
+                            last_recorded_frame_perf = frames_prebuffer_list[-1][3]
                             frames_prebuffer_list = []  # thread safety, don't use .clear()
                         rec_q_put([(cam_frame_id, frame, when, frame_perf_c)])  # thread queue
+                        last_recorded_frame_id = cam_frame_id
+                        last_recorded_frame_perf = frame_perf_c
                         record_q_list = (
                             self._record_queue_list
                         ) = []  # ensure we (re)start clean
 
                         #
                         self._set_status(CaptureProcessStatus.RECORDING)
+                        active_record_generation = (
+                            0
+                            if record_generation is None
+                            else int(record_generation.value)
+                        )
                         #
                         if msg_q is not None:
                             msg_q.put((SystemStatusMessageKind.CAMERA_STATUS_CHANGE,
                                        (self._camera_idx, CaptureProcessStatus.RECORDING,
-                                        first_frame_p_now, first_frame_when, first_frame_time)))
+                                        first_frame_p_now, first_frame_when,
+                                        first_frame_time, first_frame_id,
+                                        active_record_generation)))
 
                 elif not is_record_active and record_start_stop_frame_idx is not None:
                     secondary_acquire()
@@ -722,29 +967,97 @@ class VideoCapture(Process):
                             for idx1 in range(1, count_missed_frames + 1)
                         )
                     record_q_list.append((cam_frame_id, frame, when, frame_perf_c))
+                    last_recorded_frame_id = cam_frame_id
+                    last_recorded_frame_perf = frame_perf_c
                     if len(record_q_list) >= self._record_batch_size:
                         rec_q_put(record_q_list)
                         record_q_list = self._record_queue_list = []
 
+                # This frame's index as every downstream consumer knows it:
+                # relative to the start of the recording, or the category that
+                # says there is no recording. Computed for all of them rather
+                # than inside the inference branch, because the display queue
+                # stamps the same value and must not depend on inference being
+                # enabled to have one.
+                frame_idx_cat = (
+                    FrameIndexCategory.ONLINE_NO_RECORDING if record_start_stop_frame_idx is None
+                    else cam_frame_id - record_start_stop_frame_idx
+                )
+
+                net_frame = None
+                pose_put_result = POSE_PUT_NOT_ATTEMPTED
                 if net_q_put is not None:
                     # network queue goes to processing/inference
-                    frame_idx_cat = (
-                        FrameIndexCategory.ONLINE_NO_RECORDING if record_start_stop_frame_idx is None
-                        else cam_frame_id - record_start_stop_frame_idx
-                    )
-                    if net_q_put(frame, net_q_idx, frame_idx_cat, block=False) == BufferResult.Ok:
+                    # frame_perf_c travels with the frame so the pose process
+                    # can report a sensor-to-result figure, not just how long
+                    # its own call took. It is fitted to when the host's poll
+                    # first saw the frame (spinnaker_cam._capture), so it holds
+                    # neither exposure nor readout; the latency record measures
+                    # those against the NI exposure edge instead. frame_id lets
+                    # the queue pair this frame with the other cameras' frames
+                    # of the same exposure even when one of them dropped a frame
+                    # this camera kept. The latency record also joins its pose
+                    # rows on frame_id, not on the recording-relative index,
+                    # which is -1 outside a recording; a camera without a shared
+                    # trigger passes none, and those rows carry -1.
+                    net_frame = net_fit(frame)
+                    if net_q_put(net_frame, net_q_idx, frame_idx_cat, block=False,
+                                 frame_perf_c=frame_perf_c,
+                                 frame_id=cam_frame_id if net_q_shares_frame_ids else None,
+                                 ) == BufferResult.Ok:
                         cnt_net_q_put += 1
+                        pose_put_result = POSE_PUT_OK
+                    else:
+                        pose_put_result = POSE_PUT_OVERFLOW
 
-                if vid_detection is not None:
-                    vid_detection.update_frame(when, frame, frame_perf_c)
+                latency = self._latency
+                if latency is not None:
+                    latency.append("frames", (
+                        cam_frame_id, int(when), camera.frame_poll_perf_c,
+                        camera.frame_arrival_perf_c, perf_now, pose_put_result,
+                    ))
+                    if self._latency_latch_pending is latency:
+                        # The fresh stream has its first frame: place the
+                        # camera clock on the host's from where it starts.
+                        self._latency_latch_pending = None
+                        self._append_clock_latches(camera, latency)
+                    if record_start_stop_frame_idx is None:
+                        self._end_latency_if_requested(camera)
+
+                if img_q is not None:
+                    # image queue goes to GUI video reader frame, currently FixedArrayQueue.
+                    #
+                    # Stamped with frame_idx_cat, the SAME index the inference
+                    # queue carries, so the view can pair an overlay with the
+                    # frame it was computed from. It has to be this one and not
+                    # cam_frame_id: the pose path reports frames relative to the
+                    # start of the recording, so stamping the display with the
+                    # camera's own count compared two different numbering
+                    # systems and every overlay was held back.
+                    #
+                    # Which is also why this sits after the block above rather
+                    # than before it: frame_idx_cat is only known once the
+                    # recording origin has been established.
+                    if perf_now >= next_t_image_q:
+                        if image_queue_delay is not None:
+                            next_t_image_q = perf_now + image_queue_delay
+                        if len(numpy.shape(frame)) >= 3:
+                            img_q.put(img_fit(frame[:, :, 0]), frame_idx_cat)
+                        elif net_frame is not None and img_fit.shape == net_fit.shape:
+                            img_q.put(net_frame, frame_idx_cat)  # already averaged this frame
+                        else:
+                            img_q.put(img_fit(frame), frame_idx_cat)
+
 
                 # if not (is_record_active and record_start_stop_frame_idx is not None) and attrs.record_prebuffer_duration > 0:
                 update_frames_prebuffer(frame, when, frame_time, frame_perf_c, cam_frame_id)
 
             except Exception as err:
                 logger.exception("Error during capture loop: %s", err)
-                if save_err is not None:
+                if save_err is None:
                     save_err = str(err)
+                    if self._errors:
+                        self._errors.value = save_err[:len(self._errors)].encode()
                 fault_count += 1
             else:
                 save_err = None
@@ -758,6 +1071,9 @@ class VideoCapture(Process):
         camera = self._camera
         try:
             logger.info(f"<{self._name}> capture loop ended")
+            self._stim_session_active = False
+            self._stop_stim_evidence()
+            self._close_latency()
 
             if camera is not None:
                 camera.end_capture()
@@ -768,13 +1084,6 @@ class VideoCapture(Process):
                 logger.debug("joining record thread")
                 vid_rec.join()
                 self._record = None
-
-            video_detection = self._video_detection
-            if video_detection is not None:
-                video_detection.cancel()
-                logger.debug("joining video-detection thread")
-                video_detection.join()
-                self._video_detection = None
 
             logger.debug("joining command thread")
             thread = self._command_thread
@@ -815,6 +1124,7 @@ class VideoCapture(Process):
 
     def _user_terminate(self):
         self._is_running = False
+        self._stop_stim_evidence()
 
     def _begin_capture(self):
         self._is_capturing = True
@@ -823,7 +1133,15 @@ class VideoCapture(Process):
         self._is_capturing = False
 
     def _enable_record(self, *, is_from_start: bool=False):
+        if not is_from_start:
+            # Before the flag below: the capture loop polls it between frames
+            # and starts the recording on the next one, and that frame needs
+            # the stream to be there to be recorded in it.
+            self._start_latency()
         self._is_record_active = self._record_properties.should_record(True, is_from_start=is_from_start)
+        if self._stim_detector is not None and not is_from_start:
+            self._stim_session_active = True
+            self._start_stim_evidence()
         logger.verbose("_enable_record: is_record_active=%s", self._is_record_active)
 
     def _disable_record(self, *, is_triggered: Optional[bool]=False, is_from_start: bool=False):
@@ -831,5 +1149,305 @@ class VideoCapture(Process):
         if is_triggered is None:
             is_triggered = self._is_record_active
         self._is_record_active = self._record_properties.should_record(is_triggered, is_from_start=is_from_start)
+        if self._stim_detector is not None and not is_from_start:
+            self._stim_session_active = False
+            self._stim_detector.disarm()
+            self._stop_stim_evidence()
+        if not is_from_start and self._latency is not None:
+            # Only a stream that exists can be waiting to close. DISABLE with
+            # none open is routine (the app sends it to every camera on
+            # entering a calibration step), and a request left standing would
+            # end the next recording's stream on its first frame.
+            self._latency_close_requested = True
         logger.verbose("_disable_record(is_triggered=%s, is_from_start=%s): is_record_active=%s",
                        entry_is_triggered, is_from_start, self._is_record_active)
+
+    def _arm_stim_detector(self, context):
+        if self._stim_detector is None:
+            raise RuntimeError("Stim-camera detector is not configured")
+        self._flush_pending_stim_clip(complete=False)
+        self._stim_detector.arm(context)
+
+    def _disarm_stim_detector(self, operation_id=None):
+        if self._stim_detector is not None:
+            self._stim_detector.disarm(operation_id)
+        self._flush_pending_stim_clip(complete=False)
+
+    def _flush_pending_stim_clip(self, *, complete: bool) -> bool:
+        pending, self._stim_pending_clip = self._stim_pending_clip, None
+        writer = self._stim_evidence_writer
+        if pending is None or writer is None:
+            return False
+        return writer.queue_clip(
+            pending["decision"], pending["frames"], complete=complete,
+        )
+
+    def _start_stim_evidence(self):
+        if self._stim_evidence_writer is not None:
+            return
+        project = self._project_info
+        if project is None:
+            raise RuntimeError("Stim evidence requires an active project")
+        path = pathlib.Path(project.get_session_path().location) / "streams" / "stim_camera_evidence.h5"
+        self._stim_evidence_writer = StimEvidenceWriter(path, self._attrs.stim_detection)
+
+    def _stop_stim_evidence(self):
+        writer = self._stim_evidence_writer
+        if writer is None:
+            return
+        self._flush_pending_stim_clip(complete=False)
+        self._stim_evidence_writer = None
+        error = ""
+        try:
+            writer.close()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            logger.exception("Stim-camera evidence writer failed during close")
+        if self._attrs.msg_queue is not None:
+            self._attrs.msg_queue.put((
+                SystemStatusMessageKind.STIM_CAMERA_EVIDENCE_STATUS,
+                (
+                    self._camera_idx,
+                    writer.path.as_posix(),
+                    writer.diagnostics,
+                    error,
+                    (
+                        None
+                        if self._attrs.record_generation is None
+                        else int(self._attrs.record_generation.value)
+                    ),
+                ),
+            ))
+
+    def _start_latency(self):
+        # First, whatever follows: a request left over from an earlier DISABLE
+        # must not close this recording's stream on its first frame.
+        self._latency_close_requested = False
+        # The previous recording's stream is this one's file: its close, if the
+        # loop handed it to a thread, must finish before a new writer truncates it.
+        self._wait_for_latency_closers()
+        if self._latency is not None:
+            # A previous recording that had not wound down yet.
+            self._close_latency()
+        project = self._project_info
+        if project is None or not latency_recording_enabled():
+            return
+        try:
+            writer = LatencyStreamWriter(
+                latency_stream_path(project, f"camera_{self._name}"),
+                {"frames": CAMERA_FRAME_DTYPE, "record_batches": RECORD_BATCH_DTYPE,
+                 "clock_latches": CLOCK_LATCH_DTYPE},
+                attrs={
+                    "camera": self._name,
+                    "camera_index": self._camera_idx,
+                    "is_primary": bool(self._attrs.is_primary),
+                },
+            )
+            # Owed its latches before the loop can see it, so its first frame gets them.
+            self._latency_latch_pending = writer
+            self._latency = writer
+        except Exception:
+            logger.exception("<%s> latency stream could not start; recording continues without it",
+                             self._name)
+
+    def _close_latency(self, wait: bool = True):
+        """Detach this recording's stream and close it.
+
+        The capture loop passes wait=False: close() joins the writer thread,
+        which can take as long as the disk takes to flush, and the loop must
+        not stop for it. The close then runs on its own short-lived thread.
+        Every other caller (a new recording, process exit) waits, so the file
+        is closed before they go on. close()'s timeout is left alone: a
+        timeout drops the rows still queued.
+        """
+        writer, self._latency = self._latency, None
+        self._latency_close_requested = False
+        if writer is not None:
+            if wait:
+                self._finish_latency(writer)
+            else:
+                try:
+                    closer = threading.Thread(
+                        target=self._finish_latency, args=(writer,),
+                        name=f"LatencyClose-{self._name}", daemon=True)
+                    closer.start()
+                except Exception:
+                    # No thread to be had: closing here is slow but loses nothing.
+                    logger.exception("<%s> latency close thread could not start", self._name)
+                    self._finish_latency(writer)
+                else:
+                    self._latency_closers = [
+                        thread for thread in self._latency_closers if thread.is_alive()
+                    ] + [closer]
+        if wait:
+            self._wait_for_latency_closers()
+
+    def _end_latency_if_requested(self, camera: CameraBase) -> None:
+        """Close this recording's stream if the command thread has asked for it.
+
+        Capture loop only, and only once no recording is in progress: every
+        frame of it is in the stream by then. It runs on every frame and on
+        every idle pass, because a Stop that lands while capture is disabled
+        gets no further frame to run it. The close is not waited for: it
+        flushes to a disk the ffmpeg writers may have saturated, and the
+        watchdog watches this loop.
+        """
+        latency = self._latency
+        if latency is None or not self._latency_close_requested:
+            return
+        self._append_clock_latches(camera, latency)
+        # A Record that arrived while the latches were taken has closed this
+        # stream itself and opened the next one, which is not this call's to close.
+        if self._latency is latency:
+            self._close_latency(wait=False)
+
+    def _finish_latency(self, writer):
+        stats = writer.close()
+        if stats["failed"] or any(stats["rowsDropped"].values()):
+            logger.warning("<%s> latency stream incomplete: %s", self._name, stats)
+        if stats.get("rowsRejected"):
+            # A rejected row here means the row did not fit the schema.
+            logger.error("<%s> latency stream rejected %d rows: %s", self._name,
+                         stats["rowsRejected"], stats)
+
+    def _wait_for_latency_closers(self):
+        for closer in list(self._latency_closers):
+            # close() gives up on its own after 10 s; this only outlasts that.
+            closer.join(15)
+
+    def _append_clock_latches(self, camera: CameraBase, latency: LatencyStreamWriter) -> None:
+        """Latch the camera clock a few times, back to back, into the stream.
+
+        The finalizer pairs frames with NI exposure edges through these, by
+        where the camera says each exposure happened rather than when the host
+        received it. A camera with no clock to latch answers None, which ends
+        the mark after one call; a latch that raises is logged and ends it too.
+        Neither reaches the capture loop. A wide bracket is kept and the mark
+        goes on (the finalizer drops what it cannot use; the next latch may be
+        tight), but a mark past CLOCK_LATCH_MARK_BUDGET_SECONDS ends after the
+        latch in hand, so a stalled transfer costs one call.
+        """
+        started = time.perf_counter()
+        for _ in range(CLOCK_LATCHES_PER_MARK):
+            try:
+                latch = camera.latch_clock()
+                if latch is None:
+                    return
+                if len(latch) == 3:
+                    # A camera class from before the RAW stamps: the row keeps
+                    # its shape, with the RAW pair unknown, rather than being
+                    # rejected by the writer for its length.
+                    latch = (*latch, math.nan, math.nan)
+                latency.append("clock_latches", latch)
+            except Exception:
+                logger.warning("<%s> camera clock latch failed; the recording continues without it",
+                               self._name, exc_info=True)
+                return
+            if time.perf_counter() - started > CLOCK_LATCH_MARK_BUDGET_SECONDS:
+                return
+
+    def _process_stim_frame(
+        self,
+        frame,
+        frame_id,
+        camera_timestamp_ns,
+        frame_perf_time,
+        *,
+        count_missed_frames=0,
+    ):
+        detector = self._stim_detector
+        writer = self._stim_evidence_writer
+        if detector is None or writer is None or not self._stim_session_active:
+            return
+        arm = detector.arm_context
+        for missing_index in range(int(count_missed_frames)):
+            writer.append(
+                frame_id=int(frame_id) - int(count_missed_frames) + missing_index,
+                camera_timestamp_ns=0,
+                frame_perf_time=float("nan"),
+                value=float("nan"),
+                threshold=detector.configuration.roi.threshold,
+                arm=arm,
+                decision=None,
+                gap=True,
+            )
+        value, decision = detector.process(
+            frame, frame_id, camera_timestamp_ns, frame_perf_time,
+        )
+        clip_frame = self._stim_clip_frame(frame)
+        clip_item = (
+            int(frame_id), int(camera_timestamp_ns), float(frame_perf_time), clip_frame,
+        )
+        self._stim_clip_prebuffer.append(clip_item)
+        writer.append(
+            frame_id=frame_id,
+            camera_timestamp_ns=camera_timestamp_ns,
+            frame_perf_time=frame_perf_time,
+            value=value,
+            threshold=detector.configuration.roi.threshold,
+            arm=arm,
+            decision=decision,
+        )
+        # Both run on this thread before the trigger leaves it, so the latency
+        # record times them as stages of the stim loop.
+        evidence_done = time.perf_counter()
+        clip_done = math.nan
+        if decision is not None:
+            self._begin_stim_clip(decision)
+            clip_done = time.perf_counter()
+            if (
+                decision.arm.trigger_route == "direct_ni_software"
+                and self._attrs.stim_trigger_queue is not None
+            ):
+                try:
+                    self._attrs.stim_trigger_queue.put_nowait({
+                        **decision.to_record(),
+                        "camera_index": self._camera_idx,
+                        "evidence_done_perf_time": evidence_done,
+                        "clip_done_perf_time": clip_done,
+                        "ipc_send_perf_time": time.perf_counter(),
+                    })
+                except queue.Full:
+                    logger.critical("Direct stim-to-NI trigger queue is full")
+        if decision is not None and self._attrs.msg_queue is not None:
+            try:
+                self._attrs.msg_queue.put_nowait((
+                    SystemStatusMessageKind.STIM_CAMERA_TRIGGER,
+                    (self._camera_idx, {
+                        **decision.to_record(),
+                        "evidence_done_perf_time": evidence_done,
+                        "clip_done_perf_time": clip_done,
+                        "msg_send_perf_time": time.perf_counter(),
+                    }),
+                ))
+            except queue.Full:
+                logger.critical("Stim-camera trigger message queue is full")
+        elif self._stim_pending_clip is not None:
+            pending = self._stim_pending_clip
+            pending["frames"].append(clip_item)
+            pending["remaining"] -= 1
+            if pending["remaining"] <= 0:
+                writer.queue_clip(pending["decision"], pending["frames"])
+                self._stim_pending_clip = None
+
+    def _stim_clip_frame(self, frame):
+        roi = self._stim_detector.configuration.roi
+        array = numpy.asarray(frame)
+        if array.ndim == 3:
+            array = array[:, :, 0]
+        if roi.width and roi.height:
+            array = array[roi.y:roi.y + roi.height, roi.x:roi.x + roi.width]
+        return numpy.ascontiguousarray(array)
+
+    def _begin_stim_clip(self, decision):
+        configuration = self._stim_detector.configuration
+        frames = list(self._stim_clip_prebuffer)
+        remaining = configuration.post_event_frames
+        if remaining <= 0:
+            self._stim_evidence_writer.queue_clip(decision, frames)
+            return
+        self._stim_pending_clip = {
+            "decision": decision,
+            "frames": frames,
+            "remaining": remaining,
+        }
