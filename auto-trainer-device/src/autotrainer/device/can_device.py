@@ -1226,13 +1226,13 @@ class CanDevice(Device):
                     f"STIM{stim_line} pulse duration must be shorter than the "
                     "pre-reveal delay"
                 )
-            # GPIO_PULSE is acknowledged after the firmware has returned the
-            # output low. Wait only for the remainder so pre_reveal_ms means
-            # physical rising edge -> pellet reveal.
-            remaining_delay_s = (delay_us - pulse_duration_us) / 1_000_000.0
+            # GPIO_PULSE is acknowledged when the firmware raises the output,
+            # not when it returns it low (see _STIM_ACK_TIMEOUT_S), so the delay
+            # step already starts at the rising edge: the whole interval is
+            # waited, and pre_reveal_ms means rising edge -> pellet reveal.
             steps[0:0] = [
                 {f"stim{stim_line}": pulse_duration_us},
-                {"delay": remaining_delay_s},
+                {"delay": delay_us / 1_000_000.0},
                 {"predefined": "release"},
             ]
         if isinstance(data, dict) and data.get("embedded_tone") is not None:
