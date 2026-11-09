@@ -99,8 +99,9 @@ _GPIO_INDEX_OUTPUT = {
     **{index: output for output, index in _PULSEABLE_GPIO_INDEX.items()},
 }
 
-#: jerrycan_gpio_pulse_phase_t in reachAQ-hardware's jerrycan_types.h, for a
-#: phase that arrives as a bare number, as SocketCAN decodes it.
+#: jerrycan_gpio_pulse_phase_t in reachAQ-hardware's jerrycan_types.h. Both
+#: backends deliver the phase as a bare number: SocketCAN unpacks a uint8, and
+#: pyjerrycan binds the struct's uint8 field with no enum.
 _GPIO_PULSE_PHASE_NAME = {0: "rejected", 1: "asserted", 2: "completed"}
 
 
