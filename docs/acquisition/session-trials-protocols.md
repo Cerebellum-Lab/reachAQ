@@ -122,11 +122,12 @@ Reach and must report `software_start`; Tone 1, Tone 2, and pre-reveal recipes
 require the configured physical hardware route and never fall back to Direct NI.
 
 For pre-reveal stimulation, the pellet board pulses the laser's board STIM line
-(STIM2 or STIM3), and firmware reports the pulse complete after it returns the
-output low. ReachAQ therefore schedules the remaining board delay as the
-requested pre-reveal interval minus the finite pulse width. A pulse as long as or
-longer than that interval is rejected before SEND, preserving the requested
-STIM-onset-to-cover-reveal interval. The recorded SEND command carries
+(STIM2 or STIM3). Firmware acknowledges the pulse when it raises the output,
+not when it returns it low, so the board delay that follows starts at the
+rising edge and ReachAQ schedules it as the whole requested pre-reveal
+interval: STIM onset to cover reveal. A pulse as long as or longer than that
+interval is rejected before SEND, so the output is low again before the
+reveal. The recorded SEND command carries
 `pre_reveal_stimulus` as `[delay_ms, pulse_us, stim_line]`, and the board
 sequence's `PULSE_DIGITAL_OUTPUT` event names the output pulsed in the host's
 numbering (`3` is STIM2, `4` is STIM3), as a direct board pulse does. A SEND
