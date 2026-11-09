@@ -1059,14 +1059,15 @@ class CanInterface(DeviceInterface):
         Issue a commanded delay at the target
 
         Args:
-            delay_sec: Delay (seconds)
+            delay_sec: Delay (seconds), sent to the board as the nearest whole millisecond
 
         Returns:
             bool: True if successful else False
         """
         addr = self._tgt2addr(Target.PELLET_DEVICE)
         uuid = CanInterface.next_uuid()
-        res = self._jc.Delay(addr, int(delay_sec * 1000), uuid)
+        # Rounded, not truncated: 1001 / 1000 * 1000 is 1000.999..., so int() sent 1000.
+        res = self._jc.Delay(addr, round(delay_sec * 1000), uuid)
         logger.debug("Delay addr=%s res=%s uuid=%s", addr, res, uuid)
         return res == 0
 
