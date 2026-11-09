@@ -1720,7 +1720,7 @@ class CanDevice(Device):
             motor = Motor.TONE
             freq, duration = step['tone'].split(',')  # noqa  # (hz), (sec)
             frequency_hz = int(freq)
-            duration_ms = int(float(duration) * 1000)
+            duration_ms = round(float(duration) * 1000)  # not int(): "1.001" * 1000 is 1000.999...
             success = self._send_then_record(
                 board,
                 SystemCommandKind.PLAY_TONE,

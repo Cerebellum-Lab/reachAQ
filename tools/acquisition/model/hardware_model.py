@@ -446,7 +446,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         :param frequency: in Hz (integer)
         :param duration: in seconds (float)
         """
-        duration_ms = int(duration * 1000)
+        duration_ms = round(duration * 1000)  # not int(): 1.001 * 1000 is 1000.999...
         return self._send_with_token(self._device_conn, SystemCommandKind.PLAY_TONE, (frequency, duration_ms))
 
     def pulse_stim(self, duration_us: int, stim_line: int = 3) -> Optional[UUID]:

@@ -388,6 +388,26 @@ def test_compound_tone_reports_the_executed_play_tone_command():
     assert wall_time > 0
 
 
+# The embedded tone's step carries seconds built from whole milliseconds, and
+# "1.001" * 1000 is 1000.999..., which truncation played as 1000.
+@pytest.mark.parametrize("duration_ms", [1001, 2002, 32763])
+def test_an_embedded_tone_plays_the_milliseconds_it_was_given(duration_ms):
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+    device._start_sequence = mock.Mock(return_value=True)
+    device.device_interface.emit_tone = mock.Mock(return_value=True)
+    assert device._start_send_pellet_sequence({"embedded_tone": (6000, duration_ms)})
+    step = device._start_sequence.call_args.args[0].steps[-1]
+    board = device._boards_pending_ctx[Target.PELLET_DEVICE]
+
+    assert device._perform_next_compound_step(board, [step])
+
+    device.device_interface.emit_tone.assert_called_once_with(6000, duration_ms)
+
+
 # The recorder callback costs milliseconds (the hardware model, the session
 # recorder's lock, JSON), and christielab10 measured the board answering a STIM
 # frame in about 0.3 ms. A compound step must put the frame on the bus first
