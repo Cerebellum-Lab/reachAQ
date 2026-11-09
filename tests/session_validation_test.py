@@ -843,6 +843,20 @@ def _epoch_alignment(**changes):
     })
 
 
+def _schema_four_alignment(**changes):
+    """cameraNidaqAlignment as the recorder writes a clean schema-4 latch anchor: the
+    schema-3 record without the expected-lag keys, plus the arrival match."""
+    removed = ("expectedLagSeconds", "lagGateSeconds", "expectedLagSampleIndex")
+    return {
+        **{key: value for key, value in _camera_alignment().items()
+           if key not in removed},
+        "arrival": {"status": "paired", "shift": 0, "medianLagSeconds": 0.00438,
+                    "agreement": 1.0, "reason": ""},
+        "arrivalSampleIndex": 40,
+        **changes,
+    }
+
+
 def _alignment_session(tmp_path, camera=None, *, schema=3, nidaq=True, tone=None):
     root = _session(tmp_path)
     alignment_path = root / "streams/alignment.json"
@@ -875,6 +889,32 @@ def test_frame_alignment_passes_a_clean_anchor_in_the_automatic_quick_check(tmp_
     assert "camera_latch" in result.message
     assert result.observed["anchorMethod"] == "camera_latch"
     assert result.observed["niToHostMethod"] == "raw_bridged"
+    # A schema-3 record has no arrival match: nothing to report and no lag to add.
+    assert "exposure-to-arrival" not in result.message
+    for key in ("arrivalStatus", "arrivalReason", "arrivalMedianLagSeconds",
+                "arrivalSampleIndex"):
+        assert result.observed[key] is None, key
+
+
+def test_frame_alignment_passes_a_clean_schema_four_anchor(tmp_path):
+    result = _alignment_result(
+        _alignment_session(tmp_path, _schema_four_alignment(), schema=4))
+    assert result.status.value == "pass", result.message
+    assert "exposure-to-arrival 4.380 ms" in result.message
+    assert result.observed["arrivalStatus"] == "paired"
+    assert result.observed["arrivalReason"] == ""
+    assert result.observed["arrivalMedianLagSeconds"] == pytest.approx(0.00438)
+    assert result.observed["arrivalSampleIndex"] == 40
+
+
+def test_frame_alignment_still_passes_a_clean_schema_three_expected_lag_anchor(
+        tmp_path):
+    # Sessions recorded before schema 4 are revalidated offline, and read as they were.
+    camera = _camera_alignment(
+        anchorMethod="expected_lag", anchorsAgree=None,
+        latch={"status": "unavailable"})
+    result = _alignment_result(_alignment_session(tmp_path, camera, schema=3))
+    assert result.status.value == "pass", result.message
 
 
 @pytest.mark.parametrize("camera, key, value", (
@@ -956,6 +996,44 @@ def test_frame_alignment_warns_on_a_degraded_anchor_with_the_recorders_reason(
     result = _alignment_result(_alignment_session(tmp_path, camera))
     assert result.status.value == "warning", result.message
     assert expected in result.message
+    assert "cameraNidaqAlignment.reason" in result.remediation
+
+
+@pytest.mark.parametrize("camera, expected", (
+    # The camera clock gave no match, so the arrival pairing alone placed the anchor.
+    (_schema_four_alignment(
+        confidence="ambiguous_hardware_edge", anchorMethod="host_arrival",
+        anchorsAgree=None, latch={"status": "unavailable",
+                                  "reason": "no latency stream"},
+        reason="Host-arrival pairing on the fitted NI timeline (shift 0); "
+               "camera-clock match not available (unavailable: no latency stream)"),
+     "camera-clock match not available"),
+    # Neither match was available, so the anchor is the first frame's host stamp.
+    (_schema_four_alignment(
+        confidence="ambiguous_hardware_edge", anchorMethod="first_frame_stamp",
+        anchorsAgree=None, latch={"status": "unavailable",
+                                  "reason": "no latency stream"},
+        arrival={"status": "unavailable", "shift": None, "medianLagSeconds": None,
+                 "agreement": None, "reason": "no latency stream"},
+        arrivalSampleIndex=None,
+        reason="cam_frames transition at or before the first frame's host stamp "
+               "on the fitted NI timeline; camera-clock match not available "
+               "(unavailable: no latency stream); arrival match not available "
+               "(unavailable: no latency stream)"),
+     "camera-clock match not available"),
+    (_schema_four_alignment(
+        confidence="ambiguous_hardware_edge", anchorsAgree=False, arrivalSampleIndex=107,
+        reason="Camera-clock latch pairing on the fitted NI timeline (shift 1); "
+               "the camera-clock anchor (sample 40) and the arrival anchor "
+               "(sample 107) disagree"),
+     "disagree"),
+), ids=("host-arrival", "first-frame-stamp", "anchors-disagree"))
+def test_frame_alignment_warns_on_a_degraded_schema_four_anchor(
+        tmp_path, camera, expected):
+    result = _alignment_result(_alignment_session(tmp_path, camera, schema=4))
+    assert result.status.value == "warning", result.message
+    assert expected in result.message
+    assert "unrecognised anchor method" not in result.message
     assert "cameraNidaqAlignment.reason" in result.remediation
 
 

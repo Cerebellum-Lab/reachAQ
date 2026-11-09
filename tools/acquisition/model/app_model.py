@@ -10811,6 +10811,33 @@ class AppModel(ObservableObject):
                     self.on_error("Pose model pre-validate failed",
                                   f"\nModel at {value} failed pre-validate:\n\n{err}")
 
+    def _live_tracking_anchor(self, boundary: SessionBoundary) -> FrameTimelineAnchor:
+        """Place live pose frames on the session clock.
+
+        Pose responses number frames from the first recorded one (the video
+        capture's frame_idx_cat), so frame 0 is the frame whose time is
+        boundary.start_perf_time. boundary.primary_frame_id is the camera's own
+        count since acquisition began; anchoring on it put every sample earlier
+        by however long the camera ran before Record.
+
+        The rate is measured once a second of frames carries its own capture
+        times (frame_perf_c, host arrival): the rig's cameras deliver 149.9845
+        frames per host second for a configured 150, and the configured rate an
+        hour in misplaces a frame by 0.37 s.
+        """
+        primary = self._ordered_reach_cameras(enabled_only=True)[0]
+        frame_rate = float(
+            primary.active_config.params.get("fps")
+            or self._behavior.system_machine.intersession.frame_rate
+        )
+        latest = self._live_tracking.latest()
+        if latest is not None:
+            frame_id = latest.primary_frame_ids[-1]
+            elapsed = latest.primary_frame_perf_times[-1] - boundary.start_perf_time
+            if frame_id >= frame_rate and elapsed > 0:
+                frame_rate = frame_id / elapsed
+        return FrameTimelineAnchor(0, boundary.start_perf_time, frame_rate)
+
     def _on_pose_response_ready(self, response: PoseResponse):
         # One row per pose, on this receive thread rather than the Qt thread:
         # the latency record's last pose stage.
@@ -10822,17 +10849,9 @@ class AppModel(ObservableObject):
             in {SessionRecordingStatus.RECORDING, SessionRecordingStatus.STOPPING}
         ):
             try:
-                primary = self._ordered_reach_cameras(enabled_only=True)[0]
-                frame_rate = primary.active_config.params.get("fps")
-                if frame_rate is None:
-                    frame_rate = self._behavior.system_machine.intersession.frame_rate
                 sample = LiveTrackingSample.from_pose_response(
                     response,
-                    FrameTimelineAnchor(
-                        boundary.primary_frame_id,
-                        boundary.start_perf_time,
-                        float(frame_rate),
-                    ),
+                    self._live_tracking_anchor(boundary),
                 )
                 if sample is not None:
                     self._live_tracking.append(sample)
@@ -11774,26 +11793,11 @@ class AppModel(ObservableObject):
             boundary = self._recording_session.boundary
             expected_start_frame_id = expected_end_frame_id = None
             if boundary is not None:
-                primary = self._ordered_reach_cameras(enabled_only=True)[0]
-                frame_rate = float(
-                    primary.active_config.params.get("fps")
-                    or self._behavior.system_machine.intersession.frame_rate
-                )
-                expected_start_frame_id = max(
-                    boundary.primary_frame_id,
-                    math.ceil(
-                        boundary.primary_frame_id
-                        + (window_start[1] - boundary.start_perf_time) * frame_rate
-                        - 1e-9
-                    ),
-                )
-                expected_end_frame_id = max(
-                    expected_start_frame_id,
-                    math.floor(
-                        boundary.primary_frame_id
-                        + (perf_c - boundary.start_perf_time) * frame_rate
-                        + 1e-9
-                    ),
+                expected_start_frame_id, expected_end_frame_id = (
+                    self._live_tracking_anchor(boundary).frame_id_bounds(
+                        window_start[1],
+                        perf_c,
+                    )
                 )
             tracking_window = self._live_tracking.window(
                 window_start[1],

@@ -632,7 +632,7 @@ def test_camera_and_tone_edges_are_correlated_on_nidaq_timeline(tmp_path):
     )
     assert alignment["canonicalBoundary"]["primaryFrameId"] == 42
     assert alignment["canonicalBoundary"]["nidaqSampleIndex"] == 101
-    assert alignment["schemaVersion"] == 3
+    assert alignment["schemaVersion"] == 4
 
 
 def test_all_structured_events_receive_recorded_frame_alignment(tmp_path):
@@ -2045,7 +2045,7 @@ def test_alignment_records_the_board_clock_chain(tmp_path):
     session_dir = next(Path(tmp_path).rglob("alignment.json")).parent
     alignment = json.loads((session_dir / "alignment.json").read_text(encoding="utf-8"))
     assert alignment["boardClockChain"]["boards"][0]["toneCrossCheck"]["matched"] == 2
-    assert alignment["schemaVersion"] == 3
+    assert alignment["schemaVersion"] == 4
 
 
 def test_alignment_without_a_timekeeper_says_so_and_still_finalizes(tmp_path):
@@ -2387,7 +2387,7 @@ def test_alignment_records_the_board_sequence_gap_totals(tmp_path):
     session_dir = next(Path(tmp_path).rglob("alignment.json")).parent
     alignment = json.loads((session_dir / "alignment.json").read_text(encoding="utf-8"))
     assert alignment["boardSequenceGaps"] == [{"bootId": 7, "missing": 4}]
-    assert alignment["schemaVersion"] == 3
+    assert alignment["schemaVersion"] == 4
 
 
 def test_alignment_gap_totals_are_empty_when_none_were_given(tmp_path):

@@ -39,12 +39,18 @@ def test_the_drain_reports_skips_and_the_newest_batches_ids():
     assert ids[:, 0].tolist() == [12, 12]
 
 
-def test_a_three_element_item_has_no_latency():
-    assert split_pose_item(("pose", "live", "idx")) == ("pose", "live", "idx", None)
+def test_a_three_element_item_has_no_latency_and_no_frame_times():
+    assert split_pose_item(("pose", "live", "idx")) == ("pose", "live", "idx", None, None)
 
 
-def test_a_four_element_item_keeps_its_latency():
-    assert split_pose_item(("pose", "live", "idx", (1,)))[3] == (1,)
+def test_a_four_element_item_keeps_its_latency_and_has_no_frame_times():
+    item = split_pose_item(("pose", "live", "idx", (1,)))
+    assert item[3] == (1,)
+    assert item[4] is None
+
+
+def test_a_five_element_item_keeps_latency_and_frame_times():
+    assert split_pose_item(("pose", "live", "idx", (1,), "perf"))[3:] == ((1,), "perf")
 
 
 class _BlockedWriter:

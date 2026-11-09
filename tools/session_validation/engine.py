@@ -687,9 +687,12 @@ def _frame_alignment_rule(context):
     camera = alignment.get("cameraNidaqAlignment") or {}
     fit = camera.get("niToHost") or {}
     latch = camera.get("latch") or {}
+    arrival = camera.get("arrival") or {}
     status = camera.get("status")
     # The reasons go in too: a pass can still carry one worth reading, such as
-    # a perf-only fit's or an exposure the recorder set aside as implausible.
+    # a perf-only fit's or, in a schema-3 file only, an exposure the recorder set
+    # aside as implausible.
+    # The schema-3 lag keys stay (None in schema 4); the arrival keys are None in schema 3.
     observed = {
         "schemaVersion": schema,
         "status": status,
@@ -701,6 +704,10 @@ def _frame_alignment_rule(context):
         "exposureSeconds": camera.get("exposureSeconds"),
         "latchStatus": latch.get("status"),
         "latchReason": latch.get("reason"),
+        "arrivalStatus": arrival.get("status"),
+        "arrivalReason": arrival.get("reason"),
+        "arrivalMedianLagSeconds": arrival.get("medianLagSeconds"),
+        "arrivalSampleIndex": camera.get("arrivalSampleIndex"),
         "niToHostValid": fit.get("valid"),
         "niToHostMethod": fit.get("method"),
         "niToHostReason": fit.get("reason"),
@@ -738,7 +745,10 @@ def _frame_alignment_rule(context):
         warnings.append(f"the first frame was anchored on the NI epoch timeline: {reason}")
     elif not fit.get("valid", False):
         warnings.append(f"the NI-to-host fit is invalid: {reason}")
-    elif method not in ("camera_latch", "expected_lag"):
+    elif method not in (
+        "camera_latch", "host_arrival", "first_frame_stamp",
+        "expected_lag",  # schema 3, still revalidated offline
+    ):
         warnings.append(f"unrecognised anchor method {method!r}: {reason}")
     elif camera.get("confidence") != "hardware_edge" or camera.get("anchorsAgree") is False:
         warnings.append(
@@ -759,10 +769,13 @@ def _frame_alignment_rule(context):
             observed=observed, paths=paths, remediation=" ".join(remediations),
         )
     lag = camera.get("impliedLagSeconds")
+    arrival_lag = arrival.get("medianLagSeconds")
     return _result(
         rule_id, "pass",
         f"First frame anchored by {method} at hardware_edge"
-        + ("" if lag is None else f", implied lag {lag * 1e3:.3f} ms"),
+        + ("" if lag is None else f", implied lag {lag * 1e3:.3f} ms")
+        + ("" if not isinstance(arrival_lag, (int, float))
+           else f", exposure-to-arrival {arrival_lag * 1e3:.3f} ms"),
         observed=observed, paths=paths,
     )
 _frame_alignment_rule.RULE_ID = "alignment.frames"

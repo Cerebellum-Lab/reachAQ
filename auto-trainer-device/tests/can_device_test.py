@@ -1269,6 +1269,132 @@ def test_rel_move_succeed_after_uuid_ack_timeout(
     assert device._commands_handler_thread.is_alive()
 
 
+def test_a_lost_pulse_ack_does_not_resend_the_pre_reveal_pulse(
+    expected_tok, expected_tok_event, tokens_acked, device, device_conn, caplog,
+):
+    """The board pulsed, its ack never arrived: one pulse, the reveal not held
+    for the default 3 s timeout, and the command still completes."""
+    interface = device.device_interface
+    real_pulse = interface.pulse_digital_output
+    pulses, releases = [], []
+
+    def pulse_without_ack(output, duration_us):
+        pulses.append((output, duration_us, time.perf_counter()))
+        if len(pulses) == 1:
+            interface.next_uuid()  # the frame went out; the board's ack is lost
+            return True
+        return real_pulse(output, duration_us)
+
+    interface.pulse_digital_output = pulse_without_ack
+    real_release = interface.release_pellet
+    interface.release_pellet = lambda: (releases.append(time.perf_counter()), real_release())[1]
+    device.default_command_ack_timeout_duration = 1.0  # keep the "before" run short
+    engaged = []
+    device.property_changed += (
+        lambda name, value, old: engaged.append(value) if name == device.UUID_ACK_TIMEOUT_ENGAGED else None)
+    ctx = uuid.uuid4()
+    expected_tok.value = ctx
+
+    with caplog.at_level(logging.WARNING, logger="autotrainer.device.can_device"):
+        # Board STIM2 is DigitalOutputs.STIMULUS_3 (BOARD_STIM_LINE_OUTPUTS);
+        # board STIM3 is STIMULUS_4, which the log assertion below would not name.
+        device.notify_message(
+            SystemCommandKind.SEND_PELLET, {"pre_reveal_stimulus": (200, 1000, 2)}, context=ctx)
+        assert expected_tok_event.wait(5)
+
+    assert ctx in tokens_acked
+    assert len(pulses) == 1, "the lost ack must not re-send the pulse"
+    assert pulses[0][:2] == (DigitalOutputs.STIMULUS_3, 1000)
+    assert len(releases) == 1
+    # Reveal held by the 0.25 s stim timeout plus the 0.199 s delay (~0.5 s),
+    # never by the 1.0 s default: before the fix this is >= 1.2 s.
+    assert releases[0] - pulses[0][2] < device.default_command_ack_timeout_duration
+    assert engaged == [True, False]
+    assert any("not re-sending" in r.getMessage() and "STIMULUS_3" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_a_lost_ack_for_a_standalone_pulse_finishes_the_command_without_a_resend(
+    expected_tok, expected_tok_event, tokens_acked, device, device_conn,
+):
+    interface = device.device_interface
+    calls = []
+
+    def pulse_without_ack(output, duration_us):
+        calls.append(output)
+        interface.next_uuid()
+        return True
+
+    interface.pulse_digital_output = pulse_without_ack
+    stages = []
+    device.latency_observer = lambda stage, fields: stages.append((stage, fields))
+    ctx = uuid.uuid4()
+    expected_tok.value = ctx
+
+    device.notify_message(
+        SystemCommandKind.PULSE_DIGITAL_OUTPUT, (int(DigitalOutputs.STIMULUS_3.value), 1000), context=ctx)
+    assert expected_tok_event.wait(5)
+
+    assert calls == [DigitalOutputs.STIMULUS_3]
+    assert ctx in tokens_acked
+    lost = [f for s, f in stages if s == "ack_lost"]
+    assert len(lost) == 1
+    assert lost[0]["token"] == str(ctx)
+    assert lost[0]["kind"] == "PULSE_DIGITAL_OUTPUT"
+    assert lost[0]["waited"] == pytest.approx(0.25, abs=0.15)
+
+
+@pytest.mark.parametrize("step, timeout, skips", [
+    ({"stim3": 1000}, 0.25, True),
+    ({"stim2": 1000}, 0.25, True),
+    ({"x": 1.0}, 3.0, False),
+], ids=["stim3", "stim2", "absolute-move"])
+def test_a_stim_step_arms_the_short_no_retry_timeout(step, timeout, skips):
+    device, interface, board = _open_compound_device()
+    assert device._perform_next_compound_step(board, [dict(step)])
+    assert device._prev_command_timeout == timeout
+    assert device._prev_command_skips_retry is skips
+
+
+def test_a_move_sent_after_a_stim_with_a_lost_ack_still_retries_on_its_own_lost_ack(
+    expected_tok, expected_tok_event, tokens_acked, device, device_conn,
+):
+    """The no-retry policy belongs to the stimulus command alone. The release
+    sent after a stim whose ack was lost must still be re-sent, after its own
+    timeout, when its own ack is lost: it is what reveals the pellet."""
+    interface = device.device_interface
+    real_release = interface.release_pellet
+    pulses, releases = [], []
+
+    def pulse_without_ack(output, duration_us):
+        pulses.append(output)
+        interface.next_uuid()  # the frame went out; the board's ack is lost
+        return True
+
+    def release_without_ack_once(*args, **kwargs):
+        releases.append(time.perf_counter())
+        if len(releases) == 1:
+            interface.next_uuid()  # the first release loses its ack as well
+            return True
+        return real_release(*args, **kwargs)
+
+    interface.pulse_digital_output = pulse_without_ack
+    interface.release_pellet = release_without_ack_once
+    device.default_command_ack_timeout_duration = 0.5
+    ctx = uuid.uuid4()
+    expected_tok.value = ctx
+
+    device.notify_message(
+        SystemCommandKind.SEND_PELLET, {"pre_reveal_stimulus": (200, 1000, 2)}, context=ctx)
+    assert expected_tok_event.wait(5)
+
+    assert ctx in tokens_acked
+    assert len(pulses) == 1, "the stim is still never re-sent"
+    assert len(releases) == 2, "the release must be retried on its own lost ack"
+    # The retry waited the release's own 0.5 s timeout, not the stim's 0.25 s.
+    assert releases[1] - releases[0] >= 0.45
+
+
 def test_pyjerrycan_interface_keeps_the_configured_transport():
     """A non-SocketCAN transport must not be replaced by bare constructor defaults.
 
