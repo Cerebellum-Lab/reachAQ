@@ -1483,8 +1483,10 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             commands_in_prog = list(self._pending_tokens.values())
         if popped is not None:
             self._refresh_cmd_in_progress(commands_in_prog)
-        logger.error("Pellet board refused command %s (token=%s): %s",
-                     getattr(refusal.command, "name", refusal.command), token, refusal.message)
+        # Below ERROR: the device has logged it at ERROR already, and every
+        # ERROR record lands in the footer, where AppModel shows the notice.
+        logger.warning("Pellet board refused command %s (token=%s): %s",
+                       getattr(refusal.command, "name", refusal.command), token, refusal.message)
         if refusal.needs_home:
             names = {_AXIS_NAMES[m] for m in refusal.needs_home}
             self._set_axes_needing_home(tuple(sorted(names | set(self._axes_needing_home))))

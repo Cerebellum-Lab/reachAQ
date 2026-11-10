@@ -584,3 +584,15 @@ def test_a_refused_release_wakes_prepare_cover_policy_without_waiting_for_the_ti
     assert "refused" in str(error)
     assert waited < 5
     assert pellet_m._prepared_cover_policy is None
+
+
+def test_a_refusal_is_logged_below_error_so_the_footer_keeps_the_operator_notice(machine, caplog):
+    pellet_m = machine.pellet
+    pellet_m._api_status_token = pellet_m._token_move_home = "home-1"
+
+    with caplog.at_level(logging.DEBUG, logger="autotrainer.behavior.pellet.pellet_machine"):
+        pellet_m._pellet_device_command_refused("home-1", refusal=_refusal("home-1"))
+
+    refused = [r for r in caplog.records if "refused" in r.getMessage()]
+    assert refused, "the refusal is still logged"
+    assert all(r.levelno < logging.ERROR for r in refused)
