@@ -1,6 +1,44 @@
 schema_version: 1
 board_type: pellet_module
 versions:
+  - version: 2.3.1
+    wire_schema_version: 1
+    required_capabilities:
+      - finite_stim3_pulse
+    optional_capabilities:
+      - timing_trailer
+      - time_sync
+      - stepper_driver_fault
+    hardware_release: v2.3.1
+    tested_reachaq_release: pre-release-devel
+    qualification_status: rollout_pending
+    qualification_date: null
+    limitations:
+      - >-
+        Not yet released or run on a board as a merged image. A pellet v1.2
+        board passed the seven v1.2 checks on christielab10 (2026-11-09) with
+        the firmware before the storage-partition merge; no v1.3 board has
+        run it.
+      - >-
+        First firmware to drive the pellet v1.3 shared stepper enable (PD2)
+        and to watch the drivers' DIAG lines. Pellet v1.3 boards need at
+        least this version: on 2.3.0 or older they accept moves and do not
+        move. A v1.3 board reports capabilities 0x00000044 (bit 6,
+        stepper_driver_fault, means it found its enable net at boot); a v1.2
+        board reports 0x00000004, as on 2.3.0. stepper_driver_fault is
+        optional because the policy cannot require it on v1.3 boards only.
+      - >-
+        Refuses or interrupts motion and says why in the ACK error: -1 EPERM
+        (ESTOP), -5 EIO (driver fault or drivers not proven), -16 EBUSY
+        (axis moving or needing a home), -116 ETIMEDOUT (enable off after
+        30 s of host silence). -11 EAGAIN means the axis is already there and
+        is success. reachAQ stops the command's sequence on a refusal, fails
+        the trial as a hardware error and tells the operator.
+      - >-
+        Moves the settings store (storage-partition fix), so the first update
+        to this version loses the stored motor configuration and FIXED_XYZ
+        positions once. reachAQ rewrites the motor configuration at connect;
+        re-save the FIXED_XYZ positions.
   - version: 2.3.0
     wire_schema_version: 1
     required_capabilities:
