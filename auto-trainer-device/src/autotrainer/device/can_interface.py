@@ -99,6 +99,11 @@ _GPIO_INDEX_OUTPUT = {
     **{index: output for output, index in _PULSEABLE_GPIO_INDEX.items()},
 }
 
+#: jerrycan_gpio_pulse_phase_t in reachAQ-hardware's jerrycan_types.h. Both
+#: backends deliver the phase as a bare number: SocketCAN unpacks a uint8, and
+#: pyjerrycan binds the struct's uint8 field with no enum.
+_GPIO_PULSE_PHASE_NAME = {0: "rejected", 1: "asserted", 2: "completed"}
+
 
 class MissingDeviceAddressError(RuntimeError):
     """Dedicated for when device address could not be read"""
@@ -1729,7 +1734,14 @@ class CanInterface(DeviceInterface):
     @staticmethod
     def _translate_gpio_pulse_status(message) -> DigitalPulseStatus:
         status = message.gpio_pulse_status
-        phase = getattr(status.phase, "name", str(status.phase)).lower()
+        # A bare number used to be recorded as its digit.
+        phase = getattr(status.phase, "name", None)
+        if phase is None:
+            phase = _GPIO_PULSE_PHASE_NAME.get(int(status.phase))
+            if phase is None:
+                logger.warning("GPIO pulse status with unknown phase %d", status.phase)
+                phase = str(status.phase)
+        phase = phase.lower()
         # Every status used to be labelled STIM3, so STIM2 pulses and refused
         # tone-line pulses were recorded against the wrong line.
         channel = _GPIO_INDEX_OUTPUT.get(int(status.gpio_idx))
