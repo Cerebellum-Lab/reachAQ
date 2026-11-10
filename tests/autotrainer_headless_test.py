@@ -1816,6 +1816,45 @@ def test_gpu_preflight_failure_does_not_block_cameras_and_hardware(
     assert "nouveau" in inference.error
 
 
+def test_live_inference_leaves_out_the_stimulation_mode_stim_camera(
+    app_model,
+    system_config,
+    trainer_config_dir,
+    monkeypatch,
+):
+    # In stimulation mode stimCam is its own 900 Hz domain at its own frame
+    # size. The inference preflight still counted it, so live inference failed
+    # ("same frame size") and Record was refused with it.
+    system_config.inference.is_enabled = True
+    for camera in system_config.cameras:
+        if camera.id in CameraId.reach_camera_ids():
+            camera.is_enabled = True
+        if camera.id == CameraId.Camera3:
+            camera.params.update(stim_width=128, stim_height=128)
+    system_config.save_default(trainer_config_dir)
+    assert app_model.load_configuration() is True
+    monkeypatch.setattr(app_model, "_selected_protocol_requires_stim_camera", lambda: True)
+    monkeypatch.setattr(
+        app_model.inference,
+        "check_live_inference_runtime",
+        lambda: GpuRuntimeStatus(True, backend="test"),
+    )
+    start_reach = mock.Mock(return_value=True)
+    monkeypatch.setattr(app_model, "_start_reach_camera_domains", start_reach)
+    monkeypatch.setattr(app_model, "_start_can_domain", mock.Mock(return_value=False))
+    monkeypatch.setattr(app_model, "_start_inference_domain", mock.Mock(return_value=False))
+
+    assert app_model.capture_start() is True
+
+    assert app_model.stim_camera._stim_detection_configuration is not None
+    assert app_model.stim_camera.shape != app_model.left_camera.shape
+    indices = start_reach.call_args.args[0]
+    assert set(indices) == {app_model.left_camera, app_model.right_camera}
+    assert app_model.stim_camera not in app_model._inference_cameras
+    inference = app_model.subsystem_statuses[SubsystemId.LIVE_INFERENCE.value]
+    assert "same frame size" not in (inference.error or "")
+
+
 def test_hardware_start_failure_performs_can_safety_shutdown(
     app_model,
     monkeypatch,

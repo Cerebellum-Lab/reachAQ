@@ -1,4 +1,5 @@
 import math
+import pickle
 import queue
 
 import h5py
@@ -95,6 +96,22 @@ def test_evidence_writer_batches_hdf5_rows(tmp_path):
         assert store.attrs["dropped_batches"] == 0
         assert store["clips/op-1/frames"].shape == (2, 2, 3)
         assert store.attrs["clips_written"] == 1
+
+
+def test_detector_survives_the_pickle_that_spawns_its_capture_process():
+    # VideoCapture builds the detector in the parent and spawn pickles it into
+    # the capture process; its lock raised there, so stimCam never started in
+    # stimulation mode.
+    detector = StimCameraDetector(_configuration())
+    restored = pickle.loads(pickle.dumps(detector))
+
+    assert restored.configuration == detector.configuration
+    assert restored.arm_context is None
+    assert restored._lock is not detector._lock
+    restored.arm(_arm())
+    assert restored.process(numpy.full((10, 10), 4), 1, 10, 1.0)[1] is None
+    decision = restored.process(numpy.full((10, 10), 6), 2, 20, 1.1)[1]
+    assert decision is not None and decision.stim_frame_id == 2
 
 
 def test_capture_hot_path_emits_one_nonblocking_trigger():
