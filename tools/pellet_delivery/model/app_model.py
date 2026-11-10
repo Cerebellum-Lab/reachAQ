@@ -44,6 +44,7 @@ class AppModel(ObservableObject):
         #
         msg_handler.property_changed += self._message_handler_property_changed
         msg_handler.ack_received += self.reader_ack_received
+        msg_handler.command_refused += self.reader_command_refused
 
         self._is_connected = False
 
@@ -392,6 +393,12 @@ class AppModel(ObservableObject):
     def reader_ack_received(self, ack, *, perf_c: Optional[float]=None):
         logger.info(f"ack context received: {ack}")
         if self._last_command is not None and ack == self._last_command:
+            self._last_command = None
+            self.command_pending = False
+
+    def reader_command_refused(self, token, *, perf_c: Optional[float]=None, refusal=None):
+        logger.error(f"command refused by the board: {token}: {getattr(refusal, 'message', refusal)}")
+        if self._last_command is not None and token == self._last_command:
             self._last_command = None
             self.command_pending = False
 

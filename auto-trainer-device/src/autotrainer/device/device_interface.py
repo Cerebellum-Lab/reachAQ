@@ -26,6 +26,8 @@ from autotrainer.core import Offset3DTuple, get_verbose_logger
 from autotrainer.core.message import Motor
 from autotrainer.core.message.system_status_message import StepperStatusMessage
 
+from .board_refusal import board_error_name, is_refusal
+
 logger = get_verbose_logger(__name__)
 
 
@@ -482,18 +484,22 @@ class Acknowledge(Source):
     #: refused: -EPERM for a pulse aimed at a tone confirmation line, -EBUSY for
     #: a second pulse while one is in flight, -EINVAL for a duration out of
     #: range, -ENOTSUP for a board with no pulse counter. An acknowledgement is
-    #: not by itself a success, so callers that care must read this.
+    #: not by itself a success, so callers that care must read this. -EAGAIN
+    #: is the exception: the axis is already at the target (board_refusal).
     error: int = 0
 
     @property
     def is_failure(self) -> bool:
-        return int(self.error) != 0
+        return is_refusal(self.error)
 
     @property
     def failure_reason(self) -> str:
         if not self.is_failure:
             return ""
-        return f"the board refused the command with error {int(self.error)}"
+        return (
+            f"the board refused the command with {board_error_name(self.error)}"
+            f" ({int(self.error)})"
+        )
 
 
 _zero_position = Offset3DTuple(0, 0, 0)

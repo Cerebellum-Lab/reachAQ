@@ -37,3 +37,19 @@ def test_the_failure_reason_names_the_errno():
 
 def test_a_successful_acknowledgement_has_no_reason():
     assert Acknowledge(uuid=4, error=0).failure_reason == ""
+
+
+def test_the_failure_reason_names_the_board_errno_by_its_firmware_number():
+    # picolibc numbers: -116 is ETIMEDOUT on the board, not the host's 110.
+    assert "ETIMEDOUT" in Acknowledge(uuid=4, error=-116).failure_reason
+    assert "-116" in Acknowledge(uuid=4, error=-116).failure_reason
+    assert "EIO" in Acknowledge(uuid=4, error=-5).failure_reason
+    assert "board error -22" in Acknowledge(uuid=4, error=-22).failure_reason
+
+
+def test_eagain_is_not_a_refusal_for_a_motion_command():
+    """-EAGAIN: the target is within 1/microsteps turn, the axis is already there."""
+    already_there = Acknowledge(uuid=4, error=-11)
+
+    assert already_there.is_failure is False
+    assert already_there.failure_reason == ""

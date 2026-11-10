@@ -530,3 +530,30 @@ def test_gpu_scan_formats_compact_identity(monkeypatch):
 
     assert result.state == "ok"
     assert result.info == "✓ 1 NVIDIA GPU\n→ GPU0 NVIDIA T1000 · 4096 MiB · drv 595.71.05"
+
+
+def test_pellet_status_shows_needs_home_and_the_last_refusal(qapp):
+    app_model = _AppModelStub()
+    app_model.hardware.can_enabled = True
+    app_model.hardware.pellet_controller_enabled = True
+    app_model.hardware.connected = True
+    app_model.hardware_scan_results["pellet"] = HardwareScanEntry(
+        "✓ controller session connected", "ok")
+    content = HardwareStatusContent(app_model)
+    try:
+        panel = content._category_panels["pellet"]
+        assert "motors" in panel.details_text
+        assert "no refusal" in panel.details_text
+        assert "#e8f5ec" in panel.header.styleSheet()
+
+        app_model.hardware.pellet_axes_needing_home = ("X", "Y")
+        app_model.hardware.last_command_refusal = (
+            "Pellet axis X needs homing after a stop. Home the pellet axes. (MOVE_X: EBUSY -16)")
+        app_model.hardware.property_changed("pellet_needs_home", ("X", "Y"), ())
+        qapp.processEvents()
+
+        assert "needs home: X, Y" in panel.details_text
+        assert "EBUSY -16" in panel.details_text
+        assert "#fff4d6" in panel.header.styleSheet(), "a needs-home axis is a warning"
+    finally:
+        content.deleteLater()

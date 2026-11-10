@@ -18,6 +18,8 @@ from .device_interface import (DeviceInterface, Target, Motor, ServoConfig, Step
 from .emulation_interface import EmulationInterface
 from .can_device import CanDevice, HAVE_CAN_DEVICE
 from .can_failure import CanFailure, CanFailureKind
+from .board_refusal import (CommandRefusal, CommandRefusedError, RefusedCommandClass,
+                            board_error_name, is_refusal)
 from .can_diagnostics import capture_can_diagnostics
 from .can_ownership import (CanChannelInUseError, CanChannelOwnership,
                             can_lock_path)

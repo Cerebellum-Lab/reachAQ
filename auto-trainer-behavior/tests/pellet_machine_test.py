@@ -496,3 +496,91 @@ def test_pre_reveal_stimulus_refuses_a_line_that_cannot_carry_a_stimulus(
 def test_pre_reveal_pulse_refusal_names_the_line(machine):
     with pytest.raises(ValueError, match="STIM2 pulse duration must be within"):
         machine.pellet.prepare_pre_reveal_stimulus(200, 99, stim_line=2)
+
+
+def _refusal(token, error=-5):
+    from autotrainer.core import Motor, SystemCommandKind
+    from autotrainer.device import CommandRefusal, RefusedCommandClass
+
+    return CommandRefusal(
+        token=token, error=error, command=SystemCommandKind.SEND_PELLET,
+        step="{'predefined': 'send'}", command_class=RefusedCommandClass.FIXED_XYZ,
+        motors=(Motor.PELLET_X_MOTOR, Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR),
+    )
+
+
+def test_a_refused_send_does_not_fire_pellet_sent_or_clear_the_wrong_token(machine):
+    pellet_m = machine.pellet
+    pellet_m._covered_state = False
+    pellet_m.send_pellet(force=True)
+    token = pellet_m._token_pellet_send
+    assert token is not None and pellet_m._api_status_token == token
+    pellet_m._token_cover_pellet = "another-command"
+    sent, released = [], []
+    pellet_m.events.pellet_sent += lambda **kwargs: sent.append(kwargs)
+    pellet_m.events.pellet_released += lambda **kwargs: released.append(kwargs)
+
+    # Through the message handler, as the device delivers it.
+    pellet_m._message_handler.command_refused(token, perf_c=None, refusal=_refusal(token))
+
+    assert sent == [] and released == []
+    assert pellet_m._token_pellet_send is None
+    assert pellet_m._api_status_token is None
+    assert pellet_m._token_cover_pellet == "another-command"
+    assert pellet_m.covered_state is None, "steps after the refusal did not run"
+
+
+def test_a_refusal_of_a_token_the_machine_did_not_send_changes_nothing(machine):
+    pellet_m = machine.pellet
+    pellet_m._covered_state = True
+    pellet_m._api_status_token = pellet_m._token_move_retract = "retract"
+
+    pellet_m._pellet_device_command_refused("someone-else", refusal=_refusal("someone-else"))
+
+    assert pellet_m._api_status_token == "retract"
+    assert pellet_m.covered_state is True
+
+
+def test_a_refused_release_wakes_prepare_cover_policy_without_waiting_for_the_timeout(machine):
+    import threading
+    import time
+
+    pellet_m = machine.pellet
+    machine.algorithm.pellet_cover_enabled = True
+    pellet_m._covered_state = True
+    outcome = []
+    token = "release-1"
+
+    def release(*, force=False):
+        # Stands in for the relayed trigger, which returns None, not the
+        # transition's result: prepare_cover_policy would stop at "Could not
+        # queue" before it waits.
+        pellet_m._api_status_token = pellet_m._token_release_pellet = token
+        return True
+
+    pellet_m.release_pellet = release
+
+    def prepare():
+        started = time.monotonic()
+        try:
+            pellet_m.prepare_cover_policy("reveal", timeout=10.0)
+        except Exception as error:
+            outcome.append((error, time.monotonic() - started))
+        else:
+            outcome.append((None, time.monotonic() - started))
+
+    waiter = threading.Thread(target=prepare, daemon=True)
+    waiter.start()
+    deadline = time.monotonic() + 5
+    while pellet_m._token_release_pellet is None and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert pellet_m._token_release_pellet == token
+
+    pellet_m._pellet_device_command_refused(token, refusal=_refusal(token, -1))
+    waiter.join(5)
+
+    ((error, waited),) = outcome
+    assert isinstance(error, PelletDeviceCommandFailed)
+    assert "refused" in str(error)
+    assert waited < 5
+    assert pellet_m._prepared_cover_policy is None

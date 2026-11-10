@@ -1,6 +1,71 @@
 schema_version: 1
 board_type: pellet_module
 versions:
+  - version: 2.3.1
+    wire_schema_version: 1
+    required_capabilities:
+      - finite_stim3_pulse
+    optional_capabilities:
+      - timing_trailer
+      - time_sync
+      - stepper_driver_fault
+    hardware_release: v2.3.1
+    tested_reachaq_release: pre-release-devel
+    qualification_status: rollout_pending
+    qualification_date: null
+    limitations:
+      - >-
+        Rollout pending. The released image passed qualification on a pellet
+        v1.2 board (rig evidence below). Still outstanding before this entry
+        is qualified: a recorded session passing reachaq-validate-session. A
+        pellet v1.3 board is not qualified until the v1.3 board checks pass;
+        no v1.3 board has run this firmware.
+      - >-
+        First firmware to drive the pellet v1.3 shared stepper enable (PD2)
+        and to watch the drivers' DIAG lines. Pellet v1.3 boards need at
+        least this version: on 2.3.0 or older they accept moves and do not
+        move. A v1.3 board reports capabilities 0x00000044 (bit 6,
+        stepper_driver_fault: it found its enable net at boot); a v1.2 board
+        reports 0x00000004, as on 2.3.0. stepper_driver_fault is optional
+        because this policy has no hardware-revision field: requiring it
+        would reject every v1.2 board, and a v1.3 board whose PD2 sample read
+        low reports no bit 6 and cannot be told from a v1.2 board.
+      - >-
+        Refuses or interrupts motion and says why in the ACK error: -1 EPERM
+        (ESTOP), -5 EIO (driver fault or drivers not proven), -16 EBUSY
+        (axis moving or needing a home), -116 ETIMEDOUT (enable off after
+        30 s of host silence); -11 EAGAIN means the axis is already there. A
+        reachAQ that ignores the ACK error treats a refused move as done.
+        Acting on it (the 2.3.1 host changes R2-R6) is required before a
+        pellet v1.3 board is deployed.
+      - >-
+        Moves the settings store (storage-partition fix), so the first update
+        to this version loses the stored motor configuration and FIXED_XYZ
+        positions once. reachAQ rewrites the motor configuration at connect;
+        re-save the FIXED_XYZ positions.
+      - >-
+        Rig evidence, christielab10, 2026-11-10, from
+        tools/hardware/qualify_pellet_firmware.py at reachAQ
+        v3.0.0-62-g7bb69c74: 19 of 19 checks on the rig's pellet v1.2 board,
+        flashed from reachaq-pellet-v2.3.1-linux-x86_64.tar.gz (sha256
+        d203f93fabaa80152973fbb16eb39ea7581595f91dada8f8e4c208b7b5a51ce1),
+        built from tag v2.3.1 at reachAQ-hardware b26c264. Record
+        pellet-2.3.1-20261110T220013Z.json under
+        ~/Autotrainer/pellet_firmware_qualification (sha256
+        a3785bbb887733a314488c1ab5add0030e814c4bd338b918ffdd7d8b370d9198).
+        The board reports 2.3.1, wire schema 1 and capabilities 0x00000004.
+        STIM2 lands on /PXI1Slot5/PFI1 (readback port0/line5) and STIM3 on
+        /PXI1Slot5/PFI0 (readback port0/line6). 500 ms pulses on STIM2 and
+        STIM3 return low unaided after 500.08 and 499.64 ms; 50 of 50 short
+        STIM3 pulses are acknowledged, reported asserted and completed, and
+        counted at the NI; pulses on STIM0/STIM1 are refused with -EPERM; the
+        tone, timing-label and three reconnect checks pass; a reboot changes
+        the boot id and nothing else; the CAN controller saw no bus-off (tx
+        error counter 74 before, 0 after). Also seen after that reboot, not a
+        check in the record: all five motor configurations read back intact
+        on the moved settings store. The earlier record that day,
+        pellet-2.3.1-20261110T214525Z.json (14 of 19), failed only through
+        the qualify script's old one-line terminal map, fixed in 7bb69c74.
   - version: 2.3.0
     wire_schema_version: 1
     required_capabilities:

@@ -95,6 +95,7 @@ class PelletMachine(StateMachine):
         self._message_handler = msg_handler
         if msg_handler is not None:
             msg_handler.ack_received += self._pellet_device_ack_received
+            msg_handler.command_refused += self._pellet_device_command_refused
 
         self._pellet_device = pellet_device
 
@@ -125,6 +126,10 @@ class PelletMachine(StateMachine):
         self._prepared_embedded_tone = None
         self._prepared_pre_reveal_stimulus = None
         self._command_ack_condition = threading.Condition(threading.RLock())
+        # Refusals seen, and the token fields the last one cleared: a waiter
+        # tells its own command's refusal from its ack by these.
+        self._refusal_count = 0
+        self._last_refused_token_attrs = ()
 
         self.machine = Machine(
             model=[self],
@@ -278,6 +283,7 @@ class PelletMachine(StateMachine):
             self._prepared_cover_policy = policy
             return
         trigger = self.cover_pellet if expected else self.release_pellet
+        refusals_before = self._refusal_count
         if not trigger(force=True):
             raise PelletDeviceCommandFailed(
                 f"Could not queue protocol cover policy {policy}"
@@ -292,6 +298,13 @@ class PelletMachine(StateMachine):
                         f"Timed out waiting for protocol cover policy {policy}"
                     )
                 self._command_ack_condition.wait(remaining)
+            if (
+                self._refusal_count != refusals_before
+                and token_attr in self._last_refused_token_attrs
+            ):
+                raise PelletDeviceCommandFailed(
+                    f"Pellet board refused the protocol cover policy {policy}"
+                )
         self._prepared_cover_policy = policy
 
     def cancel_prepared_cover_policy(self) -> None:
@@ -448,6 +461,41 @@ class PelletMachine(StateMachine):
             # we could possibly & erroneously acknowledge a successfully load-pellet...
             caller="pellet_device_ack_received",
         )
+
+    @BehaviorAlgorithm.relay_func(wait=False)
+    def _pellet_device_command_refused(self, token: Optional[str], *, perf_c: Optional[float]=None,
+                                       refusal=None):
+        """The board refused one of our commands: it ended, and will never be acknowledged.
+
+        Its token is cleared without the events an ack fires: a refused send
+        presented no pellet, a refused release revealed nothing. The command
+        stopped part way, so a cover or release step may not have run.
+        """
+        if token is None:
+            return
+        attrs = [
+            attr for attr in (
+                "_token_pellet_send", "_token_pellet_load", "_token_cover_pellet",
+                "_token_release_pellet", "_token_move_retract", "_token_move_home",
+            )
+            if getattr(self, attr) == token
+        ]
+        was_api_token = token == self._api_status_token
+        if not attrs and not was_api_token:
+            logger.debug("ignoring pellet refusal of an external command. token=%r", token)
+            return
+        logger.error("pellet command refused: token=%s %s", token, getattr(refusal, "message", refusal))
+        with self._command_ack_condition:
+            # Cleared under the lock with the count, so a waiter that sees its
+            # token gone also sees the refusal.
+            for attr in attrs:
+                setattr(self, attr, None)
+            if was_api_token:
+                self._api_status_token = None
+            self._covered_state = None
+            self._refusal_count += 1
+            self._last_refused_token_attrs = tuple(attrs)
+            self._command_ack_condition.notify_all()
 
     @property
     def pellet_send_end_perf_c(self) -> float:

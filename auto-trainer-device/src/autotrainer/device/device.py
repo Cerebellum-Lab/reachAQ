@@ -70,6 +70,18 @@ class Device(ObservableObject):
         if self._api is not None:
             self._api.send_message(SystemStatusMessageKind.ACKNOWLEDGE, (token, perf_c))
 
+    def _refuse_command(self, refusal) -> None:
+        """End a command the board refused: its waiters get COMMAND_REFUSED, never ACKNOWLEDGE.
+
+        No deviceCommandAcknowledge API event is posted: the command did not complete.
+        """
+        logger.verbose("sending command refusal: %s %s", refusal.token, refusal.error_name)
+        if self._api is not None:
+            self._api.send_message(
+                SystemStatusMessageKind.COMMAND_REFUSED,
+                (refusal.token, refusal.perf_c, refusal),
+            )
+
     @property
     def api(self):
         return self._api

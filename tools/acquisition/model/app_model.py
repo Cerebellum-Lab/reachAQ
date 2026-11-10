@@ -3061,6 +3061,12 @@ class AppModel(ObservableObject):
                 "Pellet firmware is not compatible: "
                 + str(compatibility.get("reason") or "unknown compatibility state")
             )
+        axes = getattr(self._hardware, "pellet_axes_needing_home", ())
+        if pellet_source_required and isinstance(axes, tuple) and axes:
+            blockers.append(
+                f"Pellet axis {', '.join(axes)} needs homing after a refused command: "
+                "home the pellet axes"
+            )
         if self.animal_metadata_refresh_busy:
             blockers.append("SoftMouse animal metadata refresh is still running")
         if self._recording_session.status is not SessionRecordingStatus.READY:
@@ -10638,7 +10644,7 @@ class AppModel(ObservableObject):
         hard = self._hardware
         if name == hard.CAN_CONNECTION_STATE_PROPERTY:
             self._on_can_connection_state_changed(value)
-        elif name == hard.FIRMWARE_COMPATIBILITY_PROPERTY:
+        elif name in {hard.FIRMWARE_COMPATIBILITY_PROPERTY, hard.PELLET_NEEDS_HOME_PROPERTY}:
             self.property_changed(
                 self.Props.RECORDING_BLOCKERS,
                 self.recording_blockers,
@@ -12053,6 +12059,10 @@ class AppModel(ObservableObject):
             in_session=self._behavior.algorithm.is_in_session,
         )
         if finalized is None:
+            if failure.category == "board_refusal":
+                # A refused home or manual move belongs to no attempt: without
+                # this, nothing would tell the operator.
+                self.on_error("Pellet command refused", failure.error)
             return
         self._notify_trial_protocol_state()
         self._evaluate_automatic_stop_policy(
