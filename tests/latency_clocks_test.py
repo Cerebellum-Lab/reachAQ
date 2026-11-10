@@ -51,6 +51,27 @@ def test_a_floating_input_is_unusable():
     assert "noise" in result.reason
 
 
+def test_rising_edges_hold_about_one_copy_of_the_channel():
+    # The latency finalizer scans four laser channels inside Stop: 27M samples each on a
+    # 45-minute session, 216 MB a float64 copy. A finite copy, two temporaries and the
+    # medians' own copies took 2.3 s of Stop on christielab10.
+    import tracemalloc
+
+    values = np.random.default_rng(5).normal(0, 0.01, 2_000_000)
+    values[500::1000] += 5.0
+
+    tracemalloc.start()
+    try:
+        result = clocks.rising_edges(values, min_swing=0.1)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert result.usable and result.positions.size == 2000
+    assert peak < 1.5 * values.nbytes, (
+        f"peak {peak / 1e6:.1f} MB for a {values.nbytes / 1e6:.0f} MB channel")
+
+
 def test_each_read_stamp_bounds_the_last_sample_of_the_read_before_it():
     # A block's stamp is taken before the blocking read that returns it: 2.0 is
     # when the read of samples 4-6 began, after samples 0-3 were in hand.

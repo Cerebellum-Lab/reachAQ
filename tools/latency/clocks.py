@@ -180,18 +180,25 @@ def rising_edges(values, *, min_swing: float) -> EdgeResult:
     unusable rather than producing edges from noise.
     """
     values = numpy.asarray(values, dtype=numpy.float64)
-    finite = values[numpy.isfinite(values)]
+    # A channel is 27M samples on a 45-minute session, so at most one copy of
+    # it is held at a time: the finite samples are the channel itself unless
+    # it has a gap, and the deviations are made absolute and ranked in place.
+    is_finite = numpy.isfinite(values)
+    finite = values if is_finite.all() else values[is_finite]
     empty = numpy.empty(0, dtype=numpy.int64)
     if finite.size < 2:
         return EdgeResult(empty, math.nan, False, "no samples")
     baseline = float(numpy.median(finite))
-    noise = 1.4826 * float(numpy.median(numpy.abs(finite - baseline)))
+    deviation = finite - baseline
+    numpy.abs(deviation, out=deviation)
+    noise = 1.4826 * float(numpy.median(deviation, overwrite_input=True))
+    del deviation
     swing = float(finite.max()) - baseline
     if swing < max(float(min_swing), 10.0 * noise):
         return EdgeResult(empty, math.nan, False,
                           f"swing {swing:.4f} against noise {noise:.4f} (min {min_swing})")
     threshold = baseline + swing / 2
-    above = numpy.isfinite(values) & (values >= threshold)
+    above = is_finite & (values >= threshold)
     positions = numpy.flatnonzero(above[1:] & ~above[:-1]) + 1
     return EdgeResult(positions.astype(numpy.int64), threshold, True)
 
