@@ -2,7 +2,9 @@ import csv
 import hashlib
 import json
 import logging
+import os
 import time as stdlib_time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -1493,6 +1495,62 @@ def test_nidaq_stop_timeout_remains_retryable(monkeypatch, tmp_path):
         recorder.close()
 
 
+class _ProducingRing:
+    """An NI ring with ten new 1 kHz samples, from perf 10 s, at every copy."""
+    channel_names = ("barcode",)
+    capacity = 16
+    sample_rate_hz = 1000.0
+
+    def __init__(self):
+        self.next_index = 0
+
+    def copy_since(self, _last, destination):
+        start = self.next_index
+        self.next_index += 10
+        destination[0, :10] = 0.0
+        return SimpleNamespace(
+            sample_count=10, start_sample_index=start, end_sample_index=start + 10,
+            overrun_samples=0, gap_count=0, epoch=1,
+            source_perf_time=10.0 + (start + 10) / 1000.0,
+            source_wall_time=100.0 + (start + 10) / 1000.0,
+            source_raw_time=7.0 + (start + 10) / 1000.0,
+            perf_times=lambda indices: 10.0 + indices / 1000.0,
+            wall_times=lambda indices: 100.0 + indices / 1000.0,
+        )
+
+
+def test_the_nidaq_copies_end_a_second_past_the_last_frame(tmp_path, monkeypatch):
+    # The copies used to run until Stop's finalization closed the spool: 60.75 s past
+    # the last frame of a 45-minute session on christielab10, late and starved by the
+    # finalization the whole way.
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=15)
+    laser = _EventSource("trace_received")
+    laser.configuration = SimpleNamespace(backend="disabled")
+    recorder = SessionDataRecorder(
+        SimpleNamespace(sample_ring=_ProducingRing(), timing_plan=None), laser)
+    snapshots = []
+    monkeypatch.setattr(recorder, "_write_session",
+                        lambda **snapshot: snapshots.append(snapshot) or {})
+    try:
+        recorder.arm(project)
+        recorder.commit_start(10.0, 100.0)
+        recorder.end_nidaq_capture_after(10.5)
+        thread = recorder._nidaq_thread
+        thread.join(30.0)
+
+        assert not thread.is_alive()
+        with recorder._lock:
+            last = recorder._nidaq_stats["last_perf_time"]
+        assert 11.5 <= last < 11.52
+
+        recorder.stop(10.5)
+        assert snapshots[0]["nidaq_chunks"].last_perf_time == last
+        assert recorder._nidaq_copy_until is None  # the next session copies until its own end
+    finally:
+        recorder.abort()
+
+
 def test_nidaq_poll_reuses_preallocated_ring_scratch():
     destinations = []
 
@@ -1997,6 +2055,124 @@ def test_block_stamps_from_a_spool_hold_one_column_at_a_time(tmp_path):
     # The perf column is dropped before the RAW column is read: one float64 column
     # (16 MB here) plus the run bookkeeping, not two.
     assert peak < 1.5 * samples * 8, f"peak {peak / 1e6:.1f} MB"
+
+
+def _session_spool(tmp_path, samples, channels=10):
+    """A spool with every column the recorder writes, at 10 kHz from perf 100 s."""
+    path = tmp_path / "nidaq_capture.h5"
+    perf = 100.0 + np.arange(samples) / 10_000.0
+    stamps = np.repeat(100.0 + np.arange(samples // 167 + 1) * 0.0167, 167)[:samples]
+    values = np.empty((channels, samples), dtype=np.float32)
+    values[0] = (np.arange(samples) // 33) % 2  # a camera line at about 150 Hz
+    values[1:] = np.random.default_rng(3).normal(0.0, 0.01, (channels - 1, samples))
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("sample_index", data=np.arange(samples, dtype=np.int64))
+        handle.create_dataset("perf_time", data=perf)
+        handle.create_dataset("wall_time", data=perf + 1_700_000_000.0)
+        handle.create_dataset("epoch", data=np.ones(samples, dtype=np.uint64))
+        handle.create_dataset("block_observation_perf_time", data=stamps)
+        handle.create_dataset("block_observation_wall_time", data=stamps + 1_700_000_000.0)
+        handle.create_dataset("block_observation_raw_time", data=stamps - 3.0)
+        # The recorder's own chunks: every channel of 65,536 samples together.
+        handle.create_dataset("values", data=values, chunks=(channels, min(samples, 65_536)))
+    return session_data_recorder._NidaqSpoolSnapshot(
+        path=path, channel_names=tuple(f"ai{index}" for index in range(channels)),
+        sample_rate_hz=10_000.0, sample_count=samples, first_sample_index=0,
+        last_sample_index=samples - 1, first_perf_time=100.0, last_perf_time=float(perf[-1]),
+        gap_count=0, overrun_samples=0, first_error=None, last_error=None, error_count=0,
+        worker_failed=False)
+
+
+def test_the_published_nidaq_is_a_plain_gzip_selection_of_the_spool(tmp_path):
+    """Every dataset holds the selected samples, in the chunks and filter h5py's own
+    gzip write gives them, so any HDF5 reader opens the file as before."""
+    snapshot = _session_spool(tmp_path, 200_003, channels=3)
+    start_perf = 100.0 + 1_233.5 / 10_000.0
+    end_perf = 100.0 + 197_000.5 / 10_000.0
+    first, last = 1_234, 197_001
+
+    SessionDataRecorder._write_nidaq_spool_selection(
+        tmp_path / "nidaq.h5", start_perf, 50.0, end_perf, snapshot)
+
+    with h5py.File(snapshot.path, "r") as spool, \
+            h5py.File(tmp_path / "nidaq.h5", "r") as published, \
+            h5py.File(tmp_path / "plain.h5", "w") as plain:
+        perf = spool["perf_time"][first:last]
+        expected = {name: spool[name][first:last] for name in (
+            "sample_index", "perf_time", "epoch", "block_observation_perf_time",
+            "block_observation_wall_time", "block_observation_raw_time")}
+        expected["offset_seconds"] = perf - start_perf
+        expected["wall_time"] = 50.0 + perf - start_perf
+        expected["values"] = spool["values"][:, first:last]
+        assert sorted(published) == sorted(expected)
+        for name, data in expected.items():
+            reference = plain.create_dataset(name, data=data, compression="gzip")
+            dataset = published[name]
+            assert np.array_equal(dataset[()], data), name
+            assert (dataset.dtype, dataset.chunks, dataset.compression,
+                    dataset.compression_opts, dataset.shuffle) == (
+                reference.dtype, reference.chunks, "gzip", 4, False), name
+        assert published.attrs["first_perf_time"] == perf[0]
+        assert published.attrs["last_perf_time"] == perf[-1]
+        assert published.attrs["epoch"] == 1
+
+
+def test_deflated_chunks_read_back_with_edges_in_both_dimensions(tmp_path):
+    data = np.arange(3 * 2_500, dtype=np.float32).reshape(3, 2_500)
+
+    with h5py.File(tmp_path / "out.h5", "w") as output, ThreadPoolExecutor(2) as pool:
+        dataset = output.create_dataset("values", shape=data.shape, dtype=np.float32,
+                                        chunks=(2, 1_000), compression="gzip")
+        SessionDataRecorder._write_deflated(dataset, lambda start, stop: data[:, start:stop], pool)
+
+    with h5py.File(tmp_path / "out.h5", "r") as stored:
+        assert np.array_equal(stored["values"][()], data)
+
+
+def test_requested_channels_cost_about_as_much_as_the_timeline_they_come_with(tmp_path):
+    # Three channels of a 45-minute spool took 2.5 s of Stop on christielab10 read through
+    # one scattered selection across the (channels, 65536) chunks; the sample index and
+    # perf time they come with took about 0.3 s.
+    snapshot = _session_spool(tmp_path, 3_000_000)
+    started = stdlib_time.perf_counter()
+    SessionDataRecorder._nidaq_arrays(snapshot, requested_names=())
+    timeline = stdlib_time.perf_counter() - started
+
+    started = stdlib_time.perf_counter()
+    names, _, _, values, _ = SessionDataRecorder._nidaq_arrays(
+        snapshot, requested_names=("ai2", "ai0", "missing", "ai2"))
+    channels = stdlib_time.perf_counter() - started
+
+    with h5py.File(snapshot.path, "r") as spool:
+        stored = spool["values"][()]
+    assert names == ("ai2", "ai0", "ai2")
+    assert values.dtype == np.float32
+    assert np.array_equal(values, stored[[2, 0, 2]])
+    assert channels < 3 * timeline + 0.05, (
+        f"{channels:.2f} s for the channels, {timeline:.2f} s without")
+
+
+@pytest.mark.skipif((os.cpu_count() or 1) < 4, reason="a parallel deflate needs the cores to show")
+def test_publishing_nidaq_deflates_in_parallel(tmp_path):
+    # 3,000,000 samples, five minutes at 10 kHz. Deflated a chunk at a time, as h5py's
+    # own gzip write does, a 45-minute session's took 17 s of Stop on christielab10.
+    snapshot = _session_spool(tmp_path, 3_000_000)
+    with h5py.File(snapshot.path, "r") as spool:
+        columns = {name: spool[name][()] for name in spool}
+    started = stdlib_time.perf_counter()
+    with h5py.File(tmp_path / "plain.h5", "w") as plain:
+        for name, data in columns.items():
+            plain.create_dataset(name, data=data, compression="gzip")
+    plain_seconds = stdlib_time.perf_counter() - started
+    del columns
+
+    started = stdlib_time.perf_counter()
+    SessionDataRecorder._write_nidaq_spool_selection(
+        tmp_path / "nidaq.h5", 100.0, 50.0, 1_000.0, snapshot)
+    elapsed = stdlib_time.perf_counter() - started
+
+    assert elapsed < 0.7 * plain_seconds, (
+        f"{elapsed:.2f} s against {plain_seconds:.2f} s for h5py's gzip write")
 
 
 def test_camera_exposures_given_at_arm_reach_finalization(tmp_path, monkeypatch):

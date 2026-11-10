@@ -2589,11 +2589,11 @@ class AppModel(ObservableObject):
                             logger.warning(
                                 "camera recording end arrived without an active token"
                             )
-                        else:
-                            self._recording_session.set_pending_end(
-                                end_perf,
-                                session_token,
-                            )
+                        elif self._recording_session.set_pending_end(
+                            end_perf,
+                            session_token,
+                        ):
+                            self._session_data_recorder.end_nidaq_capture_after(end_perf)
                     elif (
                         self._recording_session.status == SessionRecordingStatus.ABORTING
                         and not self._abort_had_recording_started

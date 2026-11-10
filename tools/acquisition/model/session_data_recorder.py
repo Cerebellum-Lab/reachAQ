@@ -7,7 +7,9 @@ import logging
 import math
 import threading
 import time
+import zlib
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -66,6 +68,17 @@ _PRESSURE_FIELDS = (
     ("board_sequence", np.int64),
     ("board_time_us", np.int64),
 )
+
+# Threads that deflate nidaq.h5's chunks. Deflated one chunk at a time inside
+# h5py, a 45-minute session's 27M samples took 17 s of Stop on christielab10;
+# on eight threads it took under 3 s.
+_NIDAQ_DEFLATE_THREADS = 8
+
+# How far past the recording's last frame the NI copies run. Until stop() they
+# ran on through the finalization: 60.75 s on a 45-minute session, with the
+# copies starved and late. The fit reads stamps only up to the end, and the
+# published file holds samples only up to it.
+_NIDAQ_TAIL_SECONDS = 1.0
 
 
 class _PressureRing:
@@ -275,6 +288,8 @@ class SessionDataRecorder:
         self._nidaq_stats = self._new_nidaq_stats()
         self._nidaq_stop = threading.Event()
         self._nidaq_thread: Optional[threading.Thread] = None
+        # The perf time the NI copies may stop at, once the recording has ended.
+        self._nidaq_copy_until: Optional[float] = None
         self._source_manifest = ()
         self._source_results = {}
         self._trial_records = ()
@@ -368,6 +383,7 @@ class SessionDataRecorder:
                 or f"{project.short_id}-g{getattr(project, 'session_generation', 0)}"
             )
             self._nidaq_stop.clear()
+            self._nidaq_copy_until = None
             self._camera_exposure_seconds = dict(camera_exposure_seconds or {})
         thread = threading.Thread(
             target=self._poll_nidaq,
@@ -1046,6 +1062,7 @@ class SessionDataRecorder:
         self._trial_summary = {}
         self._metadata_generation_id = None
         self._pending_stop_end_perf = None
+        self._nidaq_copy_until = None
         self._camera_exposure_seconds = {}
 
     def _drain_event_queue(self) -> tuple:
@@ -1397,9 +1414,27 @@ class SessionDataRecorder:
     def _value_at(values, index):
         return values[index] if index < len(values) else math.nan
 
+    def end_nidaq_capture_after(self, end_perf: float) -> None:
+        """Let the NI copies end once the spool holds samples
+        _NIDAQ_TAIL_SECONDS past end_perf, the recording's last frame, rather
+        than at stop(). stop() still joins the thread and closes the spool."""
+        with self._lock:
+            self._nidaq_copy_until = float(end_perf) + _NIDAQ_TAIL_SECONDS
+
+    def _nidaq_copies_done(self) -> bool:
+        with self._lock:
+            last = self._nidaq_stats["last_perf_time"]
+            return (
+                self._nidaq_copy_until is not None
+                and last is not None
+                and last >= self._nidaq_copy_until
+            )
+
     def _poll_nidaq(self) -> None:
         while not self._nidaq_stop.wait(0.01):
             self._copy_nidaq_once()
+            if self._nidaq_copies_done():
+                return
         self._copy_nidaq_once()
 
     def _copy_nidaq_once(self) -> None:
@@ -2855,21 +2890,22 @@ class SessionDataRecorder:
                 indices = source["sample_index"][:]
                 perf = source["perf_time"][:]
                 if rows:
-                    # h5py only accepts a strictly increasing fancy index, and
-                    # these rows are in the order the caller asked for, not the
+                    # These rows are in the order the caller asked for, not the
                     # order the channels were stored in. Those differ on a real
                     # rig - tone1 is stored after cam_frames but requested
-                    # before it - so reading them directly raised
-                    # "Indexing elements must be in increasing order" and took
-                    # the whole session finalization down with it, leaving the
-                    # recording without its metadata.
+                    # before it - and once a strictly increasing fancy index
+                    # raised on them and took the whole session finalization
+                    # down with it. A fancy index across the (channels, 65536)
+                    # chunks was also slow: 2.5 s of Stop for three channels
+                    # of a 45-minute session.
                     #
-                    # So read ascending, then put the rows back in the
-                    # requested order. np.unique also collapses a repeated
-                    # channel, which the index would reject for the same
-                    # reason, and its inverse restores the repeat.
+                    # So read each distinct channel once, as a row of its own,
+                    # then put the rows back in the requested order. np.unique
+                    # collapses a repeated channel and its inverse restores it.
                     ascending, restore = np.unique(rows, return_inverse=True)
-                    values = source["values"][ascending.tolist(), :][restore]
+                    values = np.stack([
+                        source["values"][row, :] for row in ascending.tolist()
+                    ])[restore]
                 else:
                     values = np.empty((0, len(indices)), dtype=np.float32)
             return selected_names, indices, perf, values, chunks.sample_rate_hz
@@ -4664,7 +4700,8 @@ class SessionDataRecorder:
         snapshot: _NidaqSpoolSnapshot,
         timing_plan=None,
     ) -> None:
-        with h5py.File(snapshot.path, "r") as source, h5py.File(path, "w") as output:
+        with h5py.File(snapshot.path, "r") as source, h5py.File(path, "w") as output, \
+                ThreadPoolExecutor(_NIDAQ_DEFLATE_THREADS, thread_name_prefix="NidaqDeflate") as pool:
             perf_source = source["perf_time"]
             count = int(perf_source.shape[0])
             if count:
@@ -4726,22 +4763,26 @@ class SessionDataRecorder:
                     if selected_count:
                         output_dataset[...] = np.nan
                     continue
-                for relative in range(0, selected_count, 65536):
-                    amount = min(65536, selected_count - relative)
-                    output_dataset[relative:relative + amount] = source_dataset[
-                        first + relative:first + relative + amount
-                    ]
+                if selected_count:
+                    SessionDataRecorder._write_deflated(
+                        output_dataset,
+                        lambda start, stop, column=source_dataset: (
+                            column[first + start:first + stop]
+                        ),
+                        pool,
+                    )
             values = output.create_dataset(
                 "values",
                 shape=(len(snapshot.channel_names), selected_count),
                 dtype=np.float32,
                 compression="gzip" if selected_count else None,
             )
-            for relative in range(0, selected_count, 65536):
-                amount = min(65536, selected_count - relative)
-                values[:, relative:relative + amount] = source["values"][
-                    :, first + relative:first + relative + amount
-                ]
+            if selected_count:
+                SessionDataRecorder._write_deflated(
+                    values,
+                    lambda start, stop: source["values"][:, first + start:first + stop],
+                    pool,
+                )
             perf_dataset = output["perf_time"]
             offsets = output.create_dataset(
                 "offset_seconds",
@@ -4755,12 +4796,20 @@ class SessionDataRecorder:
                 dtype=np.float64,
                 compression="gzip" if selected_count else None,
             )
-            for relative in range(0, selected_count, 65536):
-                amount = min(65536, selected_count - relative)
-                selected_perf = perf_dataset[relative:relative + amount]
-                offsets[relative:relative + amount] = selected_perf - start_perf
-                wall[relative:relative + amount] = (
-                    start_wall + selected_perf - start_perf
+            if selected_count:
+                # From the spool's perf_time, the slice perf_dataset holds, so
+                # nothing inflates the just-written column back.
+                SessionDataRecorder._write_deflated(
+                    offsets,
+                    lambda start, stop: perf_source[first + start:first + stop] - start_perf,
+                    pool,
+                )
+                SessionDataRecorder._write_deflated(
+                    wall,
+                    lambda start, stop: (
+                        start_wall + perf_source[first + start:first + stop] - start_perf
+                    ),
+                    pool,
                 )
             if selected_count:
                 first_perf = float(perf_dataset[0])
@@ -4771,3 +4820,40 @@ class SessionDataRecorder:
                 output.attrs["last_offset_seconds"] = last_perf - start_perf
                 output.attrs["sample_rate_hz"] = snapshot.sample_rate_hz
                 output.attrs["epoch"] = int(output["epoch"][-1])
+
+    @staticmethod
+    def _write_deflated(dataset, read, pool, *, chunks_per_read=64):
+        """Fill a gzip dataset with read(start, stop), its values from start to
+        stop along the last axis, in the dataset's own chunks and at its own
+        gzip level: the file HDF5's filter would write, deflated on pool."""
+        level = int(dataset.compression_opts)
+        chunk = dataset.chunks
+        length = chunk[-1]
+        total = dataset.shape[-1]
+        pending = deque()
+
+        def write(limit):
+            while len(pending) > limit:
+                offset, deflated = pending.popleft()
+                dataset.id.write_direct_chunk(offset, deflated.result())
+
+        for start in range(0, total, length * chunks_per_read):
+            block = read(start, min(total, start + length * chunks_per_read))
+            rows = range(0, block.shape[0], chunk[0]) if block.ndim == 2 else (None,)
+            for column in range(0, block.shape[-1], length):
+                for row in rows:
+                    piece = (
+                        block[column:column + length] if row is None
+                        else block[row:row + chunk[0], column:column + length]
+                    )
+                    if piece.shape != chunk:
+                        # An edge chunk is stored whole; nothing reads past the shape.
+                        whole = np.zeros(chunk, dtype=dataset.dtype)
+                        whole[tuple(slice(0, size) for size in piece.shape)] = piece
+                        piece = whole
+                    offset = (start + column,) if row is None else (row, start + column)
+                    pending.append((offset, pool.submit(
+                        zlib.compress, np.ascontiguousarray(piece, dtype=dataset.dtype), level,
+                    )))
+            write(4 * _NIDAQ_DEFLATE_THREADS)
+        write(0)
