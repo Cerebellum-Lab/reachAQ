@@ -501,3 +501,23 @@ def test_recovery_does_not_retry_a_connect_whose_home_was_refused(hardware_model
     assert hardware_model.connect.call_count == 1
     assert hardware_model._can_connection_state["state"] == "failed"
     assert "E-stop" in hardware_model._can_connection_state["error"]
+
+
+def test_a_refusal_is_logged_below_error_so_the_footer_keeps_the_operator_notice(
+    hardware_model, caplog,
+):
+    """Every ERROR record reaches the status bar, and the last one wins there.
+
+    The device logs the refusal at ERROR first and AppModel shows the operator
+    notice last; a second ERROR copy from here would replace the notice with a
+    line carrying the token.
+    """
+    import logging
+
+    token = _pending(hardware_model)
+    with caplog.at_level(logging.DEBUG, logger="tools.acquisition.model.hardware_model"):
+        hardware_model._command_refused(token, refusal=_refusal(token))
+
+    refused = [r for r in caplog.records if "refused" in r.getMessage()]
+    assert refused, "the refusal is still logged"
+    assert all(r.levelno < logging.ERROR for r in refused)

@@ -1,8 +1,9 @@
 """The operator learns of a command the pellet board refused.
 
 A refusal that matches the active pellet attempt finalizes it as a hardware
-error. One that matches no attempt (a refused home, a manual move) reaches
-on_error. While a refusal says an axis needs a home, Record is blocked.
+error. Every refusal, in a trial or not (a refused home, a manual move),
+reaches on_error, which the main window shows in its footer: non-blocking, no
+window. While a refusal says an axis needs a home, Record is blocked.
 """
 
 from autotrainer.behavior.pellet_trial import HardwareErrorKind, TrialOutcome
@@ -48,7 +49,9 @@ def test_a_refused_send_pellet_finalizes_the_attempt_as_a_hardware_error(app_mod
     assert attempt.outcome is TrialOutcome.HARDWARE_ERROR
     assert attempt.hardware_error_kind is HardwareErrorKind.MOTOR_FAILURE
     assert app_model._trial_ledger.count() == 0
-    assert shown == [], "the trial record carries it; no dialog for a matched refusal"
+    ((title, message),) = shown
+    assert "refused" in title.lower()
+    assert "EIO" in message
 
 
 def test_a_refused_home_with_no_active_attempt_reaches_on_error(app_model):
@@ -95,3 +98,34 @@ def test_recording_is_blocked_while_a_pellet_axis_needs_homing(app_model):
 
     app_model.hardware._set_axes_needing_home(())
     assert _needs_home_blockers(app_model) == []
+
+
+def test_on_error_shows_in_the_footer_and_opens_no_window(monkeypatch):
+    """The operator asked for refusal notices that block nothing: the status bar."""
+    import os
+    from types import SimpleNamespace
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from tools.acquisition.view import main_window
+
+    app = QApplication.instance() or QApplication([])
+    footer = []
+    window = SimpleNamespace(statusBar=lambda: SimpleNamespace(
+        showMessage=lambda text, timeout: footer.append((text, timeout))))
+
+    def no_window(*args, **kwargs):
+        raise AssertionError("a refusal notice must not open a window")
+
+    monkeypatch.setattr(main_window, "QMessageBox", no_window)
+
+    main_window.MainWindow._show_message(
+        window, "Pellet command refused",
+        "Pellet motors are in E-stop. Release the E-stop, then home the pellet axes.")
+    app.processEvents()
+
+    assert footer == [(
+        "Error: Pellet command refused: Pellet motors are in E-stop. Release the "
+        "E-stop, then home the pellet axes.",
+        15000,
+    )]

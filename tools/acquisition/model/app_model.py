@@ -12058,11 +12058,12 @@ class AppModel(ObservableObject):
             failure,
             in_session=self._behavior.algorithm.is_in_session,
         )
+        if failure.category == "board_refusal":
+            # Every refusal, in a trial or not (a refused home, a manual move).
+            # The main window shows on_error in its footer: it blocks nothing.
+            # Last, so the footer ends on this text rather than a log line.
+            self.on_error("Pellet command refused", failure.error)
         if finalized is None:
-            if failure.category == "board_refusal":
-                # A refused home or manual move belongs to no attempt: without
-                # this, nothing would tell the operator.
-                self.on_error("Pellet command refused", failure.error)
             return
         self._notify_trial_protocol_state()
         self._evaluate_automatic_stop_policy(

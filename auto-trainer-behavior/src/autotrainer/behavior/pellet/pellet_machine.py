@@ -484,7 +484,8 @@ class PelletMachine(StateMachine):
         if not attrs and not was_api_token:
             logger.debug("ignoring pellet refusal of an external command. token=%r", token)
             return
-        logger.error("pellet command refused: token=%s %s", token, getattr(refusal, "message", refusal))
+        # Below ERROR, which would land in the footer over the operator notice.
+        logger.warning("pellet command refused: token=%s %s", token, getattr(refusal, "message", refusal))
         with self._command_ack_condition:
             # Cleared under the lock with the count, so a waiter that sees its
             # token gone also sees the refusal.
