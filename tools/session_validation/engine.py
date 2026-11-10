@@ -1235,6 +1235,9 @@ def _trial_rule(context):
         "success", "failure", "pellet_missing", "no_reach", "unscored",
         "hardware_error", "incomplete", "aborted",
     }
+    # Attempts left without a score; their recorded data is intact, so they warn.
+    unscored_outcomes = {"incomplete", "aborted"}
+    unscored = {}
     with path.open("r", encoding="utf-8") as stream:
         for index, line in enumerate(stream, 1):
             if not line.strip():
@@ -1267,6 +1270,11 @@ def _trial_rule(context):
                 errors.append(f"row {index}: finalization precedes acknowledgement")
             if record.get("outcome") not in terminal_outcomes:
                 errors.append(f"row {index}: nonterminal outcome {record.get('outcome')!r}")
+            if record.get("outcome") in unscored_outcomes:
+                reason = record.get("error") or "no reason recorded"
+                unscored.setdefault((record.get("outcome"), reason), []).append(
+                    str(record.get("attempt_label"))
+                )
             if finalized is None:
                 errors.append(f"row {index}: finalized time is missing")
             if int(record.get("reach_count", 0)) < 0:
@@ -1278,8 +1286,12 @@ def _trial_rule(context):
         summary = context.json("streams/trial_summary.json")
         if int(summary.get("physical_attempts", -1)) != len(records):
             errors.append("trial summary physical_attempts differs from trials.jsonl")
-        if int(summary.get("incomplete_attempts", 0)):
-            errors.append("finalized session contains incomplete attempts")
+        incomplete = sum(item.get("outcome") in unscored_outcomes for item in records)
+        if int(summary.get("incomplete_attempts", incomplete)) != incomplete:
+            errors.append(
+                f"trial summary incomplete_attempts={summary.get('incomplete_attempts')}; "
+                f"recomputed={incomplete}"
+            )
         recomputed = {
             "physical_attempts": len(records),
             "hardware_errors": sum(
@@ -1302,9 +1314,16 @@ def _trial_rule(context):
         for key, value in recomputed.items():
             if int(summary.get(key, -1)) != value:
                 errors.append(f"trial summary {key}={summary.get(key)}; recomputed={value}")
+    warnings = [
+        f"{outcome} {'attempt' if len(labels) == 1 else 'attempts'} "
+        f"{', '.join(labels)}: {reason}"
+        for (outcome, reason), labels in unscored.items()
+    ]
+    status = "fail" if errors else ("warning" if warnings else "pass")
     return _result(
-        "trials.lifecycle", "fail" if errors else "pass",
-        "; ".join(errors) if errors else "Pellet-attempt identities and summary are complete",
+        "trials.lifecycle", status,
+        "; ".join(errors or warnings) if (errors or warnings)
+        else "Pellet-attempt identities and summary are complete",
     )
 _trial_rule.RULE_ID = "trials.lifecycle"
 _trial_rule.MINIMUM = ValidationProfile.FAST

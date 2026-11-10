@@ -237,6 +237,73 @@ def test_validator_reconciles_trial_and_protocol_operation(tmp_path):
     ).status.value == "pass"
 
 
+def _attempt(attempt_id, outcome, error=""):
+    return {
+        "operation_id": f"can-send-{attempt_id}",
+        "trial_id": 1,
+        "attempt_id": attempt_id,
+        "attempt_label": f"1.{attempt_id}",
+        "send_perf_time": 10.0 * attempt_id,
+        "send_ack_perf_time": 10.0 * attempt_id + 0.1,
+        "finalized_perf_time": 10.0 * attempt_id + 1.0,
+        "outcome": outcome,
+        "error": error,
+        "reach_count": 0,
+        "success_count": 0,
+        "consumption_count": 0,
+    }
+
+
+def _write_attempts(root, attempts, **summary_changes):
+    _write(root / "streams/trials.jsonl", "".join(json.dumps(item) + "\n" for item in attempts))
+    summary = {
+        "physical_attempts": len(attempts),
+        "hardware_errors": 0,
+        "incomplete_attempts": sum(
+            item["outcome"] in {"incomplete", "aborted"} for item in attempts
+        ),
+        "pending_analysis_attempts": 0,
+        "pellets_presented": len(attempts),
+        "reaches": 0,
+        "successful_reaches": 0,
+        "pellets_consumed": 0,
+    }
+    summary.update(summary_changes)
+    _write(root / "streams/trial_summary.json", json.dumps(summary))
+
+
+def test_unscored_attempts_warn_with_their_labels_and_reasons(tmp_path):
+    root = _session(tmp_path)
+    _write_attempts(root, [
+        _attempt(1, "incomplete", "intertrial analysis ended without a result"),
+        _attempt(2, "failure"),
+        _attempt(3, "incomplete", "intertrial analysis ended without a result"),
+        _attempt(4, "aborted", "recording aborted by operator"),
+    ])
+
+    result = _rule(root, "trials.lifecycle")
+
+    assert result.status.value == "warning"
+    assert result.message == (
+        "incomplete attempts 1.1, 1.3: intertrial analysis ended without a result; "
+        "aborted attempt 1.4: recording aborted by operator"
+    )
+
+
+def test_an_incomplete_count_that_disagrees_with_the_attempts_fails(tmp_path):
+    root = _session(tmp_path)
+    _write_attempts(
+        root,
+        [_attempt(1, "incomplete", "intertrial analysis ended without a result")],
+        incomplete_attempts=0,
+    )
+
+    result = _rule(root, "trials.lifecycle")
+
+    assert result.status.value == "fail"
+    assert "trial summary incomplete_attempts=0; recomputed=1" in result.message
+
+
 def test_validator_reconciles_automatic_shift_policy_and_recommendation(tmp_path):
     root = _session(tmp_path)
     policy = {
