@@ -8,6 +8,13 @@ import uuid
 from collections import deque
 from typing import Optional
 
+#: Fit only an offset until the exchanges span this much board time: a few
+#: exchanges milliseconds apart (reachAQ's open() sends 4 back to back) carry
+#: host-side scheduling noise far larger than any real drift over that span.
+MIN_SLOPE_SPAN_SECONDS = 10.0
+#: A crystal-driven board cannot drift more than this from the host clock.
+MAX_PLAUSIBLE_DRIFT = 0.001
+
 
 @dataclasses.dataclass(frozen=True)
 class BoardClockObservation:
@@ -31,6 +38,7 @@ class BoardClockEstimate:
     residual_seconds: float
     round_trip_bound_seconds: float
     uncertainty_seconds: float
+    slope_fitted: bool = False
 
     def map_board_time(self, board_time_us: int) -> float:
         return self.intercept_seconds + self.slope * (int(board_time_us) / 1e6)
@@ -122,17 +130,18 @@ class BoardClockModel:
             )[:min(4, len(observations))])
         x = [item.board_midpoint_seconds for item in selected]
         y = [item.host_midpoint_seconds for item in selected]
-        if len(selected) < 2 or max(x) == min(x):
-            slope = 1.0
-        else:
+        slope, slope_fitted = 1.0, False
+        if len(selected) >= 2 and max(x) - min(x) >= MIN_SLOPE_SPAN_SECONDS:
             x_mean = sum(x) / len(x)
             y_mean = sum(y) / len(y)
-            slope = sum(
+            candidate = sum(
                 (x_i - x_mean) * (y_i - y_mean)
                 for x_i, y_i in zip(x, y)
             ) / sum((x_i - x_mean) ** 2 for x_i in x)
-            if not 0.999 <= slope <= 1.001:
-                raise ValueError(f"Board clock drift estimate is implausible: {slope}")
+            # An implausible slope means the exchanges are bad, not the clock:
+            # keep the offset-only fit rather than refusing to align at all.
+            if abs(candidate - 1.0) <= MAX_PLAUSIBLE_DRIFT:
+                slope, slope_fitted = candidate, True
         intercept = sum(y_i - slope * x_i for x_i, y_i in zip(x, y)) / len(x)
         residual = math.sqrt(sum(
             (y_i - (intercept + slope * x_i)) ** 2
@@ -151,15 +160,22 @@ class BoardClockModel:
             residual_seconds=residual,
             round_trip_bound_seconds=rtt_bound,
             uncertainty_seconds=max(residual, rtt_bound / 2.0),
+            slope_fitted=slope_fitted,
         )
 
 
 class BoardSequenceTracker:
-    """Detect reboot, duplicate, backward, and missing board message sequences."""
+    """Detect reboot, duplicate, backward, and missing board message sequences.
+
+    ``gap`` is what this frame found missing; ``gap_total`` is what every frame of
+    the board's current boot has found, so a total read off any later frame also
+    counts a gap seen on a frame that was not recorded.
+    """
 
     def __init__(self):
         self._boot_id = None
         self._sequence = None
+        self._missing = 0
 
     def observe(self, boot_id: int, sequence: int) -> dict:
         boot_id, sequence = int(boot_id), int(sequence)
@@ -173,9 +189,11 @@ class BoardSequenceTracker:
         )
         self._boot_id = boot_id
         self._sequence = sequence
+        self._missing = 0 if reboot else self._missing + gap
         return {
             "reboot": reboot,
             "duplicate": duplicate,
             "backward": backward,
             "gap": gap,
+            "gap_total": self._missing,
         }

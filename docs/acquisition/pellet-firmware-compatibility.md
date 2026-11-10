@@ -13,7 +13,7 @@ required; camera-only operation is unaffected when CAN/pellet is disabled.
 |---|---|---|
 | `2.3.0` | `finite_stim3_pulse` (the first release to report its capabilities) | Rig-verified; recorded-session validation pending |
 | `2.2.0` | nothing (it reports no capabilities) | Rollout pending |
-| `2.1.0` | `timing_trailer`, `time_sync`, `finite_stim3_pulse` | Rollout pending |
+| `2.1.0` | nothing (it implements no capability report or time sync) | Rollout pending |
 | `2.0.0` | nothing | Legacy fallback: host-receive timing only, no finite STIM3 pulse |
 | Emulator `0.1.0` | nothing | Automated tests only |
 
@@ -24,6 +24,20 @@ uncertainty, transport estimate, and selected event time remain distinct in
 `streams/device.csv`. Alignment preference is an unambiguous NI physical edge,
 then a valid in-range board clock model, then kernel/host receive time. No
 derived value overwrites raw evidence.
+
+Pellet firmware 2.4.0 is the first to advertise `time_sync`; through 2.3.0 the
+capability is never reported. A board that advertises it makes `open()` run four
+time-sync exchanges a few milliseconds apart. Earlier reachAQ fitted a clock
+slope to those closely spaced exchanges and raised `ValueError` when it fell
+outside 0.999 to 1.001, so it failed to open the board. The board-clock fit now
+fits an offset only until the exchanges span 10 s of board time, and falls back
+to an offset when a slope is implausible. `observe` still raises `ValueError`
+for non-finite or out-of-order timestamps; `_translate_time_sync` catches it,
+logs a warning and drops that exchange, so a bad exchange does not abort the
+read. The `2.4.0` entry is therefore not in the table above. It is added
+at that firmware's release, and only in a reachAQ that has this fix; a checkout
+has it when `auto-trainer-device/src/autotrainer/device/board_clock.py` defines
+`MIN_SLOPE_SPAN_SECONDS`.
 
 ## Updating a rig to new firmware
 
