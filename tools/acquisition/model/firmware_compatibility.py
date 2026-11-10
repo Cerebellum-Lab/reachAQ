@@ -18,6 +18,10 @@ CAPABILITY_BITS = {
     # firmware advertises it yet, so precheck methods stay unavailable
     # until a board reports this bit.
     "pellet_precheck": 1 << 3,
+    # Board reports the CAN sync claps it hears (SYNC_CLAP_OBSERVED).
+    "sync_listener": 1 << 4,
+    # Board sends the CAN sync clap and drives the NI-DAQ barcode line.
+    "timekeeper": 1 << 5,
 }
 
 

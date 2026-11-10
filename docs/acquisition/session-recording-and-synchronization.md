@@ -288,8 +288,11 @@ timestamps, and device indices. Events buffer continuously before Record and
 are sliced at the canonical boundary. Raw byte-for-byte CAN frame capture is not
 part of this format.
 
-Rows are in host receive-time order (`perf_time`); rows received at the same
-time keep their arrival order. Sessions recorded before 2026-09-24 can have
+Rows are in `perf_time` order. For an inbound row `perf_time` is the event time:
+the host receive time, or, for a board-timed row with a usable clock model, the
+board's time aligned to the host clock; `host_receive_perf_time` always keeps
+the receive time. Rows at the same time keep their arrival order. Sessions
+recorded before 2026-09-24 can have
 rows out of order, and fail `events.alignment` and `events.frames` with
 `nonmonotonic performance timestamp`.
 
@@ -441,9 +444,15 @@ CAN warnings and errors remain in both logs.
 - `toneConfirmation`, including canonical NI pulse onsets, grouped outbound
   command/immediate status/periodic GPIO observations, unmatched valid events
   and pulses, and separately classified short-pulse artifacts;
+- `boardClockChain`: pellet board time linked to NI-DAQ time through the IO
+  module's clap and barcode, or why that is unavailable (see Board clock chain,
+  below);
 - `enabledSources`, including source role/binding, runtime state, actual paths,
   sample/frame count, first/last offsets, gap and overrun counts, failure, and
   `persistenceStatus`;
+- `boardSequenceGaps`: for each board boot seen during the session, the messages
+  the host's sequence tracker found missing (see the end of Board clock chain,
+  below);
 - `deviceEventOverruns`, `sessionComplete`, and `incompleteReasons`.
 
 How schemaVersion 4 chooses the first recorded frame's transition on the
@@ -837,6 +846,217 @@ The frozen runtime mode is derived from, but never written back over, the
 operator's saved camera configuration. Interrupted arming/session boundaries
 retain a truncated clip with an explicit completeness warning instead of
 silently discarding its pre-trigger evidence.
+
+### Board clock chain (`alignment.json` `boardClockChain`)
+
+The IO module, the timekeeper, ties pellet board time to the NI-DAQ. It sends a
+clap on CAN every second and plays the same tick as a barcode on the NI
+`barcode` line. A barcode frame is a 1 ms high start pulse, the 32-bit tick least
+significant bit first at 1 ms per bit (high is 1), then low: 33 ms in all. Every
+board stamps the end of a clap frame on its own clock and reports it as
+`SYNC_CLAP_OBSERVED`; the timekeeper reports its own claps the same way, and the
+board time of each barcode's start edge as `SYNC_BARCODE`. reachAQ records them
+in `device.csv` as `SYNC_CLAP_OBSERVATION` and `SYNC_BARCODE_REPORT` rows, with
+the usual `board_boot_id`, `board_sequence`, `board_time_us` and
+`board_timestamp_kind` columns. They are the only frame types it records from a
+board it has no driver for; everything else such a board sends is ignored.
+
+After the session, finalization links three clocks. NI time is the NI sample
+index divided by the sample rate. The chain reads every device row captured and
+the whole NI spool, including pre-roll and post-roll outside the session window:
+those rows are as good evidence as any inside it. Rows of earlier sessions are
+not: the device-row ring holds 100 000 rows and is not cleared between
+sessions.
+
+The chain also needs a host reference for the NI recording, to tie a barcode
+frame to the timekeeper boot that played it: the session's NI-to-host fit (the
+one `cameraNidaqAlignment` uses) when it is valid, else the line through the
+host times of the first and the last NI samples that have a finite host stamp.
+That line is a reference only if both points are finite, the second is later,
+and its slope is within 1 % of 1; a failed gate is no reference. `pairing` says
+which was used, `host_time` or `host_endpoints`, and is `null` when neither was.
+With neither the chain is `unavailable`: a tick alone does not say which
+timekeeper boot reported it. Only rows the host received
+(`host_receive_perf_time`) within the recording's host span, widened by 5 s each
+side, are used, and `rowsOutsideNiSpan` counts the rest. With `host_time`,
+the session's fit runs from the spool's first stamp to the last frame, and the
+rest of the recording is the fit's end segments carried on. At the start that
+is what the spool's first copy holds from before that stamp, up to the NI
+ring's window (10 s by default). At the end it is the post-roll frames and the
+recording's last host time. The error is milliseconds at most, against the
+0.5 s pairing window and the 5 s span margin. `host_endpoints` carries nothing
+on; its error is the drift described next.
+
+The `host_endpoints` line has a slope of exactly 1. The host time the spool
+stores for a sample is the epoch's anchor plus the sample index over the nominal
+rate, so the line through two of them carries no NI-versus-host drift, which the
+session's fit measures. Without a valid fit, then, barcode frames stop pairing
+with their reports once that drift has moved the line by the 0.5 s pairing
+window: after about 0.5 s divided by the drift, 1.4 hours at 100 ppm. This fails
+safe. Frames that no longer pair are lost, and a record that cannot pair enough
+of them is `unavailable`; none is ever paired to the wrong boot.
+
+A session with no `SYNC_BARCODE_REPORT` row, as most sessions are, does not read
+the NI spool for the chain at all. Only a barcode report stamped `physical_start`
+and a clap stamped `observed` are used; rows with another stamp kind are counted
+in `rowsRejectedForStampKind` and left out.
+
+Each link is a continuous piecewise-linear fit, one segment per 120 s, not one
+straight line. A crystal's rate moves with temperature, and one line per link
+would lose the whole chain to a drift that wanders by a fraction of a part per
+million over an hour. The fit is least squares, repeated once without points
+beyond five robust sigmas, and a link is valid only when it has enough points
+over enough time, its residual is small, and every segment runs forward. Each
+link is recorded with its knot table (`knots` and `knotHost`, the mapped-to
+time at each knot), so any time can be mapped through it.
+
+- **Timekeeper to NI.** Barcode frames are decoded from the `barcode` line by
+  position from the start edge, and a frame is kept only if every edge its tick
+  implies is where it should be, which rejects glitches and frames the recording
+  cut. A timekeeper reset restarts the tick numbering, and an NI frame carries
+  only a tick, so a tick never pairs alone: host time ties a frame to the boot
+  whose report it is paired with. The timekeeper reports a barcode 0.5 s after
+  its start edge, so a decoded frame is paired with a `SYNC_BARCODE` report of
+  its tick that the host received between the frame's host time and a second
+  after it (`host_receive_perf_time`; the frame's host time is its NI time
+  through the host reference above). Of one boot's pairs, only the largest group
+  that agree on NI time minus board time is kept, in every mode (pairs chain into
+  a group while neighbours are within 0.5 s, which hours of drift do not break).
+  The boot with the largest group of pairs is the timekeeper, and a tie never
+  decides: if two boots, or two runs inside one boot, pair the same number of
+  frames, the record is `unavailable` with a reason that names the tie, and
+  report counts do not break it. Every boot not used is listed under
+  `ignoredTimekeeperBoots` with its `address`, `bootId`, `reports` and
+  `framesPaired`, so a reset is visible. If no boot paired a frame, none is known
+  to be the timekeeper: `timekeeper` is `null` and every boot that reported is in
+  `ignoredTimekeeperBoots`. Every edge of every kept frame is a fit
+  point: the report's
+  start-edge board time plus the edge's offset in the frame, against the NI time
+  of the sample where that edge was seen. Ten frames spanning ten seconds are the
+  least a link is fitted from. This needs the `barcode` role on the NI-DAQ at
+  5 kHz or more.
+- **Board to timekeeper.** For each board and boot, the board's
+  `SYNC_CLAP_OBSERVATION` of a tick is paired with the timekeeper's own clap of
+  that tick, from the timekeeper boot in use, only if the host received the two
+  (`host_receive_perf_time`, not the row's `perf_time`, which for a time-synced
+  board is its aligned event time) within 0.5 s of each other. A tick the
+  timekeeper repeats after a reset cannot
+  pair with the wrong clap. The timekeeper's own claps are never listed as a
+  board, from any of its boots. Ten claps spanning ten seconds are the least a
+  link is fitted from; a board whose claps could not be paired is still listed,
+  with `clapsMatched` 0 and an invalid link.
+- **Board to NI.** The two links are composed exactly for each board, under
+  `boards[].toNi`: a table whose knots are the board link's knots and the board
+  times at which the board link, carried on past its ends by its end segments,
+  reaches each of the timekeeper link's knots, so every bend of either link is
+  a knot. It is valid only when both links are. Its `x_min` and `x_max` can run
+  past the evidence for the board: `boards[].toTimekeeper.x_min` and `x_max` are
+  the span the claps cover, and `toNi` beyond that is extrapolation. Host
+  `perf_counter`
+  follows through `cameraNidaqAlignment.niToHost`, as for every other time
+  derived from an NI sample.
+
+`boards[].toneCrossCheck` is the accuracy evidence. The links' own residuals say
+only how well their points agree, and the tones are used in none of them. Each
+pellet tone start (a `TONE_STATUS` row stamped `physical_start`, for the 5 kHz
+`tone1` or 6 kHz `tone2` line) is mapped through the board-to-NI table and
+compared with the nearest rising edge the NI-DAQ sampled on that line, within
+5 ms. A tone inside the NI recording with no edge that close is a failure of the
+chain, not a tone to leave out: its error counts as infinite. A tone outside the
+recording, or on a tone line the NI-DAQ did not record, cannot be judged and is
+counted apart (`outsideRecording`; `tonesWithoutChannel` and `channelsMissing`).
+`tonesConsidered` is the tones judged, `matched` plus `unmatched`. The target is
+the spec's: the 95th percentile of the absolute error under 0.1 ms, which is one
+sample at 10 kHz, over at least 100 tones. `meetsTarget` is true or false over
+the tones judged, and `null` only when none were; `enoughTonesForAcceptance` says
+whether there were 100, so a handful of tones that all land is not a pass of the
+acceptance. `p95AbsResidualSeconds` is `null` when the 95th percentile is itself
+a failure. The mean, median and maximum residuals are over the tones that matched.
+
+Device event times are never rewritten. No `device.csv` row's `perf_time`,
+`event_perf_time`, `event_timestamp_method` or `event_timing_confidence` changes,
+and `device.csv` gets no NI-time column. A pellet event's NI time is its
+`board_time_us` through the board-to-NI link whose `bootId` equals the row's
+`board_boot_id`. The result lives only in `alignment.json`, whose `schemaVersion`
+stays 4: `boardClockChain` was added within it, and earlier schema-4 files lack
+it.
+
+`status` is `fitted` when the timekeeper-to-NI link was made, and `unavailable`
+with a `reason` when it was not. It says nothing about a board: a board is usable
+only when its own `toNi` is valid, and `boards` is empty when no board reported
+the timekeeper's claps. Every record has the same top-level keys whatever its
+status; `niTime` and `timekeeper` are `null` when no timekeeper could be
+identified, and `pairing` is `null` until the pairing rule is known. The
+reasons:
+
+- `no SYNC_BARCODE reports: no timekeeper was on the bus`, or `N SYNC_BARCODE
+  reports, none stamped physical_start: no usable timekeeper`.
+- `SYNC_BARCODE reports carry no tick`, or `no SYNC_BARCODE report was received
+  within the NI recording's host span`.
+- `the NI-DAQ recorded no barcode channel`, `the NI-DAQ sample rate is unknown`,
+  `NI-DAQ rate N Hz is below the 5000 Hz a barcode needs`, or `NI-DAQ sample
+  index (N samples) and barcode line (M) differ in length`.
+- `ticks cannot be tied to a timekeeper boot without host time (spec section 9)`:
+  the session has no valid NI-to-host fit and no usable host times of the first
+  and last NI samples.
+- `timekeeper to NI-DAQ: ...`: no barcode frames decoded (is the barcode line
+  wired?), or none of the decoded frames matches a report (of the same tick and
+  host time); a tie between timekeeper boots (or inside one) that pair the same
+  number of frames. Those three name no timekeeper. Or, with a boot that paired
+  frames, fewer than ten matched, or the fit's own reason (too few points, too
+  short a span, too large a residual, a segment running backward); the
+  timekeeper entry then keeps its decoded, rejected, matched and inconsistent
+  frame counts.
+- `board clock chain failed: <exception>`: the chain raised.
+
+Finalization never fails because of the chain. If the chain raises, or its record
+cannot be written as JSON (the writer rejects NaN and infinity and sorts keys),
+the single `boardClockChain` record is replaced by an `unavailable` record whose
+reason is `board clock chain failed: <exception>`; the exception is logged and
+the session is written as usual. Only synthetic captures have exercised the chain
+so far; end-to-end validation needs an IO module on the bus.
+
+`events.board_time` judges each board boot's rows in that boot's sequence order,
+not in `device.csv` order. Rows are in `perf_time` order, where an aligned
+board-timed row sits at its event time, and an `observed` or `physical_start`
+event precedes the frame that reports it, so a healthy board's rows are not in
+its sequence order. The rule used to read them in file order and could report a
+sequence or clock moving backward that never did. It now groups rows by
+`board_boot_id` and sorts each group by `board_sequence`. A repeated sequence is
+an error. *Board clock moved backward* is an error only among `tx_queue` rows,
+with 1 ms of tolerance, because only queue stamps are taken in queue order. A
+sequence can no longer be seen to move backward, so that error is no longer
+reported.
+
+Loss is not read from the sequence numbers of the rows, because `device.csv`
+holds only some of the frames a board numbers. The pellet board's pressure
+readings go to `pressure.csv`, and a no-op frame (the timekeeper's own
+`SYNC_CLAP`, a door sensor or a temperature and humidity reading) is never a
+row, yet each used a sequence number, so the rows of a healthy board skip
+numbers. The rule once counted those skips as lost messages: 59 warnings over 60
+healthy timekeeper ticks. The host's sequence tracker, one per board, sees every
+frame that carries a timing trailer, and its verdict on each recorded frame is
+the `board_sequence_status_json` column. A row whose `gap` there is above zero is
+a warning (*row N: K board message(s) missing*) that names the row of the frame
+that revealed the loss. A file without the column, or a cell that cannot be read,
+counts no loss.
+
+A row can only show a loss that surfaced on a frame the recorder wrote as a row.
+A loss is shown by whichever frame follows it, which is often a pressure reading
+(about 166 a second) or a no-op frame, and neither is a row. So the recorder also
+keeps, for each board boot, the tracker's running total of missing messages
+(`gap_total` in the same JSON) from the first frame it saw after the session
+began to the last, over every frame whether or not it was recorded, and writes it
+as `alignment.json` `boardSequenceGaps`, `[{"bootId": N, "missing": K}, ...]`,
+one entry per boot seen. `schemaVersion` stays 4; the field is additive, and
+older sessions, earlier schema-4 ones included, do not have it.
+`events.board_time` warns for each boot whose
+`missing` is above zero (*board boot N: the live tracker counted K missing
+message(s) this session*), ahead of the per-row warnings. That is the same loss
+counted over the whole session, not an addition to the per-row ones. A loss shown
+on the first frame the recorder saw of a boot is not counted, because it may have
+come before the session; and a loss on the last frames before the recorder stops
+may be missed.
 
 ## Storage, discovery, and safe hardware boundaries
 

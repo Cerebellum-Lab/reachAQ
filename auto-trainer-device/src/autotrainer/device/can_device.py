@@ -48,6 +48,8 @@ from .device_interface import (
     Version,
     BoardTimeSync,
     BoardCapabilities,
+    SyncBarcodeReport,
+    SyncClapObservation,
     DigitalPulseStatus,
     PressureReading,
 )
@@ -561,6 +563,12 @@ class CanDevice(Device):
             ),
             PressureReading: lambda message: self._api.send_message(
                 SystemStatusMessageKind.PRESSURE_READING, message,
+            ),
+            SyncClapObservation: lambda message: self._api.send_message(
+                SystemStatusMessageKind.SYNC_CLAP_OBSERVATION, message,
+            ),
+            SyncBarcodeReport: lambda message: self._api.send_message(
+                SystemStatusMessageKind.SYNC_BARCODE_REPORT, message,
             ),
 
             Acknowledge: self._handle_ack,

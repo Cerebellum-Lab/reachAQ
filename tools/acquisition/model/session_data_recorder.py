@@ -23,6 +23,7 @@ import h5py
 import numpy as np
 
 from autotrainer.core import ProjectInfo
+from tools.acquisition.model import board_clock_chain
 from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.latency_event_log import LatencyEventLog
 from tools.latency import clocks, finalize_session_latency
@@ -271,6 +272,9 @@ class SessionDataRecorder:
         self._device_event_capacity = int(device_event_capacity)
         self._device_event_overruns = 0
         self._device_events_since_start = 0
+        # Per board boot: [first, latest] gap_total the live sequence tracker
+        # reported since the session started (see _note_board_gap_total).
+        self._board_gap_marks = {}
         self._pressure = _PressureRing(pressure_sample_capacity)
         self._pressure_samples_since_start = 0
         self._laser_rows = []
@@ -451,6 +455,7 @@ class SessionDataRecorder:
             # count from here rather than from the ring's own total.
             self._pressure_samples_since_start = 0
             self._pressure.clear()
+            self._board_gap_marks = {}
 
     @contextmanager
     def _locked_then_log(self):
@@ -512,6 +517,7 @@ class SessionDataRecorder:
                 0,
                 self._device_events_since_start - self._device_event_capacity,
             )
+            board_sequence_gaps = self._board_sequence_gap_records()
             pressure_columns = self._pressure.snapshot()
             pressure_overruns = max(
                 0,
@@ -554,6 +560,7 @@ class SessionDataRecorder:
                 "nidaq_chunks": nidaq_chunks,
                 "timing_plan": timing_plan,
                 "device_event_overruns": device_event_overruns,
+                "board_sequence_gaps": board_sequence_gaps,
                 "source_manifest": source_manifest,
                 "source_results": source_results,
                 "boundary": boundary,
@@ -1046,6 +1053,7 @@ class SessionDataRecorder:
         self._start_wall = None
         self._boundary = None
         self._device_events_since_start = 0
+        self._board_gap_marks = {}
         self._pressure_samples_since_start = 0
         self._laser_rows = []
         self._log_rows = []
@@ -1266,6 +1274,9 @@ class SessionDataRecorder:
         if not math.isfinite(event_perf):
             event_perf = float(perf_time)
         sequence_status = getattr(data, "board_sequence_status", None)
+        self._note_board_gap_total(
+            getattr(data, "board_boot_id", None), sequence_status,
+        )
         if kind_name == "PRESSURE_READING":
             # Pressure is ~166 Hz across the two sensors and made up 98% of
             # every device row a session wrote, which overran the shared
@@ -1308,6 +1319,41 @@ class SessionDataRecorder:
                 getattr(data, "timestamp_method", "host_receive_perf_time"),
                 getattr(data, "timing_confidence", "host_timestamp"),
             ))
+
+    def _note_board_gap_total(self, boot_id, status) -> None:
+        """Remember how many messages the live tracker found a board boot missing.
+
+        The tracker sees every frame a board sends with a timing trailer. A loss
+        shows up on whichever frame arrives next, and not every frame is a
+        device.csv row: pressure readings go to their own stream and the
+        no-op frames are never recorded, so the rows alone cannot total the
+        loss. Each frame's status carries the tracker's running total for the
+        boot (gap_total), so this keeps the first and the latest total seen
+        since the session started; their difference is the loss counted during
+        the session, and it does not depend on which frames were recorded. A
+        loss shown on the first frame of a boot is not counted, since it may
+        have happened before the session.
+        """
+        if boot_id is None or not isinstance(status, dict):
+            return
+        total = status.get("gap_total")
+        if not isinstance(total, int) or isinstance(total, bool):
+            return
+        with self._lock:
+            marks = self._board_gap_marks.get(boot_id)
+            if marks is None:
+                self._board_gap_marks[boot_id] = [total, total]
+            elif total > marks[1]:
+                marks[1] = total
+
+    def _board_sequence_gap_records(self) -> list:
+        """alignment.json's boardSequenceGaps: [{bootId, missing}], one per boot seen.
+
+        The caller holds self._lock."""
+        return [
+            {"bootId": int(boot_id), "missing": int(latest - first)}
+            for boot_id, (first, latest) in sorted(self._board_gap_marks.items())
+        ]
 
     @classmethod
     def _payload_json(cls, value) -> str:
@@ -1728,6 +1774,7 @@ class SessionDataRecorder:
         pressure_overruns=0,
         structured_event_overruns=0,
         device_event_overruns=0,
+        board_sequence_gaps=(),
         source_manifest=(),
         source_results=None,
         boundary: Optional[SessionBoundary] = None,
@@ -1747,8 +1794,14 @@ class SessionDataRecorder:
             metadata_generation_id or f"{project.short_id}-legacy"
         )
 
+        # The board clock chain is a fit, and pre-roll and post-roll rows are as
+        # good as any, so it reads the rows from before the window trim. They are
+        # not normalized here: a row of an unsupported shape outside the window
+        # has always been dropped by the trim, and must not start failing
+        # finalization now. The chain normalizes them inside its own guard.
+        untrimmed_device_rows = tuple(device_rows)
         device_rows = tuple(
-            row for row in device_rows if start_perf <= row[0] <= end_perf
+            row for row in untrimmed_device_rows if start_perf <= row[0] <= end_perf
         )
         event_rows = tuple(
             row for row in event_rows if start_perf <= row[0] <= end_perf
@@ -1786,6 +1839,9 @@ class SessionDataRecorder:
         # with its reason, rather than raised when the spool cannot support one;
         # the anchor and every timeline below then use the epoch mapping as before.
         ni_fit = SessionDataRecorder._fit_nidaq_to_host(nidaq_chunks, end_perf=end_perf)
+        board_clock_chain_record = SessionDataRecorder._board_clock_chain(
+            untrimmed_device_rows, nidaq_chunks, ni_fit=ni_fit,
+        )
         primary_exposure = (
             None
             if boundary is None or not camera_exposure_seconds
@@ -2389,11 +2445,13 @@ class SessionDataRecorder:
             "deviceEventOverruns": int(device_event_overruns),
             "structuredEventOverruns": int(structured_event_overruns),
             "retentionLimited": retention,
+            "boardSequenceGaps": [dict(item) for item in board_sequence_gaps],
             "sessionComplete": not incomplete_reasons,
             "incompleteReasons": incomplete_reasons,
             "enabledSources": finalized_sources,
             "cameraNidaqAlignment": camera_nidaq_alignment,
             "toneConfirmation": tone_confirmation,
+            "boardClockChain": board_clock_chain_record,
             "eventAlignmentContract": {
                 "scope": (
                     "all discrete structured API/application, device, laser, "
@@ -2464,6 +2522,7 @@ class SessionDataRecorder:
             "metadataGenerationId": metadata_generation_id,
             "cameraNidaqAlignment": camera_nidaq_alignment,
             "toneConfirmation": tone_confirmation,
+            "boardClockChain": board_clock_chain_record,
             "deviceEventOverruns": int(device_event_overruns),
             "structuredEventOverruns": int(structured_event_overruns),
             "retentionLimited": retention,
@@ -2989,6 +3048,70 @@ class SessionDataRecorder:
                 "NI-to-host fit failed; the alignment falls back to the epoch timeline",
             )
             return clocks.invalid_piecewise_fit(f"{type(error).__name__}: {error}")
+
+    @staticmethod
+    def _ni_host_endpoints(indices, perf, rate):
+        """((NI seconds, host perf seconds) of the first NI sample with a finite stamp, and of the last), or None.
+
+        The host reference the board clock chain falls back on when the session has
+        no NI-to-host fit. Four floats: the per-sample stamps are not kept.
+        """
+        try:
+            finite = np.isfinite(np.asarray(perf, dtype=np.float64))
+            if not finite.size or not rate:
+                return None
+            first = int(np.argmax(finite))
+            last = int(finite.size - 1 - np.argmax(finite[::-1]))
+            if not finite[first]:
+                return None
+            return tuple(
+                (float(indices[position]) / float(rate), float(perf[position])) for position in (first, last)
+            )
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _board_clock_chain(device_rows, nidaq_chunks, ni_fit=None):
+        """Pellet-to-NI clock chain, or why there is none; never raised.
+
+        Read from the whole spool and the untrimmed rows: the chain is a fit,
+        and pre-roll and post-roll claps and barcodes are as good as any.
+        ni_fit, the session's NI-to-host map, tells the chain which host time
+        each barcode frame was played at, and so which timekeeper boot its
+        tick belongs to. When it is not valid, the host times of the first and
+        last NI samples stand in. The per-sample host stamps are never passed.
+        """
+        try:
+            rows = tuple(
+                SessionDataRecorder._normalize_device_row(row) for row in device_rows
+            )
+            if board_clock_chain.has_barcode_reports(rows):
+                names, indices, perf, values, rate = SessionDataRecorder._nidaq_arrays(
+                    nidaq_chunks, requested_names=board_clock_chain.NIDAQ_CHANNELS,
+                )
+                ni_host_endpoints = SessionDataRecorder._ni_host_endpoints(indices, perf, rate)
+                # The chain needs only those two points; 8 bytes a sample, 288 MB an
+                # hour at 10 kHz, is not held while it decodes the barcode.
+                del perf
+                channels = {name: values[row] for row, name in enumerate(names)}
+            else:
+                # No timekeeper was on the bus, as in most sessions: there is
+                # nothing to decode, so the spool is not read for it.
+                indices, rate, channels, ni_host_endpoints = (), None, {}, None
+            record = board_clock_chain.board_clock_chain(
+                rows, sample_indices=indices, sample_rate_hz=rate, channels=channels,
+                ni_to_host=ni_fit, ni_host_endpoints=ni_host_endpoints,
+            )
+            # alignment.json is written with allow_nan=False and sort_keys=True, so
+            # a NaN, a numpy scalar or keys that cannot be sorted in the record
+            # would fail the write, not just this section.
+            json.dumps(record, allow_nan=False, sort_keys=True)
+            return record
+        except Exception as error:  # finalization must never fail on this evidence
+            logging.getLogger(__name__).exception("Board clock chain failed")
+            return board_clock_chain.unavailable(
+                f"board clock chain failed: {type(error).__name__}: {error}",
+            )
 
     @staticmethod
     def _read_primary_latency_stream(project, boundary):

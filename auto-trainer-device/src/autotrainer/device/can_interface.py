@@ -68,6 +68,8 @@ from .device_interface import (
     Version,
     BoardTimeSync,
     BoardCapabilities,
+    SyncClapObservation,
+    SyncBarcodeReport,
     DigitalPulseStatus,
     PressureReading,
 )
@@ -134,6 +136,11 @@ def _addr2tgt(addr: int) -> Target:
     if _is_pellet_by_addr(addr):
         return Target.PELLET_DEVICE
     raise RuntimeError(f"unknown addr for _addr2tgt: {addr}")
+
+
+def _board_type_of_addr(addr: int) -> int:
+    """Board type is bits 2 and 3 of the 5-bit CAN address; the pellet is 0."""
+    return (addr >> 2) & 0x3
 
 
 def target_to_str(target: Target) -> str:
@@ -409,8 +416,11 @@ class CanInterface(DeviceInterface):
         }
 
         self._pellet_addr: Optional[int] = None
-        self._board_clock_model = BoardClockModel()
-        self._board_sequence_tracker = BoardSequenceTracker()
+        self._foreign_board_addresses = set()
+        # One clock and one sequence per board address: a second board's
+        # trailer is not a reboot of the first.
+        self._board_clocks: Dict[int, BoardClockModel] = {}
+        self._board_sequences: Dict[int, BoardSequenceTracker] = {}
         self._time_sync_requests = {}
         self._next_time_sync_request_id = 1
 
@@ -484,11 +494,28 @@ class CanInterface(DeviceInterface):
             "TIME_SYNC_REQUEST": no_op,
             "CAPABILITIES_REQUEST": no_op,
             "GPIO_PULSE": no_op,
+            # Clock-chain and IO-module traffic. SYNC_CLAP_OBSERVED and SYNC_BARCODE
+            # are translated to recorded Sources; the rest is received and dropped
+            # until the clock chain (T3) and the IO-module driver consume it.
+            "SYNC_CLAP": no_op,
+            "SYNC_CLAP_OBSERVED": self._translate_sync_clap_observed,
+            "SYNC_BARCODE": self._translate_sync_barcode,
+            "ANALOG_BLOCK": no_op,
+            "PWM_SET": no_op,
         }
         for name, handler in optional_handlers.items():
             kind = getattr(cmd_type, name, None)
             if kind is not None:
                 self._handlers[kind] = handler
+        # Sync reports are evidence for the clock chain whichever board sends
+        # them; everything else from a board without a driver stays ignored.
+        self._any_board_types = frozenset(
+            kind for kind in (
+                getattr(cmd_type, "SYNC_CLAP_OBSERVED", None),
+                getattr(cmd_type, "SYNC_BARCODE", None),
+            )
+            if kind is not None
+        )
 
     def __allow_fake_status_time(self, motor):
         if _debug_path_fake_status_timeout.exists():
@@ -1646,6 +1673,10 @@ class CanInterface(DeviceInterface):
         Returns:
             Populated class type (see device_interface.py) or None
         """
+        sequence_status = self._observe_board_sequence(message)
+        if not _is_pellet_by_addr(message.dst_id) and message.type not in self._any_board_types:
+            self._ignore_foreign_board(message.dst_id)
+            return None
         handler = self._handlers.get(message.type, None)
         if handler is None:
             logger.warning("Unhandled message type: %s", message.type)
@@ -1656,10 +1687,50 @@ class CanInterface(DeviceInterface):
                 raise TypeError(f"CAN decoder returned unsupported value: {type(res)}")
             res.timestamp_ns = self._get_timestamp_ns(message)
             res.index = self._get_index(message)
-            self._apply_board_timing(res, message)
+            self._apply_board_timing(res, message, sequence_status)
         return res
 
-    def _apply_board_timing(self, source: Source, message) -> None:
+    def _ignore_foreign_board(self, address: int) -> None:
+        """Skip traffic from a board this host has no driver for.
+
+        Most handlers resolve their target through _addr2tgt, which raises for
+        any non-pellet address, and ACKNOWLEDGE matches by uuid alone, so a
+        foreign ACK could confirm a pellet command. read() translates a whole
+        batch at once, so a single frame from another board used to discard
+        the pellet frames read with it. Logged once per address: an IO board
+        streams hundreds of frames a second.
+        """
+        if address in self._foreign_board_addresses:
+            return
+        self._foreign_board_addresses.add(address)
+        logger.warning(
+            "Ignoring CAN traffic from board address %d (board type %d): "
+            "this reachAQ has no driver for that board",
+            address, _board_type_of_addr(address),
+        )
+
+    def _board_clock(self, address: int) -> BoardClockModel:
+        model = self._board_clocks.get(address)
+        if model is None:
+            model = self._board_clocks[address] = BoardClockModel()
+        return model
+
+    def _observe_board_sequence(self, message) -> dict:
+        """Track every trailer, whatever becomes of its frame.
+
+        A trailer-bearing frame the host does not turn into a Source - a no-op
+        type, a foreign board's frame - still used up a sequence number on the
+        board; skipping it made the next tracked frame report a lost message.
+        """
+        if not bool(getattr(message, "board_timing_valid", False)):
+            return {}
+        tracker = self._board_sequences.get(message.dst_id)
+        if tracker is None:
+            tracker = self._board_sequences[message.dst_id] = BoardSequenceTracker()
+        timing = message.timing
+        return tracker.observe(int(timing.boot_id), int(timing.sequence))
+
+    def _apply_board_timing(self, source: Source, message, sequence_status: dict) -> None:
         source.event_perf_time = source.index / 1e9
         if not bool(getattr(message, "board_timing_valid", False)):
             return
@@ -1669,16 +1740,14 @@ class CanInterface(DeviceInterface):
         source.board_time_us = int(timing.board_time_us)
         kind = getattr(timing.kind, "name", str(timing.kind))
         source.board_timestamp_kind = str(kind).lower()
-        source.board_sequence_status = self._board_sequence_tracker.observe(
-            source.board_boot_id, source.board_sequence,
-        )
-        estimate = self._board_clock_model.estimate
-        if (
-            source.board_sequence_status.get("reboot")
-            and (estimate is None or estimate.boot_id != source.board_boot_id)
-        ):
-            self._board_clock_model.reset(source.board_boot_id)
-        aligned = self._board_clock_model.align(source.board_time_us)
+        source.board_sequence_status = sequence_status
+        model = self._board_clock(message.dst_id)
+        estimate = model.estimate
+        # Compare boot ids directly: the tracker's reboot flag is spent on
+        # whichever frame of the new boot arrived first, which may not be this one.
+        if estimate is not None and estimate.boot_id != source.board_boot_id:
+            model.reset(source.board_boot_id)
+        aligned = model.align(source.board_time_us)
         if aligned is None:
             return
         source.board_aligned_perf_time = aligned["perf_time"]
@@ -1699,15 +1768,21 @@ class CanInterface(DeviceInterface):
             and bool(getattr(message, "board_timing_valid", False))
             and timing is not None
         ):
-            estimate = self._board_clock_model.observe(
-                request_id=request_id,
-                host_send_perf_ns=host_send_ns,
-                board_receive_time_us=int(response.request_receive_time_us),
-                board_send_time_us=int(response.response_queue_time_us),
-                host_receive_perf_ns=self._get_index(message),
-                boot_id=int(timing.boot_id),
-            )
-            model = dataclasses.asdict(estimate)
+            try:
+                estimate = self._board_clock(message.dst_id).observe(
+                    request_id=request_id,
+                    host_send_perf_ns=host_send_ns,
+                    board_receive_time_us=int(response.request_receive_time_us),
+                    board_send_time_us=int(response.response_queue_time_us),
+                    host_receive_perf_ns=self._get_index(message),
+                    boot_id=int(timing.boot_id),
+                )
+            except ValueError as error:
+                # One bad exchange must not abort read(): open() and the
+                # 30 s resync both run through it.
+                logger.warning("Rejected board time-sync exchange %d: %s", request_id, error)
+            else:
+                model = dataclasses.asdict(estimate)
         return BoardTimeSync(
             target=_addr2tgt(message.dst_id),
             request_id=request_id,
@@ -1724,6 +1799,21 @@ class CanInterface(DeviceInterface):
             wire_schema_version=int(response.wire_schema_version),
             capabilities=int(response.capabilities),
             boot_id=int(response.boot_id),
+        )
+
+    @staticmethod
+    def _translate_sync_clap_observed(message) -> SyncClapObservation:
+        observed = message.sync_clap_observed
+        return SyncClapObservation(
+            board_address=int(message.dst_id),
+            tick=int(observed.tick),
+            clapper_node=int(observed.clapper_node),
+        )
+
+    @staticmethod
+    def _translate_sync_barcode(message) -> SyncBarcodeReport:
+        return SyncBarcodeReport(
+            board_address=int(message.dst_id), tick=int(message.sync_barcode.tick),
         )
 
     @staticmethod

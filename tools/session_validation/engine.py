@@ -1122,13 +1122,68 @@ def _optional_int(row, name):
     return int(value)
 
 
+# Queue stamps are taken before the queue insert, so an interrupt that queues
+# between them can put a later stamp first; anything beyond this is a real reset.
+_QUEUE_CLOCK_TOLERANCE_US = 1000
+
+
+def _tracker_gap(row):
+    """Messages the live tracker found missing just before this row's frame.
+
+    The host's sequence tracker saw every trailer-bearing frame a board sent,
+    including the ones device.csv does not hold, so its count is the evidence
+    of loss. A row that has no readable count (a file written before the column
+    existed, a blank or damaged cell) contributes none: nothing says it lost
+    anything, and the rows alone cannot tell, because most of a board's frames
+    are never rows.
+    """
+    text = row.get("board_sequence_status_json")
+    if not isinstance(text, str) or not text:
+        return 0
+    try:
+        status = json.loads(text)
+    except ValueError:
+        return 0
+    gap = status.get("gap") if isinstance(status, dict) else None
+    if isinstance(gap, int) and not isinstance(gap, bool) and gap > 0:
+        return gap
+    return 0
+
+
+def _session_gap_totals(context):
+    """(boot id, missing) for each board boot the live tracker counted loss on.
+
+    alignment.json's boardSequenceGaps totals the tracker's gaps over every frame
+    of the session, including the ones that are not device.csv rows (pressure
+    readings, no-op frames), where no row can show the loss. Sessions written
+    before the field existed have none; whatever cannot be read is skipped.
+    """
+    try:
+        records = context.json("streams/alignment.json").get("boardSequenceGaps")
+    except (OSError, ValueError, AttributeError):
+        return []
+    if not isinstance(records, list):
+        return []
+    totals = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        boot, missing = item.get("bootId"), item.get("missing")
+        if (
+            all(isinstance(value, int) and not isinstance(value, bool) for value in (boot, missing))
+            and missing > 0
+        ):
+            totals.append((boot, missing))
+    return totals
+
+
 def _board_time_rule(context):
     path = context.path("streams/device.csv")
     if not path.is_file():
         return _result("events.board_time", "not_applicable", "Device stream is absent")
     errors, warnings = [], []
     timestamped = 0
-    previous = {}
+    envelopes = {}
     model_ids = set()
     with path.open("r", encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
@@ -1157,21 +1212,10 @@ def _board_time_rule(context):
                 if None in (boot, sequence, board_us):
                     errors.append(f"row {line_number}: partial board timing envelope")
                     continue
-                prior = previous.get(boot)
-                if prior is not None:
-                    prior_sequence, prior_us = prior
-                    delta = (sequence - prior_sequence) & 0xFFFFFFFF
-                    if delta == 0:
-                        errors.append(f"row {line_number}: duplicate board sequence {sequence}")
-                    elif delta >= 0x80000000:
-                        errors.append(f"row {line_number}: board sequence moved backward")
-                    elif delta > 1:
-                        warnings.append(
-                            f"row {line_number}: {delta - 1} board message(s) missing"
-                        )
-                    if board_us < prior_us:
-                        errors.append(f"row {line_number}: board clock moved backward")
-                previous[boot] = (sequence, board_us)
+                envelopes.setdefault(boot, []).append((
+                    line_number, sequence, board_us,
+                    row.get("board_timestamp_kind") or "", _tracker_gap(row),
+                ))
 
                 aligned = _optional_float(row, "board_aligned_perf_time")
                 model_id = row.get("board_clock_model_id") or None
@@ -1202,11 +1246,37 @@ def _board_time_rule(context):
                         warnings.append(f"row {line_number}: transport delay exceeds 1 s")
             except (TypeError, ValueError) as error:
                 errors.append(f"row {line_number}: {error}")
+    # device.csv is ordered by event time, and a board stamps observed and
+    # physical events before the frame that reports them is queued, so a
+    # board's rows are judged in the order the board numbered them. Loss is
+    # not read off the sequence numbers of the rows: most of a board's frames
+    # are not rows (its pressure stream, its no-op frames), so they skip
+    # numbers on a healthy board. It is the tracker's own count (_tracker_gap).
+    for entries in envelopes.values():
+        entries.sort(key=lambda entry: entry[1])
+        previous_sequence = None
+        latest_queue_us = None
+        for line_number, sequence, board_us, kind, missing in entries:
+            if previous_sequence is not None and sequence == previous_sequence:
+                errors.append(f"row {line_number}: duplicate board sequence {sequence}")
+            if missing:
+                warnings.append(f"row {line_number}: {missing} board message(s) missing")
+            previous_sequence = sequence
+            if kind == "tx_queue":
+                if latest_queue_us is not None and board_us < latest_queue_us - _QUEUE_CLOCK_TOLERANCE_US:
+                    errors.append(f"row {line_number}: board clock moved backward")
+                latest_queue_us = board_us if latest_queue_us is None else max(latest_queue_us, board_us)
     if not timestamped:
         return _result(
             "events.board_time", "not_applicable",
             "No board timing envelopes were present; host receive timing remains in use",
         )
+    session_gaps = _session_gap_totals(context)
+    # First, so the 20 details shown always include the session's own account.
+    warnings[:0] = [
+        f"board boot {boot}: the live tracker counted {missing} missing message(s) this session"
+        for boot, missing in session_gaps
+    ]
     status = "fail" if errors else ("warning" if warnings else "pass")
     details = errors or warnings
     return _result(
@@ -1214,7 +1284,8 @@ def _board_time_rule(context):
         "; ".join(details[:20]) if details else "Board clocks, sequences, and aligned events are valid",
         observed={
             "timestamped_rows": timestamped,
-            "boot_epochs": len(previous),
+            "boot_epochs": len(envelopes),
+            "session_missing_messages": sum(missing for _, missing in session_gaps),
             "clock_models": sorted(model_ids),
             "warnings": len(warnings),
             "errors": len(errors),
