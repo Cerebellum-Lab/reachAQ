@@ -179,41 +179,46 @@ def align_camera_timestamp_files(
         ),
         "utc_when",
     ]
+
+    # Each value as table.loc[frame_id][field] returns it: cast to the dtype
+    # pandas gives a whole row, so integer stamps still print as floats. A
+    # .loc per value took 41 s of Stop on a 45-minute session; these lists and
+    # the row positions below take about one.
+    def column(table, field):
+        return table[field].astype(table.iloc[0].dtype).tolist()
+
+    primary_times = column(primary, "frame_time")
+    camera_whens = [column(table, "frame_when") for table in tables]
+    # Each camera's row for each primary frame, or -1 when it has none.
+    camera_rows = [table.index.get_indexer(primary_ids).tolist() for table in tables]
+
     def write_timing(path):
         with path.open("w", newline="", encoding="utf-8") as stream:
-            writer = csv.DictWriter(stream, output_fields)
-            writer.writeheader()
-            for frame_id in primary_ids:
-                primary_row = primary.loc[frame_id]
-                primary_when = primary_row["frame_when"]
-                secondary_when = (
-                    math.nan
-                    if len(tables) < 2 or frame_id not in tables[1].index
-                    else tables[1].loc[frame_id]["frame_when"]
-                )
-                recorded_frame_time = primary_row["frame_time"]
+            writer = csv.writer(stream)
+            writer.writerow(output_fields)
+            for position, frame_id in enumerate(primary_ids):
+                whens = [
+                    math.nan if rows[position] < 0 else values[rows[position]]
+                    for values, rows in zip(camera_whens, camera_rows)
+                ]
+                primary_when = whens[0]
+                secondary_when = math.nan if len(tables) < 2 else whens[1]
+                recorded_frame_time = primary_times[position]
                 utc_when = (
                     float(recorded_frame_time)
                     if _finite(recorded_frame_time)
                     else first_frame_time + (frame_id - primary_first) * frame_duration
                 )
-                row = {
-                    "frame_id": frame_id,
-                    "frame_when": primary_when if _finite(primary_when) else "",
-                    "frame_present_primary": 1,
-                    "frame_present_secondary": 1 if _finite(secondary_when) else 0,
-                    "utc_when": utc_when,
-                }
-                for table, field_name in zip(tables, camera_fields):
-                    frame_when = (
-                        math.nan
-                        if frame_id not in table.index
-                        else table.loc[frame_id]["frame_when"]
-                    )
-                    row[f"frame_when_{field_name}"] = (
-                        frame_when if _finite(frame_when) else ""
-                    )
-                    row[f"frame_present_{field_name}"] = 1 if _finite(frame_when) else 0
+                row = [
+                    frame_id,
+                    primary_when if _finite(primary_when) else "",
+                    1,
+                    1 if _finite(secondary_when) else 0,
+                ]
+                for frame_when in whens:
+                    present = _finite(frame_when)
+                    row.extend((frame_when if present else "", 1 if present else 0))
+                row.append(utc_when)
                 writer.writerow(row)
 
     atomic_publish_file(output_path, write_timing)

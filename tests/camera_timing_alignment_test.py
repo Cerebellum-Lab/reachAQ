@@ -1,5 +1,6 @@
 import csv
 import json
+import time
 
 import pytest
 
@@ -81,6 +82,78 @@ def test_alignment_counts_each_cameras_present_frames(tmp_path):
 
     assert diagnostics["cameras"]["left"]["presentFrames"] == 4
     assert diagnostics["cameras"]["right"]["presentFrames"] == 2
+
+
+def test_the_timing_file_keeps_its_exact_text(tmp_path):
+    """frame_timing.csv byte for byte, as the row-at-a-time merge wrote it.
+
+    Integer arrival stamps print as floats. A blank the capture inserted and a
+    frame the secondary never wrote both leave empty fields, and a frame with
+    no frame_time takes its UTC time from the first frame and the frame rate.
+    """
+    primary = tmp_path / "left.txt"
+    secondary = tmp_path / "right.txt"
+    output = tmp_path / "frame_timing.csv"
+    primary.write_text(
+        "1793995561.4592035, 150, 88836625845888, 259875.39, 1760\n"
+        "1793995561.4658704, 150, nan, 259875.3966, 1761\n"
+        "nan, 150, 88836639180536, 259875.4033, 1762\n",
+        encoding="utf-8",
+    )
+    secondary.write_text(
+        "1793995561.4525366, 150, 88222181270000, 259875.3833, 1759\n"
+        "1793995561.4592035, 150, 88222187937592, 259875.39, 1760\n"
+        "1793995561.4725371, 150, 88222201272080, 259875.4033, 1762\n"
+        "1793995561.479204, 150, 88222207940000, 259875.41, 1763\n",
+        encoding="utf-8",
+    )
+
+    align_camera_timestamp_files(
+        (
+            CameraTimestampInput("left", "left", primary),
+            CameraTimestampInput("right", "right", secondary),
+        ),
+        output_path=output,
+        diagnostics_path=tmp_path / "camera_alignment.json",
+        primary_frame_id=1760,
+        primary_fps=150,
+    )
+
+    assert output.read_bytes() == (
+        b"frame_id,frame_when,frame_present_primary,frame_present_secondary,"
+        b"frame_when_left,frame_present_left,frame_when_right,frame_present_right,"
+        b"utc_when\r\n"
+        b"1760,88836625845888.0,1,1,88836625845888.0,1,88222187937592.0,1,"
+        b"1793995561.4592035\r\n"
+        b"1761,,1,0,,0,,0,1793995561.4658704\r\n"
+        b"1762,88836639180536.0,1,1,88836639180536.0,1,88222201272080.0,1,"
+        b"1793995561.4725368\r\n"
+    )
+
+
+def test_the_merge_stays_fast_on_a_long_session(tmp_path):
+    # 150,000 frames, under 17 minutes at 150 fps. Looking each value up with
+    # DataFrame.loc took 41 s of Stop on a 45-minute session on christielab10,
+    # about 11 s at this size.
+    primary = tmp_path / "left.txt"
+    secondary = tmp_path / "right.txt"
+    _write_timestamps(primary, range(150_000))
+    _write_timestamps(secondary, range(150_000))
+
+    started = time.perf_counter()
+    align_camera_timestamp_files(
+        (
+            CameraTimestampInput("left", "left", primary),
+            CameraTimestampInput("right", "right", secondary),
+        ),
+        output_path=tmp_path / "frame_timing.csv",
+        diagnostics_path=tmp_path / "camera_alignment.json",
+        primary_frame_id=0,
+        primary_fps=150,
+    )
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 5.0, f"the merge took {elapsed:.1f} s on 150,000 frames"
 
 
 @pytest.mark.parametrize(
