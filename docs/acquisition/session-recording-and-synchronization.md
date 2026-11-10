@@ -866,7 +866,9 @@ index divided by the sample rate. The chain reads every device row captured and
 the whole NI spool, including pre-roll and post-roll outside the session window:
 those rows are as good evidence as any inside it. Rows of earlier sessions are
 not: the device-row ring holds 100 000 rows and is not cleared between
-sessions.
+sessions. On a normal Stop the NI copies end about 1 s after the last frame
+(`_NIDAQ_TAIL_SECONDS`), so the post-roll the chain sees is about a second.
+If the recording's end never arrives they run on until Stop.
 
 The chain also needs a host reference for the NI recording, to tie a barcode
 frame to the timekeeper boot that played it: the session's NI-to-host fit (the
@@ -878,14 +880,17 @@ which was used, `host_time` or `host_endpoints`, and is `null` when neither was.
 With neither the chain is `unavailable`: a tick alone does not say which
 timekeeper boot reported it. Only rows the host received
 (`host_receive_perf_time`) within the recording's host span, widened by 5 s each
-side, are used, and `rowsOutsideNiSpan` counts the rest. With `host_time`,
-the session's fit runs from the spool's first stamp to the last frame, and the
-rest of the recording is the fit's end segments carried on. At the start that
-is what the spool's first copy holds from before that stamp, up to the NI
-ring's window (10 s by default). At the end it is the post-roll frames and the
-recording's last host time. The error is milliseconds at most, against the
-0.5 s pairing window and the 5 s span margin. `host_endpoints` carries nothing
-on; its error is the drift described next.
+side, are used, and `rowsOutsideNiSpan` counts the rest. Those are not only
+earlier sessions' rows. Device rows run on until Stop, so this session's rows
+received later than 5 s after the spool's end are counted too, as are rows
+from the arming period, more than 5 s before the spool's first sample. With
+`host_time`, the session's fit runs from the spool's first stamp to the last
+frame, and the rest of the recording is the fit's end segments carried on. At
+the start that is what the spool's first copy holds from before that stamp, up
+to the NI ring's window (10 s by default). At the end it is the post-roll frames
+and the recording's last host time. The error is milliseconds at most, against
+the 0.5 s pairing window and the 5 s span margin. `host_endpoints` carries
+nothing on; its error is the drift described next.
 
 The `host_endpoints` line has a slope of exactly 1. The host time the spool
 stores for a sample is the epoch's anchor plus the sample index over the nominal

@@ -78,7 +78,8 @@ _NIDAQ_DEFLATE_THREADS = 8
 # How far past the recording's last frame the NI copies run. Until stop() they
 # ran on through the finalization: 60.75 s on a 45-minute session, with the
 # copies starved and late. The fit reads stamps only up to the end, and the
-# published file holds samples only up to it.
+# published file holds samples only up to it. The board clock chain reads the
+# spool's post-roll and gets this second of it.
 _NIDAQ_TAIL_SECONDS = 1.0
 
 

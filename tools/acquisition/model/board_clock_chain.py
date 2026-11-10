@@ -168,8 +168,10 @@ PAIRING_CLUSTER_SECONDS = 0.5
 #: event only if the host received them this close together (row column 9).
 CLAP_HOST_WINDOW_SECONDS = 0.5
 #: The device-row ring holds 100 000 rows and is not cleared between sessions,
-#: so older sessions' rows are in it. A row counts only if the host received it
-#: within the NI recording's host span widened by this.
+#: so older sessions' rows are in it. So are this session's own rows from before
+#: the spool opened and after its copies ended (device rows run on until Stop).
+#: A row counts only if the host received it within the NI recording's host span
+#: widened by this.
 NI_SPAN_MARGIN_SECONDS = 5.0
 TONE_MATCH_WINDOW_SECONDS = 0.005
 #: The spec's end-to-end acceptance: |error| 95th percentile under 0.1 ms over at least 100 tones.
@@ -542,7 +544,8 @@ def board_clock_chain(
             "valid NI-to-host fit and no usable first and last NI sample host times", rejected=rejected,
         )
     host_map, pairing, span = reference
-    # Rows the host received outside the recording (earlier sessions', left in the ring) are not evidence.
+    # Rows the host received outside the recording (earlier sessions' left in the ring, this session's
+    # from before the spool or after it ended) are not evidence.
     barcode_rows, outside = _within(barcode_rows, span)
     claps, outside_claps = _within(_envelopes(device_rows, _KIND_CLAP), span)
     tones, outside_tones = _within(_envelopes(device_rows, _KIND_TONE), span)
