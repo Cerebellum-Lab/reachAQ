@@ -1,6 +1,8 @@
 import os
 import queue
+import re
 import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -297,6 +299,50 @@ def test_the_x264_encoder_keeps_mono_fillers_in_a_colour_recording(project_info)
     decoded = _decode(video)
     assert len(decoded) == len(frames)
     assert numpy.abs(decoded[0][:, :, 0].astype(int) - decoded[0][:, :, 1].astype(int)).mean() > 20
+
+
+@pytest.mark.parametrize("fps", [25, 50, 50.0])
+def test_x264_up_to_50_fps_is_encoded_with_the_arguments_it_always_had(fps):
+    assert ffmpeg_writer.x264_output_args(fps) == ffmpeg_writer.X264_OUTPUT_ARGS
+
+
+@pytest.mark.parametrize("fps, tick_rate", [(150, "300/1"), (150.0, "300/1"), (59.94, "2997/25")])
+def test_x264_above_50_fps_rate_controls_at_50_and_keeps_the_real_rate_in_the_header(fps, tick_rate):
+    assert ffmpeg_writer.x264_output_args(fps) == (
+        *ffmpeg_writer.X264_OUTPUT_ARGS,
+        "-x264-params", "force-cfr=1:fps=50",
+        "-bsf:v", f"h264_metadata=tick_rate={tick_rate}",
+    )
+
+
+def _h264_header_fps(video):
+    """The frame rate in the H.264 stream header (the SPS timing), not the container's."""
+    trace = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-i", str(video), "-c", "copy", "-bsf:v", "trace_headers", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=30,
+    ).stderr
+    units_per_tick = int(re.search(r"num_units_in_tick\s.*= (\d+)", trace).group(1))
+    time_scale = int(re.search(r"time_scale\s.*= (\d+)", trace).group(1))
+    return time_scale / (2 * units_per_tick)
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("fps", [50, 150])
+def test_an_x264_recording_states_its_real_frame_rate(tmp_path, fps):
+    video = tmp_path / f"rate{fps}.mp4"
+    writer = ffmpeg_writer.FfmpegX264Writer(str(video), fps, (64, 64), False)
+    try:
+        for frame in _gradient_frames(10):
+            writer.write(frame)
+    finally:
+        writer.release()
+
+    capture = cv2.VideoCapture(str(video))
+    try:
+        assert capture.get(cv2.CAP_PROP_FPS) == pytest.approx(fps)
+    finally:
+        capture.release()
+    assert _h264_header_fps(video) == pytest.approx(fps)
 
 
 def test_x264_without_ffmpeg_is_reported_rather_than_silent(project_info, monkeypatch):
