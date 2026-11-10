@@ -26,6 +26,12 @@ class AckReceivedHandlerT(Protocol):
         """Acknowledge of given token"""
 
 
+class CommandRefusedHandlerT(Protocol):
+
+    def __call__(self, token: str, *, perf_c: Optional[float]=None, refusal: Any=None):
+        """The board refused the command of given token: it ended, and will never be acknowledged"""
+
+
 class MessageHandler(ObservableObject):
     """
     Base class for handling messages that come from the hardware.  It has two primary purposes.
@@ -61,10 +67,11 @@ class MessageHandler(ObservableObject):
     # type hints helper:
     # dynamic event:
     ack_received: AckReceivedHandlerT
+    command_refused: CommandRefusedHandlerT
 
     def __init__(self, input_queue: Queue, name: str = "message-handler", event_names=()):
         super().__init__(
-            event_names=event_names + ("ack_received", "decoded_message_received"),
+            event_names=event_names + ("ack_received", "command_refused", "decoded_message_received"),
         )
         self._input_queue = input_queue
         self._name = name
@@ -129,6 +136,12 @@ class MessageHandler(ObservableObject):
                     self.ack_received(tok, perf_c=perf_c)
                 except Exception as err:
                     logger.exception("Error during ack_received callback: %s", err)
+            elif msg == SystemStatusMessageKind.COMMAND_REFUSED:
+                tok, perf_c, refusal = data
+                try:
+                    self.command_refused(tok, perf_c=perf_c, refusal=refusal)
+                except Exception as err:
+                    logger.exception("Error during command_refused callback: %s", err)
             elif msg == SystemStatusMessageKind.FIRMWARE_VERSION:
                 self.property_changed(MessageHandler.FIRMWARE_VERSION_PROPERTY, data, None)
             else:

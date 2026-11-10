@@ -22,6 +22,7 @@ from autotrainer.core.event import post_api_event_content
 import autotrainer.device
 from .can_device import HAVE_CAN_DEVICE
 from .can_failure import CanFailure, CanFailureKind
+from .board_refusal import CommandRefusedError
 from .device import Device
 from .device_api import DeviceApi
 from .device_interface import DeviceInterface, ServoConfig, StepperConfig
@@ -196,12 +197,16 @@ class DeviceConnection(DeviceConnectionProtocol):
     def await_acknowledge(self, tokens: Set, *, timeout: float=1, raise_on_timeout=True):
         orig_cb = self._api.message_callback
         tokens_acked = []
+        refusals = []
         def cb(kind, context):
             if kind == SystemStatusMessageKind.ACKNOWLEDGE:
                 tok, *r_args = context
                 if tok in tokens:
                     tokens_acked.append(tok)
                     tokens.remove(tok)
+            elif kind == SystemStatusMessageKind.COMMAND_REFUSED and context[0] in tokens:
+                refusals.append(context[2])
+                tokens.remove(context[0])
             elif orig_cb is not None:
                 orig_cb(kind, context)
         self._api.message_callback = cb
@@ -209,7 +214,9 @@ class DeviceConnection(DeviceConnectionProtocol):
             yield
             logger.verbose("Now waiting tokens %s", tokens)
             perf_timeout = time.perf_counter() + timeout
-            while len(tokens) > 0:
+            while len(tokens) > 0 or refusals:
+                if refusals:
+                    raise CommandRefusedError(refusals[0])
                 if time.perf_counter() > perf_timeout:
                     if raise_on_timeout:
                         raise RuntimeError(f"command timeout waiting for acknowledge tokens: {tokens}")

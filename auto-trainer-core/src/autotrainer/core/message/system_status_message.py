@@ -20,6 +20,13 @@ class SystemStatusMessageKind(IntEnum):
     which callers determine if and when specific commands are completed.
     """
 
+    COMMAND_REFUSED = 2
+    """
+    Sent instead of ACKNOWLEDGE when the board refused a command or stopped it part way: the board's ACK carried an
+    error other than 0 or -EAGAIN. Data is (context, perf_c, refusal), the refusal a
+    ``autotrainer.device.CommandRefusal``. The command ended; it will never be acknowledged.
+    """
+
     FIRMWARE_VERSION = 101
     """Message will contain the firmware version of the device as a string."""
     # TODO: This needs to be more complex than a string now that different modules are part of the same device and
