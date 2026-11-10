@@ -878,7 +878,10 @@ which was used, `host_time` or `host_endpoints`, and is `null` when neither was.
 With neither the chain is `unavailable`: a tick alone does not say which
 timekeeper boot reported it. Only rows the host received
 (`host_receive_perf_time`) within the recording's host span, widened by 5 s each
-side, are used, and `rowsOutsideNiSpan` counts the rest.
+side, are used, and `rowsOutsideNiSpan` counts the rest. The session's fit
+ends at the last frame: pre-roll lies inside it, and post-roll frames, like the
+recording's last host time, are its last segment carried on, an error of
+milliseconds at most against the 0.5 s pairing window and the 5 s span margin.
 
 The `host_endpoints` line has a slope of exactly 1. The host time the spool
 stores for a sample is the epoch's anchor plus the sample index over the nominal

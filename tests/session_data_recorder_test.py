@@ -2220,7 +2220,7 @@ def test_alignment_pairs_the_board_clock_chain_by_host_time_through_the_sessions
 
     rows, channels, _ = synthetic_rig()
     chunks = _blocked_nidaq_chunks(channels, ("barcode", "tone1"))
-    assert SessionDataRecorder._fit_nidaq_to_host(chunks).valid  # the fit _write_session will hand the chain
+    assert SessionDataRecorder._fit_nidaq_to_host(chunks, end_perf=1042.0).valid  # the fit _write_session will hand the chain
     project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=11)
 
     result = SessionDataRecorder._write_session(project, 1000.0, 2000.0, 1042.0, rows, (), (), chunks)
@@ -2229,6 +2229,38 @@ def test_alignment_pairs_the_board_clock_chain_by_host_time_through_the_sessions
     assert chain["status"] == "fitted", chain["reason"]
     assert chain["pairing"] == "host_time"
     assert chain["boards"][0]["toneCrossCheck"]["matched"] == 2
+
+
+def test_alignment_pairs_post_roll_barcode_frames_past_the_ni_fits_end_by_host_time(tmp_path):
+    from board_clock_chain_synthetic import io_to_ni, synthetic_rig
+
+    rows, channels, _ = synthetic_rig()
+    chunks = _blocked_nidaq_chunks(channels, ("barcode", "tone1"))
+    # The NI fit ends at the last stamp at or before end_perf; the chain reads the whole spool. The barcode plays
+    # once a second, at NI 13 to 41 s (host 1013 to 1041 s). 1030.5 cuts the fit at NI 30.49 s, half a second
+    # from the frames either side, so 18 frames lie inside it and 11 past it, placed by its last segment carried on.
+    end_perf = 1030.5
+    fit = SessionDataRecorder._fit_nidaq_to_host(chunks, end_perf=end_perf)
+    assert fit.valid
+    frame_ni_seconds = [io_to_ni(10.0 + tick) for tick in range(1, 30)]
+    inside = sum(seconds <= fit.x_max for seconds in frame_ni_seconds)
+    assert 0 < inside < len(frame_ni_seconds)  # frames lie on both sides of x_max
+
+    def chain_of(session, end):
+        project = ProjectInfo(
+            root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=session,
+        )
+        return SessionDataRecorder._write_session(project, 1000.0, 2000.0, end, rows, (), (), chunks)["boardClockChain"]
+
+    whole_spool = chain_of(12, 1042.0)  # every frame inside the fit, as in the test above
+    cut = chain_of(13, end_perf)
+
+    assert whole_spool["status"] == "fitted", whole_spool["reason"]
+    assert cut["status"] == "fitted", cut["reason"]
+    assert cut["pairing"] == "host_time"
+    matched = cut["timekeeper"]["barcodeFramesMatched"]
+    assert matched > inside  # more frames matched than lie inside the fit, so some past x_max did
+    assert matched == whole_spool["timekeeper"]["barcodeFramesMatched"]
 
 
 def test_board_clock_chain_is_given_the_ni_fit(monkeypatch):
