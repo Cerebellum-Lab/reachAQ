@@ -326,6 +326,13 @@ class HardwareStatusContent(ContentWidget):
         else:
             state = "connection failed"
             panel_state = "error"
+        try:
+            axes = hardware.pellet_axes_needing_home
+            refusal = hardware.last_command_refusal
+        except Exception:
+            axes, refusal = (), ""
+        if axes and panel_state == "ok":
+            panel_state = "warning"
         self._set_enabled("pellet", is_enabled, panel_state)
         rows = [("pellet", self._pellet_binding(), state)]
         rows.append(self._subsystem_status_row(SubsystemId.CAN_PELLET, "health"))
@@ -347,6 +354,11 @@ class HardwareStatusContent(ContentWidget):
             "compatibility",
             "supported" if commands_allowed else "blocked",
             str(compatibility.get("reason", "not reported")),
+        ))
+        rows.append((
+            "motors",
+            f"needs home: {', '.join(axes)}" if axes else "no axis flagged",
+            refusal or "no refusal",
         ))
         self._set_info(
             "pellet",
@@ -689,6 +701,8 @@ class HardwareStatusContent(ContentWidget):
     def _on_hardware_model_property_changed(self, property_name: str, _value, _):
         if property_name in {
             "pellet_version",
+            "pellet_needs_home",
+            "last_command_refusal",
             "device_pellet_status_timeout_engaged",
             "can_enabled",
             "pellet_controller_enabled",

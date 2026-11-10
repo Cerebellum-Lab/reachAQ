@@ -21,7 +21,7 @@ from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core.event import post_api_detector_event_content
 from autotrainer.core.message import SystemDataArgsKwargs
 from autotrainer.device import (CanTransportConfiguration, CanTransportKind, DeviceConnectionProtocol, HAVE_CAN_DEVICE,
-                                DeviceConnection, CanDevice, CanFailure, CanFailureKind,
+                                DeviceConnection, CanDevice, CanFailure, CanFailureKind, CommandRefusedError,
                                 StepperConfig, ServoConfig, Device, ColorLed, Target, EmulationInterface,
                                 capture_can_diagnostics)
 from autotrainer.device.device_interface import BOARD_STIM_LINE_OUTPUTS
@@ -31,6 +31,8 @@ from tools.acquisition.model.firmware_compatibility import FirmwareCompatibility
 logger = get_verbose_logger(__name__)
 
 _nans_offset3dTuple = Offset3DTuple.get_nan()
+
+_AXIS_NAMES = {Motor.PELLET_X_MOTOR: "X", Motor.PELLET_Y_MOTOR: "Y", Motor.PELLET_Z_MOTOR: "Z"}
 
 
 _reg_pellet_version_clean = re.compile("pellet ?:? *")
@@ -46,6 +48,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
     PENDING_COMMAND_PROPERTY = "pending_command"
     CAN_CONNECTION_STATE_PROPERTY = "can_connection_state"
+    PELLET_NEEDS_HOME_PROPERTY = "pellet_needs_home"
+    LAST_COMMAND_REFUSAL_PROPERTY = "last_command_refusal"
 
     DEVICE_ACK_TIMEOUT_ENGAGED = "device_ack_timeout_engaged"
     DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED = "device_pellet_status_timeout_engaged"
@@ -100,9 +104,14 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
         self._pending_tokens: Dict[UUID, Tuple[SystemCommandKind, float]] = {}
         self._command_outcomes: Dict[UUID, Tuple[str, str]] = {}
+        # Stepper axes the board will refuse to move until each is homed, as
+        # its refusals said; cleared by an acknowledged home.
+        self._axes_needing_home: Tuple[str, ...] = ()
+        self._last_command_refusal = ""
 
         message_handler.property_changed += self._message_handler_property_changed
         message_handler.ack_received += self._ack_received
+        message_handler.command_refused += self._command_refused
         message_handler.decoded_message_received += self._decoded_device_message
 
         self._dcs_config: Optional[DiamondTriangleOffsetConfig] = None
@@ -183,6 +192,16 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     @property
     def pending_tokens(self) -> List[str]:
         return list(self._pending_tokens)
+
+    @property
+    def pellet_axes_needing_home(self) -> Tuple[str, ...]:
+        """Pellet stepper axes ("X", "Y", "Z") a refusal said need a home."""
+        return self._axes_needing_home
+
+    @property
+    def last_command_refusal(self) -> str:
+        """The operator text of the board's last refusal, or ""."""
+        return self._last_command_refusal
 
     def _check_dcs_cfg(self, *, return_none: bool=False):
         cfg = self._dcs_config
@@ -726,6 +745,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         # non-presenting mechanical state. Motor configuration is acknowledged
         # above before homing because its limits and velocities govern HOME.
         self._home_and_detach_pellet(send_dev_ack_cmd)
+        self._set_axes_needing_home(())  # the connect home was acknowledged
 
         self._device_initialization_complete = True
 
@@ -1229,6 +1249,17 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                         _recovery=True,
                         _generation=generation,
                     )
+                except CommandRefusedError as exc:
+                    # The bus works; the board refused (an E-stop, a driver
+                    # fault). Another attempt would only be refused again.
+                    error = f"CAN recovery stopped: {exc.refusal.message}"
+                    logger.error("%s", error)
+                    self._emit_device_event(
+                        "state", "recovery_refused",
+                        data={"error": error, "generation": generation},
+                    )
+                    self._set_can_connection_state("failed", error=error, generation=generation)
+                    return
                 except Exception as exc:
                     last_error = str(exc) or exc.__class__.__name__
                     logger.exception("CAN recovery attempt %s/%s failed", attempt, len(delays))
@@ -1439,6 +1470,55 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 "Received unexpected ack token: %s", token)
         else:
             self._refresh_cmd_in_progress(commands_in_prog)
+            if popped[0] in {SystemCommandKind.SEND_HOME, SystemCommandKind.SEND_TO_LIMITS}:
+                # Both home all three axes, and only the whole sequence is acknowledged.
+                self._set_axes_needing_home(())
+
+    def _command_refused(self, token, *, perf_c: Optional[float] = None, refusal=None):
+        """The board refused the command of this token: it ended and will never be acknowledged."""
+        with self._lock:
+            popped = self._pending_tokens.pop(token, None)
+            if popped is not None:
+                self._remember_command_outcome(token, "refused", refusal.message)
+            commands_in_prog = list(self._pending_tokens.values())
+        if popped is not None:
+            self._refresh_cmd_in_progress(commands_in_prog)
+        logger.error("Pellet board refused command %s (token=%s): %s",
+                     getattr(refusal.command, "name", refusal.command), token, refusal.message)
+        if refusal.needs_home:
+            names = {_AXIS_NAMES[m] for m in refusal.needs_home}
+            self._set_axes_needing_home(tuple(sorted(names | set(self._axes_needing_home))))
+        prev, self._last_command_refusal = self._last_command_refusal, refusal.message
+        self.property_changed(self.LAST_COMMAND_REFUSAL_PROPERTY, refusal.message, prev)
+        command = refusal.command if popped is None else popped[0]
+        self._emit_device_event(
+            "state",
+            "command_refused",
+            data={
+                "command": getattr(command, "name", str(command)),
+                "step": refusal.step,
+                "error": refusal.error,
+                "error_name": refusal.error_name,
+                "resent": refusal.resent,
+                "needs_home": list(self._axes_needing_home),
+                "message": refusal.message,
+            },
+            context=None if token is None else str(token),
+        )
+        # A refusal is not a CAN fault: COMMAND and OPERATION_UNKNOWN start no recovery.
+        self.command_failed(CanFailure(
+            CanFailureKind.OPERATION_UNKNOWN if refusal.outcome_unknown else CanFailureKind.COMMAND,
+            refusal.message,
+            command=command,
+            context=None if token is None else str(token),
+            category="board_refusal",
+            error_code=int(refusal.error),
+        ))
+
+    def _set_axes_needing_home(self, axes: Tuple[str, ...]) -> None:
+        prev, self._axes_needing_home = self._axes_needing_home, tuple(axes)
+        if prev != self._axes_needing_home:
+            self.property_changed(self.PELLET_NEEDS_HOME_PROPERTY, self._axes_needing_home, prev)
 
     def wait_pending_command_acked(
         self,
