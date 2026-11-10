@@ -82,6 +82,10 @@ def monitor_message_queue(msg_queue):
         if kind == SystemStatusMessageKind.ACKNOWLEDGE:
             get_input = True
 
+        elif kind == SystemStatusMessageKind.COMMAND_REFUSED:
+            print(f"REFUSED: {data[2].message}")
+            get_input = True
+
         elif kind == SystemStatusMessageKind.FIRMWARE_VERSION:
             print(data)
             get_input = True

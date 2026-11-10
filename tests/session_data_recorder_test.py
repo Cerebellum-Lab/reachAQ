@@ -242,6 +242,37 @@ def test_structured_device_ledger_captures_decoded_input_and_output():
         recorder.close()
 
 
+def test_a_refused_command_row_carries_its_token_and_the_boards_code():
+    from autotrainer.core import Motor
+    from autotrainer.device import CommandRefusal, RefusedCommandClass
+
+    handler = _EventSource("decoded_message_received")
+    laser = _EventSource("trace_received")
+    recorder = SessionDataRecorder(object(), laser, system_message_handler=handler)
+    recorder._armed = True
+    refusal = CommandRefusal(
+        token="token-1", error=-16, command=SystemCommandKind.SEND_PELLET,
+        step="{'predefined': 'send'}", command_class=RefusedCommandClass.FIXED_XYZ,
+        motors=(Motor.PELLET_X_MOTOR, Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR),
+    )
+    try:
+        handler.decoded_message_received(
+            SystemStatusMessageKind.COMMAND_REFUSED,
+            ("token-1", 10.15, refusal),
+            10.2,
+            100.2,
+        )
+
+        (row,) = tuple(recorder._device_rows)
+        assert row[2:6] == ("inbound", "COMMAND_REFUSED", "", "token-1")
+        payload = json.loads(row[8])
+        assert payload[0] == "token-1"
+        assert payload[2]["error"] == -16
+        assert payload[2]["command"] == int(SystemCommandKind.SEND_PELLET)  # IntEnum: by value
+    finally:
+        recorder.close()
+
+
 def test_device_events_are_buffered_before_record_is_armed():
     handler = _EventSource("decoded_message_received")
     laser = _EventSource("trace_received")
