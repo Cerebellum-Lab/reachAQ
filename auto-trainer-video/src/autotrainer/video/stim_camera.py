@@ -120,6 +120,18 @@ class StimCameraDetector:
         self._observed_below = False
         self._triggered = False
 
+    # VideoCapture builds the detector in the parent, and spawn pickles it into
+    # the capture process. A lock cannot be pickled, so stimCam never started in
+    # stimulation mode; each process gets a lock of its own instead.
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state["_lock"]
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
+
     @property
     def arm_context(self):
         with self._lock:
