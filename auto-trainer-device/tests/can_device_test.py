@@ -202,10 +202,35 @@ def test_send_sequence_can_prepend_board_timed_pre_reveal_stimulus():
     sequence = device._start_sequence.call_args.args[0]
     assert sequence.steps[:3] == [
         {"stim3": 1000},
-        {"delay": 0.199},
+        {"delay": 0.2},
         {"predefined": "release"},
     ]
     assert device._send_pellet.steps == original
+
+
+@pytest.mark.parametrize("pulse_us", [1_000, 20_000, 100_000])
+def test_the_pre_reveal_wait_is_the_whole_interval_whatever_the_pulse_width(pulse_us):
+    # The board acks GPIO_PULSE at assert (rig, Pellet 2.3.0: ASSERTED, ack,
+    # COMPLETED in 104 of 104 pulses), so the delay step already starts at
+    # the rising edge. Taking the pulse off it revealed the pellet early by
+    # the pulse width.
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+    device._start_sequence = mock.Mock(return_value=True)
+
+    assert device._start_send_pellet_sequence({
+        "pre_reveal_stimulus": (500, pulse_us, 2),
+    })
+
+    sequence = device._start_sequence.call_args.args[0]
+    assert sequence.steps[:3] == [
+        {"stim2": pulse_us},
+        {"delay": 0.5},
+        {"predefined": "release"},
+    ]
 
 
 def test_send_sequence_rejects_pulse_longer_than_pre_reveal_interval():
@@ -361,6 +386,26 @@ def test_compound_tone_reports_the_executed_play_tone_command():
     assert target is Target.PELLET_DEVICE
     assert perf_time > 0
     assert wall_time > 0
+
+
+# The embedded tone's step carries seconds built from whole milliseconds, and
+# "1.001" * 1000 is 1000.999..., which truncation played as 1000.
+@pytest.mark.parametrize("duration_ms", [1001, 2002, 32763])
+def test_an_embedded_tone_plays_the_milliseconds_it_was_given(duration_ms):
+    device = CanDevice(
+        api=DeviceApi(message_callback=data_callback),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+    device._start_sequence = mock.Mock(return_value=True)
+    device.device_interface.emit_tone = mock.Mock(return_value=True)
+    assert device._start_send_pellet_sequence({"embedded_tone": (6000, duration_ms)})
+    step = device._start_sequence.call_args.args[0].steps[-1]
+    board = device._boards_pending_ctx[Target.PELLET_DEVICE]
+
+    assert device._perform_next_compound_step(board, [step])
+
+    device.device_interface.emit_tone.assert_called_once_with(6000, duration_ms)
 
 
 # The recorder callback costs milliseconds (the hardware model, the session
@@ -1306,7 +1351,7 @@ def test_a_lost_pulse_ack_does_not_resend_the_pre_reveal_pulse(
     assert len(pulses) == 1, "the lost ack must not re-send the pulse"
     assert pulses[0][:2] == (DigitalOutputs.STIMULUS_3, 1000)
     assert len(releases) == 1
-    # Reveal held by the 0.25 s stim timeout plus the 0.199 s delay (~0.5 s),
+    # Reveal held by the 0.25 s stim timeout plus the 0.2 s delay (~0.5 s),
     # never by the 1.0 s default: before the fix this is >= 1.2 s.
     assert releases[0] - pulses[0][2] < device.default_command_ack_timeout_duration
     assert engaged == [True, False]

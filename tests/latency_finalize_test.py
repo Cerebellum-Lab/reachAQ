@@ -2,6 +2,7 @@ import dataclasses
 import gc
 import hashlib
 import json
+import os
 import time
 import weakref
 from pathlib import Path
@@ -978,6 +979,45 @@ def test_the_raw_column_is_not_kept_alive_through_the_channel_scans(tmp_path, mo
     assert ni["transitions"].tolist() == [1002, 1004, 1006, 1008]
     assert np.isfinite(ni["block_stamps"].raw).all()  # the RAW stamps were read and kept
     assert alive_during_scan == [False]
+
+
+@pytest.mark.parametrize(("shape", "options", "row"), (
+    ((10_000,), {"chunks": (1_024,), "compression": "gzip"}, None),  # a column, an edge chunk
+    ((3, 10_000), {"chunks": (1, 1_024), "compression": "gzip"}, 2),  # nidaq.h5's channel rows
+    ((3, 10_000), {"chunks": (2, 1_024), "compression": "gzip"}, 1),  # a row inside a chunk
+    ((10_000,), {"chunks": (1_024,), "compression": "gzip", "shuffle": True}, None),
+    ((10_000,), {}, None),                                            # contiguous, no filter
+))
+def test_inflated_reads_return_what_h5py_reads(tmp_path, shape, options, row):
+    data = np.random.default_rng(4).normal(size=shape)
+    with h5py.File(tmp_path / "data.h5", "w") as handle:
+        handle.create_dataset("data", data=data, **options)
+
+    with h5py.File(tmp_path / "data.h5", "r") as handle:
+        read = finalize._read_inflated(handle["data"], row)
+        expected = handle["data"][()] if row is None else handle["data"][row, :]
+
+    assert read.dtype == expected.dtype
+    assert np.array_equal(read, expected)
+
+
+@pytest.mark.skipif((os.cpu_count() or 1) < 4, reason="a parallel inflate needs the cores to show")
+def test_inflated_reads_inflate_in_parallel(tmp_path):
+    # The latency finalizer reads two stamp columns and five channels of nidaq.h5 inside
+    # Stop: 1.6 s on a 45-minute session on christielab10, one chunk at a time in h5py.
+    data = np.random.default_rng(6).normal(0, 0.01, 4_000_000)
+    with h5py.File(tmp_path / "nidaq.h5", "w") as handle:
+        handle.create_dataset("column", data=data, compression="gzip")
+
+    with h5py.File(tmp_path / "nidaq.h5", "r") as handle:
+        started = time.perf_counter()
+        handle["column"][()]
+        plain = time.perf_counter() - started
+        started = time.perf_counter()
+        finalize._read_inflated(handle["column"])
+        threaded = time.perf_counter() - started
+
+    assert threaded < 0.7 * plain, f"{threaded:.2f} s against {plain:.2f} s for h5py's read"
 
 
 def test_a_raw_stamped_session_bridges_ni_to_host_through_raw(tmp_path):

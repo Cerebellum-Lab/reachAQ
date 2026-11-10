@@ -7,7 +7,9 @@ import logging
 import math
 import threading
 import time
+import zlib
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,6 +23,7 @@ import h5py
 import numpy as np
 
 from autotrainer.core import ProjectInfo
+from tools.acquisition.model import board_clock_chain
 from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.latency_event_log import LatencyEventLog
 from tools.latency import clocks, finalize_session_latency
@@ -66,6 +69,18 @@ _PRESSURE_FIELDS = (
     ("board_sequence", np.int64),
     ("board_time_us", np.int64),
 )
+
+# Threads that deflate nidaq.h5's chunks. Deflated one chunk at a time inside
+# h5py, a 45-minute session's 27M samples took 17 s of Stop on christielab10;
+# on eight threads it took under 3 s.
+_NIDAQ_DEFLATE_THREADS = 8
+
+# How far past the recording's last frame the NI copies run. Until stop() they
+# ran on through the finalization: 60.75 s on a 45-minute session, with the
+# copies starved and late. The fit reads stamps only up to the end, and the
+# published file holds samples only up to it. The board clock chain reads the
+# spool's post-roll and gets this second of it.
+_NIDAQ_TAIL_SECONDS = 1.0
 
 
 class _PressureRing:
@@ -258,6 +273,9 @@ class SessionDataRecorder:
         self._device_event_capacity = int(device_event_capacity)
         self._device_event_overruns = 0
         self._device_events_since_start = 0
+        # Per board boot: [first, latest] gap_total the live sequence tracker
+        # reported since the session started (see _note_board_gap_total).
+        self._board_gap_marks = {}
         self._pressure = _PressureRing(pressure_sample_capacity)
         self._pressure_samples_since_start = 0
         self._laser_rows = []
@@ -275,6 +293,8 @@ class SessionDataRecorder:
         self._nidaq_stats = self._new_nidaq_stats()
         self._nidaq_stop = threading.Event()
         self._nidaq_thread: Optional[threading.Thread] = None
+        # The perf time the NI copies may stop at, once the recording has ended.
+        self._nidaq_copy_until: Optional[float] = None
         self._source_manifest = ()
         self._source_results = {}
         self._trial_records = ()
@@ -368,6 +388,7 @@ class SessionDataRecorder:
                 or f"{project.short_id}-g{getattr(project, 'session_generation', 0)}"
             )
             self._nidaq_stop.clear()
+            self._nidaq_copy_until = None
             self._camera_exposure_seconds = dict(camera_exposure_seconds or {})
         thread = threading.Thread(
             target=self._poll_nidaq,
@@ -435,6 +456,7 @@ class SessionDataRecorder:
             # count from here rather than from the ring's own total.
             self._pressure_samples_since_start = 0
             self._pressure.clear()
+            self._board_gap_marks = {}
 
     @contextmanager
     def _locked_then_log(self):
@@ -496,6 +518,7 @@ class SessionDataRecorder:
                 0,
                 self._device_events_since_start - self._device_event_capacity,
             )
+            board_sequence_gaps = self._board_sequence_gap_records()
             pressure_columns = self._pressure.snapshot()
             pressure_overruns = max(
                 0,
@@ -538,6 +561,7 @@ class SessionDataRecorder:
                 "nidaq_chunks": nidaq_chunks,
                 "timing_plan": timing_plan,
                 "device_event_overruns": device_event_overruns,
+                "board_sequence_gaps": board_sequence_gaps,
                 "source_manifest": source_manifest,
                 "source_results": source_results,
                 "boundary": boundary,
@@ -1030,6 +1054,7 @@ class SessionDataRecorder:
         self._start_wall = None
         self._boundary = None
         self._device_events_since_start = 0
+        self._board_gap_marks = {}
         self._pressure_samples_since_start = 0
         self._laser_rows = []
         self._log_rows = []
@@ -1046,6 +1071,7 @@ class SessionDataRecorder:
         self._trial_summary = {}
         self._metadata_generation_id = None
         self._pending_stop_end_perf = None
+        self._nidaq_copy_until = None
         self._camera_exposure_seconds = {}
 
     def _drain_event_queue(self) -> tuple:
@@ -1249,6 +1275,9 @@ class SessionDataRecorder:
         if not math.isfinite(event_perf):
             event_perf = float(perf_time)
         sequence_status = getattr(data, "board_sequence_status", None)
+        self._note_board_gap_total(
+            getattr(data, "board_boot_id", None), sequence_status,
+        )
         if kind_name == "PRESSURE_READING":
             # Pressure is ~166 Hz across the two sensors and made up 98% of
             # every device row a session wrote, which overran the shared
@@ -1291,6 +1320,41 @@ class SessionDataRecorder:
                 getattr(data, "timestamp_method", "host_receive_perf_time"),
                 getattr(data, "timing_confidence", "host_timestamp"),
             ))
+
+    def _note_board_gap_total(self, boot_id, status) -> None:
+        """Remember how many messages the live tracker found a board boot missing.
+
+        The tracker sees every frame a board sends with a timing trailer. A loss
+        shows up on whichever frame arrives next, and not every frame is a
+        device.csv row: pressure readings go to their own stream and the
+        no-op frames are never recorded, so the rows alone cannot total the
+        loss. Each frame's status carries the tracker's running total for the
+        boot (gap_total), so this keeps the first and the latest total seen
+        since the session started; their difference is the loss counted during
+        the session, and it does not depend on which frames were recorded. A
+        loss shown on the first frame of a boot is not counted, since it may
+        have happened before the session.
+        """
+        if boot_id is None or not isinstance(status, dict):
+            return
+        total = status.get("gap_total")
+        if not isinstance(total, int) or isinstance(total, bool):
+            return
+        with self._lock:
+            marks = self._board_gap_marks.get(boot_id)
+            if marks is None:
+                self._board_gap_marks[boot_id] = [total, total]
+            elif total > marks[1]:
+                marks[1] = total
+
+    def _board_sequence_gap_records(self) -> list:
+        """alignment.json's boardSequenceGaps: [{bootId, missing}], one per boot seen.
+
+        The caller holds self._lock."""
+        return [
+            {"bootId": int(boot_id), "missing": int(latest - first)}
+            for boot_id, (first, latest) in sorted(self._board_gap_marks.items())
+        ]
 
     @classmethod
     def _payload_json(cls, value) -> str:
@@ -1397,9 +1461,27 @@ class SessionDataRecorder:
     def _value_at(values, index):
         return values[index] if index < len(values) else math.nan
 
+    def end_nidaq_capture_after(self, end_perf: float) -> None:
+        """Let the NI copies end once the spool holds samples
+        _NIDAQ_TAIL_SECONDS past end_perf, the recording's last frame, rather
+        than at stop(). stop() still joins the thread and closes the spool."""
+        with self._lock:
+            self._nidaq_copy_until = float(end_perf) + _NIDAQ_TAIL_SECONDS
+
+    def _nidaq_copies_done(self) -> bool:
+        with self._lock:
+            last = self._nidaq_stats["last_perf_time"]
+            return (
+                self._nidaq_copy_until is not None
+                and last is not None
+                and last >= self._nidaq_copy_until
+            )
+
     def _poll_nidaq(self) -> None:
         while not self._nidaq_stop.wait(0.01):
             self._copy_nidaq_once()
+            if self._nidaq_copies_done():
+                return
         self._copy_nidaq_once()
 
     def _copy_nidaq_once(self) -> None:
@@ -1693,6 +1775,7 @@ class SessionDataRecorder:
         pressure_overruns=0,
         structured_event_overruns=0,
         device_event_overruns=0,
+        board_sequence_gaps=(),
         source_manifest=(),
         source_results=None,
         boundary: Optional[SessionBoundary] = None,
@@ -1712,8 +1795,14 @@ class SessionDataRecorder:
             metadata_generation_id or f"{project.short_id}-legacy"
         )
 
+        # The board clock chain is a fit, and pre-roll and post-roll rows are as
+        # good as any, so it reads the rows from before the window trim. They are
+        # not normalized here: a row of an unsupported shape outside the window
+        # has always been dropped by the trim, and must not start failing
+        # finalization now. The chain normalizes them inside its own guard.
+        untrimmed_device_rows = tuple(device_rows)
         device_rows = tuple(
-            row for row in device_rows if start_perf <= row[0] <= end_perf
+            row for row in untrimmed_device_rows if start_perf <= row[0] <= end_perf
         )
         event_rows = tuple(
             row for row in event_rows if start_perf <= row[0] <= end_perf
@@ -1751,6 +1840,9 @@ class SessionDataRecorder:
         # with its reason, rather than raised when the spool cannot support one;
         # the anchor and every timeline below then use the epoch mapping as before.
         ni_fit = SessionDataRecorder._fit_nidaq_to_host(nidaq_chunks, end_perf=end_perf)
+        board_clock_chain_record = SessionDataRecorder._board_clock_chain(
+            untrimmed_device_rows, nidaq_chunks, ni_fit=ni_fit,
+        )
         primary_exposure = (
             None
             if boundary is None or not camera_exposure_seconds
@@ -2354,11 +2446,13 @@ class SessionDataRecorder:
             "deviceEventOverruns": int(device_event_overruns),
             "structuredEventOverruns": int(structured_event_overruns),
             "retentionLimited": retention,
+            "boardSequenceGaps": [dict(item) for item in board_sequence_gaps],
             "sessionComplete": not incomplete_reasons,
             "incompleteReasons": incomplete_reasons,
             "enabledSources": finalized_sources,
             "cameraNidaqAlignment": camera_nidaq_alignment,
             "toneConfirmation": tone_confirmation,
+            "boardClockChain": board_clock_chain_record,
             "eventAlignmentContract": {
                 "scope": (
                     "all discrete structured API/application, device, laser, "
@@ -2429,6 +2523,7 @@ class SessionDataRecorder:
             "metadataGenerationId": metadata_generation_id,
             "cameraNidaqAlignment": camera_nidaq_alignment,
             "toneConfirmation": tone_confirmation,
+            "boardClockChain": board_clock_chain_record,
             "deviceEventOverruns": int(device_event_overruns),
             "structuredEventOverruns": int(structured_event_overruns),
             "retentionLimited": retention,
@@ -2855,21 +2950,22 @@ class SessionDataRecorder:
                 indices = source["sample_index"][:]
                 perf = source["perf_time"][:]
                 if rows:
-                    # h5py only accepts a strictly increasing fancy index, and
-                    # these rows are in the order the caller asked for, not the
+                    # These rows are in the order the caller asked for, not the
                     # order the channels were stored in. Those differ on a real
                     # rig - tone1 is stored after cam_frames but requested
-                    # before it - so reading them directly raised
-                    # "Indexing elements must be in increasing order" and took
-                    # the whole session finalization down with it, leaving the
-                    # recording without its metadata.
+                    # before it - and once a strictly increasing fancy index
+                    # raised on them and took the whole session finalization
+                    # down with it. A fancy index across the (channels, 65536)
+                    # chunks was also slow: 2.5 s of Stop for three channels
+                    # of a 45-minute session.
                     #
-                    # So read ascending, then put the rows back in the
-                    # requested order. np.unique also collapses a repeated
-                    # channel, which the index would reject for the same
-                    # reason, and its inverse restores the repeat.
+                    # So read each distinct channel once, as a row of its own,
+                    # then put the rows back in the requested order. np.unique
+                    # collapses a repeated channel and its inverse restores it.
                     ascending, restore = np.unique(rows, return_inverse=True)
-                    values = source["values"][ascending.tolist(), :][restore]
+                    values = np.stack([
+                        source["values"][row, :] for row in ascending.tolist()
+                    ])[restore]
                 else:
                     values = np.empty((0, len(indices)), dtype=np.float32)
             return selected_names, indices, perf, values, chunks.sample_rate_hz
@@ -2953,6 +3049,70 @@ class SessionDataRecorder:
                 "NI-to-host fit failed; the alignment falls back to the epoch timeline",
             )
             return clocks.invalid_piecewise_fit(f"{type(error).__name__}: {error}")
+
+    @staticmethod
+    def _ni_host_endpoints(indices, perf, rate):
+        """((NI seconds, host perf seconds) of the first NI sample with a finite stamp, and of the last), or None.
+
+        The host reference the board clock chain falls back on when the session has
+        no NI-to-host fit. Four floats: the per-sample stamps are not kept.
+        """
+        try:
+            finite = np.isfinite(np.asarray(perf, dtype=np.float64))
+            if not finite.size or not rate:
+                return None
+            first = int(np.argmax(finite))
+            last = int(finite.size - 1 - np.argmax(finite[::-1]))
+            if not finite[first]:
+                return None
+            return tuple(
+                (float(indices[position]) / float(rate), float(perf[position])) for position in (first, last)
+            )
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _board_clock_chain(device_rows, nidaq_chunks, ni_fit=None):
+        """Pellet-to-NI clock chain, or why there is none; never raised.
+
+        Read from the whole spool and the untrimmed rows: the chain is a fit,
+        and pre-roll and post-roll claps and barcodes are as good as any.
+        ni_fit, the session's NI-to-host map, tells the chain which host time
+        each barcode frame was played at, and so which timekeeper boot its
+        tick belongs to. When it is not valid, the host times of the first and
+        last NI samples stand in. The per-sample host stamps are never passed.
+        """
+        try:
+            rows = tuple(
+                SessionDataRecorder._normalize_device_row(row) for row in device_rows
+            )
+            if board_clock_chain.has_barcode_reports(rows):
+                names, indices, perf, values, rate = SessionDataRecorder._nidaq_arrays(
+                    nidaq_chunks, requested_names=board_clock_chain.NIDAQ_CHANNELS,
+                )
+                ni_host_endpoints = SessionDataRecorder._ni_host_endpoints(indices, perf, rate)
+                # The chain needs only those two points; 8 bytes a sample, 288 MB an
+                # hour at 10 kHz, is not held while it decodes the barcode.
+                del perf
+                channels = {name: values[row] for row, name in enumerate(names)}
+            else:
+                # No timekeeper was on the bus, as in most sessions: there is
+                # nothing to decode, so the spool is not read for it.
+                indices, rate, channels, ni_host_endpoints = (), None, {}, None
+            record = board_clock_chain.board_clock_chain(
+                rows, sample_indices=indices, sample_rate_hz=rate, channels=channels,
+                ni_to_host=ni_fit, ni_host_endpoints=ni_host_endpoints,
+            )
+            # alignment.json is written with allow_nan=False and sort_keys=True, so
+            # a NaN, a numpy scalar or keys that cannot be sorted in the record
+            # would fail the write, not just this section.
+            json.dumps(record, allow_nan=False, sort_keys=True)
+            return record
+        except Exception as error:  # finalization must never fail on this evidence
+            logging.getLogger(__name__).exception("Board clock chain failed")
+            return board_clock_chain.unavailable(
+                f"board clock chain failed: {type(error).__name__}: {error}",
+            )
 
     @staticmethod
     def _read_primary_latency_stream(project, boundary):
@@ -4664,7 +4824,8 @@ class SessionDataRecorder:
         snapshot: _NidaqSpoolSnapshot,
         timing_plan=None,
     ) -> None:
-        with h5py.File(snapshot.path, "r") as source, h5py.File(path, "w") as output:
+        with h5py.File(snapshot.path, "r") as source, h5py.File(path, "w") as output, \
+                ThreadPoolExecutor(_NIDAQ_DEFLATE_THREADS, thread_name_prefix="NidaqDeflate") as pool:
             perf_source = source["perf_time"]
             count = int(perf_source.shape[0])
             if count:
@@ -4726,22 +4887,26 @@ class SessionDataRecorder:
                     if selected_count:
                         output_dataset[...] = np.nan
                     continue
-                for relative in range(0, selected_count, 65536):
-                    amount = min(65536, selected_count - relative)
-                    output_dataset[relative:relative + amount] = source_dataset[
-                        first + relative:first + relative + amount
-                    ]
+                if selected_count:
+                    SessionDataRecorder._write_deflated(
+                        output_dataset,
+                        lambda start, stop, column=source_dataset: (
+                            column[first + start:first + stop]
+                        ),
+                        pool,
+                    )
             values = output.create_dataset(
                 "values",
                 shape=(len(snapshot.channel_names), selected_count),
                 dtype=np.float32,
                 compression="gzip" if selected_count else None,
             )
-            for relative in range(0, selected_count, 65536):
-                amount = min(65536, selected_count - relative)
-                values[:, relative:relative + amount] = source["values"][
-                    :, first + relative:first + relative + amount
-                ]
+            if selected_count:
+                SessionDataRecorder._write_deflated(
+                    values,
+                    lambda start, stop: source["values"][:, first + start:first + stop],
+                    pool,
+                )
             perf_dataset = output["perf_time"]
             offsets = output.create_dataset(
                 "offset_seconds",
@@ -4755,12 +4920,20 @@ class SessionDataRecorder:
                 dtype=np.float64,
                 compression="gzip" if selected_count else None,
             )
-            for relative in range(0, selected_count, 65536):
-                amount = min(65536, selected_count - relative)
-                selected_perf = perf_dataset[relative:relative + amount]
-                offsets[relative:relative + amount] = selected_perf - start_perf
-                wall[relative:relative + amount] = (
-                    start_wall + selected_perf - start_perf
+            if selected_count:
+                # From the spool's perf_time, the slice perf_dataset holds, so
+                # nothing inflates the just-written column back.
+                SessionDataRecorder._write_deflated(
+                    offsets,
+                    lambda start, stop: perf_source[first + start:first + stop] - start_perf,
+                    pool,
+                )
+                SessionDataRecorder._write_deflated(
+                    wall,
+                    lambda start, stop: (
+                        start_wall + perf_source[first + start:first + stop] - start_perf
+                    ),
+                    pool,
                 )
             if selected_count:
                 first_perf = float(perf_dataset[0])
@@ -4771,3 +4944,40 @@ class SessionDataRecorder:
                 output.attrs["last_offset_seconds"] = last_perf - start_perf
                 output.attrs["sample_rate_hz"] = snapshot.sample_rate_hz
                 output.attrs["epoch"] = int(output["epoch"][-1])
+
+    @staticmethod
+    def _write_deflated(dataset, read, pool, *, chunks_per_read=64):
+        """Fill a gzip dataset with read(start, stop), its values from start to
+        stop along the last axis, in the dataset's own chunks and at its own
+        gzip level: the file HDF5's filter would write, deflated on pool."""
+        level = int(dataset.compression_opts)
+        chunk = dataset.chunks
+        length = chunk[-1]
+        total = dataset.shape[-1]
+        pending = deque()
+
+        def write(limit):
+            while len(pending) > limit:
+                offset, deflated = pending.popleft()
+                dataset.id.write_direct_chunk(offset, deflated.result())
+
+        for start in range(0, total, length * chunks_per_read):
+            block = read(start, min(total, start + length * chunks_per_read))
+            rows = range(0, block.shape[0], chunk[0]) if block.ndim == 2 else (None,)
+            for column in range(0, block.shape[-1], length):
+                for row in rows:
+                    piece = (
+                        block[column:column + length] if row is None
+                        else block[row:row + chunk[0], column:column + length]
+                    )
+                    if piece.shape != chunk:
+                        # An edge chunk is stored whole; nothing reads past the shape.
+                        whole = np.zeros(chunk, dtype=dataset.dtype)
+                        whole[tuple(slice(0, size) for size in piece.shape)] = piece
+                        piece = whole
+                    offset = (start + column,) if row is None else (row, start + column)
+                    pending.append((offset, pool.submit(
+                        zlib.compress, np.ascontiguousarray(piece, dtype=dataset.dtype), level,
+                    )))
+            write(4 * _NIDAQ_DEFLATE_THREADS)
+        write(0)

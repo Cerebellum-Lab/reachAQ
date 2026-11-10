@@ -137,3 +137,13 @@ def test_a_board_that_cannot_answer_is_not_treated_as_a_failure():
     ):
         HardwareModel._request_board_capabilities(model, interface)
         assert model._board_capabilities == 0
+
+
+def test_policy_names_the_sync_role_capabilities():
+    result = FirmwareCompatibilityPolicy.load().evaluate(
+        "Pellet: 2.1.0", wire_schema_version=1, capabilities=0b110011,
+    )
+
+    assert result.reported_capabilities == (
+        "timing_trailer", "time_sync", "sync_listener", "timekeeper",
+    )

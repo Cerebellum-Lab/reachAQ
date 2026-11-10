@@ -1402,6 +1402,30 @@ def test_abort_during_analysis_cancels_analysis_and_removes_session(
     assert app_model.session_recording_status is SessionRecordingStatus.READY
 
 
+def test_the_recording_end_bounds_the_nidaq_copies(app_model):
+    _, token = app_model._recording_session.begin_record(
+        app_model.project.short_id, {},
+    )
+    app_model._recording_session.transition(
+        SessionRecordingStatus.STOPPING,
+        expected=(SessionRecordingStatus.ARMING,),
+        token=token,
+    )
+    camera = app_model._identify_session_reference_cam_idx()
+
+    with mock.patch.object(
+        app_model._session_data_recorder, "end_nidaq_capture_after",
+    ) as end, mock.patch.object(app_model.behavior.algorithm, "set_capture_status"):
+        app_model._handle_proc_msg(
+            (SystemStatusMessageKind.CAMERA_STATUS_CHANGE,
+             (camera, CaptureProcessStatus.RUNNING, 12.5, 999, token.generation)),
+            cams_closed_finished={},
+        )
+
+    assert app_model._recording_session.pending_end_perf == 12.5
+    end.assert_called_once_with(12.5)
+
+
 def test_stop_finishes_auxiliary_data_after_raw_writers_close(app_model):
     _, token = app_model._recording_session.begin_record(
         app_model.project.short_id, {},

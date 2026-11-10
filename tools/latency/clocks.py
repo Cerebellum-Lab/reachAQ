@@ -1,13 +1,14 @@
 """Clock mappings for the latency record and the session's frame alignment.
 
-A mapping is a straight line, y = offset + drift * x, or for NI to host a
-continuous piecewise-linear table (PiecewiseClockFit) with a knot every
-KNOT_SECONDS: time.perf_counter() is CLOCK_MONOTONIC, which systemd-timesyncd
-slews at every poll, and one line per session leaves millisecond errors after
-an hour. Each fit carries its own quality numbers and a validity verdict, so a
-figure derived through it can say how far to trust it, and an invalid mapping
-lowers the confidence of what depends on it instead of quietly producing a
-number.
+A mapping is a straight line, y = offset + drift * x, or a continuous
+piecewise-linear table (PiecewiseClockFit) with a knot every KNOT_SECONDS:
+for NI to host, and for each link of the board clock chain
+(fit_piecewise_line). time.perf_counter() is CLOCK_MONOTONIC, which
+systemd-timesyncd slews at every poll, and one line per session leaves
+millisecond errors after an hour. Each fit carries its own quality numbers
+and a validity verdict, so a figure derived through it can say how far to
+trust it, and an invalid mapping lowers the confidence of what depends on it
+instead of quietly producing a number.
 """
 
 from __future__ import annotations
@@ -45,6 +46,8 @@ RECORD_KNOT_SECONDS = 10.0
 PIECEWISE_ENVELOPE = "piecewise_envelope"
 RAW_BRIDGED = "raw_bridged"
 STRAIGHT_LINE = "straight_line"
+# fit_piecewise_line: a link between two clocks fitted over any x, not only NI to host.
+PIECEWISE_LINE = "piecewise_line"
 # A bridge knot's perf-minus-RAW offset is the median over the stamp pairs
 # this close to it (200 pairs at the 10 ms copy cadence), so one pair whose
 # reader was preempted between its two clock reads cannot move a knot. A knot
@@ -180,18 +183,25 @@ def rising_edges(values, *, min_swing: float) -> EdgeResult:
     unusable rather than producing edges from noise.
     """
     values = numpy.asarray(values, dtype=numpy.float64)
-    finite = values[numpy.isfinite(values)]
+    # A channel is 27M samples on a 45-minute session, so at most one copy of
+    # it is held at a time: the finite samples are the channel itself unless
+    # it has a gap, and the deviations are made absolute and ranked in place.
+    is_finite = numpy.isfinite(values)
+    finite = values if is_finite.all() else values[is_finite]
     empty = numpy.empty(0, dtype=numpy.int64)
     if finite.size < 2:
         return EdgeResult(empty, math.nan, False, "no samples")
     baseline = float(numpy.median(finite))
-    noise = 1.4826 * float(numpy.median(numpy.abs(finite - baseline)))
+    deviation = finite - baseline
+    numpy.abs(deviation, out=deviation)
+    noise = 1.4826 * float(numpy.median(deviation, overwrite_input=True))
+    del deviation
     swing = float(finite.max()) - baseline
     if swing < max(float(min_swing), 10.0 * noise):
         return EdgeResult(empty, math.nan, False,
                           f"swing {swing:.4f} against noise {noise:.4f} (min {min_swing})")
     threshold = baseline + swing / 2
-    above = numpy.isfinite(values) & (values >= threshold)
+    above = is_finite & (values >= threshold)
     positions = numpy.flatnonzero(above[1:] & ~above[:-1]) + 1
     return EdgeResult(positions.astype(numpy.int64), threshold, True)
 
@@ -579,6 +589,103 @@ def fit_piecewise_envelope(end_index, seen_perf, sample_rate: float, *,
     return PiecewiseClockFit(
         knots=knots, knot_host=knot_host, residual_rms=rms, points=int(x.size),
         valid=bool(valid), reason=reason,
+    )
+
+
+def _hat_normal_equations(x, y, knots, chunk_rows: int = 20_000):
+    """The normal equations of a least-squares fit in the hat basis, a block of points at a time.
+
+    x is sorted, so a block of it touches only a few neighbouring knots, and
+    _hat_design is built over just those. One dense (points x knots) matrix for
+    the barcode edges of a long session would be hundreds of megabytes to
+    gigabytes, almost all of it zeros.
+    """
+    size = knots.size
+    normal = numpy.zeros((size, size))
+    rhs = numpy.zeros(size)
+    for start in range(0, x.size, chunk_rows):
+        xs, ys = x[start:start + chunk_rows], y[start:start + chunk_rows]
+        first, last = (
+            int(numpy.clip(numpy.searchsorted(knots, edge, side="right") - 1, 0, size - 2))
+            for edge in (xs[0], xs[-1])
+        )
+        columns = slice(first, last + 2)
+        design = _hat_design(xs, knots[columns])
+        normal[columns, columns] += design.T @ design
+        rhs[columns] += design.T @ ys
+    return normal, rhs
+
+
+def invalid_piecewise_line_fit(reason: str) -> PiecewiseClockFit:
+    """invalid_piecewise_fit, labelled as fit_piecewise_line's: for a link that is not NI to host."""
+    return dataclasses.replace(invalid_piecewise_fit(reason), method=PIECEWISE_LINE)
+
+
+def fit_piecewise_line(x, y, *, max_residual: float, min_points: int = MIN_FIT_POINTS,
+                       min_span: float = 0.0, knot_seconds: float = KNOT_SECONDS,
+                       min_window_points: int = MIN_WINDOW_POINTS) -> PiecewiseClockFit:
+    """y as a continuous piecewise-linear function of x: fit_line for a clock that wanders.
+
+    A crystal's rate moves with temperature, so one line per link leaves a
+    residual that grows with the session and, past max_residual, throws the
+    whole link away. This fits one segment per knot_seconds of x (a knot every
+    KNOT_SECONDS), joined at the knots, by least squares in the hat basis, then
+    once more without points beyond 5 robust sigmas, as fit_line does. A span
+    shorter than one window is a single straight segment, which is fit_line's
+    answer. A window with fewer than min_window_points points joins its
+    neighbour. valid needs the rms residual within max_residual, at least
+    min_points points spanning at least min_span of x, and every segment running
+    forward (map must be invertible); invalid fits carry their reason and an
+    empty table.
+
+    x is the clock being mapped, y the clock it is mapped to; both in seconds.
+    """
+    x = numpy.asarray(x, dtype=numpy.float64)
+    y = numpy.asarray(y, dtype=numpy.float64)
+    keep = numpy.isfinite(x) & numpy.isfinite(y)
+    x, y = x[keep], y[keep]
+    needed = max(2, int(min_points))
+    if x.size < needed:
+        return invalid_piecewise_line_fit(f"{x.size} points, need {needed}")
+    order = numpy.argsort(x, kind="stable")
+    x, y = x[order], y[order]
+    span = float(x[-1] - x[0])
+    if span <= 0:
+        return invalid_piecewise_line_fit("the points span no time")
+    if span < min_span:
+        return invalid_piecewise_line_fit(f"the points span {span:.1f} s, need {min_span:.1f} s")
+    inner = numpy.arange(x[0], x[-1], knot_seconds)
+    knots = _merge_sparse_windows(numpy.append(inner[inner < x[-1]], x[-1]), x, min_window_points)
+    for attempt in range(2):
+        if x.size < max(needed, knots.size):
+            return invalid_piecewise_line_fit(f"{x.size} points, need {max(needed, knots.size)}")
+        # Centre y: sample and perf_counter values are large and the knot values
+        # would otherwise lose their last digits to the solve.
+        y0 = float(y.mean())
+        normal, rhs = _hat_normal_equations(x, y - y0, knots)
+        coefficients, _, rank, _ = numpy.linalg.lstsq(normal, rhs, rcond=None)
+        if rank < knots.size:
+            return invalid_piecewise_line_fit("a knot window has no points")
+        residual = y - y0 - _interp_extrapolate(x, knots, coefficients)
+        if attempt == 1:
+            break
+        median_residual = numpy.median(residual)
+        spread = 1.4826 * float(numpy.median(numpy.abs(residual - median_residual)))
+        inliers = numpy.abs(residual - median_residual) <= max(5.0 * spread, 1e-9)
+        if inliers.all() or inliers.sum() < needed:
+            break
+        x, y = x[inliers], y[inliers]
+    rms = float(numpy.sqrt(numpy.mean(residual ** 2)))
+    knot_values = coefficients + y0
+    valid = rms <= max_residual
+    reason = "" if valid else f"residual rms {rms:.6f} s above {max_residual:.6f} s"
+    drifts = numpy.diff(knot_values) / numpy.diff(knots)
+    if valid and not numpy.all(drifts > 0):
+        valid = False
+        reason = f"a knot window runs backwards (segment drift {numpy.min(drifts):.6f}, not above 0)"
+    return PiecewiseClockFit(
+        knots=knots, knot_host=knot_values, residual_rms=rms, points=int(x.size),
+        valid=bool(valid), reason=reason, method=PIECEWISE_LINE,
     )
 
 

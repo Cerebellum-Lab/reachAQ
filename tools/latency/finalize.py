@@ -13,6 +13,9 @@ import json
 import logging
 import math
 import time
+import zlib
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Mapping, Optional, Union
 
@@ -46,6 +49,10 @@ SECONDARY_TRIGGER_DELAY = ("unmeasured; a secondary camera's exposure starts a t
 HOST_ARRIVAL_PAIRING = ("camera-to-NI pairing by host arrival assumes exposure→arrival "
                         "under one frame period")
 HOST_ARRIVAL_PAIRING_REASON = f"{HOST_ARRIVAL_PAIRING} (no camera clock latch)"
+# Threads that inflate nidaq.h5's gzip chunks. Read through h5py one chunk at a
+# time, the two stamp columns and five channels of a 45-minute session took
+# 1.6 s of Stop on christielab10.
+INFLATE_THREADS = 8
 
 
 def _text(value) -> str:
@@ -116,6 +123,46 @@ def read_raw_stream(path: Path, *, retry_seconds: Optional[float] = None) -> dic
 _read_h5 = read_raw_stream
 
 
+def _read_inflated(dataset, row=None):
+    """dataset[()], or dataset[row, :] of a 2-D one, with each gzip chunk
+    inflated on a thread of its own. A dataset stored any other way - no
+    chunks, or any filter but deflate - is read by h5py as before."""
+    from h5py import h5d, h5z
+    plist = dataset.id.get_create_plist()
+    if (
+        plist.get_layout() != h5d.CHUNKED
+        or plist.get_nfilters() != 1
+        or plist.get_filter(0)[0] != h5z.FILTER_DEFLATE
+        or dataset.ndim != (1 if row is None else 2)
+    ):
+        return dataset[()] if row is None else dataset[row, :]
+    chunk = dataset.chunks
+    length = chunk[-1]
+    total = dataset.shape[-1]
+    first_row = None if row is None else row - row % chunk[0]
+    result = numpy.empty(total, dtype=dataset.dtype)
+    pending = deque()
+
+    def place(limit):
+        while len(pending) > limit:
+            start, inflated = pending.popleft()
+            stored = numpy.frombuffer(inflated.result(), dtype=dataset.dtype).reshape(chunk)
+            if row is not None:
+                stored = stored[row - first_row]
+            stop = min(total, start + length)
+            result[start:stop] = stored[:stop - start]
+
+    with ThreadPoolExecutor(INFLATE_THREADS) as pool:
+        for start in range(0, total, length):
+            offset = (start,) if row is None else (first_row, start)
+            skipped, data = dataset.id.read_direct_chunk(offset)
+            # A set filter bit is a chunk HDF5 stored without deflating it.
+            pending.append((start, pool.submit(bytes if skipped else zlib.decompress, data)))
+            place(4 * INFLATE_THREADS)
+        place(0)
+    return result
+
+
 def _read_nidaq(path: Path) -> dict:
     """What the loops need from nidaq.h5, reduced one array at a time.
 
@@ -146,13 +193,14 @@ def _read_nidaq(path: Path) -> dict:
         consecutive = count > 0 and int(stored[count - 1]) - first == count - 1
         index = (numpy.arange(first, first + count, dtype=numpy.int64) if consecutive
                  else stored[()])
-        seen = store["block_observation_perf_time"][()]
+        seen = _read_inflated(store["block_observation_perf_time"])
         # Older sessions have no RAW column; the selector then fits perf alone.
         # A column that is there but unusable costs the RAW bridge, not the file.
         raw = column = None
         if "block_observation_raw_time" in store:
             try:
-                column = numpy.asarray(store["block_observation_raw_time"][()], dtype=numpy.float64)
+                column = numpy.asarray(_read_inflated(store["block_observation_raw_time"]),
+                                       dtype=numpy.float64)
                 if column.shape == seen.shape:
                     raw = column
                 else:
@@ -180,7 +228,7 @@ def _read_nidaq(path: Path) -> dict:
                 continue
             channel = None  # one channel's samples at a time
             try:
-                channel = values[row, :]
+                channel = _read_inflated(values, row)
                 if name == "cam_frames":
                     result["transitions"] = sample_of(clocks.transitions(channel))
                 else:

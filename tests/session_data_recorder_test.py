@@ -2,7 +2,9 @@ import csv
 import hashlib
 import json
 import logging
+import os
 import time as stdlib_time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -1493,6 +1495,62 @@ def test_nidaq_stop_timeout_remains_retryable(monkeypatch, tmp_path):
         recorder.close()
 
 
+class _ProducingRing:
+    """An NI ring with ten new 1 kHz samples, from perf 10 s, at every copy."""
+    channel_names = ("barcode",)
+    capacity = 16
+    sample_rate_hz = 1000.0
+
+    def __init__(self):
+        self.next_index = 0
+
+    def copy_since(self, _last, destination):
+        start = self.next_index
+        self.next_index += 10
+        destination[0, :10] = 0.0
+        return SimpleNamespace(
+            sample_count=10, start_sample_index=start, end_sample_index=start + 10,
+            overrun_samples=0, gap_count=0, epoch=1,
+            source_perf_time=10.0 + (start + 10) / 1000.0,
+            source_wall_time=100.0 + (start + 10) / 1000.0,
+            source_raw_time=7.0 + (start + 10) / 1000.0,
+            perf_times=lambda indices: 10.0 + indices / 1000.0,
+            wall_times=lambda indices: 100.0 + indices / 1000.0,
+        )
+
+
+def test_the_nidaq_copies_end_a_second_past_the_last_frame(tmp_path, monkeypatch):
+    # The copies used to run until Stop's finalization closed the spool: 60.75 s past
+    # the last frame of a 45-minute session on christielab10, late and starved by the
+    # finalization the whole way.
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=15)
+    laser = _EventSource("trace_received")
+    laser.configuration = SimpleNamespace(backend="disabled")
+    recorder = SessionDataRecorder(
+        SimpleNamespace(sample_ring=_ProducingRing(), timing_plan=None), laser)
+    snapshots = []
+    monkeypatch.setattr(recorder, "_write_session",
+                        lambda **snapshot: snapshots.append(snapshot) or {})
+    try:
+        recorder.arm(project)
+        recorder.commit_start(10.0, 100.0)
+        recorder.end_nidaq_capture_after(10.5)
+        thread = recorder._nidaq_thread
+        thread.join(30.0)
+
+        assert not thread.is_alive()
+        with recorder._lock:
+            last = recorder._nidaq_stats["last_perf_time"]
+        assert 11.5 <= last < 11.52
+
+        recorder.stop(10.5)
+        assert snapshots[0]["nidaq_chunks"].last_perf_time == last
+        assert recorder._nidaq_copy_until is None  # the next session copies until its own end
+    finally:
+        recorder.abort()
+
+
 def test_nidaq_poll_reuses_preallocated_ring_scratch():
     destinations = []
 
@@ -1745,14 +1803,17 @@ def test_nidaq_coverage_allows_less_than_one_sample_period_at_a_boundary(
     assert "end boundary coverage" not in messages
 
 
-def _nidaq_spool(tmp_path, channel_names, values):
-    """A spooled NI-DAQ capture, as the stream writer leaves it on disk."""
+def _nidaq_spool(tmp_path, channel_names, values, perf_offset=0.0):
+    """A spooled NI-DAQ capture, as the stream writer leaves it on disk.
+
+    Sample i is stamped perf_offset + i / 10 kHz, so a host clock that reads NI seconds plus perf_offset.
+    """
     path = tmp_path / "nidaq.h5"
     samples = len(values[0])
     with h5py.File(path, "w") as handle:
         handle.create_dataset("sample_index", data=np.arange(samples, dtype=np.int64))
         handle.create_dataset("perf_time",
-                              data=np.arange(samples, dtype=np.float64) / 10_000.0)
+                              data=perf_offset + np.arange(samples, dtype=np.float64) / 10_000.0)
         handle.create_dataset("values", data=np.asarray(values, dtype=np.float32))
     return session_data_recorder._NidaqSpoolSnapshot(
         path=path,
@@ -1761,8 +1822,8 @@ def _nidaq_spool(tmp_path, channel_names, values):
         sample_count=samples,
         first_sample_index=0,
         last_sample_index=samples - 1,
-        first_perf_time=0.0,
-        last_perf_time=(samples - 1) / 10_000.0,
+        first_perf_time=perf_offset,
+        last_perf_time=perf_offset + (samples - 1) / 10_000.0,
         gap_count=0,
         overrun_samples=0,
         first_error=None,
@@ -1999,6 +2060,124 @@ def test_block_stamps_from_a_spool_hold_one_column_at_a_time(tmp_path):
     assert peak < 1.5 * samples * 8, f"peak {peak / 1e6:.1f} MB"
 
 
+def _session_spool(tmp_path, samples, channels=10):
+    """A spool with every column the recorder writes, at 10 kHz from perf 100 s."""
+    path = tmp_path / "nidaq_capture.h5"
+    perf = 100.0 + np.arange(samples) / 10_000.0
+    stamps = np.repeat(100.0 + np.arange(samples // 167 + 1) * 0.0167, 167)[:samples]
+    values = np.empty((channels, samples), dtype=np.float32)
+    values[0] = (np.arange(samples) // 33) % 2  # a camera line at about 150 Hz
+    values[1:] = np.random.default_rng(3).normal(0.0, 0.01, (channels - 1, samples))
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("sample_index", data=np.arange(samples, dtype=np.int64))
+        handle.create_dataset("perf_time", data=perf)
+        handle.create_dataset("wall_time", data=perf + 1_700_000_000.0)
+        handle.create_dataset("epoch", data=np.ones(samples, dtype=np.uint64))
+        handle.create_dataset("block_observation_perf_time", data=stamps)
+        handle.create_dataset("block_observation_wall_time", data=stamps + 1_700_000_000.0)
+        handle.create_dataset("block_observation_raw_time", data=stamps - 3.0)
+        # The recorder's own chunks: every channel of 65,536 samples together.
+        handle.create_dataset("values", data=values, chunks=(channels, min(samples, 65_536)))
+    return session_data_recorder._NidaqSpoolSnapshot(
+        path=path, channel_names=tuple(f"ai{index}" for index in range(channels)),
+        sample_rate_hz=10_000.0, sample_count=samples, first_sample_index=0,
+        last_sample_index=samples - 1, first_perf_time=100.0, last_perf_time=float(perf[-1]),
+        gap_count=0, overrun_samples=0, first_error=None, last_error=None, error_count=0,
+        worker_failed=False)
+
+
+def test_the_published_nidaq_is_a_plain_gzip_selection_of_the_spool(tmp_path):
+    """Every dataset holds the selected samples, in the chunks and filter h5py's own
+    gzip write gives them, so any HDF5 reader opens the file as before."""
+    snapshot = _session_spool(tmp_path, 200_003, channels=3)
+    start_perf = 100.0 + 1_233.5 / 10_000.0
+    end_perf = 100.0 + 197_000.5 / 10_000.0
+    first, last = 1_234, 197_001
+
+    SessionDataRecorder._write_nidaq_spool_selection(
+        tmp_path / "nidaq.h5", start_perf, 50.0, end_perf, snapshot)
+
+    with h5py.File(snapshot.path, "r") as spool, \
+            h5py.File(tmp_path / "nidaq.h5", "r") as published, \
+            h5py.File(tmp_path / "plain.h5", "w") as plain:
+        perf = spool["perf_time"][first:last]
+        expected = {name: spool[name][first:last] for name in (
+            "sample_index", "perf_time", "epoch", "block_observation_perf_time",
+            "block_observation_wall_time", "block_observation_raw_time")}
+        expected["offset_seconds"] = perf - start_perf
+        expected["wall_time"] = 50.0 + perf - start_perf
+        expected["values"] = spool["values"][:, first:last]
+        assert sorted(published) == sorted(expected)
+        for name, data in expected.items():
+            reference = plain.create_dataset(name, data=data, compression="gzip")
+            dataset = published[name]
+            assert np.array_equal(dataset[()], data), name
+            assert (dataset.dtype, dataset.chunks, dataset.compression,
+                    dataset.compression_opts, dataset.shuffle) == (
+                reference.dtype, reference.chunks, "gzip", 4, False), name
+        assert published.attrs["first_perf_time"] == perf[0]
+        assert published.attrs["last_perf_time"] == perf[-1]
+        assert published.attrs["epoch"] == 1
+
+
+def test_deflated_chunks_read_back_with_edges_in_both_dimensions(tmp_path):
+    data = np.arange(3 * 2_500, dtype=np.float32).reshape(3, 2_500)
+
+    with h5py.File(tmp_path / "out.h5", "w") as output, ThreadPoolExecutor(2) as pool:
+        dataset = output.create_dataset("values", shape=data.shape, dtype=np.float32,
+                                        chunks=(2, 1_000), compression="gzip")
+        SessionDataRecorder._write_deflated(dataset, lambda start, stop: data[:, start:stop], pool)
+
+    with h5py.File(tmp_path / "out.h5", "r") as stored:
+        assert np.array_equal(stored["values"][()], data)
+
+
+def test_requested_channels_cost_about_as_much_as_the_timeline_they_come_with(tmp_path):
+    # Three channels of a 45-minute spool took 2.5 s of Stop on christielab10 read through
+    # one scattered selection across the (channels, 65536) chunks; the sample index and
+    # perf time they come with took about 0.3 s.
+    snapshot = _session_spool(tmp_path, 3_000_000)
+    started = stdlib_time.perf_counter()
+    SessionDataRecorder._nidaq_arrays(snapshot, requested_names=())
+    timeline = stdlib_time.perf_counter() - started
+
+    started = stdlib_time.perf_counter()
+    names, _, _, values, _ = SessionDataRecorder._nidaq_arrays(
+        snapshot, requested_names=("ai2", "ai0", "missing", "ai2"))
+    channels = stdlib_time.perf_counter() - started
+
+    with h5py.File(snapshot.path, "r") as spool:
+        stored = spool["values"][()]
+    assert names == ("ai2", "ai0", "ai2")
+    assert values.dtype == np.float32
+    assert np.array_equal(values, stored[[2, 0, 2]])
+    assert channels < 3 * timeline + 0.05, (
+        f"{channels:.2f} s for the channels, {timeline:.2f} s without")
+
+
+@pytest.mark.skipif((os.cpu_count() or 1) < 4, reason="a parallel deflate needs the cores to show")
+def test_publishing_nidaq_deflates_in_parallel(tmp_path):
+    # 3,000,000 samples, five minutes at 10 kHz. Deflated a chunk at a time, as h5py's
+    # own gzip write does, a 45-minute session's took 17 s of Stop on christielab10.
+    snapshot = _session_spool(tmp_path, 3_000_000)
+    with h5py.File(snapshot.path, "r") as spool:
+        columns = {name: spool[name][()] for name in spool}
+    started = stdlib_time.perf_counter()
+    with h5py.File(tmp_path / "plain.h5", "w") as plain:
+        for name, data in columns.items():
+            plain.create_dataset(name, data=data, compression="gzip")
+    plain_seconds = stdlib_time.perf_counter() - started
+    del columns
+
+    started = stdlib_time.perf_counter()
+    SessionDataRecorder._write_nidaq_spool_selection(
+        tmp_path / "nidaq.h5", 100.0, 50.0, 1_000.0, snapshot)
+    elapsed = stdlib_time.perf_counter() - started
+
+    assert elapsed < 0.7 * plain_seconds, (
+        f"{elapsed:.2f} s against {plain_seconds:.2f} s for h5py's gzip write")
+
+
 def test_camera_exposures_given_at_arm_reach_finalization(tmp_path, monkeypatch):
     captured = {}
     monkeypatch.setattr(SessionDataRecorder, "_write_session",
@@ -2018,3 +2197,496 @@ def test_camera_exposures_given_at_arm_reach_finalization(tmp_path, monkeypatch)
         recorder.close()
 
     assert captured["camera_exposure_seconds"] == {"left": 1.75e-4, "right": 1.75e-4}
+
+
+def test_alignment_records_the_board_clock_chain(tmp_path):
+    from board_clock_chain_synthetic import RATE, synthetic_rig
+
+    rows, channels, indices = synthetic_rig()
+    perf = 1000.0 + indices / RATE
+    names = ("barcode", "tone1")
+    chunk = (
+        indices, perf, 2000.0 + (perf - 1000.0),
+        np.vstack([channels["barcode"], channels["tone1"]]).astype(np.float32),
+        names, RATE, 1, 0, 0,
+    )
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=4)
+
+    result = SessionDataRecorder._write_session(
+        project, 1000.0, 2000.0, float(perf[-1]), rows, (), (), (chunk,),
+    )
+
+    assert result["boardClockChain"]["status"] == "fitted"
+    assert result["boardClockChain"]["pairing"] == "host_endpoints"  # one chunk gives no NI-to-host fit
+    session_dir = next(Path(tmp_path).rglob("alignment.json")).parent
+    alignment = json.loads((session_dir / "alignment.json").read_text(encoding="utf-8"))
+    assert alignment["boardClockChain"]["boards"][0]["toneCrossCheck"]["matched"] == 2
+    assert alignment["schemaVersion"] == 4
+
+
+def test_alignment_without_a_timekeeper_says_so_and_still_finalizes(tmp_path):
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=5)
+
+    result = SessionDataRecorder._write_session(project, 10.0, 100.0, 11.0, (), (), (), ())
+
+    assert result["boardClockChain"]["status"] == "unavailable"
+    assert "no SYNC_BARCODE reports" in result["boardClockChain"]["reason"]
+
+
+def test_board_clock_chain_uses_rows_outside_the_session_window(tmp_path):
+    from board_clock_chain_synthetic import RATE, synthetic_rig
+
+    rows, channels, indices = synthetic_rig()
+    perf = 1000.0 + indices / RATE
+    chunk = (
+        indices, perf, 2000.0 + (perf - 1000.0),
+        np.vstack([channels["barcode"], channels["tone1"]]).astype(np.float32),
+        ("barcode", "tone1"), RATE, 1, 0, 0,
+    )
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=6)
+
+    # Only the rows of ticks 8 and 9 fall inside the window: too few barcode
+    # edges to fit on their own, so a fit proves the pre-roll and post-roll
+    # rows were used.
+    result = SessionDataRecorder._write_session(
+        project, 1020.0, 2020.0, 1022.0, rows, (), (), (chunk,),
+    )
+
+    assert result["boardClockChain"]["status"] == "fitted"
+    assert result["boardClockChain"]["timekeeper"]["barcodeFramesMatched"] > 20
+
+
+def test_board_clock_chain_failure_never_fails_finalization(tmp_path, monkeypatch):
+    from tools.acquisition.model import board_clock_chain
+
+    def explode(*_args, **_kwargs):
+        raise ValueError("synthetic chain failure")
+
+    monkeypatch.setattr(board_clock_chain, "board_clock_chain", explode)
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=7)
+
+    result = SessionDataRecorder._write_session(project, 10.0, 100.0, 11.0, (), (), (), ())
+
+    chain = result["boardClockChain"]
+    assert chain["status"] == "unavailable"
+    assert chain["reason"] == "board clock chain failed: ValueError: synthetic chain failure"
+    assert chain["boards"] == [] and chain["timekeeper"] is None
+    session_dir = next(Path(tmp_path).rglob("alignment.json")).parent
+    alignment = json.loads((session_dir / "alignment.json").read_text(encoding="utf-8"))
+    assert alignment["boardClockChain"] == chain
+
+
+def test_board_clock_chain_record_that_cannot_be_written_is_replaced(tmp_path, monkeypatch):
+    from tools.acquisition.model import board_clock_chain
+
+    # alignment.json is written with allow_nan=False: a NaN would fail the whole write.
+    monkeypatch.setattr(
+        board_clock_chain, "board_clock_chain",
+        lambda *_args, **_kwargs: {"status": "fitted", "boards": [], "residual": float("nan")},
+    )
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=8)
+
+    result = SessionDataRecorder._write_session(project, 10.0, 100.0, 11.0, (), (), (), ())
+
+    assert result["boardClockChain"]["status"] == "unavailable"
+    assert (next(Path(tmp_path).rglob("alignment.json"))).is_file()
+
+
+def test_board_clock_chain_reads_a_spooled_capture_in_the_rig_channel_order(tmp_path):
+    from board_clock_chain_synthetic import synthetic_rig
+
+    rows, channels, indices = synthetic_rig()
+    silent = np.zeros(indices.size, dtype=np.float32)
+    # cam_frames is stored before the barcode and the tones on the bench rig.
+    snapshot = _nidaq_spool(
+        tmp_path,
+        ("cam_frames", "barcode", "tone1", "tone2"),
+        [silent, channels["barcode"], channels["tone1"], silent],
+        perf_offset=1000.0,
+    )
+
+    record = SessionDataRecorder._board_clock_chain(rows, snapshot)
+
+    assert record["status"] == "fitted"
+    assert record["boards"][0]["toneCrossCheck"]["matched"] == 2
+
+
+def test_board_clock_chain_does_not_read_the_spool_without_a_barcode_report(tmp_path, monkeypatch):
+    from board_clock_chain_synthetic import device_row
+
+    reads = []
+    monkeypatch.setattr(
+        SessionDataRecorder, "_nidaq_arrays",
+        staticmethod(lambda *args, **kwargs: reads.append(args) or pytest.fail("the spool was read")),
+    )
+    # Most sessions have no timekeeper: tone and clap rows, no barcode report.
+    rows = (
+        device_row(1.0, "TONE_STATUS", {"frequency_hz": 5000}, 1, 1, 1_000_000, "physical_start"),
+        device_row(2.0, "SYNC_CLAP_OBSERVATION", {"board_address": 0, "tick": 1, "clapper_node": 8},
+                   1, 2, 2_000_000, "observed"),
+    )
+
+    record = SessionDataRecorder._board_clock_chain(rows, ("a spool that must not be opened",))
+
+    assert reads == []
+    assert record["status"] == "unavailable"
+    assert "no SYNC_BARCODE reports" in record["reason"]
+
+
+def test_board_clock_chain_record_with_keys_json_cannot_sort_is_replaced(tmp_path, monkeypatch):
+    from tools.acquisition.model import board_clock_chain
+
+    # The writer sorts keys; a record that dumps without sorting must not slip past the backstop.
+    monkeypatch.setattr(
+        board_clock_chain, "board_clock_chain",
+        lambda *_args, **_kwargs: {"status": "fitted", "boards": [], 1: "a", "b": 2},
+    )
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=9)
+
+    result = SessionDataRecorder._write_session(project, 10.0, 100.0, 11.0, (), (), (), ())
+
+    assert result["boardClockChain"]["status"] == "unavailable"
+    assert "TypeError" in result["boardClockChain"]["reason"]
+    assert next(Path(tmp_path).rglob("alignment.json")).is_file()
+
+
+def test_a_malformed_row_outside_the_window_leaves_finalization_and_device_csv_unchanged(tmp_path):
+    from board_clock_chain_synthetic import device_row
+
+    in_window = device_row(10.5, "TONE_STATUS", {"frequency_hz": 5000}, 1, 1, 1_000_000, "physical_start")
+    # Five fields: not a row shape _normalize_device_row knows. It is outside the
+    # window, so the trim has always dropped it before it could matter.
+    malformed = (500.0, 1.0, "inbound", "TONE_STATUS", "")
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=10)
+
+    result = SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 11.0, (in_window, malformed), (), (), (),
+    )
+
+    assert result["boardClockChain"]["status"] == "unavailable"
+    assert "ValueError" in result["boardClockChain"]["reason"]
+    streams_dir = next(Path(tmp_path).rglob("alignment.json")).parent
+    with (streams_dir / "device.csv").open(newline="", encoding="utf-8") as stream:
+        csv_rows = list(csv.DictReader(stream))
+    assert [row["kind"] for row in csv_rows] == ["TONE_STATUS"]  # only the row inside the window
+
+
+def _blocked_nidaq_chunks(channels, names, rate=10_000.0, block=100):
+    """A capture as the recorder holds it: a chunk per 10 ms copy, each stamped with the host time of its read.
+
+    The host clock reads NI seconds plus 1000, and a copy is stamped 0.3 ms after the last sample before it,
+    so the NI-to-host fit the recorder makes of these is valid and close to that.
+    """
+    samples = len(channels[names[0]])
+    indices = np.arange(samples, dtype=np.int64)
+    values = np.vstack([channels[name] for name in names]).astype(np.float32)
+    chunks = []
+    for start in range(0, samples, block):
+        stop = min(start + block, samples)
+        stamp = 1000.0 + (start - 1) / rate + 0.0003
+        chunks.append((
+            indices[start:stop], 1000.0 + indices[start:stop] / rate, 2000.0 + indices[start:stop] / rate,
+            values[:, start:stop], tuple(names), rate, 1, 0, 0, stamp, 1000.0 + stamp, float("nan"),
+        ))
+    return tuple(chunks)
+
+
+def test_alignment_pairs_the_board_clock_chain_by_host_time_through_the_sessions_ni_fit(tmp_path):
+    from board_clock_chain_synthetic import synthetic_rig
+
+    rows, channels, _ = synthetic_rig()
+    chunks = _blocked_nidaq_chunks(channels, ("barcode", "tone1"))
+    assert SessionDataRecorder._fit_nidaq_to_host(chunks, end_perf=1042.0).valid  # the fit _write_session will hand the chain
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=11)
+
+    result = SessionDataRecorder._write_session(project, 1000.0, 2000.0, 1042.0, rows, (), (), chunks)
+
+    chain = result["boardClockChain"]
+    assert chain["status"] == "fitted", chain["reason"]
+    assert chain["pairing"] == "host_time"
+    assert chain["boards"][0]["toneCrossCheck"]["matched"] == 2
+
+
+def test_alignment_pairs_post_roll_barcode_frames_past_the_ni_fits_end_by_host_time(tmp_path):
+    from board_clock_chain_synthetic import io_to_ni, synthetic_rig
+
+    rows, channels, _ = synthetic_rig()
+    chunks = _blocked_nidaq_chunks(channels, ("barcode", "tone1"))
+    # The NI fit ends at the last stamp at or before end_perf; the chain reads the whole spool. The barcode plays
+    # once a second, at NI 13 to 41 s (host 1013 to 1041 s). 1030.5 cuts the fit at NI 30.49 s, half a second
+    # from the frames either side, so 18 frames lie inside it and 11 past it, placed by its last segment carried on.
+    end_perf = 1030.5
+    fit = SessionDataRecorder._fit_nidaq_to_host(chunks, end_perf=end_perf)
+    assert fit.valid
+    frame_ni_seconds = [io_to_ni(10.0 + tick) for tick in range(1, 30)]
+    inside = sum(seconds <= fit.x_max for seconds in frame_ni_seconds)
+    assert 0 < inside < len(frame_ni_seconds)  # frames lie on both sides of x_max
+
+    def chain_of(session, end):
+        project = ProjectInfo(
+            root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=session,
+        )
+        return SessionDataRecorder._write_session(project, 1000.0, 2000.0, end, rows, (), (), chunks)["boardClockChain"]
+
+    whole_spool = chain_of(12, 1042.0)  # every frame inside the fit, as in the test above
+    cut = chain_of(13, end_perf)
+
+    assert whole_spool["status"] == "fitted", whole_spool["reason"]
+    assert cut["status"] == "fitted", cut["reason"]
+    assert cut["pairing"] == "host_time"
+    matched = cut["timekeeper"]["barcodeFramesMatched"]
+    assert matched > inside  # more frames matched than lie inside the fit, so some past x_max did
+    assert matched == whole_spool["timekeeper"]["barcodeFramesMatched"]
+
+
+def test_board_clock_chain_is_given_the_ni_fit(monkeypatch):
+    from tools.acquisition.model import board_clock_chain
+
+    seen = {}
+    monkeypatch.setattr(
+        board_clock_chain, "board_clock_chain",
+        lambda *_args, **kwargs: seen.update(kwargs) or board_clock_chain.unavailable("spy"),
+    )
+    fit = object()
+
+    SessionDataRecorder._board_clock_chain((), (), ni_fit=fit)
+
+    assert seen["ni_to_host"] is fit
+
+
+def test_board_clock_chain_reads_a_spooled_capture_and_pairs_by_the_fit_or_by_the_endpoints(tmp_path):
+    from board_clock_chain_synthetic import rig_ni_to_host, synthetic_rig
+
+    rows, channels, indices = synthetic_rig()
+    silent = np.zeros(indices.size, dtype=np.float32)
+    snapshot = _nidaq_spool(
+        tmp_path, ("cam_frames", "barcode", "tone1", "tone2"), [silent, channels["barcode"], channels["tone1"], silent],
+        perf_offset=1000.0,
+    )
+
+    by_endpoints = SessionDataRecorder._board_clock_chain(rows, snapshot)
+    by_fit = SessionDataRecorder._board_clock_chain(rows, snapshot, ni_fit=rig_ni_to_host())
+
+    assert (by_endpoints["status"], by_endpoints["pairing"]) == ("fitted", "host_endpoints")
+    assert (by_fit["status"], by_fit["pairing"]) == ("fitted", "host_time")
+
+
+def _spooled_arrays(rows_indices, perf_of, channels):
+    """A stand-in for _nidaq_arrays that makes its per-sample stamps fresh on each call and lets the test watch them."""
+    import weakref
+
+    made = []
+
+    def arrays(_chunks, requested_names=None):
+        perf = perf_of(rows_indices)
+        made.append(weakref.ref(perf))
+        return ("barcode",), rows_indices, perf, channels["barcode"][None, :], 10_000.0
+
+    return arrays, made
+
+
+def test_board_clock_chain_is_given_the_ni_endpoints_and_never_the_stamps(monkeypatch):
+    from board_clock_chain_synthetic import synthetic_rig
+    from tools.acquisition.model import board_clock_chain
+
+    rows, channels, indices = synthetic_rig()
+    arrays, made = _spooled_arrays(indices, lambda index: 1000.0 + index / 10_000.0, channels)
+    seen = {}
+
+    def spy(*_args, **kwargs):
+        seen.update(kwargs)
+        seen["stamps_alive"] = made[0]() is not None
+        return board_clock_chain.unavailable("spy")
+
+    monkeypatch.setattr(SessionDataRecorder, "_nidaq_arrays", staticmethod(arrays))
+    monkeypatch.setattr(board_clock_chain, "board_clock_chain", spy)
+
+    SessionDataRecorder._board_clock_chain(rows, ("chunks",))
+
+    last = float(indices[-1]) / 10_000.0
+    assert seen["ni_host_endpoints"] == ((0.0, 1000.0), (last, 1000.0 + last))
+    assert all(type(value) is float for pair in seen["ni_host_endpoints"] for value in pair)
+    assert seen["stamps_alive"] is False  # `del perf` ran before the chain did, and only four floats were kept
+    assert seen["ni_to_host"] is None
+
+
+def test_board_clock_chain_endpoints_skip_samples_without_a_finite_stamp(monkeypatch):
+    from board_clock_chain_synthetic import synthetic_rig
+
+    rows, channels, indices = synthetic_rig()
+
+    def stamps(index):
+        perf = 1000.0 + index / 10_000.0
+        perf[:50] = np.nan
+        perf[-70:] = np.inf
+        return perf
+
+    arrays, _ = _spooled_arrays(indices, stamps, channels)
+    monkeypatch.setattr(SessionDataRecorder, "_nidaq_arrays", staticmethod(arrays))
+
+    record = SessionDataRecorder._board_clock_chain(rows, ("chunks",))
+
+    assert record["status"] == "fitted" and record["pairing"] == "host_endpoints"
+
+
+def test_board_clock_chain_without_a_fit_or_a_finite_stamp_is_unavailable(monkeypatch):
+    from board_clock_chain_synthetic import synthetic_rig
+
+    rows, channels, indices = synthetic_rig()
+    arrays, _ = _spooled_arrays(indices, lambda index: np.full(index.size, np.nan), channels)
+    monkeypatch.setattr(SessionDataRecorder, "_nidaq_arrays", staticmethod(arrays))
+
+    record = SessionDataRecorder._board_clock_chain(rows, ("chunks",))
+
+    assert record["status"] == "unavailable" and "without host time" in record["reason"]
+    assert record["pairing"] is None
+
+
+def _gap_frame(boot, sequence, gap, gap_total):
+    return SimpleNamespace(
+        index=10_200_000_000, timestamp_ns=100_200_000_000, event_perf_time=10.2,
+        board_boot_id=boot, board_sequence=sequence, board_time_us=sequence * 1000,
+        board_timestamp_kind="tx_queue", instance=0, pressure=1,
+        board_sequence_status={"gap": gap, "gap_total": gap_total, "reboot": False},
+    )
+
+
+def test_board_gap_totals_come_from_every_frame_the_tracker_saw(tmp_path, monkeypatch):
+    # A lost message surfaces on whichever frame arrives next. When that is a
+    # pressure reading it is never a device.csv row, so no row shows the loss.
+    captured = {}
+    monkeypatch.setattr(SessionDataRecorder, "_write_session",
+                        staticmethod(lambda **snapshot: captured.update(snapshot) or {}))
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=14)
+    ring = SimpleNamespace(channel_names=(), capacity=1, sample_rate_hz=1000.0,
+                           copy_since=lambda last, destination: None)
+    laser = _EventSource("trace_received")
+    laser.configuration = SimpleNamespace(backend="disabled")
+    recorder = SessionDataRecorder(SimpleNamespace(sample_ring=ring, timing_plan=None), laser)
+    tone, pressure = SystemStatusMessageKind.TONE_STATUS, SystemStatusMessageKind.PRESSURE_READING
+    try:
+        recorder.arm(project)
+        recorder._on_device_message(tone, _gap_frame(7, 1, 0, 5), 9.0, 99.0)  # before the session: 5 lost already
+        recorder.commit_start(10.0, 100.0)
+        recorder._on_device_message(tone, _gap_frame(7, 20, 0, 5), 10.1, 100.1)
+        recorder._on_device_message(pressure, _gap_frame(7, 24, 3, 8), 10.2, 100.2)  # 3 lost, shown on a pressure frame
+        recorder._on_device_message(tone, _gap_frame(7, 25, 0, 8), 10.3, 100.3)
+        recorder._on_device_message(tone, _gap_frame(9, 3, 0, 0), 10.4, 100.4)
+        recorder._on_device_message(tone, _gap_frame(9, 5, 1, 1), 10.5, 100.5)
+        recorder._on_device_message(tone, SimpleNamespace(index=1, timestamp_ns=1), 10.6, 100.6)  # no timing trailer
+        recorder.stop(11.0)
+    finally:
+        recorder.close()
+
+    assert captured["board_sequence_gaps"] == [
+        {"bootId": 7, "missing": 3}, {"bootId": 9, "missing": 1},
+    ]
+
+
+def test_alignment_records_the_board_sequence_gap_totals(tmp_path):
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=6)
+
+    SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 11.0, (), (), (), (),
+        board_sequence_gaps=[{"bootId": 7, "missing": 4}],
+    )
+
+    session_dir = next(Path(tmp_path).rglob("alignment.json")).parent
+    alignment = json.loads((session_dir / "alignment.json").read_text(encoding="utf-8"))
+    assert alignment["boardSequenceGaps"] == [{"bootId": 7, "missing": 4}]
+    assert alignment["schemaVersion"] == 4
+
+
+def test_alignment_gap_totals_are_empty_when_none_were_given(tmp_path):
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=7)
+
+    SessionDataRecorder._write_session(project, 10.0, 100.0, 11.0, (), (), (), ())
+
+    session_dir = next(Path(tmp_path).rglob("alignment.json")).parent
+    alignment = json.loads((session_dir / "alignment.json").read_text(encoding="utf-8"))
+    assert alignment["boardSequenceGaps"] == []
+
+
+def test_the_validator_reads_the_gap_totals_the_recorder_wrote(tmp_path):
+    from board_clock_chain_synthetic import device_row
+
+    project = ProjectInfo(root=str(tmp_path), device_id="test", when=datetime(2026, 1, 2, 3, 4, 5), session=8)
+    rows = (device_row(10.5, "TONE_STATUS", {}, 7, 1, 1_000_000, "tx_queue"),)
+
+    SessionDataRecorder._write_session(
+        project, 10.0, 100.0, 11.0, rows, (), (), (),
+        board_sequence_gaps=[{"bootId": 7, "missing": 4}],
+    )
+
+    session_dir = next(Path(tmp_path).rglob("alignment.json")).parent.parent
+    report = validate_session(session_dir, profile=ValidationProfile.FAST)
+    result = next(item for item in report.results if item.rule_id == "events.board_time")
+    assert result.status.value == "warning", result.message
+    assert "board boot 7: the live tracker counted 4 missing message(s)" in result.message
+
+
+def test_a_clap_and_a_barcode_report_reach_the_chain_as_the_recorder_wrote_them():
+    """CAN frame -> Source -> recorder row -> what the chain reads.
+
+    The translators, the recorder and the chain were each tested against rows
+    their own author wrote. This runs one clap and one barcode report through
+    all three and checks the columns and names the chain reads.
+    """
+    from autotrainer.device import CanTransportConfiguration, Target
+    from autotrainer.device.can_interface import CanInterface
+    from autotrainer.device.socketcan_jerrycan import (
+        JerryCANCmdType, JerryCANMsg, JerryCANTimestampKind, JerryCANTiming, SyncBarcode, SyncClapObserved,
+    )
+    from tools.acquisition.model import board_clock_chain as chain
+
+    io_module, boot = 0x08, 0xB007
+    interface = CanInterface(
+        required_targets=(Target.PELLET_DEVICE,),
+        can_transport=CanTransportConfiguration(kind="socketcan", fd=True),
+    )
+    interface._get_index = lambda item: item.index
+    interface._get_timestamp_ns = lambda item: item.timestamp_ns
+
+    def frame(message_type, stamp, sequence, board_us, index):
+        message = JerryCANMsg()
+        message.type = message_type
+        message.dst_id = io_module
+        message.index = index
+        message.board_timing_valid = True
+        message.timing = JerryCANTiming(
+            version=1, kind=stamp, boot_id=boot, sequence=sequence, board_time_us=board_us,
+        )
+        return message
+
+    clap_frame = frame(JerryCANCmdType.SYNC_CLAP_OBSERVED, JerryCANTimestampKind.OBSERVED, 5, 7_200_000, 101_200_000_000)
+    clap_frame.sync_clap_observed = SyncClapObserved(tick=41, clapper_node=io_module)
+    barcode_frame = frame(
+        JerryCANCmdType.SYNC_BARCODE, JerryCANTimestampKind.PHYSICAL_START, 6, 7_000_000, 101_500_000_000,
+    )
+    barcode_frame.sync_barcode = SyncBarcode(tick=41)
+    clap, barcode = interface._translate(clap_frame), interface._translate(barcode_frame)
+    # What a time-synced board's row carries: an event time apart from the receive time.
+    clap.event_perf_time = 99.0
+
+    recorder = SessionDataRecorder(object(), _EventSource("trace_received"))
+    try:
+        recorder._on_device_message(SystemStatusMessageKind.SYNC_CLAP_OBSERVATION, clap, 101.2, 1.0)
+        recorder._on_device_message(SystemStatusMessageKind.SYNC_BARCODE_REPORT, barcode, 101.5, 1.0)
+        rows = tuple(SessionDataRecorder._normalize_device_row(row) for row in recorder._device_rows)
+    finally:
+        recorder.close()
+
+    assert rows[0][0] == pytest.approx(99.0) and rows[0][9] == pytest.approx(101.2)
+    assert chain.has_barcode_reports(rows)
+    (clap_seen,) = chain._envelopes(rows, SystemStatusMessageKind.SYNC_CLAP_OBSERVATION.name)
+    assert (clap_seen.address, clap_seen.boot_id, clap_seen.board_us) == (io_module, boot, 7_200_000)
+    assert clap_seen.payload["tick"] == 41
+    assert clap_seen.payload["clapper_node"] == io_module
+    assert clap_seen.stamp_kind == chain._STAMP_OBSERVED == "observed"
+    assert clap_seen.host_perf == pytest.approx(101.2)  # the receive time, not the event time
+    (barcode_seen,) = chain._envelopes(rows, SystemStatusMessageKind.SYNC_BARCODE_REPORT.name)
+    assert (barcode_seen.address, barcode_seen.boot_id, barcode_seen.board_us) == (io_module, boot, 7_000_000)
+    assert barcode_seen.payload["tick"] == 41
+    assert barcode_seen.stamp_kind == chain._STAMP_START_EDGE == "physical_start"
+    assert barcode_seen.host_perf == pytest.approx(101.5)

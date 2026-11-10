@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from fractions import Fraction
 from pathlib import Path
 from typing import FrozenSet, Optional, Tuple
 
@@ -28,6 +29,17 @@ X264_OUTPUT_ARGS = (
     "-threads", "6",
     "-pix_fmt", "yuv420p",
 )
+
+# x264's CRF rate control weighs each frame by its duration: it divides the
+# frame's complexity by the duration over 40 ms, with durations clipped at
+# 10 ms. The same frames are therefore quantized more coarsely the higher the
+# frame rate: P-frame QP 17 at 50 fps against 20 at 150 fps on christielab10's
+# 1024x1024 scene, where 98% of macroblocks were then skipped and a faint
+# (+4 grey) moving target was placed about twice as far off (2026-11-09).
+# Above this rate x264 rate-controls as if at this rate, so a recording keeps
+# the fidelity it would have at 50 fps, for 1.3-6.4x the bytes and up to 8%
+# more encoder CPU. Recordings at or below it encode exactly as before.
+X264_RATE_CONTROL_FPS = 50
 
 # The encoder runs below capture and live pose: it has throughput to spare at
 # every preset, they have a deadline. Priority alone did not protect live
@@ -70,6 +82,25 @@ def x264_available() -> bool:
     return " libx264 " in encoders
 
 
+def x264_output_args(fps: float) -> Tuple[str, ...]:
+    """ffmpeg's output arguments for an x264 recording at `fps` frames per second.
+
+    Up to X264_RATE_CONTROL_FPS they are X264_OUTPUT_ARGS. Above it,
+    force-cfr makes x264 rate-control at that rate instead of from the frames'
+    timestamps, which the container keeps at the real rate. x264 then writes
+    the pinned rate into the stream header too, so h264_metadata puts the real
+    one back (H.264 counts two ticks per frame).
+    """
+    if fps <= X264_RATE_CONTROL_FPS:
+        return X264_OUTPUT_ARGS
+    tick_rate = Fraction(str(fps)) * 2
+    return (
+        *X264_OUTPUT_ARGS,
+        "-x264-params", f"force-cfr=1:fps={X264_RATE_CONTROL_FPS}",
+        "-bsf:v", f"h264_metadata=tick_rate={tick_rate.numerator}/{tick_rate.denominator}",
+    )
+
+
 def efficiency_cpus() -> Optional[FrozenSet[int]]:
     """The efficiency cores this process may use, or None if the processor has none.
 
@@ -110,7 +141,7 @@ class FfmpegX264Writer:
                 executable, "-hide_banner", "-loglevel", "error", "-y",
                 "-f", "rawvideo", "-pix_fmt", "bgr24" if is_color else "gray",
                 "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
-                *X264_OUTPUT_ARGS, path,
+                *x264_output_args(fps), path,
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,

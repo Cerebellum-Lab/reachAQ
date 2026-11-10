@@ -31,6 +31,10 @@ class ClosedVideoValidation:
 # 6-minute 1024x1024 H.264 recording in 45 s; eight did it in 7.7 s
 # (christielab10, 2026-10-06).
 _FFPROBE_DECODE_THREADS = 8
+# The rig's own 256x256 mp4v decodes faster on one thread: 35,149 frames in
+# 0.92 s against 1.37 s on eight (christielab10, 2026-11-09). Frame threads
+# cost more than such small frames take to decode.
+_SMALL_MPEG4_PIXELS = 256 * 256
 
 
 def closed_video_timeout_seconds(frame_count: int) -> float:
@@ -43,19 +47,13 @@ def closed_video_timeout_seconds(frame_count: int) -> float:
     return max(30.0, int(frame_count) / 1000.0)
 
 
-def _ffprobe_frame_count(video_path: Path, timeout_seconds: float) -> int:
+def _ffprobe_count(video_path: Path, timeout_seconds: float, arguments, what: str) -> int:
     completed = subprocess.run(
         (
             "ffprobe",
             "-v",
             "error",
-            "-threads",
-            str(_FFPROBE_DECODE_THREADS),
-            "-select_streams",
-            "v:0",
-            "-count_frames",
-            "-show_entries",
-            "stream=nb_read_frames",
+            *arguments,
             "-of",
             "default=nokey=1:noprint_wrappers=1",
             video_path.as_posix(),
@@ -72,8 +70,76 @@ def _ffprobe_frame_count(video_path: Path, timeout_seconds: float) -> int:
         )
     value = completed.stdout.strip().splitlines()
     if not value or value[-1].strip().upper() == "N/A":
-        raise RuntimeError("ffprobe did not report a decoded frame count")
+        raise RuntimeError(f"ffprobe did not report a {what}")
     return int(value[-1].strip())
+
+
+def _decode_threads(video_path: Path, timeout_seconds: float) -> int:
+    """One thread for small mp4v, eight otherwise or when the stream cannot be read."""
+    try:
+        completed = subprocess.run(
+            (
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,width,height",
+                "-of",
+                "csv=p=0",
+                video_path.as_posix(),
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=float(timeout_seconds),
+        )
+        codec, width, height = completed.stdout.strip().split(",")
+        if codec == "mpeg4" and int(width) * int(height) <= _SMALL_MPEG4_PIXELS:
+            return 1
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return _FFPROBE_DECODE_THREADS
+
+
+def _ffprobe_frame_count(video_path: Path, timeout_seconds: float) -> int:
+    """The decoded frame count, which --full session validation checks."""
+    return _ffprobe_count(
+        video_path,
+        timeout_seconds,
+        (
+            "-threads",
+            str(_decode_threads(video_path, timeout_seconds)),
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=nb_read_frames",
+        ),
+        "decoded frame count",
+    )
+
+
+def _ffprobe_packet_count(video_path: Path, timeout_seconds: float) -> int:
+    """The video's packets, one per frame written, counted without decoding.
+
+    Decoding both cameras' 45-minute videos took 17 s of Stop on christielab10
+    at 256 px mp4v, and would take about 112 s at 1024 px H.264; counting their
+    packets took 0.26 s. --full session validation still decodes every frame.
+    """
+    return _ffprobe_count(
+        video_path,
+        timeout_seconds,
+        (
+            "-select_streams",
+            "v:0",
+            "-count_packets",
+            "-show_entries",
+            "stream=nb_read_packets",
+        ),
+        "packet count",
+    )
 
 
 def _opencv_frame_count(video_path: Path) -> int:
@@ -108,14 +174,16 @@ def validate_closed_video(
     writer_diagnostics = dict(writer_diagnostics or {})
     warnings = []
     failure = ""
-    counter_backend = "ffprobe"
+    # The count is kept as decoded_frame_count, the key stored sessions and
+    # the validation engine use; counter_backend says how it was counted.
+    counter_backend = "ffprobe_packets"
 
     if not video_path.is_file():
         decoded_count = 0
         failure = f"closed video is missing: {video_path}"
     else:
         try:
-            decoded_count = _ffprobe_frame_count(
+            decoded_count = _ffprobe_packet_count(
                 video_path,
                 ffprobe_timeout_seconds,
             )

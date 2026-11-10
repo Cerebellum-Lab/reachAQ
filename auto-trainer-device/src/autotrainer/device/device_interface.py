@@ -164,6 +164,21 @@ class BoardCapabilities(Source):
 
 
 @dataclass
+class SyncClapObservation(Source):
+    """A board heard the timekeeper's CAN clap; its board timing (OBSERVED) says when."""
+    board_address: int = 0
+    tick: int = 0
+    clapper_node: int = 0
+
+
+@dataclass
+class SyncBarcodeReport(Source):
+    """The timekeeper started barcode `tick` on the NI-DAQ line; its board timing (PHYSICAL_START) says when."""
+    board_address: int = 0
+    tick: int = 0
+
+
+@dataclass
 class DigitalPulseStatus(Source):
     # None when the board reported a line that is not a stimulus output.
     channel: Optional[DigitalOutputs] = None

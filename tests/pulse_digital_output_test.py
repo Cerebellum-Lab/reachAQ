@@ -1,5 +1,7 @@
 """The finite pulse request, which the firmware will answer once it implements it."""
 
+import enum
+import logging
 import struct
 
 import pytest
@@ -84,14 +86,19 @@ def test_a_transport_without_the_command_is_refused(interface):
         api.pulse_digital_output(DigitalOutputs.STIMULUS_4, 1000)
 
 
-def pulse_status(gpio_idx, phase=2, error=0):
-    """A GPIO_PULSE_STATUS frame as the board sends it, decoded and translated."""
+def pulse_status_frame(gpio_idx, phase=2, error=0):
+    """A GPIO_PULSE_STATUS frame as the board sends it, decoded."""
     from autotrainer.device.socketcan_jerrycan import JerryCANCmdType, decode_frame
 
     can_id = (JerryCANCmdType.GPIO_PULSE_STATUS << 5) | 0x01
     payload = struct.pack("<BHIBi", 0, gpio_idx, 1000, phase, error)
+    return decode_frame(can_id, payload + bytes([23]))
+
+
+def pulse_status(gpio_idx, phase=2, error=0):
+    """A GPIO_PULSE_STATUS frame as the board sends it, decoded and translated."""
     return CanInterface._translate_gpio_pulse_status(
-        decode_frame(can_id, payload + bytes([23])))
+        pulse_status_frame(gpio_idx, phase, error))
 
 
 @pytest.mark.parametrize("gpio_idx, channel", [
@@ -112,3 +119,32 @@ def test_the_board_refusing_a_tone_line_is_recorded_against_that_line():
 
 def test_a_pulse_status_for_an_unknown_line_names_none():
     assert pulse_status(2).channel is None
+
+
+@pytest.mark.parametrize("phase, name", [
+    (0, "rejected"),
+    (1, "asserted"),
+    (2, "completed"),
+])
+def test_a_socketcan_phase_is_recorded_by_name(phase, name):
+    # SocketCAN decodes the phase as a bare uint8, which used to be recorded
+    # as the digit.
+    assert pulse_status(7, phase=phase).phase == name
+
+
+def test_a_named_phase_keeps_its_name():
+    class Phase(enum.IntEnum):
+        COMPLETED = 2
+
+    message = pulse_status_frame(7)
+    message.gpio_pulse_status.phase = Phase.COMPLETED
+
+    assert CanInterface._translate_gpio_pulse_status(message).phase == "completed"
+
+
+def test_an_unknown_phase_keeps_its_value_and_warns(caplog):
+    with caplog.at_level(logging.WARNING):
+        status = pulse_status(7, phase=9)
+
+    assert status.phase == "9"
+    assert "unknown phase 9" in caplog.text
