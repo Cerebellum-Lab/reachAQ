@@ -13,7 +13,8 @@ a pulse it never produced, or produces one it never reports, fails either way.
   * identity: version, wire schema, capabilities and boot id, judged by the
     same compatibility policy the application applies at startup;
   * mapping: which NI terminal each board stimulus output drives, measured by
-    holding each output high, rather than trusted from configuration;
+    holding each output high, rather than trusted from configuration: one
+    PFI, watched, plus any digital readback lines, recorded;
   * tones: each mapped frequency raises only its confirmation line, and an
     unmapped one raises none;
   * pulses: a 500 ms finite pulse on STIM2 and STIM3 rises, returns low
@@ -333,20 +334,40 @@ def check_identity(evidence, identity, policy, expected):
         qualification_status=result.qualification_status)
 
 
+def is_pfi(terminal):
+    """Whether `terminal` is a PFI pin (`/Dev/PFIn`) rather than a port line."""
+    return re.fullmatch(r"PFI\d+", terminal.strip("/").split("/")[-1], re.IGNORECASE) is not None
+
+
 def map_stim_terminals(evidence, nidaqmx, interface, configuration):
-    """Which NI terminal each pulseable board output drives, measured now."""
+    """Which NI terminal each pulseable board output drives, measured now.
+
+    The watched terminal is the one PFI the output raises: the pulse check
+    times it and the drop check counts edges on it. A port line that rises
+    with it is a digital readback of the same output, recorded but not
+    watched; christielab10 gained them after 2.3.0 was qualified (port0/line5
+    for STIM2, line6 for STIM3). No PFI, or more than one, fails.
+    """
     observed = {}
     check_digital(nidaqmx, interface, configuration, wiring_points(configuration),
                   lambda label, terminals: observed.__setitem__(label, terminals))
     terminals = {}
     for name in PULSE_GPIO:
         seen = observed.get(f"board {name}", [])
-        ok = len(seen) == 1
-        evidence.add(f"{name} lands on NI", ok,
-                     f"holding board {name} high raised {', '.join(seen) or 'nothing'}",
-                     terminals=seen)
+        pfis = [terminal for terminal in seen if is_pfi(terminal)]
+        readbacks = [terminal for terminal in seen if not is_pfi(terminal)]
+        ok = len(pfis) == 1
+        detail = f"holding board {name} high raised {', '.join(seen) or 'nothing'}"
         if ok:
-            terminals[name] = seen[0]
+            detail += f"; watching {pfis[0]}"
+            if readbacks:
+                detail += f", readback {', '.join(readbacks)}"
+        else:
+            detail += f"; needs exactly one PFI, found {len(pfis)}"
+        evidence.add(f"{name} lands on NI", ok, detail, terminals=seen,
+                     watched=pfis[0] if ok else None, readbacks=readbacks)
+        if ok:
+            terminals[name] = pfis[0]
     return terminals
 
 
