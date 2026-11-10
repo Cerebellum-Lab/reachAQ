@@ -1162,7 +1162,7 @@ class AppModel(ObservableObject):
         pellet_m.events.pellet_sending += self._on_pellet_sending
         pellet_m.events.pellet_sent += self._on_pellet_sent
         pellet_m.set_send_preparation_callbacks(
-            readiness=self._protocol_send_readiness,
+            readiness=self._pellet_send_readiness,
             guard=self._guard_protocol_send,
         )
 
@@ -3061,8 +3061,8 @@ class AppModel(ObservableObject):
                 "Pellet firmware is not compatible: "
                 + str(compatibility.get("reason") or "unknown compatibility state")
             )
-        axes = getattr(self._hardware, "pellet_axes_needing_home", ())
-        if pellet_source_required and isinstance(axes, tuple) and axes:
+        axes = self._pellet_axes_needing_home()
+        if pellet_source_required and axes:
             blockers.append(
                 f"Pellet axis {', '.join(axes)} needs homing after a refused command: "
                 "home the pellet axes"
@@ -6197,6 +6197,21 @@ class AppModel(ObservableObject):
             # straight after, and is refused while the board is still held by
             # this one's cleanup. The abort ends it in milliseconds.
             wait_until_cancelled_ends(handle)
+
+    def _pellet_axes_needing_home(self) -> Tuple[str, ...]:
+        axes = getattr(self._hardware, "pellet_axes_needing_home", ())
+        return axes if isinstance(axes, tuple) else ()
+
+    def _pellet_send_readiness(self) -> bool:
+        """Whether an automatic send may go: asked for every send that is not forced.
+
+        While a refusal says an axis needs a home, the board would refuse the
+        send as well, so automation waits for an acknowledged home. Asked each
+        time, it cannot outlive the state; a manual (forced) send is not held.
+        """
+        if self._pellet_axes_needing_home():
+            return False
+        return self._protocol_send_readiness()
 
     def _protocol_send_readiness(self) -> bool:
         if (
@@ -12044,6 +12059,12 @@ class AppModel(ObservableObject):
     def _on_hardware_command_failed(self, failure: CanFailure) -> None:
         """Finalize the matching physical pellet attempt as a hardware error."""
         operation = self._trial_action_executor.operation
+        if self._is_refused_trial_stimulus(failure, operation):
+            # The trial's board STIM pulse goes out after the pellet, under its
+            # own token: a refused one fails the attempt it belongs to, as a
+            # refused send does.
+            failure = dataclasses.replace(
+                failure, context=self._pellet_cycles.active_attempt.operation_id)
         if (
             operation is not None
             and operation.state not in operation.TERMINAL
@@ -12068,6 +12089,19 @@ class AppModel(ObservableObject):
         self._notify_trial_protocol_state()
         self._evaluate_automatic_stop_policy(
             protocol_complete=self._protocol_runner.protocol_complete,
+        )
+
+    def _is_refused_trial_stimulus(self, failure: CanFailure, operation) -> bool:
+        """A refused board pulse that is the active attempt's hardware_stim3 stimulus."""
+        attempt = self._pellet_cycles.active_attempt
+        firing = None if operation is None else getattr(operation.recipe, "laser_firing", None)
+        return (
+            failure.category == "board_refusal"
+            and failure.command is SystemCommandKind.PULSE_DIGITAL_OUTPUT
+            and attempt is not None
+            and firing is not None
+            and firing.trigger_route is LaserTriggerRoute.HARDWARE_STIM3
+            and self._trial_action_executor.matches_send_context(attempt.operation_id)
         )
 
     def _on_pellet_sent(
