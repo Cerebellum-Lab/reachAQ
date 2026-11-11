@@ -107,6 +107,8 @@ Current hardware bring-up tools live under `tools/hardware`:
 
 * `tools/hardware/validate_can_hardware.py` - discover the pellet CAN board,
   request status/configuration, or perform explicitly enabled motion tests.
+  It exits 1, naming the code, when the board refuses a command (any ACK
+  error other than 0 and -11).
 * `tools/hardware/validate_laser_hardware.py` - validate configured NI-DAQ laser
   channels one controlled operation at a time.
 * `tools/hardware/verify_nidaq_wiring.py` - drive each board output and laser
