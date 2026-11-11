@@ -384,6 +384,11 @@ class StepperConfig(MotorSource):
         self._flip_limit_orientation = value
 
 
+#: STEPPER_STATUS.status bits (pellet firmware 2.3.1). A v1.2 board always sends 0.
+STEPPER_STATUS_DRIVER_FAULT = 0x01  # this motor's driver raised DIAG; latched until a re-home
+STEPPER_STATUS_ENABLE_OFF = 0x02  # the shared enable is off, for any reason
+
+
 @dataclass
 class StepperStatus(Source, StepperStatusMessage):
     _motor: Motor = Motor.NONE
@@ -391,6 +396,7 @@ class StepperStatus(Source, StepperStatusMessage):
     _send_position: float = 0 # (mm)
     _limit_switch: bool = False
     position_error: bool = False
+    status: int = 0  # STEPPER_STATUS_* bits
 
     def __init__(
         self,
@@ -401,6 +407,7 @@ class StepperStatus(Source, StepperStatusMessage):
         limit_switch: bool,
         *,
         position_error: bool = False,
+        status: int = 0,
     ):
         super().__init__(target)
 
@@ -409,6 +416,7 @@ class StepperStatus(Source, StepperStatusMessage):
         self._send_position = send_position
         self._limit_switch = limit_switch
         self.position_error = position_error
+        self.status = status
 
     @property
     def motor(self) -> Motor:
@@ -427,6 +435,16 @@ class StepperStatus(Source, StepperStatusMessage):
     @property
     def is_at_limit(self) -> bool:
         return self._limit_switch
+
+    @property
+    def driver_fault(self) -> bool:
+        """True if this motor's driver has raised DIAG (latched until a re-home)."""
+        return bool(self.status & STEPPER_STATUS_DRIVER_FAULT)
+
+    @property
+    def enable_off(self) -> bool:
+        """True if the shared enable is off, for any reason."""
+        return bool(self.status & STEPPER_STATUS_ENABLE_OFF)
 
 
 @dataclass

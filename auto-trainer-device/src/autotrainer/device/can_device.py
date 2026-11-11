@@ -1569,7 +1569,8 @@ class CanDevice(Device):
         if api is not None and kind is not None:
             prev_data, prev_perf_c = self._previous_stepper_status_pos_perf_c.get(kind, (None, -math.inf))
             perf_now = get_perf_now()
-            data = (message.position, message.send_position, message.is_at_limit, message.position_error)
+            data = (message.position, message.send_position, message.is_at_limit, message.position_error,
+                    message.status)
             if data != prev_data or perf_now - prev_perf_c > self.same_data_refresh_delay:
                 self._previous_stepper_status_pos_perf_c[kind] = (data, perf_now)
                 api.send_message(kind, message)
