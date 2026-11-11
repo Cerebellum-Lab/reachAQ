@@ -3067,6 +3067,12 @@ class AppModel(ObservableObject):
                 f"Pellet axis {', '.join(axes)} needs homing after a refused command: "
                 "home the pellet axes"
             )
+        faults = self._pellet_axes_with_driver_fault()
+        if pellet_source_required and faults:
+            blockers.append(
+                f"Pellet stepper driver fault on axis {', '.join(faults)}: "
+                "home the pellet axes to clear it"
+            )
         if self.animal_metadata_refresh_busy:
             blockers.append("SoftMouse animal metadata refresh is still running")
         if self._recording_session.status is not SessionRecordingStatus.READY:
@@ -6200,6 +6206,10 @@ class AppModel(ObservableObject):
 
     def _pellet_axes_needing_home(self) -> Tuple[str, ...]:
         axes = getattr(self._hardware, "pellet_axes_needing_home", ())
+        return axes if isinstance(axes, tuple) else ()
+
+    def _pellet_axes_with_driver_fault(self) -> Tuple[str, ...]:
+        axes = getattr(self._hardware, "pellet_axes_with_driver_fault", ())
         return axes if isinstance(axes, tuple) else ()
 
     def _pellet_send_readiness(self) -> bool:
@@ -10659,7 +10669,11 @@ class AppModel(ObservableObject):
         hard = self._hardware
         if name == hard.CAN_CONNECTION_STATE_PROPERTY:
             self._on_can_connection_state_changed(value)
-        elif name in {hard.FIRMWARE_COMPATIBILITY_PROPERTY, hard.PELLET_NEEDS_HOME_PROPERTY}:
+        elif name in {
+            hard.FIRMWARE_COMPATIBILITY_PROPERTY,
+            hard.PELLET_NEEDS_HOME_PROPERTY,
+            hard.PELLET_DRIVER_FAULT_PROPERTY,
+        }:
             self.property_changed(
                 self.Props.RECORDING_BLOCKERS,
                 self.recording_blockers,

@@ -9,12 +9,14 @@ window. While a refusal says an axis needs a home, Record is blocked.
 from types import SimpleNamespace
 
 from autotrainer.behavior.pellet_trial import HardwareErrorKind, TrialOutcome
-from autotrainer.core import Motor, SystemCommandKind
+from autotrainer.core import MessageHandler, Motor, SystemCommandKind
 from autotrainer.device import (
     CanFailure,
     CanFailureKind,
     CommandRefusal,
     RefusedCommandClass,
+    StepperStatus,
+    Target,
 )
 from tools.acquisition.model.subsystem_status import SubsystemId, SubsystemState
 from tools.acquisition.model.trial_action import PreparedState, PreparedTrialOperation
@@ -220,3 +222,28 @@ def test_a_manual_send_is_not_held_by_a_needs_home_axis(app_model):
     app_model.hardware._set_axes_needing_home(("X", "Y", "Z"))
 
     assert pellet.can_send_pellet(force=True) is True
+
+
+def test_recording_is_blocked_while_a_pellet_driver_fault_is_reported(app_model):
+    app_model._acquisition.started = True
+    app_model._set_subsystem_status(
+        SubsystemId.CAN_PELLET, SubsystemState.READY, required_for_recording=True,
+    )
+    published = []
+    app_model.property_changed += (
+        lambda name, value, old:
+        published.append(value) if name == app_model.Props.RECORDING_BLOCKERS else None)
+
+    def report(status):
+        app_model.hardware._message_handler_property_changed(
+            MessageHandler.STEPPER_Y_PROPERTY,
+            StepperStatus(Target.PELLET_DEVICE, Motor.PELLET_Y_MOTOR, 1.0, 2.0, False, status=status),
+            None)
+
+    report(0x03)
+    (blocker,) = [b for b in app_model.recording_blockers if "driver fault" in b]
+    assert "Y" in blocker and "home the pellet axes" in blocker
+    assert any(any("driver fault" in b for b in blockers) for blockers in published)
+
+    report(0x02)  # enable off alone blocks nothing
+    assert [b for b in app_model.recording_blockers if "driver fault" in b] == []

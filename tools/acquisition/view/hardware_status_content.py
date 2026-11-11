@@ -331,8 +331,15 @@ class HardwareStatusContent(ContentWidget):
             refusal = hardware.last_command_refusal
         except Exception:
             axes, refusal = (), ""
+        # Read apart from the needs-home pair, so a model without it keeps that row.
+        try:
+            faults = tuple(hardware.pellet_axes_with_driver_fault or ())
+        except Exception:
+            faults = ()
         if axes and panel_state == "ok":
             panel_state = "warning"
+        if faults and panel_state in {"ok", "warning"}:
+            panel_state = "error"
         self._set_enabled("pellet", is_enabled, panel_state)
         rows = [("pellet", self._pellet_binding(), state)]
         rows.append(self._subsystem_status_row(SubsystemId.CAN_PELLET, "health"))
@@ -359,6 +366,11 @@ class HardwareStatusContent(ContentWidget):
             "motors",
             f"needs home: {', '.join(axes)}" if axes else "no axis flagged",
             refusal or "no refusal",
+        ))
+        rows.append((
+            "drivers",
+            f"fault on {', '.join(faults)}" if faults else "no fault reported",
+            "home the pellet axes to clear it" if faults else "none latched",
         ))
         self._set_info(
             "pellet",
@@ -702,6 +714,7 @@ class HardwareStatusContent(ContentWidget):
         if property_name in {
             "pellet_version",
             "pellet_needs_home",
+            "pellet_driver_fault",
             "last_command_refusal",
             "device_pellet_status_timeout_engaged",
             "can_enabled",
