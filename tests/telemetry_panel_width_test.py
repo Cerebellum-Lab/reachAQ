@@ -194,7 +194,7 @@ def test_the_stim_p99_readout_says_what_it_spans(qapp):
     assert "excludes exposure" in tip
 
 
-# The five readouts that were the whole expanded row at bbf065d8, before the
+# The five readouts that were the whole expanded row at dadb2b66, before the
 # latency record added two (caption, widest reading). Kept here, not read off
 # the panel, so the baseline cannot drift along with what is being checked.
 _PRE_LATENCY_RECORD_READOUTS = (

@@ -1,7 +1,7 @@
 # Pellet firmware: the GPIO pulse command
 
 > **Resolved in pellet firmware v2.2.0** (`reachAQ-hardware` tag `v2.2.0`,
-> commit `01ee28b`), flashed and verified on `christielab10` on 2026-09-17.
+> commit `434e50c`), flashed and verified on `christielab10` on 2026-09-17.
 > This document is kept as the specification that release was built against and
 > as the record of what was wrong before it. Everything below describes
 > v2.1.0 and earlier.

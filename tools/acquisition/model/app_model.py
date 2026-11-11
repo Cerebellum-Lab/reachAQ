@@ -6996,7 +6996,7 @@ class AppModel(ObservableObject):
             # a controller still closing can hold inputs on the stream's
             # lines, as a ramp's does. The ramp let go of its hold on the
             # stream as it ended, and the stream restarted over that close
-            # (final re-review, affb7491). The close's late finish asks for
+            # (final re-review, d000df96). The close's late finish asks for
             # the stream again.
             and not self._given_up_close_refusal()
         )

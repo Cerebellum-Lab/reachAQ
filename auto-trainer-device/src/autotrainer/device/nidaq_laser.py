@@ -47,7 +47,7 @@ _OPERATION_CANCEL_TIMEOUT_S = 5.0
 #: so that what it does next finds the board free; the one bound for every
 #: such path, the application's too. The abort ends it in milliseconds
 #: (christielab10: the wait woke 21-35 ms after the cancel, H8a and H8c on
-#: c12189cd); this bounds a sick driver.
+#: 56f58866); this bounds a sick driver.
 CANCELLED_OPERATION_WAIT_S = 2.0
 #: How long a stop or close keeps trying while an abort is still finishing.
 #: DAQmx refused a stop so, -88710, made while a task never started, its
@@ -116,7 +116,7 @@ class NidaqLaserOperation:
         #: Called by cancel() before any abort: closes the pulse's shutter,
         #: as close() closes the shutters first. After an abort the output
         #: holds its amplitude until the cleanup's reset: 0 V came 24-40 ms
-        #: after the cancel on the 6713 (H8a, H8c on c12189cd), the abort
+        #: after the cancel on the 6713 (H8a, H8c on 56f58866), the abort
         #: itself taking 12.6-32 ms. With the shutter closed the light is off
         #: for it.
         self._before_abort = before_abort
@@ -776,7 +776,7 @@ class NidaqLaserController:
         # Before the operation exists, as the refusals that need no more than
         # the request are. Made in the pulse's own thread, it came back as that
         # operation's failure, and the laser model kept the amplitude as what
-        # the output may still hold (final re-review, affb7491). The one
+        # the output may still hold (final re-review, d000df96). The one
         # refusal after it is of the buffer (_execute_synchronized_pulse_train):
         # that needs the rate the timing resolves, so it fails the operation
         # before any task exists, with nothing driven. It is still raised as a

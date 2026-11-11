@@ -46,10 +46,12 @@ versions:
       - >-
         Rig evidence, christielab10, 2026-11-10, from
         tools/hardware/qualify_pellet_firmware.py at reachAQ
-        v3.0.0-62-g7bb69c74: 19 of 19 checks on the rig's pellet v1.2 board,
+        v3.0.0-62-g7bb69c74, as the record names it (that commit is 88256883
+        after the 2026-11-11 history rewrite, which changed only commit
+        messages): 19 of 19 checks on the rig's pellet v1.2 board,
         flashed from reachaq-pellet-v2.3.1-linux-x86_64.tar.gz (sha256
         d203f93fabaa80152973fbb16eb39ea7581595f91dada8f8e4c208b7b5a51ce1),
-        built from tag v2.3.1 at reachAQ-hardware b26c264. Record
+        built from tag v2.3.1 at reachAQ-hardware a7d7613. Record
         pellet-2.3.1-20261110T220013Z.json under
         ~/Autotrainer/pellet_firmware_qualification (sha256
         a3785bbb887733a314488c1ab5add0030e814c4bd338b918ffdd7d8b370d9198).
@@ -65,7 +67,7 @@ versions:
         check in the record: all five motor configurations read back intact
         on the moved settings store. The earlier record that day,
         pellet-2.3.1-20261110T214525Z.json (14 of 19), failed only through
-        the qualify script's old one-line terminal map, fixed in 7bb69c74.
+        the qualify script's old one-line terminal map, fixed in 88256883.
   - version: 2.3.0
     wire_schema_version: 1
     required_capabilities:
@@ -171,7 +173,7 @@ versions:
       - Physical rig qualification and retained acceptance evidence are pending.
       - >-
         Firmware v2.1.0 implements no capability-report or time-sync command.
-        Verified against the release source (commit 161b635): its command set
+        Verified against the release source (commit 6f3fd6d): its command set
         is CFG/GPIO/SERVO/STEPPER/TONE/AUDIO/DOOR_SENSOR/PRESSURE_READ and
         friends, with no counterpart to the host's CAPABILITIES_REQUEST (0x23)
         or TIME_SYNC_REQUEST (0x1F), and the board answers neither on the bus.

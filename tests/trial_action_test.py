@@ -565,7 +565,7 @@ def test_the_cycle_takes_the_waveforms_length_from_the_profile(monkeypatch):
 def test_a_laser_the_controller_refuses_is_recorded_as_a_refusal(monkeypatch):
     # The preparation error is "<type>: <message>". A pulse refused before it
     # drove anything reads LaserPulseRefused, which says more than the
-    # RuntimeError it read before affb7491; kept, and documented (controller
+    # RuntimeError it read before d000df96; kept, and documented (controller
     # ruling, workstream D).
     from autotrainer.device import (
         LaserChannelId, LaserPulseTrain, LaserSynchronizedPulseTrain)

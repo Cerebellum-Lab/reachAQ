@@ -70,7 +70,7 @@ def test_requirement_enforcement_still_rejects_a_missing_capability(tmp_path):
 def test_shipped_v2_1_0_runs_without_capability_reporting():
     """The real v2.1.0 firmware answers no capability query at all.
 
-    Verified on the rig and against the release source (commit 161b635): its
+    Verified on the rig and against the release source (commit 6f3fd6d): its
     command set has no counterpart to CAPABILITIES_REQUEST (0x23) or
     TIME_SYNC_REQUEST (0x1F). A board reporting nothing must still run, with
     the three timing capabilities simply absent.

@@ -147,7 +147,7 @@ class LaserSynchronizedPulseTrain:
 
 #: How long the start of each calibration step is left out of its point, by
 #: default: a time, whatever the step's length. Confirmed on christielab10
-#: with 5 ms steps at 100 kHz (H2b, c12189cd): laser 2's diode came within 2%
+#: with 5 ms steps at 100 kHz (H2b, 56f58866): laser 2's diode came within 2%
 #: in 270-610 us, laser 1's in 420-430 us, the command copies at once, and
 #: every point lands within 0.5% of its step. Laser 2 needs 55-61 samples
 #: against the 60 dropped, so there is little margin. What settles is the
