@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import math
 from unittest import mock
@@ -694,10 +695,12 @@ def test_a_refused_automatic_release_holds_automatic_covers_as_well(machine, mon
 
 
 @pytest.mark.parametrize("policy, command", [("cover", "cover_pellet"), ("reveal", "release_pellet")])
-def test_a_protocol_cover_policy_is_sent_while_a_refused_cover_holds(machine, policy, command):
+def test_a_protocol_cover_policy_is_sent_while_a_refused_cover_holds(machine, monkeypatch, policy, command):
     """The protocol's cover or release is forced, so no standing hold may stop it."""
     pellet_m = machine.pellet
     device = pellet_m._pellet_device
+    # Let the algorithm permit an automatic release, so only the hold can stop one.
+    monkeypatch.setattr(machine.algorithm, "can_release_pellet", lambda **kwargs: True)
     device.cover_pellet.return_value = "cover-1"
     device.release_pellet.return_value = "release-1"
     pellet_m.set_motion_readiness_callback(lambda: False)  # an axis needs a home
@@ -705,12 +708,14 @@ def test_a_protocol_cover_policy_is_sent_while_a_refused_cover_holds(machine, po
     pellet_m.cover_pellet()
     pellet_m._pellet_device_command_refused("cover-1", refusal=_refusal("cover-1", -1))
     assert pellet_m.can_cover_pellet() is False, "an automatic cover is held"
+    assert pellet_m.can_release_pellet() is False, "and so is an automatic release"
     device.cover_pellet.reset_mock()
     device.release_pellet.reset_mock()
 
-    # The relayed trigger returns None, so this ends in "Could not queue" (or a
-    # timeout) after the command went out. The command is what a hold would stop.
-    with pytest.raises((PelletDeviceCommandFailed, TimeoutError)):
+    # What happens after the command goes out is not under test: the relayed
+    # trigger returns None today, so the call ends in "Could not queue"; once
+    # that is fixed it waits for an ack that never comes (TimeoutError).
+    with contextlib.suppress(PelletDeviceCommandFailed, TimeoutError):
         pellet_m.prepare_cover_policy(policy, timeout=0.05)
 
     getattr(device, command).assert_called_once()
