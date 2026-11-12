@@ -20,14 +20,18 @@ required; camera-only operation is unaffected when CAN/pellet is disabled.
 
 Each entry's `limitations` in the YAML file say what that version cannot do.
 
+A pellet v1.3 board needs firmware 2.3.1 or later. On 2.3.0 or older it
+accepts moves and does not move them, and reachAQ cannot tell, because the
+policy has no board-revision field.
+
 Raw kernel/host receive time, board time, aligned board time, clock model,
 uncertainty, transport estimate, and selected event time remain distinct in
 `streams/device.csv`. Alignment preference is an unambiguous NI physical edge,
 then a valid in-range board clock model, then kernel/host receive time. No
 derived value overwrites raw evidence.
 
-Pellet firmware 2.4.0 is the first to advertise `time_sync`; through 2.3.0 the
-capability is never reported. A board that advertises it makes `open()` run four
+Pellet firmware 2.4.0 is the first to advertise `time_sync`; no earlier release
+reports the capability. A board that advertises it makes `open()` run four
 time-sync exchanges a few milliseconds apart. Earlier reachAQ fitted a clock
 slope to those closely spaced exchanges and raised `ValueError` when it fell
 outside 0.999 to 1.001, so it failed to open the board. The board-clock fit now
@@ -77,16 +81,26 @@ shutdown starts, and the log names the reason:
 - `Required capability mismatch`: the version is listed but the board did not
   report a capability the entry requires.
 - `... was refused by the board: <reason>`: the board answered the startup
-  home, or a motor-configuration write, with an error, and the reason ends with
-  the code. reachAQ does not retry a refused startup: CAN recovery stops and
-  logs `CAN recovery stopped: <reason>`. What to do depends on the code:
+  home, or a motor-configuration write, with an error. The message ends with
+  the error's name and number and a closing parenthesis, for example
+  `: EIO -5)`. reachAQ does not retry a refused startup, and nothing homes
+  until you run Refresh Hardware. If the same refusal comes while reachAQ is
+  reconnecting by itself after a CAN fault, the log reads
+  `CAN recovery stopped: <reason>` instead, and recovery makes no further
+  attempt; restart reachAQ, which connects and homes again, and if that is
+  refused too, act on its code as below. What to do for a refused startup
+  depends on the code:
   - `EPERM -1`: E-stop asserted. Release it, then Refresh Hardware.
   - `EIO -5`: a driver fault stopped the home, or the drivers failed to
     re-prove. Refresh Hardware once, which homes again
-    (`hardware_model.py:756`). If that home is refused too, reboot the
-    pellet board and check its 12 V supply.
+    (`HardwareModel._connect_locked` in
+    `tools/acquisition/model/hardware_model.py`). If that home is refused
+    too, reboot the pellet board and check its 12 V supply.
   - `EBUSY -16` on the home: an axis is busy or stuck. Reboot the pellet
     board.
+  - Any other code, or a refused motor-configuration write: the message says
+    only that the board refused the command, with its error. This page has no
+    action for it; report the code.
 
 ## Qualifying a new firmware version
 
