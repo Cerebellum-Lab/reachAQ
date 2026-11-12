@@ -87,9 +87,9 @@ shutdown starts, and the log names the reason:
   home comes from Refresh Hardware or from starting System Mode. If the same
   refusal comes while reachAQ is reconnecting by itself after a CAN fault, the
   log reads `CAN recovery stopped: <reason>` instead, and recovery makes no
-  further attempt; restart reachAQ, which connects and homes again, and if that
-  is refused too, act on its code as below. What to do for a refused startup
-  depends on the code:
+  further attempt and closes the connection; Refresh Hardware connects and
+  homes again, and if that is refused too, act on its code as below. What to
+  do for a refused startup depends on the code:
   - `EPERM -1`: E-stop asserted by another CAN client (reachAQ never sends
     one). Stop that client, or reboot the pellet board, which releases it;
     then Refresh Hardware.
