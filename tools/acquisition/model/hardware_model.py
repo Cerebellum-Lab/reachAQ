@@ -1558,7 +1558,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 "Pellet stepper driver fault on axis %s: home the pellet axes to clear it",
                 ", ".join(self._axes_with_driver_fault))
         elif not self._axes_with_driver_fault:
-            logger.info("Pellet stepper driver fault cleared")
+            logger.info("Pellet stepper driver fault no longer reported")
         self.property_changed(
             self.PELLET_DRIVER_FAULT_PROPERTY, self._axes_with_driver_fault, prev)
 

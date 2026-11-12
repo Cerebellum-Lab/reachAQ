@@ -370,7 +370,8 @@ class HardwareStatusContent(ContentWidget):
         rows.append((
             "drivers",
             f"fault on {', '.join(faults)}" if faults else "no fault reported",
-            "home the pellet axes to clear it" if faults else "none latched",
+            ("home the pellet axes to clear it; if it returns right after a home, "
+             "reboot the pellet board and check the 12 V supply") if faults else "none reported",
         ))
         self._set_info(
             "pellet",

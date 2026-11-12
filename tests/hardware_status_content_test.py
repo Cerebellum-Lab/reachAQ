@@ -571,6 +571,7 @@ def test_pellet_status_shows_driver_fault_and_needs_home(qapp):
     try:
         panel = content._category_panels["pellet"]
         assert "no fault reported" in panel.details_text
+        assert "none reported" in panel.details_text
 
         app_model.hardware.pellet_axes_needing_home = ("X", "Y", "Z")
         app_model.hardware.last_command_refusal = ""
@@ -580,6 +581,7 @@ def test_pellet_status_shows_driver_fault_and_needs_home(qapp):
 
         assert "fault on Y" in panel.details_text
         assert "needs home: X, Y, Z" in panel.details_text
+        assert "reboot the pellet board and check the 12 V supply" in panel.details_text
         assert "#fdebec" in panel.header.styleSheet(), "a driver fault is an error"
     finally:
         content.deleteLater()
