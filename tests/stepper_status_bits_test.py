@@ -106,7 +106,6 @@ def test_two_faulted_axes_are_listed_in_order_and_logged_once(hardware_model, ca
         _report(hardware_model, "X", 0x03)  # arrives second, sorts first
         _report(hardware_model, "X", 0x03)
     assert hardware_model.pellet_axes_with_driver_fault == ("X", "Z")
-    assert ", ".join(hardware_model.pellet_axes_with_driver_fault) == "X, Z"
     assert published == [("Z",), ("X", "Z")]
     assert len(_driver_fault_warnings(caplog)) == 1, "the second axis adds no second WARNING"
 
