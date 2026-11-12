@@ -11,6 +11,7 @@ required; camera-only operation is unaffected when CAN/pellet is disabled.
 
 | Firmware | Requires | Status |
 |---|---|---|
+| `2.3.1` | `finite_stim3_pulse`; `stepper_driver_fault` (bit 6) is optional, and only a pellet v1.3 board reports it | Rollout pending; 19 of 19 qualification checks on a pellet v1.2 board; no v1.3 board has run it; recorded-session validation pending; required on a pellet v1.3 board |
 | `2.3.0` | `finite_stim3_pulse` (the first release to report its capabilities) | Rig-verified; recorded-session validation pending |
 | `2.2.0` | nothing (it reports no capabilities) | Rollout pending |
 | `2.1.0` | nothing (it implements no capability report or time sync) | Rollout pending |
@@ -75,6 +76,17 @@ shutdown starts, and the log names the reason:
   listed one.
 - `Required capability mismatch`: the version is listed but the board did not
   report a capability the entry requires.
+- `... was refused by the board: <reason>`: the board answered the startup
+  home, or a motor-configuration write, with an error, and the reason ends with
+  the code. reachAQ does not retry a refused startup: CAN recovery stops and
+  logs `CAN recovery stopped: <reason>`. What to do depends on the code:
+  - `EPERM -1`: E-stop asserted. Release it, then Refresh Hardware.
+  - `EIO -5`: a driver fault stopped the home, or the drivers failed to
+    re-prove. Refresh Hardware once, which homes again
+    (`hardware_model.py:756`). If that home is refused too, reboot the
+    pellet board and check its 12 V supply.
+  - `EBUSY -16` on the home: an axis is busy or stuck. Reboot the pellet
+    board.
 
 ## Qualifying a new firmware version
 

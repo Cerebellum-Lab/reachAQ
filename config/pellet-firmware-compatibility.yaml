@@ -114,6 +114,12 @@ versions:
         completed, and counted at the NI; a reboot changes the boot id and
         nothing else. Still outstanding before this entry is qualified: a
         recorded session passing reachaq-validate-session.
+      - >-
+        Not for pellet v1.3 boards. This firmware does not drive the v1.3
+        shared stepper enable, so a v1.3 board on it accepts moves and does
+        not move. It reports nothing that lets the host see this (capability
+        bit 6, stepper_driver_fault, starts at 2.3.1). Flash 2.3.1 or later
+        onto a v1.3 board.
   - version: 2.2.0
     wire_schema_version: 1
     required_capabilities: []
