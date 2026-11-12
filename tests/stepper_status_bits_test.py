@@ -43,6 +43,9 @@ def test_translate_stepper_status_carries_driver_fault_and_enable_off():
     other = _interface()._translate_stepper_status(_wire(status=0x02))
     assert other.driver_fault is False and other.enable_off is True
 
+    driver_only = _interface()._translate_stepper_status(_wire(status=0x01))
+    assert driver_only.driver_fault is True and driver_only.enable_off is False
+
 
 def test_a_status_byte_of_zero_reports_neither_bit():
     status = _interface()._translate_stepper_status(_wire(status=0x00))
