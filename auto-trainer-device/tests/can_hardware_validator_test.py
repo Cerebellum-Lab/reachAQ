@@ -4,7 +4,7 @@ import sys
 import pytest
 
 from autotrainer.core import Motor
-from autotrainer.device.device_interface import Acknowledge
+from autotrainer.device.device_interface import Acknowledge, Version
 import tools.hardware.validate_can_hardware as validator
 from tools.hardware.validate_can_hardware import (
     _motor_config_from_file,
@@ -89,13 +89,41 @@ def _run_home(monkeypatch, error):
     return validator.main()
 
 
-def test_listen_reports_a_refused_command_and_main_exits_nonzero(monkeypatch, capsys):
-    assert _run_home(monkeypatch, -5) == 1
+@pytest.mark.parametrize("error, name", [
+    (-1, "EPERM"),
+    (-5, "EIO"),
+    (-16, "EBUSY"),
+    (-22, "board error -22"),
+    (-116, "ETIMEDOUT"),
+])
+def test_listen_reports_a_refused_command_and_main_exits_nonzero(monkeypatch, capsys, error, name):
+    assert _run_home(monkeypatch, error) == 1
     err = capsys.readouterr().err
-    assert "EIO" in err and "(-5)" in err and "uuid 7" in err
+    assert f"ERROR: uuid 7: the board refused the command with {name} ({error})" in err.splitlines()
+
+
+def test_a_listen_reports_every_refusal_in_order_and_skips_other_messages(monkeypatch, capsys):
+    monkeypatch.setattr(_InterfaceThatAnswers, "answers", (
+        Version(version="2.3.1"),
+        Acknowledge(uuid=1, error=-16),
+        Acknowledge(uuid=2, error=-5),
+    ))
+    monkeypatch.setattr(validator, "CanInterface", _InterfaceThatAnswers)
+    monkeypatch.setattr(sys, "argv", [
+        "validate_can_hardware.py", "--channel", "test-bus", "--action", "listen",
+        "--listen-seconds", "0.05",
+    ])
+
+    assert validator.main() == 1
+    err = capsys.readouterr().err
+    assert err.splitlines() == [
+        "ERROR: uuid 1: the board refused the command with EBUSY (-16)",
+        "ERROR: uuid 2: the board refused the command with EIO (-5)",
+    ]
 
 
 @pytest.mark.parametrize("error", [0, -11])
 def test_an_ack_of_zero_or_eagain_is_not_a_refusal_and_main_exits_zero(monkeypatch, capsys, error):
     assert _run_home(monkeypatch, error) == 0
-    assert "refused" not in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "ERROR" not in err and "refused" not in err
