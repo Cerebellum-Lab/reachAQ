@@ -122,6 +122,7 @@ class PelletMachine(StateMachine):
         self._prev_notify_load_failed_perf_c = -math.inf
         self._send_readiness_callback = None
         self._send_guard_callback = None
+        self._motion_readiness_callback = None
         self._prepared_cover_policy: Optional[str] = None
         self._prepared_embedded_tone = None
         self._prepared_pre_reveal_stimulus = None
@@ -251,6 +252,8 @@ class PelletMachine(StateMachine):
             can_use
             and self._algorithm.can_load_pellet(pellet_state=self._state, use_any_cam=use_any_cam)
         )
+        if can and not force and self._motion_readiness_callback is not None:
+            can = bool(self._motion_readiness_callback())
         if can != self._prev_can_load:
             self._prev_can_load = can
         return can
@@ -269,6 +272,10 @@ class PelletMachine(StateMachine):
         """Install the application-owned protocol preparation boundary."""
         self._send_readiness_callback = readiness
         self._send_guard_callback = guard
+
+    def set_motion_readiness_callback(self, readiness: Optional[Callable[[], bool]]) -> None:
+        """Install the application-owned check that the board will accept automatic motion."""
+        self._motion_readiness_callback = readiness
 
     def prepare_cover_policy(self, policy: str, *, timeout: float = 15.0) -> None:
         """Acknowledge an explicit one-shot cover policy before SEND."""

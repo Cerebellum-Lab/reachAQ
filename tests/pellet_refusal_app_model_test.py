@@ -8,6 +8,7 @@ window. While a refusal says an axis needs a home, Record is blocked.
 
 from types import SimpleNamespace
 
+from autotrainer.behavior.pellet import PelletState
 from autotrainer.behavior.pellet_trial import HardwareErrorKind, TrialOutcome
 from autotrainer.core import MessageHandler, Motor, SystemCommandKind
 from autotrainer.device import (
@@ -247,3 +248,59 @@ def test_recording_is_blocked_while_a_pellet_driver_fault_is_reported(app_model)
 
     report(0x02)  # enable off alone blocks nothing
     assert [b for b in app_model.recording_blockers if "driver fault" in b] == []
+
+
+def _start_session_and_drain(app_model, mock_system, reason):
+    assert app_model.behavior.algorithm.start_session(reason=reason)
+    mock_system.mock_pellet_ack(until_none=True)  # whatever session start sent
+    mock_system.pellet_dev.reset_mock()  # count only what the test itself causes
+
+
+def test_a_refused_load_is_not_reissued_while_a_pellet_axis_needs_homing(app_model, mock_system):
+    """A refused LOAD leaves the machine in `loading` with its token cleared.
+
+    The scene has not changed, so each pose response sent the load again and
+    the board refused it again: an ERROR, a device event and an on_error per
+    inference frame until someone homed.
+    """
+    pellet, device = mock_system.pellet, mock_system.pellet_dev
+    _start_session_and_drain(app_model, mock_system, "refused-load-test")
+    device.load_pellet.side_effect = lambda: f"load-{device.load_pellet.call_count}"
+    pellet.state = PelletState.loading
+
+    mock_system.mock_pellet_missing()
+    assert device.load_pellet.call_count == 1
+
+    mock_system.msg_handler.command_refused("load-1", perf_c=None, refusal=_refusal(
+        "load-1", -16, SystemCommandKind.LOAD_PELLET, RefusedCommandClass.STEPPER_MOVE,
+        (Motor.PELLET_X_MOTOR,)))
+    assert app_model.hardware.pellet_axes_needing_home == ("X",)
+
+    mock_system.mock_pose_response(pellet_seen=False)
+    assert device.load_pellet.call_count == 1, "the refused load was sent again"
+
+    for _ in range(3):
+        mock_system.mock_pellet_ack(until_none=True)  # a cover the held machine sent instead
+        mock_system.mock_pose_response(pellet_seen=False)
+    assert device.load_pellet.call_count == 1
+    assert pellet.state == PelletState.loading
+
+    app_model.hardware._set_axes_needing_home(())  # what an acknowledged home does
+    mock_system.mock_pose_response(pellet_seen=False)
+    assert device.load_pellet.call_count == 2, "the first scene update after the home loads"
+
+
+def test_a_held_machine_in_monitoring_sends_no_load_while_the_pellet_is_gone(app_model, mock_system):
+    """After a refused SEND the machine goes sending -> monitoring and would load next."""
+    pellet, device = mock_system.pellet, mock_system.pellet_dev
+    _start_session_and_drain(app_model, mock_system, "held-monitoring-test")
+    app_model.hardware._set_axes_needing_home(("X", "Y", "Z"))
+    pellet.state = PelletState.monitoring
+    pellet._covered_state = True
+
+    mock_system.mock_pellet_missing()
+    mock_system.mock_pellet_ack(until_none=True)
+    mock_system.mock_pose_response(pellet_seen=False)
+
+    device.load_pellet.assert_not_called()
+    device.send_pellet.assert_not_called()

@@ -1165,6 +1165,7 @@ class AppModel(ObservableObject):
             readiness=self._pellet_send_readiness,
             guard=self._guard_protocol_send,
         )
+        pellet_m.set_motion_readiness_callback(self._pellet_motion_readiness)
 
         analysis.watchdog_monitor.property_changed += self._on_watchdog_property_changed
 
@@ -6211,6 +6212,16 @@ class AppModel(ObservableObject):
     def _pellet_axes_with_driver_fault(self) -> Tuple[str, ...]:
         axes = getattr(self._hardware, "pellet_axes_with_driver_fault", ())
         return axes if isinstance(axes, tuple) else ()
+
+    def _pellet_motion_readiness(self) -> bool:
+        """Whether the board will accept automatic pellet motion: no axis needs a home.
+
+        While a refusal says an axis needs a home, the board would refuse
+        automatic motion as well, so automation waits for an acknowledged
+        home. It is asked on every automatic load; a forced (manual) load is
+        not held.
+        """
+        return not self._pellet_axes_needing_home()
 
     def _pellet_send_readiness(self) -> bool:
         """Whether an automatic send may go: asked for every send that is not forced.

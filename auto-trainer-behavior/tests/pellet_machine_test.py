@@ -596,3 +596,16 @@ def test_a_refusal_is_logged_below_error_so_the_footer_keeps_the_operator_notice
     refused = [r for r in caplog.records if "refused" in r.getMessage()]
     assert refused, "the refusal is still logged"
     assert all(r.levelno < logging.ERROR for r in refused)
+
+
+def test_an_automatic_load_asks_the_motion_readiness_and_a_forced_one_does_not(machine, monkeypatch):
+    pellet_m = machine.pellet
+    monkeypatch.setattr(machine.algorithm, "can_load_pellet", lambda **kwargs: True)
+    ready, asked = [False], []
+    pellet_m.set_motion_readiness_callback(lambda: asked.append(1) or ready[0])
+
+    assert pellet_m.can_load_pellet() is False
+    assert pellet_m.can_load_pellet(force=True) is True
+    ready[0] = True
+    assert pellet_m.can_load_pellet() is True
+    assert len(asked) == 2, "asked for each automatic load, never for a forced one"
