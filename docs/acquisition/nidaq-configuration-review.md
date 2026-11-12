@@ -1,6 +1,6 @@
 # NI-DAQ configuration and DAQmx review
 
-Written 2026-09-22 against `feature-dev` at `a1986189`, with every claim
+Written 2026-09-22 against `feature-dev` at `35967c3a`, with every claim
 measured on christielab10 (PXI-1045 chassis, PXI-6221 in slot 5, PXI-6713 in
 slot 4, BNC-2090A breakout) unless it cites NI documentation.
 
@@ -218,7 +218,7 @@ between them - a factor of ten on this rig, silently.
 
 ### D4. `add_ai_voltage_chan` without `terminal_config`
 
-Fixed in `a1986189`. Worth keeping in the list because it is the clearest
+Fixed in `35967c3a`. Worth keeping in the list because it is the clearest
 example of the pattern: DAQmx's default is not neutral, it is per-channel, and
 on a PXI-6221 it gives ai0-ai7 differential and ai8+ single-ended. A channel
 list spanning both halves then reads some channels against pins it also reads

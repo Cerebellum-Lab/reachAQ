@@ -621,7 +621,7 @@ def test_a_stop_that_fails_otherwise_is_still_an_error(monkeypatch, caplog):
 def test_a_cancel_closes_the_pulses_shutter_before_it_aborts(held):
     # close() closes the shutters first; a trial's cancel went straight to
     # the abort, and the light stayed on for the abort and the reset, 24-40
-    # ms after the cancel on the 6713 (H8a, H8c on c12189cd).
+    # ms after the cancel on the 6713 (H8a, H8c on 56f58866).
     daq = held
     controller = NidaqLaserController(_routed())
     operation = _armed(controller, trigger_source="/PXI1Slot4/PXI_Trig0")

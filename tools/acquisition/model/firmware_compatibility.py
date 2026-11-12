@@ -22,6 +22,10 @@ CAPABILITY_BITS = {
     "sync_listener": 1 << 4,
     # Board sends the CAN sync clap and drives the NI-DAQ barcode line.
     "timekeeper": 1 << 5,
+    # Pellet v1.3 on 2.3.1 and later: the board found its stepper enable net
+    # at boot and reports driver faults in STEPPER_STATUS.status. A v1.2
+    # board never sets it, so it is optional in the policy.
+    "stepper_driver_fault": 1 << 6,
 }
 
 

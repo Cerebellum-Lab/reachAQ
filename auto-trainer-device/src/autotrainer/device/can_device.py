@@ -30,6 +30,7 @@ from .device_api import DeviceApi
 from .can_interface import CanInterface, Target, target_of_motor
 from .can_transport import CanTransportConfiguration, CanTransportKind
 from .can_failure import CanFailure, CanFailureKind
+from .board_refusal import CommandRefusal, RefusedCommandClass, is_refusal
 from .device_interface import (
     Acknowledge,
     AnalogOutput,
@@ -102,6 +103,60 @@ _shutdown_requested = _Sentinel(role="shutdown_requested")
 # the pulse and returns, which is what sends the ack), so this holds for any
 # pulse length.
 _STIM_ACK_TIMEOUT_S: float = 0.25
+
+
+_STEP_KEY_STEPPER = {
+    'x': Motor.PELLET_X_MOTOR, 'x_rel': Motor.PELLET_X_MOTOR, 'send_x_rel': Motor.PELLET_X_MOTOR,
+    'y': Motor.PELLET_Y_MOTOR, 'y_rel': Motor.PELLET_Y_MOTOR, 'send_y_rel': Motor.PELLET_Y_MOTOR,
+    'z': Motor.PELLET_Z_MOTOR, 'z_rel': Motor.PELLET_Z_MOTOR, 'send_z_rel': Motor.PELLET_Z_MOTOR,
+}
+_COMMAND_STEPPER = {
+    SystemCommandKind.MOVE_X: Motor.PELLET_X_MOTOR, SystemCommandKind.SET_X: Motor.PELLET_X_MOTOR,
+    SystemCommandKind.MOVE_Y: Motor.PELLET_Y_MOTOR, SystemCommandKind.SET_Y: Motor.PELLET_Y_MOTOR,
+    SystemCommandKind.MOVE_Z: Motor.PELLET_Z_MOTOR, SystemCommandKind.SET_Z: Motor.PELLET_Z_MOTOR,
+}
+_SERVOS = (Motor.PELLET_COVER_SERVO, Motor.PELLET_LOAD_SERVO)
+_XYZ = (Motor.PELLET_X_MOTOR, Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR)
+
+
+def _classify_sent_frame(prev_command) -> Tuple[RefusedCommandClass, Tuple[Motor, ...], str]:
+    """(class, motors, description) of the frame a board context awaits the ack of.
+
+    prev_command is that context's retry entry: (_retry_compound, [kind, step,
+    steps], ...) for a compound step, (_retry_full, (kind, data), ...) for a
+    command sent by its own handler. The class decides what the board's error
+    means (board_refusal).
+    """
+    if prev_command is None:
+        return RefusedCommandClass.OTHER, (), "unknown"
+    retry_kind, payload = prev_command[0], prev_command[1]
+    if retry_kind is _retry_compound:
+        step = payload[1]
+        description = str(step)
+        for key, motor in _STEP_KEY_STEPPER.items():
+            if key in step:
+                return RefusedCommandClass.STEPPER_MOVE, (motor,), description
+        if 'home' in step:
+            return RefusedCommandClass.STEPPER_HOME, (step['home'],), description
+        if step.get('predefined') == 'send':
+            return RefusedCommandClass.FIXED_XYZ, _XYZ, description
+        for key in ('_servo_move', '_servo_max_pos', '_servo_min_pos', '_internal_func_motor'):
+            if key in step:
+                motor = step[key][0] if key == '_servo_move' else step[key]
+                if motor in _SERVOS:
+                    return RefusedCommandClass.SERVO_MOVE, (motor,), description
+        if 'stim2' in step or 'stim3' in step:
+            return RefusedCommandClass.PULSE, (), description
+        return RefusedCommandClass.OTHER, (), description
+    kind = payload[0]
+    description = getattr(kind, "name", str(kind))
+    if kind in _COMMAND_STEPPER:
+        return RefusedCommandClass.STEPPER_MOVE, (_COMMAND_STEPPER[kind],), description
+    if kind is SystemCommandKind.SEND_FIXED_XYZ:
+        return RefusedCommandClass.FIXED_XYZ, _XYZ, description
+    if kind is SystemCommandKind.PULSE_DIGITAL_OUTPUT:
+        return RefusedCommandClass.PULSE, (), description
+    return RefusedCommandClass.OTHER, (), description
 
 
 def _no_op():
@@ -701,13 +756,18 @@ class CanDevice(Device):
             if ctx is not None and p_now is not None:
                 self._latency("dequeue", token=str(ctx), perf=p_now)
             found_board_with_uuid_ack = None
+            refusal = None
             if kind is _uuid_ack:
-                msg_uuid, msg_perf_c = data
+                msg_uuid, msg_perf_c, msg_error = data
                 for target, board_ctx in boards_pending_ctx.items():
                     if board_ctx.uuid is not None and board_ctx.uuid == msg_uuid:
                         found_board_with_uuid_ack = board_ctx
                         ctx = board_ctx.ctx
-                        cur_commands.insert(0, (_uuid_ack, data, ctx, -math.inf))
+                        if is_refusal(msg_error):
+                            # Read before the resets below clear what was sent.
+                            refusal = self._make_refusal(board_ctx, msg_error, msg_perf_c)
+                        else:
+                            cur_commands.insert(0, (_uuid_ack, data, ctx, -math.inf))
                         board_ctx.uuid = None
                         board_ctx.repeated_command_count = 0
                         board_ctx.prev_command = None
@@ -729,6 +789,9 @@ class CanDevice(Device):
                         break
                 if found_board_with_uuid_ack is None:
                     logger.debug("skipping unknown CAN uuid: %s", data)
+                    continue
+                if refusal is not None:
+                    self._stop_refused_command(found_board_with_uuid_ack, refusal)
                     continue
             else:
                 if kind is not None:
@@ -1057,6 +1120,46 @@ class CanDevice(Device):
         board_ctx.ctx = None
         board_ctx.kind = None
 
+    def _make_refusal(self, board_ctx: _BoardPendingContext, error: int, perf_c: float) -> CommandRefusal:
+        """Describe the refused frame from what the board context sent.
+
+        prev_command is the retry entry of the frame awaiting this ack: the
+        compound step, or the command itself. repeated_command_count says it
+        was re-sent after an ack timeout.
+        """
+        command_class, motors, step = _classify_sent_frame(board_ctx.prev_command)
+        return CommandRefusal(
+            token=board_ctx.ctx,
+            error=int(error),
+            command=board_ctx.kind,
+            step=step,
+            command_class=command_class,
+            motors=motors,
+            resent=board_ctx.repeated_command_count > 0,
+            perf_c=perf_c,
+        )
+
+    def _stop_refused_command(self, board_ctx: _BoardPendingContext, refusal: CommandRefusal) -> None:
+        """End a command whose frame the board refused, sending none of its remaining steps.
+
+        The resets an ack does were already done by the command loop. The
+        command is not acknowledged; its waiters get the refusal. A timeout
+        stays the only reason to re-send: a refusal never is. Steps dropped
+        here may include cover, release, retract or servo steps, and they do
+        not run: nothing moves on its own after a refusal.
+        """
+        dropped = board_ctx.compound_steps or []
+        logger.error(
+            "board refused %s with %s (%s); context=%s ; resent=%s ; dropping %s remaining step(s): %s",
+            refusal.step, refusal.error_name, refusal.error, refusal.token, refusal.resent,
+            len(dropped), refusal.message,
+        )
+        board_ctx.compound_steps = None
+        board_ctx.ctx = None
+        board_ctx.kind = None
+        if refusal.token is not None:
+            self._refuse_command(refusal)
+
     def _handle_ack(self, msg: Acknowledge):
         cur_can_uuid = self._interface.uuid()
         perf_c = msg.perf_c
@@ -1068,7 +1171,8 @@ class CanDevice(Device):
             kernel_wall=(kernel_ns / 1e9
                          if isinstance(kernel_ns, int) and kernel_ns > 0 else None),
         )
-        self._put_to_cmd_queue((_uuid_ack, (msg.uuid, perf_c), None))
+        # The board's error goes with the uuid: a refusal must not look like a success.
+        self._put_to_cmd_queue((_uuid_ack, (msg.uuid, perf_c, int(getattr(msg, "error", 0))), None))
 
     @property
     def api(self):

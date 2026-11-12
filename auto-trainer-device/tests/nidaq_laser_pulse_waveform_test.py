@@ -5,7 +5,7 @@ pulse-train waveform added low samples only between pulses, so with no
 post-stim it ended on the amplitude, and a single pulse was high samples
 alone. The output then stayed at the amplitude until the cleanup's reset,
 which comes after the task's stop and close. On christielab10 (2026-10-01,
-efe173a2) a 23 ms last pulse measured 28.45-35.0 ms and a 5 ms one
+5daa9dd6) a 23 ms last pulse measured 28.45-35.0 ms and a 5 ms one
 12.0-12.4 ms: each too long by the trace's gap from done to the reset.
 
 The 6713 also refuses a buffer of an odd number of samples per channel times

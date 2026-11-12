@@ -801,7 +801,7 @@ def _christielab10_from_yaml():
 def test_christielab10s_yaml_blocks_load_unchanged():
     # The fixtures above are Python objects; this goes through the parser,
     # camelCase and all, as a load does, on the rig's own blocks. The plan
-    # they build is the one they built at 1b13e15a, which is the stored
+    # they build is the one they built at d4415b36, which is the stored
     # stream itself: every channel, in order, with its settings and the
     # display selection.
     loaded = _christielab10_from_yaml()

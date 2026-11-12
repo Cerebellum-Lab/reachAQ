@@ -70,7 +70,7 @@ def test_requirement_enforcement_still_rejects_a_missing_capability(tmp_path):
 def test_shipped_v2_1_0_runs_without_capability_reporting():
     """The real v2.1.0 firmware answers no capability query at all.
 
-    Verified on the rig and against the release source (commit 161b635): its
+    Verified on the rig and against the release source (commit 6f3fd6d): its
     command set has no counterpart to CAPABILITIES_REQUEST (0x23) or
     TIME_SYNC_REQUEST (0x1F). A board reporting nothing must still run, with
     the three timing capabilities simply absent.
@@ -147,3 +147,55 @@ def test_policy_names_the_sync_role_capabilities():
     assert result.reported_capabilities == (
         "timing_trailer", "time_sync", "sync_listener", "timekeeper",
     )
+
+
+def test_2_3_1_is_listed_and_a_v1_2_board_reporting_0x04_is_accepted():
+    """A pellet v1.2 board on 2.3.1 has no enable net and so no bit 6."""
+    result = FirmwareCompatibilityPolicy.load().evaluate(
+        "Pellet: 2.3.1", wire_schema_version=1, capabilities=0x04,
+    )
+
+    assert result.supported
+    assert result.commands_allowed
+    assert result.reported_capabilities == ("finite_stim3_pulse",)
+    assert result.required_capabilities == ("finite_stim3_pulse",)
+
+
+def test_2_3_1_names_stepper_driver_fault_for_a_v1_3_board_reporting_0x44():
+    result = FirmwareCompatibilityPolicy.load().evaluate(
+        "Pellet: 2.3.1", wire_schema_version=1, capabilities=0x44,
+    )
+
+    assert result.commands_allowed
+    assert result.reported_capabilities == (
+        "finite_stim3_pulse", "stepper_driver_fault",
+    )
+    assert "stepper_driver_fault" in result.optional_capabilities
+
+
+def test_every_capability_name_in_the_shipped_policy_is_known():
+    """A name missing from CAPABILITY_BITS makes load() reject every version."""
+    import yaml
+    from pathlib import Path
+    from tools.acquisition.model.firmware_compatibility import CAPABILITY_BITS
+
+    path = Path(__file__).resolve().parents[1] / "config/pellet-firmware-compatibility.yaml"
+    record = yaml.safe_load(path.read_text(encoding="utf-8"))
+    names = {
+        name
+        for item in record["versions"]
+        for key in ("required_capabilities", "optional_capabilities")
+        for name in item.get(key, ())
+    }
+
+    assert names <= set(CAPABILITY_BITS)
+    FirmwareCompatibilityPolicy.load()
+
+
+def test_bit_6_does_not_collide_with_the_bits_reserved_for_timing_and_io():
+    from tools.acquisition.model.firmware_compatibility import CAPABILITY_BITS
+
+    assert CAPABILITY_BITS["stepper_driver_fault"] == 1 << 6
+    assert CAPABILITY_BITS["sync_listener"] == 1 << 4
+    assert CAPABILITY_BITS["timekeeper"] == 1 << 5
+    assert len(set(CAPABILITY_BITS.values())) == len(CAPABILITY_BITS)

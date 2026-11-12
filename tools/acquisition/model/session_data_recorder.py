@@ -1164,7 +1164,7 @@ class SessionDataRecorder:
                 for name, value in zip(_PELLET_STIMULUS_CHANNEL_NAMES, data)
             }
         if (
-            getattr(kind, "name", None) == "ACKNOWLEDGE"
+            getattr(kind, "name", None) in {"ACKNOWLEDGE", "COMMAND_REFUSED"}
             and isinstance(data, (tuple, list))
             and data
         ):
