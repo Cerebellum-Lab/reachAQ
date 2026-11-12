@@ -6220,6 +6220,8 @@ class AppModel(ObservableObject):
         automatic motion as well, so automation waits for an acknowledged
         home. It is asked on every automatic load; a forced (manual) load is
         not held.
+        It is also asked after the board refuses an automatic cover or release,
+        to end that hold.
         """
         return not self._pellet_axes_needing_home()
 

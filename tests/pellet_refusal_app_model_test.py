@@ -8,6 +8,8 @@ window. While a refusal says an axis needs a home, Record is blocked.
 
 from types import SimpleNamespace
 
+import pytest
+
 from autotrainer.behavior.pellet import PelletState
 from autotrainer.behavior.pellet_trial import HardwareErrorKind, TrialOutcome
 from autotrainer.core import MessageHandler, Motor, SystemCommandKind
@@ -304,3 +306,38 @@ def test_a_held_machine_in_monitoring_sends_no_load_while_the_pellet_is_gone(app
 
     device.load_pellet.assert_not_called()
     device.send_pellet.assert_not_called()
+
+
+@pytest.mark.parametrize("cover_enabled, command, kind", [
+    (True, "cover_pellet", SystemCommandKind.COVER_PELLET),
+    (False, "release_pellet", SystemCommandKind.RELEASE_PELLET),
+])
+def test_a_refused_automatic_servo_command_is_not_reissued_until_an_acknowledged_home(
+    app_model, mock_system, cover_enabled, command, kind,
+):
+    """Under E-stop the board refuses servo moves too (-1) and marks every axis.
+
+    With loads held the machine covers or releases instead, and the refusal
+    reset covered_state to unknown, so the same command went out every frame.
+    """
+    pellet, device = mock_system.pellet, mock_system.pellet_dev
+    mock_system.algo.pellet_cover_enabled = cover_enabled
+    _start_session_and_drain(app_model, mock_system, f"refused-{command}-test")
+    servo = getattr(device, command)
+    servo.side_effect = lambda: f"{command}-{servo.call_count}"
+    app_model.hardware._set_axes_needing_home(("X", "Y", "Z"))  # automatic loads are held while an axis needs a home
+    pellet.state = PelletState.loading
+    pellet._covered_state = None
+
+    mock_system.mock_pose_response(pellet_seen=False)
+    assert servo.call_count == 1
+
+    mock_system.msg_handler.command_refused(f"{command}-1", perf_c=None, refusal=_refusal(
+        f"{command}-1", -1, kind, RefusedCommandClass.SERVO_MOVE, (Motor.PELLET_COVER_SERVO,)))
+    for _ in range(3):
+        mock_system.mock_pose_response(pellet_seen=False)
+    assert servo.call_count == 1, "the refused servo command was sent again"
+    (device.release_pellet if cover_enabled else device.cover_pellet).assert_not_called()
+
+    app_model.hardware._set_axes_needing_home(())  # what an acknowledged home does
+    assert getattr(pellet, f"can_{command}")() is True, "the hold ends with the home"

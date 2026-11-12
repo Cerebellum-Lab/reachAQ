@@ -609,3 +609,45 @@ def test_an_automatic_load_asks_the_motion_readiness_and_a_forced_one_does_not(m
     ready[0] = True
     assert pellet_m.can_load_pellet() is True
     assert len(asked) == 2, "asked for each automatic load, never for a forced one"
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_only_a_refused_automatic_cover_holds_automatic_covers_until_motion_readiness(machine, forced):
+    pellet_m = machine.pellet
+    ready = [False]
+    pellet_m.set_motion_readiness_callback(lambda: ready[0])
+    pellet_m._covered_state = None
+    pellet_m.cover_pellet(force=forced)
+    token = pellet_m._token_cover_pellet
+    assert token is not None
+
+    pellet_m._pellet_device_command_refused(token, refusal=_refusal(token, -1))
+
+    assert pellet_m.can_cover_pellet() is forced, "only an automatic command's refusal holds"
+    assert pellet_m.can_cover_pellet(force=True) is True, "a forced command is never held"
+    ready[0] = True  # an acknowledged home
+    assert pellet_m.can_cover_pellet() is True
+    ready[0] = False
+    assert pellet_m.can_cover_pellet() is True, "the hold ended with the home"
+
+
+def test_a_forced_command_sent_after_an_automatic_cover_does_not_relabel_the_covers_refusal(machine):
+    """A refusal is judged by its own command: the cover was automatic, the release after it was not."""
+    pellet_m = machine.pellet
+    pellet_m._pellet_device.cover_pellet.return_value = "cover-1"
+    pellet_m._pellet_device.release_pellet.return_value = "release-1"
+    ready = [False]
+    pellet_m.set_motion_readiness_callback(lambda: ready[0])
+    pellet_m._covered_state = None
+    pellet_m.cover_pellet()
+    assert pellet_m._token_cover_pellet == "cover-1"
+    pellet_m.release_pellet(force=True)  # a manual release, sent while the cover is pending
+    assert pellet_m._token_release_pellet == "release-1"
+
+    pellet_m._pellet_device_command_refused("cover-1", refusal=_refusal("cover-1", -1))
+    pellet_m._api_status_token = None  # the release's ack would free the machine; it is not under test
+
+    assert pellet_m.can_cover_pellet() is False, "the automatic cover's refusal holds, whatever went after it"
+    assert pellet_m.can_cover_pellet(force=True) is True
+    ready[0] = True  # an acknowledged home
+    assert pellet_m.can_cover_pellet() is True

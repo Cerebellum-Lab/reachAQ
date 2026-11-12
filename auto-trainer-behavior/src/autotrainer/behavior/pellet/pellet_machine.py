@@ -131,6 +131,13 @@ class PelletMachine(StateMachine):
         # tells its own command's refusal from its ack by these.
         self._refusal_count = 0
         self._last_refused_token_attrs = ()
+        # A refused automatic cover or release holds both until the motion readiness
+        # says an acknowledged home happened (_servo_hold_allows); a forced one never does.
+        self._servo_reissue_held = False
+        # Whether each pending cover or release was sent forced, by its token's attribute
+        # name. An entry lives exactly as long as its token, so a command sent later
+        # cannot relabel an earlier one's refusal.
+        self._servo_token_forced: dict = {}
 
         self.machine = Machine(
             model=[self],
@@ -227,6 +234,7 @@ class PelletMachine(StateMachine):
         token = self._pellet_device.cover_pellet()
         if token is None:
             raise PelletDeviceCommandFailed
+        self._servo_token_forced["_token_cover_pellet"] = bool(force)
         self._api_status_token = self._token_cover_pellet = token
         self._covered_state = True
         self.post_event_content(ApiEventKind.pelletCoverBegin, data=dict(context=token))
@@ -235,6 +243,7 @@ class PelletMachine(StateMachine):
         token = self._pellet_device.release_pellet()
         if token is None:
             raise PelletDeviceCommandFailed
+        self._servo_token_forced["_token_release_pellet"] = bool(force)
         self._api_status_token = self._token_release_pellet = token
         self._covered_state = False
         self.post_event_content(ApiEventKind.pelletReleaseBegin, data=dict(context=token))
@@ -370,6 +379,8 @@ class PelletMachine(StateMachine):
             self.can_use_pellet_command()
             and self._algorithm.can_cover_pellet()
         )
+        if can and not force:
+            can = self._servo_hold_allows()
         if can != self._prev_can_cover:
             self._prev_can_cover = can
         return can
@@ -379,12 +390,29 @@ class PelletMachine(StateMachine):
             self.can_use_pellet_command()
             and self._algorithm.can_release_pellet(pellet_state=self._state)
         )
+        if can and not force:
+            can = self._servo_hold_allows()
         if can != self._prev_can_release:
             self._prev_can_release = can
         return can
 
     def can_use_pellet_command(self):
         return self._api_status_token is None
+
+    def _servo_hold_allows(self) -> bool:
+        """Whether an automatic cover or release is free to go.
+
+        A refused one holds both until the motion readiness says the board will
+        accept automatic motion again (an acknowledged home), or at once when no
+        readiness is installed.
+        """
+        if not self._servo_reissue_held:
+            return True
+        readiness = self._motion_readiness_callback
+        if readiness is None or readiness():
+            self._servo_reissue_held = False
+            return True
+        return False
 
     def pellet_seen(self, seen: bool):
         self.environment_changed(seen, caller="pellet_seen", is_from_inference=True)
@@ -430,10 +458,12 @@ class PelletMachine(StateMachine):
 
         elif token == self._token_cover_pellet:
             self._token_cover_pellet = None
+            self._servo_token_forced.pop("_token_cover_pellet", None)
             api_evt = ApiEventKind.pelletCoverEnd
 
         elif token == self._token_release_pellet:
             self._token_release_pellet = None
+            self._servo_token_forced.pop("_token_release_pellet", None)
             api_evt = ApiEventKind.pelletReleaseEnd
             self.events.pellet_released(perf_c=perf_now)
 
@@ -477,6 +507,10 @@ class PelletMachine(StateMachine):
         Its token is cleared without the events an ack fires: a refused send
         presented no pellet, a refused release revealed nothing. The command
         stopped part way, so a cover or release step may not have run.
+
+        A refused automatic cover or release also holds both until the motion
+        readiness says an acknowledged home happened: under E-stop the board
+        refuses every servo move, and the same command went out on each frame.
         """
         if token is None:
             return
@@ -498,6 +532,10 @@ class PelletMachine(StateMachine):
             # token gone also sees the refusal.
             for attr in attrs:
                 setattr(self, attr, None)
+                # The refused command's own flag. None: not a cover or release.
+                forced = self._servo_token_forced.pop(attr, None)
+                if forced is False:
+                    self._servo_reissue_held = True
             if was_api_token:
                 self._api_status_token = None
             self._covered_state = None
