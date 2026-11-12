@@ -78,21 +78,37 @@ def _faults_published(hardware_model):
     return published
 
 
+def _driver_fault_warnings(caplog):
+    return [r for r in caplog.records
+            if r.levelno == logging.WARNING and "driver fault" in r.getMessage()]
+
+
 def test_a_driver_fault_bit_names_its_axis_until_the_board_clears_it(hardware_model, caplog):
     published = _faults_published(hardware_model)
     with caplog.at_level(logging.DEBUG, logger="tools.acquisition.model.hardware_model"):
         for axis in "XYZ":
             _report(hardware_model, axis, 0x02)
         _report(hardware_model, "Y", 0x03)  # 0x03 for the faulted driver, 0x02 for the others
-        _report(hardware_model, "Y", 0x03)  # every 100 ms while latched
+        _report(hardware_model, "Y", 0x03)  # repeated while latched
     assert hardware_model.pellet_axes_with_driver_fault == ("Y",)
     assert published == [("Y",)]
-    assert any(r.levelno == logging.WARNING and "driver fault" in r.getMessage()
-               for r in caplog.records)
+    assert len(_driver_fault_warnings(caplog)) == 1, "a repeated, latched status logs once"
 
     _report(hardware_model, "Y", 0x00)  # a home re-proved the drivers
     assert hardware_model.pellet_axes_with_driver_fault == ()
     assert published == [("Y",), ()]
+
+
+def test_two_faulted_axes_are_listed_in_order_and_logged_once(hardware_model, caplog):
+    published = _faults_published(hardware_model)
+    with caplog.at_level(logging.DEBUG, logger="tools.acquisition.model.hardware_model"):
+        _report(hardware_model, "Z", 0x03)
+        _report(hardware_model, "X", 0x03)  # arrives second, sorts first
+        _report(hardware_model, "X", 0x03)
+    assert hardware_model.pellet_axes_with_driver_fault == ("X", "Z")
+    assert ", ".join(hardware_model.pellet_axes_with_driver_fault) == "X, Z"
+    assert published == [("Z",), ("X", "Z")]
+    assert len(_driver_fault_warnings(caplog)) == 1, "the second axis adds no second WARNING"
 
 
 def test_enable_off_alone_raises_no_fault_and_no_needs_home(hardware_model, caplog):
@@ -104,7 +120,7 @@ def test_enable_off_alone_raises_no_fault_and_no_needs_home(hardware_model, capl
     assert hardware_model.pellet_axes_with_driver_fault == ()
     assert hardware_model.pellet_axes_needing_home == ()
     assert published == []
-    assert not [r for r in caplog.records if "fault" in r.getMessage().lower()]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 def test_a_fault_that_relatches_after_a_home_shows_again(hardware_model):
@@ -115,6 +131,7 @@ def test_a_fault_that_relatches_after_a_home_shows_again(hardware_model):
     hardware_model._pending_tokens[home] = (SystemCommandKind.SEND_HOME, 1.0)
     hardware_model._ack_received(home)
     assert hardware_model.pellet_axes_needing_home == (), "the home ACK clears needs-home"
+    assert hardware_model.pellet_axes_with_driver_fault == ("Z",), "only the board's status clears a fault"
     _report(hardware_model, "Z", 0x00)
     assert hardware_model.pellet_axes_with_driver_fault == ()
 

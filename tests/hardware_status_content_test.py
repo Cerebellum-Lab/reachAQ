@@ -566,6 +566,7 @@ def test_pellet_status_shows_driver_fault_and_needs_home(qapp):
     app_model.hardware.connected = True
     app_model.hardware_scan_results["pellet"] = HardwareScanEntry(
         "✓ controller session connected", "ok")
+    app_model.hardware.pellet_axes_with_driver_fault = ()
     content = HardwareStatusContent(app_model)
     try:
         panel = content._category_panels["pellet"]
@@ -580,5 +581,33 @@ def test_pellet_status_shows_driver_fault_and_needs_home(qapp):
         assert "fault on Y" in panel.details_text
         assert "needs home: X, Y, Z" in panel.details_text
         assert "#fdebec" in panel.header.styleSheet(), "a driver fault is an error"
+    finally:
+        content.deleteLater()
+
+
+def test_pellet_status_driver_fault_alone_turns_the_header_to_error(qapp):
+    app_model = _AppModelStub()
+    app_model.hardware.can_enabled = True
+    app_model.hardware.pellet_controller_enabled = True
+    app_model.hardware.connected = True
+    app_model.hardware.pellet_axes_needing_home = ()
+    app_model.hardware.last_command_refusal = ""
+    app_model.hardware.pellet_axes_with_driver_fault = ()
+    app_model.hardware_scan_results["pellet"] = HardwareScanEntry(
+        "controller session connected", "ok")
+    content = HardwareStatusContent(app_model)
+    try:
+        panel = content._category_panels["pellet"]
+        assert "no axis flagged" in panel.details_text
+        assert "#e8f5ec" in panel.header.styleSheet()
+
+        app_model.hardware.pellet_axes_with_driver_fault = ("Y",)
+        app_model.hardware.property_changed("pellet_driver_fault", ("Y",), ())
+        qapp.processEvents()
+
+        assert "fault on Y" in panel.details_text
+        assert "no axis flagged" in panel.details_text, "no axis needs a home and none was refused"
+        assert "no refusal" in panel.details_text
+        assert "#fdebec" in panel.header.styleSheet(), "a driver fault alone is an error"
     finally:
         content.deleteLater()

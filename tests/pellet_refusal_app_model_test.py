@@ -243,13 +243,22 @@ def test_recording_is_blocked_while_a_pellet_driver_fault_is_reported(app_model)
             StepperStatus(Target.PELLET_DEVICE, Motor.PELLET_Y_MOTOR, 1.0, 2.0, False, status=status),
             None)
 
+    def fault_blockers():
+        return [b for b in app_model.recording_blockers if "driver fault" in b]
+
+    assert fault_blockers() == [], "nothing blocks before the board has reported"
+
+    report(0x02)  # enable off alone, before any fault has latched, blocks nothing
+    assert fault_blockers() == []
+
     report(0x03)
-    (blocker,) = [b for b in app_model.recording_blockers if "driver fault" in b]
+    (blocker,) = fault_blockers()
     assert "Y" in blocker and "home the pellet axes" in blocker
     assert any(any("driver fault" in b for b in blockers) for blockers in published)
 
-    report(0x02)  # enable off alone blocks nothing
-    assert [b for b in app_model.recording_blockers if "driver fault" in b] == []
+    report(0x02)  # the fault clears while the enable is still off
+    assert fault_blockers() == []
+    assert not any("driver fault" in b for b in published[-1]), "clearing the fault republishes the blockers"
 
 
 def _start_session_and_drain(app_model, mock_system, reason):
