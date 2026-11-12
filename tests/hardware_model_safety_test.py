@@ -1,3 +1,4 @@
+import dataclasses
 import threading
 import os
 from queue import Queue
@@ -421,7 +422,9 @@ class _ConnectionWhoseHomeIsRefused:
     """Stands in for DeviceConnection: version and configuration succeed, the home is refused.
 
     The refusal reaches connect the way the board's does: send_message answers through the
-    message callback, and the real await_acknowledge turns it into CommandRefusedError.
+    message callback, carrying the token it was routed by, and the real await_acknowledge
+    turns it into CommandRefusedError. A send made outside await_acknowledge has no callback
+    to answer through and fails.
     """
 
     refusal = None
@@ -444,10 +447,9 @@ class _ConnectionWhoseHomeIsRefused:
         if kind is SystemCommandKind.REQUEST_VERSION:
             type(self).on_version()
         callback = self._api.message_callback
-        if callback is None:
-            return
         if kind is SystemCommandKind.SEND_HOME:
-            callback(SystemStatusMessageKind.COMMAND_REFUSED, (context, 0.0, self.refusal))
+            callback(SystemStatusMessageKind.COMMAND_REFUSED,
+                     (context, 0.0, dataclasses.replace(self.refusal, token=context)))
         else:
             callback(SystemStatusMessageKind.ACKNOWLEDGE, (context, 0.0))
 
