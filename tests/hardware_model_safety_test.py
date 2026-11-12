@@ -473,7 +473,7 @@ def test_connect_fails_with_the_reason_when_the_connect_time_home_is_refused(
     monkeypatch.setattr(HardwareModel, "_request_board_capabilities", lambda self, device: None)
 
     try:
-        with pytest.raises(CommandRefusedError, match="did not re-prove"):
+        with pytest.raises(CommandRefusedError, match="once more"):
             hardware_model.connect(Queue())
         assert hardware_model._device_conn.sent[-1] is SystemCommandKind.SEND_HOME
         assert hardware_model._can_connection_state["state"] != "ready"
