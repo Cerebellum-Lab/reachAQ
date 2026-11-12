@@ -1165,6 +1165,7 @@ class AppModel(ObservableObject):
             readiness=self._pellet_send_readiness,
             guard=self._guard_protocol_send,
         )
+        pellet_m.set_motion_readiness_callback(self._pellet_motion_readiness)
 
         analysis.watchdog_monitor.property_changed += self._on_watchdog_property_changed
 
@@ -3066,6 +3067,12 @@ class AppModel(ObservableObject):
             blockers.append(
                 f"Pellet axis {', '.join(axes)} needs homing after a refused command: "
                 "home the pellet axes"
+            )
+        faults = self._pellet_axes_with_driver_fault()
+        if pellet_source_required and faults:
+            blockers.append(
+                f"Pellet stepper driver fault on axis {', '.join(faults)}: "
+                "home the pellet axes to clear it"
             )
         if self.animal_metadata_refresh_busy:
             blockers.append("SoftMouse animal metadata refresh is still running")
@@ -6201,6 +6208,22 @@ class AppModel(ObservableObject):
     def _pellet_axes_needing_home(self) -> Tuple[str, ...]:
         axes = getattr(self._hardware, "pellet_axes_needing_home", ())
         return axes if isinstance(axes, tuple) else ()
+
+    def _pellet_axes_with_driver_fault(self) -> Tuple[str, ...]:
+        axes = getattr(self._hardware, "pellet_axes_with_driver_fault", ())
+        return axes if isinstance(axes, tuple) else ()
+
+    def _pellet_motion_readiness(self) -> bool:
+        """Whether the board will accept automatic pellet motion: no axis needs a home.
+
+        While a refusal says an axis needs a home, the board would refuse
+        automatic motion as well, so automation waits for an acknowledged
+        home. It is asked on every automatic load; a forced (manual) load is
+        not held.
+        While a refused automatic cover or release holds, it is also asked on
+        every automatic cover and release check, to end that hold.
+        """
+        return not self._pellet_axes_needing_home()
 
     def _pellet_send_readiness(self) -> bool:
         """Whether an automatic send may go: asked for every send that is not forced.
@@ -10659,7 +10682,11 @@ class AppModel(ObservableObject):
         hard = self._hardware
         if name == hard.CAN_CONNECTION_STATE_PROPERTY:
             self._on_can_connection_state_changed(value)
-        elif name in {hard.FIRMWARE_COMPATIBILITY_PROPERTY, hard.PELLET_NEEDS_HOME_PROPERTY}:
+        elif name in {
+            hard.FIRMWARE_COMPATIBILITY_PROPERTY,
+            hard.PELLET_NEEDS_HOME_PROPERTY,
+            hard.PELLET_DRIVER_FAULT_PROPERTY,
+        }:
             self.property_changed(
                 self.Props.RECORDING_BLOCKERS,
                 self.recording_blockers,

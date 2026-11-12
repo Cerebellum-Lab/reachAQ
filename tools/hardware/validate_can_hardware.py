@@ -4,6 +4,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
+from typing import List, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 for _path in (
@@ -19,6 +20,7 @@ from autotrainer.device import (
     MotorConfigurationFile,
     Target,
 )
+from autotrainer.device.device_interface import Acknowledge
 
 
 def main() -> int:
@@ -47,22 +49,18 @@ def main() -> int:
         print(f"pellet board address: {interface.pellet_address}")
 
         if args.action == "discover":
-            _listen(interface, args.listen_seconds)
-            return 0
+            return _refusal_exit_status(_listen(interface, args.listen_seconds))
         if args.action == "version":
             if not interface.request_version():
                 raise RuntimeError("firmware version request failed")
-            _listen(interface, args.listen_seconds)
-            return 0
+            return _refusal_exit_status(_listen(interface, args.listen_seconds))
         if args.action == "listen":
-            _listen(interface, args.listen_seconds)
-            return 0
+            return _refusal_exit_status(_listen(interface, args.listen_seconds))
         if args.action == "request-motor-config":
             motor = _motor_from_name(args.motor)
             if not interface.request_motor_config(motor):
                 raise RuntimeError(f"motor configuration request failed for {motor}")
-            _listen(interface, args.listen_seconds)
-            return 0
+            return _refusal_exit_status(_listen(interface, args.listen_seconds))
         if args.action == "write-motor-config":
             _require_config_write_allowed(args)
             motor = _motor_from_name(args.motor)
@@ -74,8 +72,7 @@ def main() -> int:
             _require_success(interface.set_motor_configuration(motor, config), args.action)
             if not interface.request_motor_config(motor):
                 raise RuntimeError(f"motor configuration readback request failed for {motor}")
-            _listen(interface, args.listen_seconds)
-            return 0
+            return _refusal_exit_status(_listen(interface, args.listen_seconds))
 
         _require_motion_allowed(args)
         if args.action == "set-x":
@@ -92,8 +89,7 @@ def main() -> int:
             _require_success(interface.stepper_home(_motor_from_name(args.motor)), args.action)
         else:
             raise RuntimeError(f"Unhandled action: {args.action}")
-        _listen(interface, args.listen_seconds)
-        return 0
+        return _refusal_exit_status(_listen(interface, args.listen_seconds))
     finally:
         interface.close()
 
@@ -147,18 +143,28 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _listen(interface: CanInterface, seconds: float) -> None:
+def _listen(interface: CanInterface, seconds: float) -> List[Acknowledge]:
     print(f"listening for {seconds:.3f} seconds")
     end = time.perf_counter() + seconds
     count = 0
+    refusals: List[Acknowledge] = []
     while time.perf_counter() < end:
         messages = interface.read(50, collect_ms=5)
         for message in messages:
             count += 1
             print(f"  {message!r}")
+            if isinstance(message, Acknowledge) and message.is_failure:
+                refusals.append(message)
         if not messages:
             time.sleep(0.005)
     print(f"received {count} translated CAN messages")
+    return refusals
+
+
+def _refusal_exit_status(refusals: Sequence[Acknowledge]) -> int:
+    for refusal in refusals:
+        print(f"ERROR: uuid {refusal.uuid}: {refusal.failure_reason}", file=sys.stderr)
+    return 1 if refusals else 0
 
 
 def _motor_from_name(name: str) -> Motor:

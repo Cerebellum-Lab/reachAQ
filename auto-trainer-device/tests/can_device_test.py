@@ -1462,3 +1462,23 @@ def test_pyjerrycan_interface_keeps_the_configured_transport():
     assert isinstance(interface, CanInterface)
     assert interface._can_transport.channel == "can7"
     assert interface._can_transport.receive_timeout_seconds == 0.25
+
+
+def test_a_stepper_status_that_changes_only_its_status_byte_is_forwarded():
+    forwarded = []
+    device = CanDevice(
+        api=DeviceApi(message_callback=lambda kind, data: forwarded.append((kind, data))),
+        force_emulation=True,
+        required_targets=(Target.PELLET_DEVICE,),
+    )
+    # Fix the refresh window, so the result depends neither on the wall clock
+    # nor on AUTOTRAINER_DEVICE_SIMILAR_DATA_REFRESH_DELAY.
+    device.same_data_refresh_delay = 3600.0
+
+    for status in (0x00, 0x02, 0x03, 0x03):  # same position each time
+        device._report_stepper_status(StepperStatus(
+            Target.PELLET_DEVICE, Motor.PELLET_X_MOTOR, 10.0, 2.0, False, status=status))
+
+    x = [data for kind, data in forwarded if kind == SystemStatusMessageKind.PELLET_MOTOR_X]
+    assert [data.status for data in x] == [0x00, 0x02, 0x03], (
+        "a change in the status byte alone goes out at once; a repeat is still deduplicated")

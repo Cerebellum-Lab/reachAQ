@@ -11,6 +11,7 @@ required; camera-only operation is unaffected when CAN/pellet is disabled.
 
 | Firmware | Requires | Status |
 |---|---|---|
+| `2.3.1` | `finite_stim3_pulse`; `stepper_driver_fault` (bit 6) is optional, and only a pellet v1.3 board reports it | Rollout pending; 19 of 19 qualification checks on a pellet v1.2 board; no v1.3 board has run it; recorded-session validation pending; required on a pellet v1.3 board |
 | `2.3.0` | `finite_stim3_pulse` (the first release to report its capabilities) | Rig-verified; recorded-session validation pending |
 | `2.2.0` | nothing (it reports no capabilities) | Rollout pending |
 | `2.1.0` | nothing (it implements no capability report or time sync) | Rollout pending |
@@ -19,14 +20,18 @@ required; camera-only operation is unaffected when CAN/pellet is disabled.
 
 Each entry's `limitations` in the YAML file say what that version cannot do.
 
+A pellet v1.3 board needs firmware 2.3.1 or later. On 2.3.0 or older it
+accepts moves and does not move them, and reachAQ cannot tell: before 2.3.1
+the board reports nothing that tells a v1.3 board from a v1.2 board.
+
 Raw kernel/host receive time, board time, aligned board time, clock model,
 uncertainty, transport estimate, and selected event time remain distinct in
 `streams/device.csv`. Alignment preference is an unambiguous NI physical edge,
 then a valid in-range board clock model, then kernel/host receive time. No
 derived value overwrites raw evidence.
 
-Pellet firmware 2.4.0 is the first to advertise `time_sync`; through 2.3.0 the
-capability is never reported. A board that advertises it makes `open()` run four
+Pellet firmware 2.4.0 is the first to advertise `time_sync`; no earlier release
+reports the capability. A board that advertises it makes `open()` run four
 time-sync exchanges a few milliseconds apart. Earlier reachAQ fitted a clock
 slope to those closely spaced exchanges and raised `ValueError` when it fell
 outside 0.999 to 1.001, so it failed to open the board. The board-clock fit now
@@ -75,6 +80,29 @@ shutdown starts, and the log names the reason:
   listed one.
 - `Required capability mismatch`: the version is listed but the board did not
   report a capability the entry requires.
+- `... was refused by the board: <reason>`: the board answered the startup
+  home, or a motor-configuration write, with an error. The message ends with
+  the error's name and number and a closing parenthesis, for example
+  `: EIO -5)`. reachAQ does not retry a refused startup on its own; the next
+  home comes from Refresh Hardware or from starting System Mode. If the same
+  refusal comes while reachAQ is reconnecting by itself after a CAN fault, the
+  log reads `CAN recovery stopped: <reason>` instead, and recovery makes no
+  further attempt; restart reachAQ, which connects and homes again, and if that
+  is refused too, act on its code as below. What to do for a refused startup
+  depends on the code:
+  - `EPERM -1`: E-stop asserted by another CAN client (reachAQ never sends
+    one). Stop that client, or reboot the pellet board, which releases it;
+    then Refresh Hardware.
+  - `EIO -5`: a driver fault stopped the home, or the drivers failed to
+    re-prove. Refresh Hardware once, which homes again
+    (`HardwareModel._connect_locked` in
+    `tools/acquisition/model/hardware_model.py`). If that home is refused
+    too, reboot the pellet board and check its 12 V supply.
+  - `EBUSY -16` on the home: an axis is busy or stuck. Reboot the pellet
+    board.
+  - Any other code, or a refused motor-configuration write: the message names
+    the error and, apart from `ETIMEDOUT -116` (it says to home the pellet
+    axes), gives no action. This page has none either; report the code.
 
 ## Qualifying a new firmware version
 

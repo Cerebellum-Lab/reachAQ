@@ -397,11 +397,19 @@ def test_eio_and_etimedout_on_a_stepper_command_mark_every_axis(error):
     assert "Home the pellet axes" in refusal.message
 
 
-def test_a_home_refused_with_eio_says_to_reboot_rather_than_home_again():
-    refusal = _refusal(RefusedCommandClass.STEPPER_HOME, -5, motors=(Motor.PELLET_Y_MOTOR,))
+def test_a_home_refused_with_eio_says_to_home_once_more_then_reboot():
+    """-5 on a home has two causes the number cannot tell apart.
 
-    assert "reboot the pellet board" in refusal.message.lower()
-    assert "12 V" in refusal.message
+    A fault latched while the home ran: another home recovers. The drivers
+    failed to re-prove: a further home repeats the check and is refused again.
+    So home once more, then reboot (release note v2.3.1, "Faults and recovery").
+    """
+    message = _refusal(RefusedCommandClass.STEPPER_HOME, -5, motors=(Motor.PELLET_Y_MOTOR,)).message
+
+    assert "once more" in message
+    assert "reboot the pellet board" in message.lower()
+    assert "12 V" in message
+    assert message.index("once more") < message.lower().index("reboot")
 
 
 def test_a_home_refused_with_ebusy_says_the_axis_is_stuck():

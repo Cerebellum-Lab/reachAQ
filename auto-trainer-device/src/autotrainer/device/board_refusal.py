@@ -166,8 +166,9 @@ class CommandRefusal:
                 )
             if error == EIO and cls is RefusedCommandClass.STEPPER_HOME:
                 return (
-                    "Pellet stepper drivers did not re-prove during the home. Reboot the "
-                    "pellet board and check the 12 V supply."
+                    "A pellet stepper driver fault stopped the home, or the drivers failed "
+                    "to re-prove. Home the pellet axes once more; if that home is refused "
+                    "too, reboot the pellet board and check the 12 V supply."
                 )
             if error == EIO:
                 return (

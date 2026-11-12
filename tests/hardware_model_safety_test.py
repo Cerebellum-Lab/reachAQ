@@ -1,13 +1,15 @@
-import contextlib
+import dataclasses
 import threading
 import os
 from queue import Queue
+from types import SimpleNamespace
 from unittest import mock
 from uuid import uuid4
 
 import pytest
 
 from autotrainer.core import Motor, SystemCommandKind
+from autotrainer.core.message import SystemStatusMessageKind
 from autotrainer.device import (
     CanFailure,
     CanFailureKind,
@@ -15,6 +17,7 @@ from autotrainer.device import (
     CanTransportKind,
     CommandRefusal,
     CommandRefusedError,
+    DeviceConnection,
     RefusedCommandClass,
 )
 from tools.acquisition.model.hardware_model import HardwareModel
@@ -416,14 +419,22 @@ def test_a_refusal_of_a_token_this_model_did_not_send_still_marks_needs_home(har
 
 
 class _ConnectionWhoseHomeIsRefused:
-    """Stands in for DeviceConnection: version and configuration succeed, the home is refused."""
+    """Stands in for DeviceConnection: version and configuration succeed, the home is refused.
+
+    The refusal reaches connect the way the board's does: send_message answers through the
+    message callback, carrying the token it was routed by, and the real await_acknowledge
+    turns it into CommandRefusedError. A send made outside await_acknowledge has no callback
+    to answer through and fails.
+    """
 
     refusal = None
     on_version = None
+    await_acknowledge = DeviceConnection.await_acknowledge
 
     def __init__(self, device, cmd_queue, *, name, failure_callback):
         self.device = device
         self.sent = []
+        self._api = SimpleNamespace(message_callback=None)
 
     def request_connect(self):
         pass
@@ -431,16 +442,16 @@ class _ConnectionWhoseHomeIsRefused:
     def wait_connected(self, *, timeout):
         pass
 
-    @contextlib.contextmanager
-    def await_acknowledge(self, tokens, *, timeout):
-        yield
-        if self.sent[-1] is SystemCommandKind.SEND_HOME:
-            raise CommandRefusedError(self.refusal)
-
     def send_message(self, kind, data=None, context=None):
         self.sent.append(kind)
         if kind is SystemCommandKind.REQUEST_VERSION:
             type(self).on_version()
+        callback = self._api.message_callback
+        if kind is SystemCommandKind.SEND_HOME:
+            callback(SystemStatusMessageKind.COMMAND_REFUSED,
+                     (context, 0.0, dataclasses.replace(self.refusal, token=context)))
+        else:
+            callback(SystemStatusMessageKind.ACKNOWLEDGE, (context, 0.0))
 
     def load_default_motor_config(self):
         pass
@@ -473,7 +484,7 @@ def test_connect_fails_with_the_reason_when_the_connect_time_home_is_refused(
     monkeypatch.setattr(HardwareModel, "_request_board_capabilities", lambda self, device: None)
 
     try:
-        with pytest.raises(CommandRefusedError, match="did not re-prove"):
+        with pytest.raises(CommandRefusedError, match="once more"):
             hardware_model.connect(Queue())
         assert hardware_model._device_conn.sent[-1] is SystemCommandKind.SEND_HOME
         assert hardware_model._can_connection_state["state"] != "ready"
