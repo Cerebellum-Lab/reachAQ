@@ -1258,6 +1258,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                         "state", "recovery_refused",
                         data={"error": error, "generation": generation},
                     )
+                    self._close_stopped_recovery(generation)
                     self._set_can_connection_state("failed", error=error, generation=generation)
                     return
                 except Exception as exc:
@@ -1297,6 +1298,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 "state", "recovery_exhausted",
                 data={"error": error, "generation": generation},
             )
+            self._close_stopped_recovery(generation)
             self._set_can_connection_state(
                 "failed", error=error, generation=generation,
             )
@@ -1304,6 +1306,21 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             with self._can_recovery_lock:
                 if generation == self._can_recovery_generation:
                     self._can_recovery_thread = None
+
+    def _close_stopped_recovery(self, generation: int) -> None:
+        """Close the transport a stopped recovery's last attempt left open.
+
+        That attempt can fail after the transport is up (a refused home, no
+        version reply). Left open, connected stays True, so Refresh Hardware
+        and the subsystem retry skip the connect that would home the axes.
+        """
+        with self._can_lifecycle_lock:
+            if not self._can_recovery_is_current(generation):
+                return  # a newer connect owns the transport
+            try:
+                self._disconnect_transport(command_outcome="unknown")
+            except Exception:
+                logger.exception("Failed to close the CAN transport after recovery stopped")
 
     def _can_recovery_is_current(self, generation: int) -> bool:
         with self._can_recovery_lock:

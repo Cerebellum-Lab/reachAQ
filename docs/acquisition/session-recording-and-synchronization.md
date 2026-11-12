@@ -131,7 +131,11 @@ closes the failed socket, reopens the transport,
 rediscovers the pellet board, requests firmware, reloads motor/move
 configuration, and restarts status streaming before publishing Ready. An
 in-flight motor operation is finalized as unknown and is never replayed across
-the reconnect boundary.
+the reconnect boundary. Recovery stops when the board refuses its home (the
+log says `CAN recovery stopped`) or when every attempt fails (`CAN recovery
+exhausted`). It then closes the transport it opened and leaves CAN Failed.
+Refresh Hardware, which retries failed hardware while System Mode runs, then
+makes a full connection, home included.
 
 Explicit System Mode stop still attempts to stop every domain even when one cleanup
 operation fails.
