@@ -422,6 +422,7 @@ class PelletMachine(StateMachine):
     def _before_move_retract(self, *, force: bool=False):
         if self._algorithm.pellet_cover_enabled:
             if self._covered_state is not True:
+                # A held cover is skipped on purpose: the board refuses the retract too.
                 with self._algorithm.set_allow_reentrant(True):
                     self.cover_pellet()
         token = self._pellet_device.send_retract()
