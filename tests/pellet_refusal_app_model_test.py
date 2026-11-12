@@ -310,11 +310,17 @@ def test_a_held_machine_in_monitoring_sends_no_load_while_the_pellet_is_gone(app
     pellet._covered_state = True
 
     mock_system.mock_pellet_missing()
+    device.load_pellet.assert_not_called()  # before the drain, which would hide a loop
+
     mock_system.mock_pellet_ack(until_none=True)
     mock_system.mock_pose_response(pellet_seen=False)
 
     device.load_pellet.assert_not_called()
     device.send_pellet.assert_not_called()
+
+    app_model.hardware._set_axes_needing_home(())  # what an acknowledged home does
+    mock_system.mock_pose_response(pellet_seen=False)
+    assert device.load_pellet.call_count == 1, "the first scene update after the home loads"
 
 
 @pytest.mark.parametrize("cover_enabled, command, kind", [
