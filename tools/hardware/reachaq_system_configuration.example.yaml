@@ -7,7 +7,7 @@
 # aliases, serials, capabilities, and valid routes are not universal defaults.
 
 !SystemConfiguration
-version: 58
+version: 59
 cameras:
 - !CameraConfiguration
   id: 0

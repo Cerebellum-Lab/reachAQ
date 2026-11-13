@@ -124,6 +124,10 @@ from .nidaq_port_configuration import (
     NidaqTaskGraph,
     NidaqTaskSpecification,
 )
-from .nidaq_stream_configuration import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
+from .nidaq_stream_configuration import (
+    NidaqDeliveryCalibration,
+    NidaqSignalChannelConfiguration,
+    NidaqSignalStreamConfiguration,
+)
 from .persistence_configuration import PersistenceConfiguration
 from .system_configuration import SystemConfiguration

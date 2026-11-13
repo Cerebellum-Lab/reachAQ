@@ -13,6 +13,7 @@ from autotrainer.core import (
     LaserSystemConfiguration,
 )
 from autotrainer.core.configuration import (
+    NidaqDeliveryCalibration,
     NidaqSignalStreamConfiguration,
     SystemConfigurationDumper,
     SystemConfigurationLoader,
@@ -181,6 +182,49 @@ def test_a_laser_refuses_a_board_pulse_outside_the_firmware_range(width):
             board_trigger_pulse_us=width)
 
 
-def test_the_system_configuration_is_version_58():
-    # 58 added the laser channel's board trigger wiring.
-    assert SystemConfiguration.version == 58
+def test_the_system_configuration_is_version_59():
+    # 58 added the laser channel's board trigger wiring, 59 the NI stream's delivery
+    # calibration.
+    assert SystemConfiguration.version == 59
+
+
+def _calibration(**overrides):
+    values = dict(offset_seconds=0.000303, spread_seconds=0.000035, sessions=27,
+                  measured="2026-11-12T19:40:00-07:00", read_chunk_samples=(167, 83, 69, 61),
+                  frame_rates_hz=(50.0, 100.0, 150.0), exposures_seconds=(0.000175, 0.001, 0.003),
+                  camera_serials=("21192301",), delivery_floor_min_seconds=0.000203,
+                  delivery_floor_max_seconds=0.000299)
+    values.update(overrides)
+    return NidaqDeliveryCalibration(**values)
+
+
+def test_the_nidaq_delivery_calibration_round_trips_in_system_yaml():
+    calibration = _calibration()
+    configuration = SystemConfiguration(
+        nidaq_stream=NidaqSignalStreamConfiguration(delivery_calibration=calibration))
+
+    text = configuration.dump_yaml()
+    loaded = SystemConfiguration.load_yaml(io.StringIO(text))
+
+    assert "deliveryCalibration: !NidaqDeliveryCalibration" in text
+    assert "offsetSeconds: 0.000303" in text
+    assert loaded.nidaq_stream.delivery_calibration == calibration
+
+
+def test_a_stream_without_a_delivery_calibration_has_none():
+    configuration = SystemConfiguration()
+
+    loaded = SystemConfiguration.load_yaml(io.StringIO(configuration.dump_yaml()))
+
+    assert loaded.nidaq_stream.delivery_calibration is None
+
+
+@pytest.mark.parametrize(("overrides", "field"), [
+    ({"offset_seconds": float("nan")}, "offset_seconds"),
+    ({"spread_seconds": 0.0}, "spread_seconds"),
+    ({"spread_seconds": float("inf")}, "spread_seconds"),
+    ({"sessions": 1}, "two sessions"),
+])
+def test_a_delivery_calibration_refuses_what_no_gate_can_use(overrides, field):
+    with pytest.raises(ValueError, match=field):
+        _calibration(**overrides)
