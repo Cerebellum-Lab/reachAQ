@@ -23,6 +23,7 @@ import h5py
 import numpy as np
 
 from autotrainer.core import ProjectInfo
+from autotrainer.core.hdf5_inheritance import mark_close_on_exec
 from tools.acquisition.model import board_clock_chain
 from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.latency_event_log import LatencyEventLog
@@ -1658,6 +1659,9 @@ class SessionDataRecorder:
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         output = h5py.File(path, "w")
+        # Open for the whole recording, in the process where NI-DAQmx's CEIP
+        # client starts processes (hdf5_inheritance says why).
+        mark_close_on_exec(output)
         channel_count = len(ring.channel_names)
         for name, dtype in (
             ("sample_index", np.int64),
@@ -4734,6 +4738,7 @@ class SessionDataRecorder:
                     ),
                 ))
         with h5py.File(path, "w") as output:
+            mark_close_on_exec(output)
             output.attrs["recording_start_perf"] = start_perf
             output.attrs["recording_start_wall"] = start_wall
             output.attrs["recording_end_perf"] = end_perf
@@ -4826,6 +4831,7 @@ class SessionDataRecorder:
     ) -> None:
         with h5py.File(snapshot.path, "r") as source, h5py.File(path, "w") as output, \
                 ThreadPoolExecutor(_NIDAQ_DEFLATE_THREADS, thread_name_prefix="NidaqDeflate") as pool:
+            mark_close_on_exec(output)
             perf_source = source["perf_time"]
             count = int(perf_source.shape[0])
             if count:

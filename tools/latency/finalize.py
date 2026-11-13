@@ -21,6 +21,7 @@ from typing import Mapping, Optional, Union
 
 import numpy
 
+from autotrainer.core.hdf5_inheritance import mark_close_on_exec
 from autotrainer.core.latency.schema import CLOCK_PAIRS, LATENCY_SCHEMA_VERSION
 
 from . import analysis, clocks
@@ -709,6 +710,7 @@ def _write_output(path: Path, results: dict, status: dict, *, session_id: str,
     staged = path.with_name(path.name + ".partial")
     try:
         with h5py.File(staged, "w") as store:
+            mark_close_on_exec(store)
             store.attrs["schema_version"] = LATENCY_SCHEMA_VERSION
             store.attrs["session_id"] = session_id
             store.attrs["app_version"] = app_version

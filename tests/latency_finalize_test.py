@@ -981,6 +981,24 @@ def test_the_raw_column_is_not_kept_alive_through_the_channel_scans(tmp_path, mo
     assert alive_during_scan == [False]
 
 
+def test_latency_h5_is_marked_close_on_exec_while_it_is_written(monkeypatch, tmp_path):
+    # It is written in the app's process at Stop, where NI-DAQmx's CEIP client starts
+    # processes that would otherwise inherit it and hold its HDF5 lock (christielab10, 2026-11-13).
+    real_mark = finalize.mark_close_on_exec
+    marked = []
+
+    def mark(store):
+        marked.append((Path(store.filename).name, real_mark(store)))
+        return marked[-1][1]
+
+    monkeypatch.setattr(finalize, "mark_close_on_exec", mark)
+    finalize._write_output(tmp_path / "latency.h5", {}, {"clocks": {}}, session_id="s",
+                           app_version="v")
+
+    assert marked == [("latency.h5.partial", True)]
+    assert (tmp_path / "latency.h5").is_file()
+
+
 @pytest.mark.parametrize(("shape", "options", "row"), (
     ((10_000,), {"chunks": (1_024,), "compression": "gzip"}, None),  # a column, an edge chunk
     ((3, 10_000), {"chunks": (1, 1_024), "compression": "gzip"}, 2),  # nidaq.h5's channel rows

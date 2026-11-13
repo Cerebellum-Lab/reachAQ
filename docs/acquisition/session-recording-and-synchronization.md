@@ -193,6 +193,13 @@ new session while the previous one remains incomplete. Successful generations re
 only now-empty staging directories. Failed staged files are never recursively cleaned
 and remain available for diagnosis and retry.
 
+The HDF5 files the application's own process writes (the NI-DAQ spool, `nidaq.h5`,
+`events.h5` and `latency.h5`) are marked close-on-exec as they are opened. HDF5 opens
+files without it, and NI-DAQmx's CEIP client starts ni-wine helpers from the process
+that uses it, at its first task create and its first task close. Those helpers live
+about 4 s and inherited every such descriptor. In v3.0.1 they held the open spool's
+HDF5 lock while Stop read it, so the session got no `nidaq.h5` or `alignment.json`.
+
 ### Camera frame and closed-video validation
 
 Camera timing rows are keyed by the vendor's actual integer frame ID, not row

@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import subprocess
 import time as stdlib_time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -1960,6 +1961,76 @@ def _spool_with_two_reads(recorder, project, ring, *, raw):
             )
         recorder._close_nidaq_spool_locked()
         return recorder._snapshot_nidaq_locked()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="flock and exec inheritance are POSIX")
+def test_a_process_started_while_the_spool_is_open_leaves_it_readable_at_stop(tmp_path, monkeypatch):
+    # v3.0.1 on christielab10, 2026-11-13: NI-DAQmx's CEIP client forks and execs ni-wine from
+    # the app's process at its first task create and its first task close. The helpers, alive
+    # about 4 s, inherited the open spool and its HDF5 flock, so Stop's read of the closed
+    # spool was refused (BlockingIOError, errno 11) and the session got no nidaq.h5. A child
+    # started with close_fds=False is the same fork and exec.
+    monkeypatch.delenv("HDF5_USE_FILE_LOCKING", raising=False)
+    project, ring, recorder = _spool_recorder(tmp_path, 13)
+    child = None
+    try:
+        with recorder._lock:
+            recorder._project = project
+            recorder._metadata_generation_id = f"{project.short_id}-g1"
+            recorder._open_nidaq_spool_locked()
+            child = subprocess.Popen(["sleep", "60"], close_fds=False)
+            recorder._append_nidaq_spool_locked(
+                np.arange(4, dtype=np.int64),
+                9.999 + np.arange(4) / 1000.0,
+                99.999 + np.arange(4) / 1000.0,
+                np.array(((0.0, 1.0, 0.0, 1.0),), dtype=np.float32),
+                ring.channel_names,
+                SimpleNamespace(epoch=1, source_perf_time=10.002, source_wall_time=100.002,
+                                gap_count=0, overrun_samples=0),
+            )
+            recorder._close_nidaq_spool_locked()
+            snapshot = recorder._snapshot_nidaq_locked()
+
+        assert SessionDataRecorder._nidaq_perf_values(snapshot, 0.0, 20.0).count == 4
+    finally:
+        if child is not None:
+            child.kill()
+            child.wait()
+        recorder.abort()
+
+
+def test_the_spool_and_the_published_nidaq_are_marked_close_on_exec(tmp_path, monkeypatch):
+    # Both are written in the app's process, where NI-DAQmx's CEIP client starts processes.
+    real_mark = session_data_recorder.mark_close_on_exec
+    marked = []
+
+    def mark(store):
+        marked.append((Path(store.filename).name, real_mark(store)))
+        return marked[-1][1]
+
+    monkeypatch.setattr(session_data_recorder, "mark_close_on_exec", mark)
+    manifest = ({"id": "nidaq.barcode", "kind": "nidaq_digital", "path": "streams/nidaq.h5",
+                 "runtimeState": "ready"},)
+    project, ring, recorder = _spool_recorder(tmp_path, 16)
+    try:
+        snapshot = _spool_with_two_reads(recorder, project, ring, raw=True)
+        SessionDataRecorder._write_session(
+            project, 10.0, 100.0, 10.005, (), (), (), snapshot, source_manifest=manifest,
+            metadata_generation_id=f"{project.short_id}-g1")
+    finally:
+        recorder.abort()
+    chunk = (np.arange(4, dtype=np.int64), 10.0 + np.arange(4) / 1000.0,
+             100.0 + np.arange(4) / 1000.0, np.zeros((1, 4), dtype=np.float32), ("barcode",),
+             1000.0, 1, 0, 0)
+    chunk_project = ProjectInfo(root=str(tmp_path / "chunks"), device_id="test",
+                                when=datetime(2026, 1, 2, 3, 4, 5), session=17)
+    SessionDataRecorder._write_session(chunk_project, 10.0, 100.0, 10.003, (), (), (), (chunk,),
+                                       source_manifest=manifest)
+
+    nidaq = [name for name, _ in marked if name.startswith(".nidaq.h5.")]
+    assert [name for name, _ in marked if name == "nidaq_capture.h5"] == ["nidaq_capture.h5"]
+    assert len(nidaq) == 2
+    assert all(result is True for _, result in marked)
 
 
 def test_the_spool_and_the_published_nidaq_carry_the_raw_stamp_of_each_read(tmp_path):
