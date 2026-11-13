@@ -1999,6 +1999,49 @@ def test_a_process_started_while_the_spool_is_open_leaves_it_readable_at_stop(tm
         recorder.abort()
 
 
+def _stopped_recorder_with_a_failing_finalization(tmp_path, monkeypatch, session):
+    """A recorder whose spool is written and whose Stop failed, retaining it for retry."""
+    project = ProjectInfo(root=str(tmp_path), device_id="test",
+                          when=datetime(2026, 1, 2, 3, 4, 5), session=session)
+    ring = SimpleNamespace(channel_names=("barcode",), capacity=16, sample_rate_hz=1000.0)
+    laser = _EventSource("trace_received")
+    laser.configuration = SimpleNamespace(backend="disabled")
+    recorder = SessionDataRecorder(SimpleNamespace(sample_ring=ring, timing_plan=None), laser)
+    snapshot = _spool_with_two_reads(recorder, project, ring, raw=True)
+    recorder._armed = True
+    recorder._start_perf = 10.0
+    recorder._start_wall = 100.0
+
+    def fail(**_snapshot):
+        raise OSError("temporary write failure")
+
+    monkeypatch.setattr(recorder, "_write_session", fail)
+    with pytest.raises(RuntimeError, match="retained for retry"):
+        recorder.stop(10.01)
+    assert recorder.has_pending_finalization
+    return recorder, snapshot
+
+
+def test_closing_keeps_the_spool_of_a_finalization_retained_for_retry(tmp_path, monkeypatch, caplog):
+    # v3.0.1 deleted it as the app closed, after Stop had retained it for retry, and the
+    # session's NI data was lost for good (christielab10, 2026-11-12).
+    recorder, snapshot = _stopped_recorder_with_a_failing_finalization(tmp_path, monkeypatch, 14)
+    with caplog.at_level(logging.WARNING, logger=session_data_recorder.__name__):
+        recorder.close()
+
+    assert snapshot.path.is_file()
+    assert not recorder.has_pending_finalization
+    assert str(snapshot.path) in caplog.text
+
+
+def test_aborting_a_recording_that_never_stopped_still_removes_its_spool(tmp_path):
+    project, ring, recorder = _spool_recorder(tmp_path, 15)
+    snapshot = _spool_with_two_reads(recorder, project, ring, raw=True)
+    recorder.abort()
+
+    assert not snapshot.path.exists()
+
+
 def test_the_spool_and_the_published_nidaq_are_marked_close_on_exec(tmp_path, monkeypatch):
     # Both are written in the app's process, where NI-DAQmx's CEIP client starts processes.
     real_mark = session_data_recorder.mark_close_on_exec

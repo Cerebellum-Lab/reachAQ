@@ -659,12 +659,24 @@ class SessionDataRecorder:
                 pending_source = pending.get("nidaq_chunks")
                 if isinstance(pending_source, _NidaqSpoolSnapshot):
                     spool_path = pending_source.path
+            # A stopped session whose finalization is retained for retry keeps
+            # its spool, as it keeps its other staged files; v3.0.1 deleted it
+            # as the app closed and the session's NI data was lost for good.
+            # Only an unfinished recording's spool is removed.
+            retained = pending is not None or self._pending_stop_end_perf is not None
+            project = (None if pending is None else pending.get("project")) or self._project
             self._pending_finalization = None
             self._pending_stop_end_perf = None
             self._end_latency_events(
                 failures, "the recorder is cleared without it")
             self._clear_locked()
-        if spool_path is not None:
+        if spool_path is None:
+            return
+        if retained:
+            logging.getLogger(__name__).warning(
+                "Session %s was not finalized; its NI-DAQ spool is kept at %s",
+                "(unknown)" if project is None else project.short_id, spool_path)
+        else:
             spool_path.unlink(missing_ok=True)
 
     def request_abort(self) -> None:

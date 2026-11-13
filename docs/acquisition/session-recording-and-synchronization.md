@@ -191,7 +191,10 @@ project identity until publication succeeds. A later Record attempt first retrie
 that exact generation and republishes its authoritative metadata; it cannot start a
 new session while the previous one remains incomplete. Successful generations remove
 only now-empty staging directories. Failed staged files are never recursively cleaned
-and remain available for diagnosis and retry.
+and remain available for diagnosis and retry. Closing the application while a
+finalization is still retained keeps its NI-DAQ spool,
+`.staging/<generation>/streams/nidaq_capture.h5`, and logs its path; only the spool
+of a recording that never stopped is removed.
 
 The HDF5 files the application's own process writes (the NI-DAQ spool, `nidaq.h5`,
 `events.h5` and `latency.h5`) are marked close-on-exec as they are opened. HDF5 opens
