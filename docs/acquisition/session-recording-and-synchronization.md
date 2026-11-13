@@ -1107,6 +1107,54 @@ on the first frame the recorder saw of a boot is not counted, because it may hav
 come before the session; and a loss on the last frames before the recorder stops
 may be missed.
 
+### NI delivery calibration (`nidaqStream.deliveryCalibration`)
+
+The camera-latch pairing is rated against where its residual should sit on this
+rig: the NI-to-host fit's delivery floor (how late the fit maps the sample
+clock, which nothing in a session measures) plus the camera's own stamp offset,
+minus the exposure. `nidaqStream.deliveryCalibration` holds that offset
+(`offsetSeconds`) and its spread between sessions (`spreadSeconds`), with what
+the calibration covered. Without it the latch match is refused on every session
+and the anchor falls to the arrival match (`ambiguous_hardware_edge`; the
+latency record pairs by host arrival, `mixed`). See `alignment.json` above.
+
+`tools/hardware/calibrate_ni_delivery.py` measures it with a loopback:
+
+1. With reachAQ and SpinView closed, connect a BNC cable from an unused analog
+   output to an unused analog input of the NI stream's board (christielab10:
+   the 6221's AO 0 to AI 6 on the BNC-2090A, with the AI 6 / AI 14 switch at SE).
+   Nothing else may be connected to either.
+2. Run, as the operator, from the repository root:
+
+   ```bash
+   conda run --no-capture-output -n reachaq python -m tools.hardware.calibrate_ni_delivery        --ao PXI1Slot5/ao0 --ai PXI1Slot5/ai6
+   ```
+
+   It refuses to start while reachAQ or SpinView is running, or when the input does
+   not follow the output (a missing cable, or the input's switch at DIFF). It
+   then records 12 isolated sessions of 120 s, about half an hour: display
+   refresh 60, 120, 144 and 165 Hz (the NI read size) at 50, 100 and 150 fps, at
+   the live exposure. Each runs from a scratch copy of the configuration with
+   CAN, the pellet controller and the laser off, under `--out`, while the output
+   steps at random times. `--refresh`, `--fps`, `--exposure-us`, `--passes` and
+   `--seconds` change the plan.
+3. It prints a table per session: the fit's delivery floor L, the residual, and
+   residual + exposure (D). A session whose fit is half an NI read late or more,
+   or whose latch pairing is not where the NI edges are, is left out and named.
+   The mean and standard deviation of D over the rest are the calibration, with
+   at least two sessions.
+4. Add `--write` to put it into `~/Autotrainer/system_configuration.yaml`. The file
+   is copied to `system_configuration_before_delivery_calibration_<time>.yaml`
+   first and only changed after every session has finished; without `--write`
+   nothing outside `--out` is changed. Then remove the cable.
+
+Calibrate again after changing the NI board, the reach cameras, their USB
+attachment or the host, since any of them moves the floor or the stamp offset.
+christielab10, 2026-11-12: L 0.20-0.30 ms at NI reads of 61-167 samples, D
+0.303 ms with 0.035 ms between 27 sessions. At display refresh of 200 Hz or more
+(reads of 50 samples or fewer) the fit maps a whole read late; such sessions are
+refused by the band rather than calibrated.
+
 ## Storage, discovery, and safe hardware boundaries
 
 Record preflight performs a real write, flush, `fsync`, and removal probe on the

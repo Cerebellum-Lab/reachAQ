@@ -367,6 +367,24 @@ conda run --no-capture-output -n reachaq python tools/hardware/verify_nidaq_wiri
 | `--report PATH` | Also write the text report to `PATH` |
 | `--config PATH`, `--record PATH` | Configuration read and result file written; default to the files above |
 
+### NI delivery calibration
+
+The camera-latch pairing that rates a session `hardware_edge` needs this rig's
+NI delivery calibration (`nidaqStream.deliveryCalibration`); without one every
+session is anchored by host arrival and rated `ambiguous_hardware_edge`. Measure
+it once the wiring passes, with a BNC loopback from an unused analog output to
+an unused analog input (christielab10: AO 0 to AI 6, AI 6 at SE) and reachAQ
+closed:
+
+```bash
+conda run --no-capture-output -n reachaq python -m tools.hardware.calibrate_ni_delivery     --ao PXI1Slot5/ao0 --ai PXI1Slot5/ai6 --write
+```
+
+It takes about half an hour, backs up the configuration before writing, and is
+described in `docs/acquisition/session-recording-and-synchronization.md`, "NI
+delivery calibration". Calibrate again after changing the NI board, the reach
+cameras or the host.
+
 ## Device identity and timing configuration
 
 The DAQ Ports dialog stores the discovered product and serial identity for each
