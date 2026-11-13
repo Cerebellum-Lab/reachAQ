@@ -27,7 +27,6 @@ from tools.acquisition.model.latency_event_log import LatencyEventLog
 from tools.autotrainer_version import __version__ as app_version
 from tools.latency import finalize
 from tools.latency import rebuild
-from tools.latency.finalize import finalize_session_latency
 
 RATE = 10_000.0
 PERIOD = 1 / 150
@@ -40,6 +39,20 @@ DIODE_DELAY = 0.0001
 START_ENTRY_NI = 1.0
 RAW_OFFSET = 3.0       # CLOCK_MONOTONIC_RAW = the unslewed host clock + 3 s
 SLEW_HALF_WIDTH = 0.2  # seconds either side of mid-session
+# The synthetic reads return 0.2-3.2 ms after their blocks and the camera stamps the exposure
+# itself, so a correct latch pairing's residual is the envelope's floor: 0.51 ms in the default
+# session, 0.22 ms in a 30 s one (more reads per envelope bin). A rig calibrated across both.
+CALIBRATION = {"exposure_seconds": 0.0, "delivery_offset_seconds": 0.00036,
+               "delivery_spread_seconds": 60e-6}
+
+
+def finalize_session_latency(session_dir, **kwargs):
+    """The finalizer as a calibrated rig runs it, unless a test passes its own inputs."""
+    return finalize.finalize_session_latency(session_dir, **{**CALIBRATION, **kwargs})
+
+
+def _band(pairing: dict) -> "finalize.clocks.ResidualBand":
+    return finalize.clocks.ResidualBand(pairing["expected_residual"], pairing["limit"])
 
 
 def _slew(host, slew):
@@ -318,8 +331,8 @@ def test_a_latch_left_out_of_the_map_is_named_in_the_camera_to_ni_record(tmp_pat
     assert json.loads(attrs["latchDropped"]) == [1]
 
 
-@pytest.mark.parametrize("disagreement, gated", [(0.0025, True), (0.0005, False)],
-                         ids=["over_tolerance", "within_tolerance"])
+@pytest.mark.parametrize("disagreement, gated", [(0.0005, True), (0.00003, False)],
+                         ids=["over_the_band", "within_the_band"])
 def test_a_latch_pairing_the_ni_path_disagrees_with_is_ambiguous(tmp_path, monkeypatch,
                                                                   disagreement, gated):
     real = finalize._latch_direct_lag_p50
@@ -333,11 +346,12 @@ def test_a_latch_pairing_the_ni_path_disagrees_with_is_ambiguous(tmp_path, monke
     assert camera["pairing"]["ambiguous"] is gated
     assert camera["valid"] is not gated
     if gated:
-        # Both numbers, in ms, and the tolerance: a quarter of a 150 fps period.
+        # Both numbers, in ms, and the band's half-width, well under a quarter period.
         reason = camera["pairing"]["reason"]
         assert f"{camera['niDerivedLagP50'] * 1e3:.3f} ms" in reason
         assert f"{camera['latchDirectLagP50'] * 1e3:.3f} ms" in reason
-        assert "1.667 ms" in reason
+        assert f"{camera['pairing']['limit'] * 1e3:.3f} ms" in reason
+        assert camera["pairing"]["limit"] < PERIOD / 4
         assert camera["reason"] == reason
         # The mixed figures fall back as for any ambiguous pairing.
         assert status["loops"]["pose"]["status"] == "partial"
@@ -434,19 +448,19 @@ def test_a_sustained_perf_step_does_not_invalidate_a_raw_pairing(tmp_path):
     status = finalize_session_latency(session, primary_camera="left")
 
     camera = status["clocks"]["cameraToNi"]
-    tolerance = finalize.clocks.latch_tolerance(PERIOD)
+    band = _band(camera["pairing"])
     assert status["clocks"]["niToHost"]["method"] == "raw_bridged"
     # The perf figures read the chord's error as a disagreement, or this test has no teeth.
-    assert abs(camera["latchDirectLagP50"] - camera["niDerivedLagP50"]) > tolerance
+    assert not band.holds(camera["latchDirectLagP50"] - camera["niDerivedLagP50"])
     assert camera["valid"] is True, camera
     assert camera["pairing"]["clock"] == "raw"
     assert camera["pairing"]["slip"] is None and camera["pairing"]["ambiguous"] is False
-    assert abs(camera["latchVersusNiRawSeconds"]) < tolerance
+    assert band.holds(camera["latchVersusNiRawSeconds"])
     assert camera["arrivalPairing"]["shift"] == 0 and camera["arrivalPairing"]["ambiguous"] is False
 
 
-@pytest.mark.parametrize("off, gated", [(0.0025, True), (0.0005, False)],
-                         ids=["over_tolerance", "within_tolerance"])
+@pytest.mark.parametrize("off, gated", [(0.0005, True), (0.00003, False)],
+                         ids=["over_the_band", "within_the_band"])
 def test_a_raw_pairing_is_checked_by_its_two_exposure_paths_on_raw(tmp_path, monkeypatch, off, gated):
     # A camera-to-NI line off by `off` moves the NI path's exposure and not the latches'.
     real = finalize.clocks.fit_camera_to_ni
@@ -468,9 +482,10 @@ def test_a_raw_pairing_is_checked_by_its_two_exposure_paths_on_raw(tmp_path, mon
     assert camera["valid"] is not gated
     if gated:
         reason = camera["pairing"]["reason"]
-        assert "NI-derived exposure" in reason and "latch-derived exposure" in reason
-        # The difference, in ms, and the tolerance: a quarter of a 150 fps period.
-        assert f"{difference * 1e3:.3f} ms" in reason and "1.667 ms" in reason
+        assert "NI-derived minus latch-derived exposure on RAW" in reason
+        # The difference, in ms, and the band's half-width.
+        assert f"{difference * 1e3:.3f} ms" in reason
+        assert f"{camera['pairing']['limit'] * 1e3:.3f} ms" in reason
         assert camera["reason"] == reason
 
 
@@ -599,8 +614,7 @@ def test_an_unreadable_stream_fails_without_raising(tmp_path, monkeypatch):
 
 def test_rebuild_writes_beside_the_original_and_leaves_it_alone(tmp_path, capsys):
     session = _session(tmp_path)
-    (session / "streams" / "alignment.json").write_text(
-        json.dumps({"canonicalBoundary": {"primaryCamera": "left"}}))
+    (session / "streams" / "alignment.json").write_text(json.dumps(_alignment()))
     assert finalize_session_latency(session, primary_camera="left")["status"] == "complete"
     original = session / "streams" / "latency.h5"
     before = hashlib.sha256(original.read_bytes()).hexdigest()
@@ -612,6 +626,29 @@ def test_rebuild_writes_beside_the_original_and_leaves_it_alone(tmp_path, capsys
     assert hashlib.sha256(original.read_bytes()).hexdigest() == before
     # The top-level status, not a substring a per-loop status would also match.
     assert json.loads(capsys.readouterr().out)["status"] == "complete"
+
+
+def _alignment(calibration=True) -> dict:
+    """alignment.json as the recorder writes it, for what a rebuild reads back."""
+    return {"canonicalBoundary": {"primaryCamera": "left"},
+            "cameraNidaqAlignment": {
+                "exposureSeconds": CALIBRATION["exposure_seconds"],
+                "deliveryCalibration": None if not calibration else {
+                    "offsetSeconds": CALIBRATION["delivery_offset_seconds"],
+                    "spreadSeconds": CALIBRATION["delivery_spread_seconds"], "sessions": 27}}}
+
+
+def test_a_rebuild_without_a_recorded_calibration_refuses_the_latch_pairing(tmp_path, capsys):
+    session = _session(tmp_path)
+    (session / "streams" / "alignment.json").write_text(json.dumps(_alignment(calibration=False)))
+
+    assert rebuild.main([str(session)]) == 0
+
+    status = json.loads(capsys.readouterr().out)
+    pairing = status["clocks"]["cameraToNi"]["pairing"]
+    # As at recording: no calibration, so host arrival pairs and the latch shift is not vouched for.
+    assert pairing["method"] == "host_arrival"
+    assert status["status"] == "partial"
 
 
 def test_two_rebuilds_in_one_second_do_not_overwrite_each_other(tmp_path, capsys):
@@ -670,7 +707,7 @@ def test_the_file_records_its_clock_fits_session_and_app_version(tmp_path):
     assert set(ni) >= {"offset", "drift", "x_min", "x_max", "reason", "segmentDriftPpmMin",
                        "segmentDriftPpmMax", "knotSeconds"}
     assert "minimum delivery delay" in ni["note"]
-    assert "unmeasured" in ni["envelope_bias_floor"]
+    assert "not subtracted" in ni["envelope_bias_floor"]
     assert "unmeasured" in ni["secondary_trigger_delay"]
     assert camera["valid"] and camera["points"] == FRAMES
     assert camera["pairing_shift"] == 0 and not camera["pairing_ambiguous"]

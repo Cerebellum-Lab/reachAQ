@@ -481,12 +481,14 @@ the primary camera's latency stream:
   Each records `status` (`unavailable`, `paired`, `ambiguous`, `outside` when
   the first frame's transition lies outside the spool, or `failed`), `shift`,
   `agreement`, `ambiguous`, `reason`, `frames`, `limitSeconds` and `slip`;
-  `latch` adds `medianResidualSeconds`, `latches`, `usableLatches`, `clock`,
-  `uncertaintySeconds` and `dropped`, and `arrival` adds `medianLagSeconds`,
+  `latch` adds `medianResidualSeconds`, `expectedResidualSeconds`, `latches`,
+  `usableLatches`, `clock`, `uncertaintySeconds` and `dropped`, and `arrival`
+  adds `medianLagSeconds`,
   the median time from the paired transition to the frame's arrival; evidence
   of a match that could not run is `unavailable` or `failed` and carries little
   more than `status` and `reason`. `limitSeconds`, `slip`, `clock`,
-  `uncertaintySeconds` and `dropped` were added within schemaVersion 4, so
+  `uncertaintySeconds`, `dropped`, `latch.expectedResidualSeconds` and the
+  top-level `deliveryCalibration` were added within schemaVersion 4, so
   earlier schema-4 files lack them; read them with a default.
   `arrivalSampleIndex` is the NI sample the arrival match names for the first
   recorded frame (null without one). `latch.frames` and `arrival.frames` count
@@ -513,15 +515,32 @@ the primary camera's latency stream:
 - The limits are measured, with one constant: `FALSE_ALARM_PROBABILITY`
   (1e-6, per check and per session, in `tools/latency/clocks.py`), which gives
   k = 4.89 standard errors (the two-sided Gaussian quantile; on a robust
-  spread, 1.4826 × MAD, an approximation). σ_NI is `niToHost.residual_rms`
-  and P is `framePeriodSeconds`.
+  spread, 1.4826 × MAD, an approximation). σ_NI is `niToHost.residual_rms`,
+  P is `framePeriodSeconds`, and D̄ and σ_D are the rig's NI delivery
+  calibration (below).
   - The latch match is trusted only while `uncertaintySeconds + k·σ_NI` is
     under P/4. Otherwise it is `ambiguous`, its shift still recorded, and
     `reason` reads *latch mapping uncertainty X ms plus 4.89 NI residuals (Y ms)
     exceeds a quarter frame period (Z ms)*.
-  - `latch.limitSeconds` is the residual tolerance, min(P/4, 2 ms): a
-    `medianResidualSeconds` beyond it is `ambiguous`. The 2 ms cap stays until
-    the NI delivery delay is measured.
+  - The latch residual is judged against a band. A Blackfly S stamps a frame
+    at the end of its exposure and the NI edge marks its start, so a correct
+    pairing's `medianResidualSeconds` sits at D̄ − `exposureSeconds`, where D̄
+    is the NI-to-host fit's delivery floor plus the camera's own stamp offset.
+    `latch.expectedResidualSeconds` is that centre and `latch.limitSeconds`
+    the half-width, min(k·σ_D + `uncertaintySeconds`, P/4); a residual outside
+    it is `ambiguous`, *median residual X ms is Y ms from the expected Z ms,
+    over the band's W ms*. A mapping a whole NI read or frame off moves the
+    residual by milliseconds, which a quarter-period test alone can miss
+    (on christielab10 at 200 Hz display refresh and 150 fps, −1.58 ms).
+  - Without a delivery calibration, or without an exposure, the band cannot be
+    judged: the latch match is `ambiguous` with *no NI delivery calibration
+    for this rig* or *the exposure is unknown*, and the arrival match anchors,
+    so the session is at most `ambiguous_hardware_edge`. The latency
+    finalizer pairs such a session by host arrival (`mixed`).
+  - An offset-only latch map (latches within 10 s) carries the camera's drift
+    within its 30 s window outside `uncertaintySeconds`; 20 ppm moves the
+    residual about 0.3 ms, so such a match can read `ambiguous` and the
+    arrival match anchors.
   - `arrival.limitSeconds` is the margin k·√(σ_NI² + (1.2533·MAD_lag/√n)²),
     MAD_lag the robust spread of the per-frame lags and n the frames counted:
     a `medianLagSeconds` within it of 0 or of P is `ambiguous`.
@@ -549,8 +568,17 @@ the primary camera's latency stream:
     flagging. A backlog that grows past one period (votes s, s−1, s−2, s−1, s)
     is not flanked by the majority, so it is flagged, which errs on the side
     of flagging too. `agreement` stays as a diagnostic.
-  - These replace the fixed 0.95 agreement, 0.1 ms arrival margin and 2 ms
-    latch bracket cap.
+  - These replace the fixed 0.95 agreement, 0.1 ms arrival margin, 2 ms
+    latch bracket cap and 2 ms latch residual cap.
+- `deliveryCalibration` is the rig's `nidaqStream.deliveryCalibration` the band
+  was centred on, or null without one: `offsetSeconds` (D̄) and
+  `spreadSeconds` (σ_D), and what the calibration covered, for provenance
+  (`sessions`, `measured`, `readChunkSamples`, `frameRatesHz`,
+  `exposuresSeconds`, `cameraSerials`, `deliveryFloorMinSeconds`,
+  `deliveryFloorMaxSeconds`). `python -m tools.latency.rebuild` judges the
+  latch pairing by this and `exposureSeconds`, as the session did.
+  `tools/hardware/calibrate_ni_delivery.py` measures it with an AO-to-AI
+  loopback (see "NI delivery calibration" below).
 - `anchorMethod` is the first that yields a transition: `camera_latch` when the
   latch match is `paired`, else `host_arrival` when the arrival match is, else
   `first_frame_stamp`, the latest transition at or before the first recorded
@@ -572,7 +600,9 @@ the primary camera's latency stream:
   less the anchor transition) and `arrival.medianLagSeconds` are measurements,
   never compared with an expected value.
 - `exposureSeconds` is the exposure the app was given (null when unknown or
-  not a finite number). It is recorded and moves no anchor.
+  not a finite number). It moves no anchor directly; it centres the latch
+  residual band, so an exposure the camera did not use refuses the latch
+  match and leaves the anchor to arrival.
 - schemaVersion 3 files differ here. They carry `expectedLagSeconds`,
   `lagGateSeconds` and `expectedLagSampleIndex`, which schema 4 drops; their
   `anchorMethod` is `camera_latch` or `expected_lag`, the transition nearest

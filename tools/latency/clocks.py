@@ -70,16 +70,20 @@ BRIDGE_MIN_RAW_COVERAGE = 0.9
 # frames within LATCH_WINDOW_SECONDS (20 ppm over 30 s is 0.6 ms).
 LATCH_DRIFT_SPAN_SECONDS = 10.0
 LATCH_WINDOW_SECONDS = 30.0
-# What may separate the NI edge from the latched camera time it is paired with:
-# a quarter period, never more than this. This residual gate is the safeguard
+# What may separate the NI edge from the latched camera time it is paired with
+# is set by the rig's NI delivery calibration (latch_residual_band). A correct
+# pairing's residual sits at the NI-to-host fit's delivery floor plus the
+# camera's own stamp offset, minus the exposure, and a bias of whole periods or
+# whole NI reads moves it by milliseconds. That residual gate is the safeguard
 # against whole-period mispairing, because a bias of whole periods plus a
-# little passes a quarter-period test at low frame rates: christielab10's NI
-# stamps, paired with their own blocks, put the edges 16.6 ms early, and
-# 50 fps paired a frame off with a 3.39 ms residual. With the bias gone the
-# residual is about 0.1 ms. The finalizer's NI-versus-latch lag check uses the
-# same tolerance but sees this same residual again, through the fitted
-# camera-to-NI line; it is no reason to relax this gate.
-LATCH_MAX_RESIDUAL_SECONDS = 0.002
+# little passes a quarter-period test: christielab10's NI stamps, paired with
+# their own blocks, put the edges 16.6 ms early and 50 fps paired a frame off
+# with a 3.39 ms residual; at 200 Hz display refresh (50-sample NI reads) the
+# fit runs a read late and 150 fps paired a frame off at -1.58 ms, inside a
+# quarter period. The loopback (2026-11-12, 27 sessions) put residual +
+# exposure at 0.303 ms, 0.035 ms between sessions. The finalizer's NI-versus-
+# latch lag check sees this same residual again, through the fitted
+# camera-to-NI line, and is judged against the same band.
 HOST_ARRIVAL = "host_arrival"
 CAMERA_LATCH = "camera_latch"
 
@@ -861,9 +865,13 @@ class Pairing:
     and no reason to refuse it; the camera-clock pairing refuses any slip,
     whose votes delivery cannot move."""
     limit: float = math.nan
-    """What the verdict was judged against, in seconds: the arrival margin or the latch tolerance."""
+    """What the verdict was judged against, in seconds: the arrival margin, or the latch
+    residual band's half-width."""
     clock: str = "perf"
     """The host clock the frames and transitions were compared on: "perf" or "raw"."""
+    expected_residual: float = math.nan
+    """Camera-clock method: the residual band's centre, the rig's delivery offset minus
+    the exposure (latch_residual_band)."""
 
 
 def coverage_factor() -> float:
@@ -1254,8 +1262,8 @@ def _dropped_reason(dropped: tuple, kept: int, model: str) -> str:
 def latch_gate_ok(fit: ClockFit, ni_residual_rms: float, frame_period: float) -> bool:
     """Whether a latch map is trusted to choose the transitions: its uncertainty
     plus coverage_factor() NI-to-host residuals (ni_residual_rms) is under a
-    quarter frame period, the bound latch_tolerance() also puts on the residual
-    (below its cap). At 150 fps the quarter is 1.67 ms; the worst session of
+    quarter frame period, the bound latch_residual_band() also puts on its
+    half-width. At 150 fps the quarter is 1.67 ms; the worst session of
     the 2026-11-03 sweep needs 0.89 + 4.89 x 0.039 = 1.08 ms. False when the
     fit's uncertainty, the residual or the period is not finite, which covers
     an invalid fit.
@@ -1287,11 +1295,52 @@ def latch_gate_reason(fit: ClockFit, ni_residual_rms: float, frame_period: float
             f"exceeds a quarter frame period ({period / 4 * 1e3:.3f} ms)")
 
 
-def latch_tolerance(frame_period: float) -> float:
-    """How far the NI path may sit from the latch path: P/4, at most LATCH_MAX_RESIDUAL_SECONDS."""
-    if not math.isfinite(frame_period):
-        return math.nan
-    return min(frame_period / 4, LATCH_MAX_RESIDUAL_SECONDS)
+@dataclasses.dataclass(frozen=True)
+class ResidualBand:
+    """Where a correct camera-latch pairing's residual lies, in seconds."""
+    centre: float
+    half_width: float
+    reason: str = ""
+    """Why the residual cannot be judged, or "" when it can."""
+
+    def holds(self, residual: float) -> bool:
+        """Whether residual lies in the band; False whenever it cannot be judged."""
+        return not self.reason and abs(float(residual) - self.centre) <= self.half_width
+
+
+def latch_residual_band(frame_period: float, *, exposure: float, delivery_offset: float,
+                        delivery_spread: float, uncertainty: float) -> ResidualBand:
+    """How far the NI path may sit from the latch path.
+
+    The camera stamps a frame at the end of its exposure and the NI edge marks
+    its start, so a correct pairing's residual (transition minus latched time)
+    sits at the rig's delivery offset minus the exposure. delivery_offset and
+    delivery_spread are the NI stream's delivery calibration: the mean of
+    residual + exposure over loopback-verified sessions and its standard
+    deviation between them. The band is centred there, coverage_factor()
+    spreads plus the latch map's own uncertainty wide, and never wider than a
+    quarter period. Unjudgeable (a reason, and holds() is False) without a
+    calibration, an exposure, a finite period or a finite map uncertainty: no
+    fixed tolerance stands in for any of them.
+    """
+    values = [_float_or_nan(value) for value in (frame_period, exposure, delivery_offset,
+                                                 delivery_spread, uncertainty)]
+    period, exposure, offset, spread, uncertainty = values
+    if not (math.isfinite(offset) and math.isfinite(spread)):
+        reason = ("no NI delivery calibration for this rig (nidaqStream.deliveryCalibration; "
+                  "tools/hardware/calibrate_ni_delivery.py measures it)")
+    elif not math.isfinite(exposure):
+        reason = "the exposure is unknown, so the expected residual is too"
+    elif not math.isfinite(period):
+        reason = "the frame period is unknown, so the residual cannot be judged"
+    elif not math.isfinite(uncertainty):
+        reason = "the latch map's uncertainty is unknown, so the residual cannot be judged"
+    else:
+        reason = ""
+    if reason:
+        return ResidualBand(math.nan, math.nan, reason)
+    half_width = min(coverage_factor() * spread + uncertainty, period / 4)
+    return ResidualBand(offset - exposure, half_width)
 
 
 def latch_window(fit: ClockFit, camera_seconds) -> numpy.ndarray:
@@ -1325,7 +1374,8 @@ def latch_clock(latches, ni_fit) -> str:
 
 def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_times,
                                    frame_period: float, *, ni_residual_rms: float,
-                                   clock: str) -> Pairing:
+                                   clock: str, exposure: float, delivery_offset: float,
+                                   delivery_spread: float) -> Pairing:
     """Which exposure transition belongs to which frame, decided by the camera's clock.
 
     The latches place camera time on the host clock named by clock ("perf" or
@@ -1337,23 +1387,25 @@ def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_
 
     The median residual (transition minus expected time, over the chosen shift)
     is where the camera stamps a frame relative to the NI edge, plus the NI-to-
-    host bias, plus the latch map's error. All of it must stay well under half a
-    period for the nearest transition to be the right one, and a bias near a
-    whole period would pair a frame off with a small residual, so a residual
-    over latch_tolerance() (a quarter period, at most 2 ms), or a shift that
-    changes partway through (find_slip), marks the pairing ambiguous. Any slip
-    does, one that looks like a backlog (reverts) too: delivery cannot move a
-    hardware timestamp, so no backlog explains it. So does a
-    latch map too uncertain to choose a transition by (latch_gate_ok: the map's
-    uncertainty plus coverage_factor() times ni_residual_rms, the NI-to-host
-    fit's residual, against a quarter period); the shift it found is still
-    reported. The lag is not measured here: median_lag is NaN. The residual
-    tolerance is in Pairing.limit.
+    host bias, plus the latch map's error. A Blackfly S stamps a frame at the end
+    of its exposure and the NI edge marks its start, so on a correct pairing it
+    sits at the rig's delivery calibration (delivery_offset, delivery_spread)
+    minus the exposure, and a bias near a whole period or a whole NI read moves
+    it by milliseconds. So a residual outside latch_residual_band(), or a shift
+    that changes partway through (find_slip), marks the pairing ambiguous, and
+    so does a band that cannot be judged: no calibration, no exposure (NaN for
+    either), no period. Any slip does, one that looks like a backlog (reverts)
+    too: delivery cannot move a hardware timestamp, so no backlog explains it.
+    So does a latch map too uncertain to choose a transition by (latch_gate_ok:
+    the map's uncertainty plus coverage_factor() times ni_residual_rms, the
+    NI-to-host fit's residual, against a quarter period); the shift it found is
+    still reported. The lag is not measured here: median_lag is NaN. The band's
+    half-width is in Pairing.limit and its centre in Pairing.expected_residual.
 
-    The limit that sets: a Blackfly S stamps a frame at the end of its exposure
-    and the NI edge marks its start, so the residual approaches minus the
-    exposure time. An exposure longer than about 1.8 ms therefore reads
-    ambiguous, visibly, rather than being paired on a guess.
+    The nearest transition is the right one only while the expected residual is
+    under half a period. A longer exposure pairs every frame a period off; its
+    residual then lies a period from the band, and it reads ambiguous, visibly,
+    rather than being paired on a guess.
     """
     fit = fit_latches(latches, clock=clock)
     if not fit.valid:
@@ -1381,27 +1433,35 @@ def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_
     inside = (numbers >= 0) & (numbers < transition_times.size)
     residual = transition_times[numbers[inside]] - expected[inside]
     median_residual = float(numpy.median(residual)) if residual.size else math.nan
-    tolerance = latch_tolerance(frame_period)
-    residual_ambiguous = not abs(median_residual) <= tolerance
+    band = latch_residual_band(frame_period, exposure=exposure, delivery_offset=delivery_offset,
+                               delivery_spread=delivery_spread, uncertainty=fit.uncertainty)
+    residual_ambiguous = not band.holds(median_residual)
     gate_ok = latch_gate_ok(fit, ni_residual_rms, frame_period)
     slip = find_slip(voters, votes, shift)
     problems = []
     if slip is not None:
         problems.append(_slip_reason(slip, shift))
-    if not math.isfinite(tolerance):
-        problems.append("the frame period is unknown, so the residual cannot be judged")
+    if band.reason:
+        problems.append(band.reason)
     elif not math.isfinite(median_residual):
         problems.append("no frame of the chosen shift has a transition")
     elif residual_ambiguous:
-        problems.append(f"median residual {median_residual * 1e3:.3f} ms is over the latch "
-                        f"tolerance ({tolerance * 1e3:.3f} ms)")
-    # An unknown frame period fails the gate too, and is already the reason.
-    if not gate_ok and math.isfinite(tolerance):
+        problems.append(latch_band_reason("median residual", median_residual, band))
+    # An unknown frame period fails the gate too; the band's reason already says so.
+    if not gate_ok and math.isfinite(_float_or_nan(frame_period)):
         problems.append(latch_gate_reason(fit, ni_residual_rms, frame_period))
     return Pairing(shift, math.nan, agreement,
                    bool(residual_ambiguous or slip is not None or not gate_ok),
                    "; ".join(problems), method=CAMERA_LATCH, median_residual=median_residual,
-                   slip=slip, limit=tolerance, clock=clock)
+                   slip=slip, limit=band.half_width, clock=clock,
+                   expected_residual=band.centre)
+
+
+def latch_band_reason(what: str, value: float, band: ResidualBand) -> str:
+    """Why value lies outside band, for a pairing's reason."""
+    return (f"{what} {value * 1e3:.3f} ms is {abs(value - band.centre) * 1e3:.3f} ms from the "
+            f"expected {band.centre * 1e3:.3f} ms, over the band's "
+            f"{band.half_width * 1e3:.3f} ms")
 
 
 def fit_camera_to_ni(frame_ids, camera_ts_ns, transition_index, sample_rate: float,

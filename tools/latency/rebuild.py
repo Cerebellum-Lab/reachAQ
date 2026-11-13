@@ -26,6 +26,24 @@ def _primary_from_alignment(session_dir: Path) -> str:
         return ""
 
 
+def _delivery_from_alignment(session_dir: Path) -> dict:
+    """The exposure and NI delivery calibration the recorder judged the latch pairing by.
+
+    alignment.json keeps both (cameraNidaqAlignment's exposureSeconds and
+    deliveryCalibration), so a rebuild judges the pairing as the session did; without
+    them the latch pairing is refused, as it was at recording."""
+    path = session_dir / "streams" / "alignment.json"
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            alignment = json.load(stream)["cameraNidaqAlignment"]
+        calibration = alignment.get("deliveryCalibration") or {}
+        return {"exposure_seconds": alignment.get("exposureSeconds"),
+                "delivery_offset_seconds": calibration.get("offsetSeconds"),
+                "delivery_spread_seconds": calibration.get("spreadSeconds")}
+    except (OSError, KeyError, ValueError, TypeError, AttributeError):
+        return {}
+
+
 def _session_id_from_manifest(session_dir: Path) -> str:
     path = session_dir / "streams" / "stream_manifest.json"
     try:
@@ -45,7 +63,8 @@ def main(argv=None) -> int:
     name = f"latency.rebuilt-{datetime.now(timezone.utc):%Y%m%dT%H%M%S%fZ}.h5"
     status = finalize_session_latency(
         args.session_dir, primary_camera=primary, output_name=name,
-        session_id=_session_id_from_manifest(args.session_dir))
+        session_id=_session_id_from_manifest(args.session_dir),
+        **_delivery_from_alignment(args.session_dir))
     print(json.dumps(status, indent=2, sort_keys=True))
     return 1 if status["status"] == "failed" else 0
 

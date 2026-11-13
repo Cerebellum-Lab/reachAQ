@@ -206,6 +206,28 @@ _MINIMUM_VALID_TONE_PULSE_SECONDS = 0.002
 _ANCHOR_STREAM_RETRY_SECONDS = 1.0
 
 
+def _delivery_calibration_record(calibration) -> Optional[dict]:
+    """alignment.json's deliveryCalibration: the NI delivery calibration the latch
+    residual band was centred on, with what it covered, or None without one. The
+    latency rebuild reads offsetSeconds and spreadSeconds back from it."""
+    if calibration is None:
+        return None
+    floor_min = calibration.delivery_floor_min_seconds
+    floor_max = calibration.delivery_floor_max_seconds
+    return {
+        "offsetSeconds": float(calibration.offset_seconds),
+        "spreadSeconds": float(calibration.spread_seconds),
+        "sessions": int(calibration.sessions),
+        "measured": str(calibration.measured),
+        "readChunkSamples": [int(value) for value in calibration.read_chunk_samples],
+        "frameRatesHz": [float(value) for value in calibration.frame_rates_hz],
+        "exposuresSeconds": [float(value) for value in calibration.exposures_seconds],
+        "cameraSerials": [str(value) for value in calibration.camera_serials],
+        "deliveryFloorMinSeconds": None if floor_min is None else float(floor_min),
+        "deliveryFloorMaxSeconds": None if floor_max is None else float(floor_max),
+    }
+
+
 def _persistence_reason(source) -> str:
     """Why a source that was not cleanly written leaves the session incomplete.
 
@@ -529,6 +551,8 @@ class SessionDataRecorder:
             log_rows = tuple(self._log_rows)
             nidaq_chunks = self._snapshot_nidaq_locked()
             timing_plan = self._nidaq_monitor.timing_plan
+            delivery_calibration = getattr(
+                getattr(self._nidaq_monitor, "configuration", None), "delivery_calibration", None)
             source_manifest = self._source_manifest
             source_results = dict(self._source_results)
             if self._laser_model.configuration.backend != "disabled":
@@ -572,6 +596,7 @@ class SessionDataRecorder:
                 "latency_events": latency_events,
                 "latency_events_failure": latency_events_failure,
                 "camera_exposure_seconds": dict(self._camera_exposure_seconds),
+                "delivery_calibration": delivery_calibration,
             }
             self._armed = False
             self._pending_stop_end_perf = None
@@ -1801,6 +1826,7 @@ class SessionDataRecorder:
         latency_events=None,
         latency_events_failure: str = "",
         camera_exposure_seconds=None,
+        delivery_calibration=None,
     ):
         session_dir = Path(project.get_session_path().location)
         streams_dir = session_dir / "streams"
@@ -1875,6 +1901,7 @@ class SessionDataRecorder:
                 SessionDataRecorder._read_primary_latency_stream(project, boundary)
             ),
             exposure_seconds=primary_exposure,
+            delivery_calibration=delivery_calibration,
         )
         recorded_frame_timeline = (
             SessionDataRecorder._load_recorded_frame_timeline(
@@ -2282,6 +2309,11 @@ class SessionDataRecorder:
                 session_id=project.short_id,
                 unwritten=(
                     {"events": latency_events_failure} if latency_events_failure else None),
+                exposure_seconds=primary_exposure,
+                delivery_offset_seconds=(
+                    None if delivery_calibration is None else delivery_calibration.offset_seconds),
+                delivery_spread_seconds=(
+                    None if delivery_calibration is None else delivery_calibration.spread_seconds),
             )
         except Exception as error:
             logging.getLogger(__name__).exception("Latency finalization failed")
@@ -3160,7 +3192,8 @@ class SessionDataRecorder:
 
     @staticmethod
     def _latch_anchor(boundary, stream, stream_reason, transition_host, period, *,
-                      ni_residual_rms, transition_raw):
+                      ni_residual_rms, transition_raw, exposure_seconds=None,
+                      delivery_calibration=None):
         """(evidence, the first recorded frame's transition number or None), by camera clock.
 
         The latency finalizer's pairing: each frame's camera timestamp, placed
@@ -3173,7 +3206,10 @@ class SessionDataRecorder:
         CLOCK_MONOTONIC_RAW, where no slew is, so one latch line holds all
         session; or None for perf_counter (transition_host), where that line
         ignores the slews. The evidence names the clock, the map's uncertainty,
-        the latches it left out, the residual tolerance and any slip.
+        the latches it left out, the residual band (its centre, the rig's NI
+        delivery calibration minus exposure_seconds, and its half-width) and any
+        slip. Without a calibration or an exposure the band cannot be judged and
+        the pairing is ambiguous.
         """
         if stream is None:
             return {"status": "unavailable", "reason": stream_reason}, None
@@ -3199,9 +3235,15 @@ class SessionDataRecorder:
                 frames["frame_id"][kept], frames["camera_ts_ns"][kept], latches, transitions,
                 math.nan if period is None else float(period), ni_residual_rms=ni_residual_rms,
                 clock=clock,
+                exposure=math.nan if exposure_seconds is None else float(exposure_seconds),
+                delivery_offset=(math.nan if delivery_calibration is None
+                                 else float(delivery_calibration.offset_seconds)),
+                delivery_spread=(math.nan if delivery_calibration is None
+                                 else float(delivery_calibration.spread_seconds)),
             )
             residual = float(pairing.median_residual)
             uncertainty, limit = float(fit.uncertainty), float(pairing.limit)
+            expected = float(pairing.expected_residual)
             # The pairing refits the same latches; the fit's own reason is what names the
             # latches it left out, and nothing else carries it.
             dropped_reason = fit.reason if fit.dropped else ""
@@ -3218,6 +3260,7 @@ class SessionDataRecorder:
                 "clock": pairing.clock,
                 "uncertaintySeconds": uncertainty if math.isfinite(uncertainty) else None,
                 "limitSeconds": limit if math.isfinite(limit) else None,
+                "expectedResidualSeconds": expected if math.isfinite(expected) else None,
                 "slip": pairing.slip,
                 "dropped": [int(row) for row in fit.dropped],
             }
@@ -3307,7 +3350,8 @@ class SessionDataRecorder:
     @staticmethod
     def _match_camera_nidaq_edge(boundary, start_perf, chunks, *, ni_fit=None,
                                  read_latency_stream=None,
-                                 exposure_seconds=None) -> dict:
+                                 exposure_seconds=None,
+                                 delivery_calibration=None) -> dict:
         """The cam_frames transition of the first recorded frame.
 
         On the drift-corrected NI-to-host fit, two measured matches over the
@@ -3319,6 +3363,10 @@ class SessionDataRecorder:
         before the first frame's own host stamp; both at lower confidence.
         The arrival pairing assumes only that a frame arrives within one frame
         period of its exposure edge, and a longer lag shows as a disagreement.
+        The latch pairing is judged against a band centred on the rig's NI
+        delivery calibration minus the exposure (clocks.latch_residual_band);
+        with either missing it is refused, so the arrival pairing anchors, below
+        hardware_edge. Both are recorded.
         read_latency_stream, a callable returning (stream, why not), is called
         only where the matches are about to be used: a locked stream costs its
         whole retry budget, which the epoch method has no use for.
@@ -3358,10 +3406,11 @@ class SessionDataRecorder:
             "ambiguitySeconds": None,
             "edgePolarity": None,
             # schemaVersion 4: how the anchor was chosen, and the two matches behind it.
-            # The exposure is recorded and moves nothing.
+            # The exposure and the delivery calibration centre the latch residual band.
             "anchorMethod": None,
             "niToHost": None if ni_fit is None else ni_fit.as_record(include_knots=True),
             "exposureSeconds": exposure_seconds,
+            "deliveryCalibration": _delivery_calibration_record(delivery_calibration),
             "impliedLagSeconds": None,
             "framePeriodSeconds": None,
             "latch": None,
@@ -3413,6 +3462,7 @@ class SessionDataRecorder:
             return SessionDataRecorder._match_camera_nidaq_edge_on_fit(
                 base, boundary, start_perf, indices, rate, channel_values, edge_positions,
                 ni_fit, read_latency_stream,
+                exposure_seconds=exposure_seconds, delivery_calibration=delivery_calibration,
             )
         except Exception as error:
             logging.getLogger(__name__).exception(
@@ -3428,7 +3478,8 @@ class SessionDataRecorder:
     @staticmethod
     def _match_camera_nidaq_edge_on_fit(base, boundary, start_perf, indices, rate,
                                         channel_values, edge_positions, ni_fit,
-                                        read_latency_stream) -> dict:
+                                        read_latency_stream, *, exposure_seconds=None,
+                                        delivery_calibration=None) -> dict:
         ni_seconds = indices[edge_positions] / float(rate)
         transition_host = ni_fit.map(ni_seconds)
         # The median interval, as the epoch method and the latency finalizer
@@ -3452,6 +3503,7 @@ class SessionDataRecorder:
         latch, latched = SessionDataRecorder._latch_anchor(
             boundary, latency_stream, stream_reason, transition_host, period,
             ni_residual_rms=ni_fit.residual_rms, transition_raw=transition_raw,
+            exposure_seconds=exposure_seconds, delivery_calibration=delivery_calibration,
         )
         arrival, arrived = SessionDataRecorder._arrival_anchor(
             boundary, latency_stream, stream_reason, transition_host, period,

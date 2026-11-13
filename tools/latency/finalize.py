@@ -43,8 +43,9 @@ CLOCK_GROUPS = (("wallToHost", "wall_to_host"), ("niToHost", "ni_to_host"),
 # An HDF5 attribute is limited to 64 KB; a wall clock that stepped constantly
 # must not cost the whole file, so only the first segments are listed.
 MAX_LISTED_WALL_FITS = 16
-ENVELOPE_BIAS_FLOOR = ("unmeasured; mapped NI times are late by about the minimum driver "
-                       "delivery delay, likely under 1 ms")
+ENVELOPE_BIAS_FLOOR = ("not subtracted; mapped NI times are late by the minimum driver "
+                       "delivery delay, whose range a rig's NI delivery calibration records "
+                       "(0.20-0.30 ms on christielab10, loopback 2026-11-12)")
 SECONDARY_TRIGGER_DELAY = ("unmeasured; a secondary camera's exposure starts a trigger delay "
                            "(microseconds) after the primary's")
 HOST_ARRIVAL_PAIRING = ("camera-to-NI pairing by host arrival assumes exposure→arrival "
@@ -370,12 +371,35 @@ def _flagged_primary(stream: dict) -> bool:
         return False
 
 
+@dataclasses.dataclass(frozen=True)
+class _Delivery:
+    """The session's exposure and the rig's NI delivery calibration: what the
+    camera-latch residual band is centred on (clocks.latch_residual_band). NaN
+    for any of them leaves the band unjudgeable, so the latch pairing is refused."""
+    exposure: float = math.nan
+    offset: float = math.nan
+    spread: float = math.nan
+
+    def pairing_inputs(self) -> dict:
+        return {"exposure": self.exposure, "delivery_offset": self.offset,
+                "delivery_spread": self.spread}
+
+
+def _seconds(value) -> float:
+    """A float, or NaN for None and anything that is not a number."""
+    try:
+        return math.nan if value is None else float(value)
+    except (TypeError, ValueError):
+        return math.nan
+
+
 class _Context:
     """Everything the loops share: the raw streams, NI data and the clock fits."""
 
     def __init__(self, raw: dict, faults: dict, streams: Path, primary_camera: str,
-                 status: dict):
+                 status: dict, delivery: "_Delivery"):
         self.status = status
+        self.delivery = delivery
         self.faults = dict(faults)  # stream name -> why it could not be read
         self.events = raw.get("events") or {}
         self.pose = raw.get("pose")
@@ -452,7 +476,8 @@ class _Context:
         # fits an HDF5 attribute and the session metadata.
         record["niToHost"] = {
             **self.ni_to_host.as_record(include_knots=False),
-            "note": "mapped NI times are late by the unmeasured minimum delivery delay",
+            "note": ("mapped NI times are late by the minimum delivery delay, which the rig's "
+                     "NI delivery calibration includes"),
         }
         transition_index = ni["transitions"]
         frames = self.primary_frames
@@ -491,20 +516,25 @@ class _Context:
             latch_dropped = list(latch_fit.dropped)
             latch_note = latch_fit.reason if latch_dropped else ""
             fallback = ""
-            if latch_fit.valid and clocks.latch_gate_ok(latch_fit, residual, self.frame_period):
+            band = clocks.latch_residual_band(self.frame_period, uncertainty=latch_fit.uncertainty,
+                                              **self.delivery.pairing_inputs())
+            if (latch_fit.valid and clocks.latch_gate_ok(latch_fit, residual, self.frame_period)
+                    and not band.reason):
                 transition_times = (self.ni_to_host.to_raw(ni_seconds) if clock == "raw"
                                     else transition_perf)
                 latch_pairing = clocks.choose_pairing_by_camera_clock(
                     ids, frames["camera_ts_ns"][within], latches, transition_times,
-                    self.frame_period, ni_residual_rms=residual, clock=clock)
+                    self.frame_period, ni_residual_rms=residual, clock=clock,
+                    **self.delivery.pairing_inputs())
                 self.arrival_pairing = clocks.choose_pairing(
                     ids, arrival, transition_perf, self.frame_period, ni_residual_rms=residual)
                 self.pairing = _confirmed_by_arrival(latch_pairing, self.arrival_pairing)
             else:
-                # No usable latch, or a latch map too uncertain to choose an edge by:
-                # host arrival alone, as for a stream with no latch at all.
+                # No usable latch, a latch map too uncertain to choose an edge by, or no
+                # delivery calibration or exposure to judge its residual by: host arrival
+                # alone, as for a stream with no latch at all.
                 fallback = _host_arrival_reason(latches, latch_fit, clocks.latch_gate_reason(
-                    latch_fit, residual, self.frame_period))
+                    latch_fit, residual, self.frame_period) or band.reason)
                 self.pairing = clocks.choose_pairing(ids, arrival, transition_perf,
                                                      self.frame_period, ni_residual_rms=residual)
         except Exception as error:
@@ -541,27 +571,30 @@ class _Context:
             # would be that line's error, and the paths are compared on RAW. The
             # residual gate in choose_pairing_by_camera_clock and the host-arrival
             # confirmation are the safeguards against whole-period mispairing
-            # and must not be relaxed on the strength of this check. A difference
-            # that is not finite was not measured, and fails nothing.
+            # and must not be relaxed on the strength of this check. Being the
+            # residual again, the difference is judged against the pairing's own
+            # band (NI-derived minus latch-derived exposure, the residual's sign).
+            # A difference that is not finite was not measured, and fails nothing.
             latch_lag = _latch_direct_lag_p50(frames, latches)
             ni_lag = _ni_derived_lag_p50(frames, latches, self.camera_to_ni, self.ni_to_host)
             record["cameraToNi"]["latchDirectLagP50"] = latch_lag
             record["cameraToNi"]["niDerivedLagP50"] = ni_lag
-            tolerance = clocks.latch_tolerance(self.frame_period)
+            band = clocks.ResidualBand(pairing.expected_residual, pairing.limit)
             if pairing.clock == "raw":
                 difference = _latch_versus_ni_raw(frames, latches, self.camera_to_ni,
                                                   self.ni_to_host)
                 record["cameraToNi"]["latchVersusNiRawSeconds"] = difference
-                disagreement = (
-                    f"NI-derived exposure and latch-derived exposure on RAW differ by "
-                    f"{difference * 1e3:.3f} ms, more than {tolerance * 1e3:.3f} ms")
+                what = "NI-derived minus latch-derived exposure on RAW"
             else:
-                difference = ni_lag - latch_lag
-                disagreement = (
-                    f"NI-derived exposure-to-arrival p50 {ni_lag * 1e3:.3f} ms and latch-direct "
-                    f"p50 {latch_lag * 1e3:.3f} ms differ by more than {tolerance * 1e3:.3f} ms")
-            if not pairing.ambiguous and abs(difference) > tolerance:
-                self.pairing = dataclasses.replace(pairing, ambiguous=True, reason=disagreement)
+                # Lags run from the exposure, so the exposure difference is their reverse.
+                difference = latch_lag - ni_lag
+                what = (f"NI-derived minus latch-direct exposure on perf (exposure-to-arrival "
+                        f"p50 {ni_lag * 1e3:.3f} ms against {latch_lag * 1e3:.3f} ms)")
+            if (not pairing.ambiguous and math.isfinite(difference)
+                    and not band.holds(difference)):
+                self.pairing = dataclasses.replace(
+                    pairing, ambiguous=True,
+                    reason=clocks.latch_band_reason(what, difference, band))
                 record["cameraToNi"]["pairing"] = dataclasses.asdict(self.pairing)
         if self.pairing.ambiguous:
             record["cameraToNi"]["valid"] = False
@@ -766,7 +799,7 @@ def _read_streams(session_dir: Path, raw_dir: Path, status: dict) -> tuple:
 
 
 def _finalize(session_dir, primary_camera: str, output_name: str, session_id: str,
-              status: dict, unwritten: Mapping[str, str]) -> None:
+              status: dict, unwritten: Mapping[str, str], delivery: _Delivery) -> None:
     session_dir = Path(session_dir)
     streams = session_dir / "streams"
     raw_dir = streams / "latency"
@@ -780,7 +813,7 @@ def _finalize(session_dir, primary_camera: str, output_name: str, session_id: st
         return
     raw, faults = _read_streams(session_dir, raw_dir, status)
     faults.update({stem: f"not written: {reason}" for stem, reason in unwritten.items()})
-    context = _Context(raw, faults, streams, primary_camera, status)
+    context = _Context(raw, faults, streams, primary_camera, status, delivery)
     for stem, stream in raw.items():
         problem = _writer_problem(f"streams/latency/{stem}.h5", stream.get("attrs", {}))
         if problem:
@@ -810,18 +843,28 @@ def _finalize(session_dir, primary_camera: str, output_name: str, session_id: st
 def finalize_session_latency(session_dir, *, primary_camera: str,
                              output_name: str = LATENCY_OUTPUT_NAME,
                              session_id: str = "",
-                             unwritten: Optional[Mapping[str, str]] = None) -> dict:
+                             unwritten: Optional[Mapping[str, str]] = None,
+                             exposure_seconds: Optional[float] = None,
+                             delivery_offset_seconds: Optional[float] = None,
+                             delivery_spread_seconds: Optional[float] = None) -> dict:
     """Analyse one session's latency streams; never raises.
 
     `unwritten` maps the stem of a raw stream whose writer failed (e.g. "events") to why it
     failed; each is named in the status's "unwritten" and "reasons", so the status is never
     "complete" or "absent".
+
+    The camera-latch pairing is judged against a band centred on the rig's NI delivery
+    calibration (delivery_offset_seconds, delivery_spread_seconds: nidaqStream's
+    deliveryCalibration) minus the primary camera's exposure_seconds. With any of the three
+    missing the band cannot be judged, the latch pairing is refused, and host arrival pairs.
     """
     status = {"status": "failed", "output": None, "loops": {}, "clocks": {}, "reasons": [],
               "unreadable": [], "unwritten": []}
     try:
         _finalize(session_dir, primary_camera, output_name, session_id, status,
-                  dict(unwritten or {}))
+                  dict(unwritten or {}),
+                  _Delivery(_seconds(exposure_seconds), _seconds(delivery_offset_seconds),
+                            _seconds(delivery_spread_seconds)))
     except Exception as error:
         logger.exception("Latency finalization failed")
         status["status"] = "failed"
