@@ -79,3 +79,26 @@ def test_the_ring_carries_the_newest_reads_raw_stamp_or_nan():
     assert ring.copy_since(3, destination).source_raw_time == 7.013
     ring.reset()
     assert math.isnan(float(ring._source_raw_time.value))
+
+
+def test_the_ring_says_where_its_newest_read_starts():
+    channel = NidaqSignalChannelConfiguration("signal", "Dev1/ai0")
+    configuration = NidaqSignalStreamConfiguration(
+        channels=(channel,), is_enabled=True, sample_rate_hz=1000.0, read_chunk_size=3,
+    )
+    ring = SharedNidaqSampleRing(configuration, capacity=12)
+    destination = np.empty((1, ring.capacity), dtype=np.float32)
+    for start in (0, 3):
+        ring.write_block(NidaqSignalSampleBlock(
+            wall_time=100.0 + start, perf_time=10.0 + start, sample_rate_hz=1000.0,
+            sample_index=start, channels=(channel,), values={"signal": (1.0, 2.0, 3.0)},
+            epoch_perf_time=10.0, epoch_wall_time=100.0,
+        ))
+
+    # One copy of both reads: its stamps are the second read's, which starts at sample 3.
+    read = ring.copy_since(None, destination)
+
+    assert (read.start_sample_index, read.end_sample_index) == (0, 6)
+    assert read.source_start_sample_index == 3
+    ring.reset()
+    assert ring._source_start_sample_index.value == -1

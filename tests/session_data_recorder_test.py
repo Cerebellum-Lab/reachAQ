@@ -2249,6 +2249,11 @@ def test_the_published_nidaq_is_a_plain_gzip_selection_of_the_spool(tmp_path):
         expected = {name: spool[name][first:last] for name in (
             "sample_index", "perf_time", "epoch", "block_observation_perf_time",
             "block_observation_wall_time", "block_observation_raw_time")}
+        # A spool from before the newest-read index publishes it unknown throughout.
+        expected["block_newest_read_start_index"] = (
+            spool["block_newest_read_start_index"][first:last]
+            if "block_newest_read_start_index" in spool
+            else np.full(last - first, -1, dtype=np.int64))
         expected["offset_seconds"] = perf - start_perf
         expected["wall_time"] = 50.0 + perf - start_perf
         expected["values"] = spool["values"][:, first:last]

@@ -231,8 +231,9 @@ def run_ends(observation_perf) -> numpy.ndarray:
     return numpy.append(ends, observation_perf.size - 1).astype(numpy.int64)
 
 
-def block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends=None) -> BlockStamps:
-    """Pair each run's stamps with the last sample of the run before it.
+def block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends=None,
+                           newest_read_at_ends=None) -> BlockStamps:
+    """Pair each run's stamps with the last sample delivered before its newest read.
 
     In nidaq.h5 a run of equal block_observation_perf_time values is not one NI
     read. It is one copy the session recorder makes from the NI sample ring
@@ -243,8 +244,19 @@ def block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends=None) -> Blo
     is an upper bound on when the previous run's last sample was taken, though
     (that sample came from an earlier read, which had returned), and that is
     what the lower envelope in fit_ni_to_host needs. The first run's stamp
-    bounds nothing and is dropped. How loose the bound is depends on the read
-    size; see fit_ni_to_host.
+    bounds nothing and is dropped.
+
+    When a copy holds more than one read, the sample the stamp bounds tightly
+    is the last one before the copy's newest read, a read after the previous
+    run's end. Paired with that end instead, every stamp is a read loose, and
+    with reads under half the copy interval (display refresh of 200 Hz or more)
+    every copy holds two: the fit then maps NI times a whole read late
+    (christielab10 loopback, 2026-11-12: 4.4-5.2 ms against 0.19-0.20 ms).
+    newest_read_at_ends, each run's newest read's first sample index
+    (block_newest_read_start_index), pairs each stamp with the sample before
+    it, or with the previous run's end where that is later. Without it, or
+    where it is negative (unknown), the previous run's end is used, as for
+    nidaq.h5 files that predate the column.
     """
     index_at_ends = numpy.asarray(index_at_ends, dtype=numpy.int64)
     perf_at_ends = numpy.asarray(perf_at_ends, dtype=numpy.float64)
@@ -253,18 +265,25 @@ def block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends=None) -> Blo
     if perf_at_ends.size < 2:
         return BlockStamps(numpy.empty(0, dtype=numpy.int64), numpy.empty(0), numpy.empty(0))
     previous_end, stamp, raw = index_at_ends[:-1], perf_at_ends[1:], raw_at_ends[1:]
+    if newest_read_at_ends is not None:
+        newest = numpy.asarray(newest_read_at_ends, dtype=numpy.int64)[1:]
+        previous_end = numpy.where(newest >= 0, numpy.maximum(previous_end, newest - 1),
+                                   previous_end)
     keep = numpy.isfinite(stamp)
     return BlockStamps(previous_end[keep], stamp[keep], raw[keep])
 
 
-def ni_block_stamps(sample_index, observation_perf, observation_raw=None) -> BlockStamps:
+def ni_block_stamps(sample_index, observation_perf, observation_raw=None,
+                    newest_read_start=None) -> BlockStamps:
     """block_stamps_from_runs over per-sample arrays, as nidaq.h5 stores them."""
     sample_index = numpy.asarray(sample_index, dtype=numpy.int64)
     observation_perf = numpy.asarray(observation_perf, dtype=numpy.float64)
     ends = run_ends(observation_perf)
     raw = (None if observation_raw is None
            else numpy.asarray(observation_raw, dtype=numpy.float64)[ends])
-    return block_stamps_from_runs(sample_index[ends], observation_perf[ends], raw)
+    newest = (None if newest_read_start is None
+              else numpy.asarray(newest_read_start, dtype=numpy.int64)[ends])
+    return block_stamps_from_runs(sample_index[ends], observation_perf[ends], raw, newest)
 
 
 def ni_block_ends(sample_index, observation_perf) -> Tuple[numpy.ndarray, numpy.ndarray]:

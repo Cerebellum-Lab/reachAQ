@@ -1730,3 +1730,20 @@ def test_every_result_of_the_piecewise_line_fitter_carries_its_own_method():
         assert fit.method == clocks.PIECEWISE_LINE and not fit.valid
     # the NI-to-host helper keeps its own label
     assert clocks.invalid_piecewise_fit("x").method == clocks.PIECEWISE_ENVELOPE
+
+
+def test_a_copys_stamp_pairs_with_the_sample_before_its_newest_read():
+    # Three copies ending at samples 99, 199 and 299; the last two hold two reads of 50, so
+    # their stamps were taken after the reads ending at 149 and 249 had returned.
+    ends = np.array([99, 199, 299])
+    stamps = np.array([1.0, 1.01, 1.02])
+
+    paired = clocks.block_stamps_from_runs(ends, stamps, newest_read_at_ends=[50, 150, 250])
+    older = clocks.block_stamps_from_runs(ends, stamps)
+    unknown = clocks.block_stamps_from_runs(ends, stamps, newest_read_at_ends=[-1, -1, -1])
+
+    assert paired.end_index.tolist() == [149, 249]
+    assert older.end_index.tolist() == unknown.end_index.tolist() == [99, 199]
+    # A newest read that began before the previous copy ended pairs with that end.
+    assert clocks.block_stamps_from_runs(ends, stamps, newest_read_at_ends=[0, 60, 250]
+                                         ).end_index.tolist() == [99, 249]

@@ -999,9 +999,9 @@ def test_the_raw_column_is_not_kept_alive_through_the_channel_scans(tmp_path, mo
     raw_arrays, alive_during_scan = [], []
     real_stamps, real_transitions = finalize.clocks.ni_block_stamps, finalize.clocks.transitions
 
-    def stamps(index, observed, raw=None):
+    def stamps(index, observed, raw=None, newest=None):
         raw_arrays.append(weakref.ref(raw))
-        return real_stamps(index, observed, raw)
+        return real_stamps(index, observed, raw, newest)
 
     def transitions(channel):
         gc.collect()

@@ -1708,6 +1708,7 @@ class SessionDataRecorder:
             ("block_observation_perf_time", np.float64),
             ("block_observation_wall_time", np.float64),
             ("block_observation_raw_time", np.float64),
+            ("block_newest_read_start_index", np.int64),
         ):
             output.create_dataset(name, shape=(0,), maxshape=(None,), dtype=dtype,
                                   chunks=True)
@@ -1745,6 +1746,11 @@ class SessionDataRecorder:
             ),
             "block_observation_raw_time": np.full(
                 count, getattr(read, "source_raw_time", math.nan), dtype=np.float64,
+            ),
+            # Which read the stamps are: a copy can hold several, and the stamps
+            # bound the sample before the newest (clocks.block_stamps_from_runs).
+            "block_newest_read_start_index": np.full(
+                count, int(getattr(read, "source_start_sample_index", -1)), dtype=np.int64,
             ),
         }
         dataset_names = (*observations, "values")
@@ -2918,18 +2924,37 @@ class SessionDataRecorder:
                     else:
                         raw_problem = (f"{raw_column.size} values against {perf_column.size} "
                                        "block_observation_perf_time stamps")
-            return (clocks.block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends),
+                newest_at_ends = SessionDataRecorder._newest_read_at_ends(
+                    source, perf_column.shape, ends)
+            return (clocks.block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends,
+                                                  newest_at_ends),
                     raw_problem)
-        index, perf, raw = [], [], []
+        index, perf, raw, newest = [], [], [], []
         for chunk in chunks:
             count = len(chunk[0])
             index.append(np.asarray(chunk[0], dtype=np.int64))
             perf.append(np.full(count, float(chunk[9]) if len(chunk) > 9 else math.nan))
             raw.append(np.full(count, float(chunk[11]) if len(chunk) > 11 else math.nan))
+            newest.append(np.full(count, int(chunk[12]) if len(chunk) > 12 else -1,
+                                  dtype=np.int64))
         if not index:
             return clocks.block_stamps_from_runs(np.empty(0, dtype=np.int64), np.empty(0)), ""
         return clocks.ni_block_stamps(np.concatenate(index), np.concatenate(perf),
-                                      np.concatenate(raw)), ""
+                                      np.concatenate(raw), np.concatenate(newest)), ""
+
+    @staticmethod
+    def _newest_read_at_ends(source, shape, ends):
+        """block_newest_read_start_index at the run ends, or None: a spool from before the
+        column has none, and one of another length cannot be paired with the run ends."""
+        if "block_newest_read_start_index" not in source:
+            return None
+        column = source["block_newest_read_start_index"]
+        if column.shape != shape:
+            logging.getLogger(__name__).warning(
+                "block_newest_read_start_index has %d values against %d stamps; pairing the "
+                "stamps with the previous copy's end", column.size, int(np.prod(shape)))
+            return None
+        return column[()][ends]
 
     @staticmethod
     def _nidaq_perf_values(chunks, start_perf, end_perf):
@@ -4773,6 +4798,7 @@ class SessionDataRecorder:
             observation_raw = (
                 float(observation[2]) if len(observation) > 2 else math.nan
             )
+            newest_read = int(observation[3]) if len(observation) > 3 else -1
             mask = (perf >= start_perf) & (perf <= end_perf)
             if np.any(mask):
                 selected.append((
@@ -4800,6 +4826,7 @@ class SessionDataRecorder:
                         observation_raw,
                         dtype=np.float64,
                     ),
+                    np.full(np.count_nonzero(mask), newest_read, dtype=np.int64),
                 ))
         with h5py.File(path, "w") as output:
             mark_close_on_exec(output)
@@ -4831,6 +4858,10 @@ class SessionDataRecorder:
                     data=np.empty(0, dtype=np.float64),
                 )
                 output.create_dataset(
+                    "block_newest_read_start_index",
+                    data=np.empty(0, dtype=np.int64),
+                )
+                output.create_dataset(
                     "values",
                     data=np.empty((len(channel_names), 0), dtype=np.float32),
                 )
@@ -4842,6 +4873,7 @@ class SessionDataRecorder:
             observation_perf = np.concatenate([item[9] for item in selected])
             observation_wall = np.concatenate([item[10] for item in selected])
             observation_raw = np.concatenate([item[11] for item in selected])
+            newest_read = np.concatenate([item[12] for item in selected])
             if indices.size > 1 and not np.all(np.diff(indices) == 1):
                 raise RuntimeError(
                     "NI-DAQ session sample indices are not strictly consecutive"
@@ -4867,6 +4899,11 @@ class SessionDataRecorder:
             output.create_dataset(
                 "block_observation_raw_time",
                 data=observation_raw,
+                compression="gzip",
+            )
+            output.create_dataset(
+                "block_newest_read_start_index",
+                data=newest_read,
                 compression="gzip",
             )
             output.create_dataset(
@@ -4939,23 +4976,26 @@ class SessionDataRecorder:
                 "block_observation_perf_time",
                 "block_observation_wall_time",
                 "block_observation_raw_time",
+                "block_newest_read_start_index",
             )
+            # A spool from before the RAW stamp or the newest-read index has no such
+            # column; the published file still gets it, unknown throughout (NaN, -1).
+            # No other column may be missing: that is a damaged spool, and it fails
+            # here rather than publishing an unknown for it.
+            optional = {"block_observation_raw_time": (np.float64, np.nan),
+                        "block_newest_read_start_index": (np.int64, -1)}
             for name in one_dimensional:
-                # A spool from before the RAW stamp has no such column; the
-                # published file still gets it, unknown throughout. No other
-                # column may be missing: that is a damaged spool, and it fails
-                # here rather than publishing NaN for it.
-                source_dataset = (source.get(name) if name == "block_observation_raw_time"
-                                  else source[name])
+                source_dataset = source.get(name) if name in optional else source[name]
                 output_dataset = output.create_dataset(
                     name,
                     shape=(selected_count,),
-                    dtype=np.float64 if source_dataset is None else source_dataset.dtype,
+                    dtype=(optional[name][0] if source_dataset is None
+                           else source_dataset.dtype),
                     compression="gzip" if selected_count else None,
                 )
                 if source_dataset is None:
                     if selected_count:
-                        output_dataset[...] = np.nan
+                        output_dataset[...] = optional[name][1]
                     continue
                 if selected_count:
                     SessionDataRecorder._write_deflated(

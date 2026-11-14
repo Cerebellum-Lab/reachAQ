@@ -213,9 +213,21 @@ def _read_nidaq(path: Path) -> dict:
             if result["raw_problem"]:
                 logger.warning("nidaq.h5 block_observation_raw_time is unusable (%s); "
                                "fitting the perf stamps alone", result["raw_problem"])
-        result["block_stamps"] = clocks.ni_block_stamps(index, seen, raw)
+        # Which read each copy's stamps are, so they pair with the sample before it
+        # (clocks.block_stamps_from_runs). Older sessions have none, and pair as before.
+        newest = None
+        if "block_newest_read_start_index" in store:
+            stored_newest = _read_inflated(store["block_newest_read_start_index"])
+            if stored_newest.shape == seen.shape:
+                newest = numpy.asarray(stored_newest, dtype=numpy.int64)
+            else:
+                logger.warning("nidaq.h5 block_newest_read_start_index has %d values against "
+                               "%d stamps; pairing the stamps with the previous copy's end",
+                               stored_newest.size, seen.size)
+            del stored_newest
+        result["block_stamps"] = clocks.ni_block_stamps(index, seen, raw, newest)
         # column is the same array as raw: left bound it would outlive both through the scans.
-        del seen, raw, column
+        del seen, raw, column, newest
         if consecutive:
             index = None
 

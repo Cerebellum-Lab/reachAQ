@@ -110,8 +110,11 @@ def test_every_sample_of_a_read_carries_the_stamp_taken_before_that_read(tmp_pat
         assert set(store) == {
             "sample_index", "perf_time", "wall_time", "epoch", "values",
             "block_observation_perf_time", "block_observation_wall_time",
-            "block_observation_raw_time",
+            "block_observation_raw_time", "block_newest_read_start_index",
         }
+        # One read a copy: each sample's newest read is the read it is in.
+        index = store["sample_index"][()]
+        assert np.array_equal(store["block_newest_read_start_index"][()], index - index % READ)
         assert tuple(store.attrs["channel_names"]) == ("cam_frames",)
         assert store.attrs["sample_rate_hz"] == RATE
         assert store["sample_index"].dtype == np.int64 and store["epoch"].dtype == np.uint64
@@ -382,3 +385,25 @@ def test_the_rigs_stamps_drive_the_ni_fit_to_a_map_that_is_late_and_never_early(
     late = fit.map(probe) - rig.host(probe)
     assert late.min() > 0.0001, late.min()
     assert late.max() < 0.0003, late.max()
+
+
+@pytest.mark.parametrize("column, late", [(True, False), (False, True)],
+                         ids=["newest_read_column", "older_spool"])
+def test_copies_of_two_reads_map_on_the_floor_only_with_the_newest_read(tmp_path, column, late):
+    # Reads under half the 10 ms copy interval (display refresh of 200 Hz or more) put two in
+    # every copy, stamped with the newest read's stamp. That stamp bounds the sample before
+    # the newest read; paired with the previous copy's end instead, the fit maps a read late.
+    rig = SyntheticRig()
+    spool = rig.write_spool(tmp_path / "spool.h5", t_from=0.0, t_to=60.0, reads_per_copy=2,
+                            newest_read_column=column)
+
+    fit = SessionDataRecorder._fit_nidaq_to_host(spool)
+
+    assert fit.valid, fit.reason
+    t = np.linspace(5.0, 55.0, 501)
+    lateness = float(np.median(fit.map(t) - rig.host(t)))
+    read = READ / RATE
+    if late:
+        assert read < lateness < read + 0.001
+    else:
+        assert 0.0 < lateness < 0.001

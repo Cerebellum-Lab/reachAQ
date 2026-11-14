@@ -265,7 +265,8 @@ resolution is 0.1 ms.
 
 The primary datasets are `sample_index`, `perf_time`, `offset_seconds`,
 `wall_time`, `epoch`, `values`, `block_observation_perf_time`,
-`block_observation_wall_time` and `block_observation_raw_time`. `values` is
+`block_observation_wall_time`, `block_observation_raw_time` and
+`block_newest_read_start_index`. `values` is
 channel-by-sample and follows the `channel_names` attribute. File attributes
 include the recording boundaries, sample rate, epoch, gap/overrun counts,
 source clock, and serialized timing plan. `perf_time` is derived from the
@@ -273,10 +274,18 @@ sample-index epoch and carries the epoch's offset and the NI clock's drift.
 The block-observation times are the stamps taken before each NI read:
 `block_observation_perf_time` on `time.perf_counter` and
 `block_observation_raw_time` on `CLOCK_MONOTONIC_RAW` (NaN where the host has
-no such clock, or the file predates it). The NI-to-host fit (NI sample time to
-host `perf_counter`) is built from these two columns, not from `perf_time`; it
-is what `alignment.json` stores as `cameraNidaqAlignment.niToHost`, and the
-host times that file derives from NI samples go through it.
+no such clock, or the file predates it). The recorder copies the NI sample ring
+every 10 ms, and each copy carries the stamps of its newest read;
+`block_newest_read_start_index` is that read's first sample index (-1 where
+unknown, or the file predates it). A copy holds two reads or more whenever the
+reads are under half the copy interval (display refresh of 200 Hz or more), and
+the stamps then bound the sample before the newest read, not the previous copy's
+last one: the fit pairs them so, and without the column it maps NI times a whole
+read late (4.4-5.2 ms on christielab10 at 200-240 Hz, against 0.19-0.20 ms with
+it). The NI-to-host fit (NI sample time to host `perf_counter`) is built from
+these columns, not from `perf_time`; it is what `alignment.json` stores as
+`cameraNidaqAlignment.niToHost`, and the host times that file derives from NI
+samples go through it.
 
 The NI-DAQ epoch is anchored once. Later block delivery time does not reconstruct
 each block independently, so host scheduling jitter cannot create backward

@@ -1078,3 +1078,15 @@ def test_a_tone_fallback_beside_a_ready_frame_timeline_keeps_its_frame_at_a_lowe
     assert frame["method"].endswith("nidaq_camera_exposure_timeline_verified_by_writer")
     assert camera["confidence"] == "hardware_edge"
     assert frame["confidence"] == "ambiguous_hardware_edge"
+
+
+def test_nidaq_h5_keeps_which_read_each_copys_stamps_are(tmp_path):
+    rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001)
+
+    streams = Path(project.get_session_path().location) / "streams"
+    with h5py.File(streams / "nidaq.h5", "r") as store:
+        newest = store["block_newest_read_start_index"][()]
+        index = store["sample_index"][()]
+    # The synthetic rig copies one read at a time, so each sample's newest read is its own.
+    assert newest.shape == index.shape
+    assert np.all(newest <= index) and np.all(index - newest < 167)
