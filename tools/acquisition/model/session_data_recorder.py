@@ -212,6 +212,16 @@ def _delivery_calibration_record(calibration) -> Optional[dict]:
     latency rebuild reads offsetSeconds and spreadSeconds back from it."""
     if calibration is None:
         return None
+    try:
+        return _delivery_calibration_fields(calibration)
+    except Exception:
+        # The configuration validates every field; whatever slipped past costs the
+        # record of it, never the session's finalization.
+        logging.getLogger(__name__).exception("NI delivery calibration could not be recorded")
+        return None
+
+
+def _delivery_calibration_fields(calibration) -> dict:
     floor_min = calibration.delivery_floor_min_seconds
     floor_max = calibration.delivery_floor_max_seconds
     return {
@@ -2320,6 +2330,8 @@ class SessionDataRecorder:
                     None if delivery_calibration is None else delivery_calibration.offset_seconds),
                 delivery_spread_seconds=(
                     None if delivery_calibration is None else delivery_calibration.spread_seconds),
+                delivery_sessions=(
+                    None if delivery_calibration is None else delivery_calibration.sessions),
             )
         except Exception as error:
             logging.getLogger(__name__).exception("Latency finalization failed")
@@ -3265,6 +3277,8 @@ class SessionDataRecorder:
                                  else float(delivery_calibration.offset_seconds)),
                 delivery_spread=(math.nan if delivery_calibration is None
                                  else float(delivery_calibration.spread_seconds)),
+                delivery_sessions=(None if delivery_calibration is None
+                                   else int(delivery_calibration.sessions)),
             )
             residual = float(pairing.median_residual)
             uncertainty, limit = float(fit.uncertainty), float(pairing.limit)

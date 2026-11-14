@@ -487,10 +487,11 @@ def test_with_raw_latches_a_perf_slew_does_not_cost_the_anchor(tmp_path):
     assert latch["uncertaintySeconds"] == pytest.approx(1e-4, abs=1e-6)
     assert latch["dropped"] == []
     # The residual band: centred on the calibration less the exposure, the calibration's
-    # spread (coverage_factor() of them) and the map's uncertainty wide.
+    # spread (prediction_factor() of them, for its session count) and the map's uncertainty wide.
     assert latch["expectedResidualSeconds"] == pytest.approx(CALIBRATION.offset_seconds - EXPOSURE)
     assert latch["limitSeconds"] == pytest.approx(
-        clocks.coverage_factor() * CALIBRATION.spread_seconds + latch["uncertaintySeconds"])
+        clocks.prediction_factor(CALIBRATION.sessions) * CALIBRATION.spread_seconds
+        + latch["uncertaintySeconds"])
 
 
 @pytest.mark.parametrize("raw, raw_latches", [(False, False), (True, False), (False, True)],

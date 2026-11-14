@@ -65,15 +65,39 @@ class NidaqDeliveryCalibration:
     delivery_floor_max_seconds: Optional[float] = None
 
     def __post_init__(self):
-        for name in ("read_chunk_samples", "frame_rates_hz", "exposures_seconds",
-                     "camera_serials"):
-            object.__setattr__(self, name, tuple(getattr(self, name)))
-        if not math.isfinite(self.offset_seconds):
-            raise ValueError("NI delivery calibration offset_seconds must be finite")
-        if not (math.isfinite(self.spread_seconds) and self.spread_seconds > 0):
+        # Every number is checked here: alignment.json, which records the calibration,
+        # is written without NaN, and a hand-edited value (YAML reads 35e-6 as text) must
+        # fail when the configuration loads, not when a session is finalized.
+        def number(name, value):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"NI delivery calibration {name} must be a number, "
+                                 f"not {value!r}") from None
+            if not math.isfinite(value):
+                raise ValueError(f"NI delivery calibration {name} must be finite")
+            return value
+
+        object.__setattr__(self, "offset_seconds", number("offset_seconds", self.offset_seconds))
+        object.__setattr__(self, "spread_seconds", number("spread_seconds", self.spread_seconds))
+        if not self.spread_seconds > 0:
             raise ValueError("NI delivery calibration spread_seconds must be positive")
+        if isinstance(self.sessions, bool) or int(self.sessions) != self.sessions:
+            raise ValueError("NI delivery calibration sessions must be a whole number")
+        object.__setattr__(self, "sessions", int(self.sessions))
         if self.sessions < 2:
             raise ValueError("NI delivery calibration needs at least two sessions")
+        object.__setattr__(self, "measured", str(self.measured))
+        object.__setattr__(self, "read_chunk_samples",
+                           tuple(int(value) for value in self.read_chunk_samples))
+        for name in ("frame_rates_hz", "exposures_seconds"):
+            object.__setattr__(self, name, tuple(number(name, value)
+                                                 for value in getattr(self, name)))
+        object.__setattr__(self, "camera_serials", tuple(str(value) for value in self.camera_serials))
+        for name in ("delivery_floor_min_seconds", "delivery_floor_max_seconds"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, number(name, value))
 
 
 @dataclasses.dataclass(frozen=True)

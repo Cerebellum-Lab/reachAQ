@@ -96,7 +96,10 @@ def test_the_delivery_floor_undoes_the_scan_quantization_and_convert_offset():
     ({"residual": 0.002}, "quarter period"),  # the latch map 2 ms from the NI path
     ({"residual": None}, "no latch residual"),
     ({"floor": float("nan")}, "no loopback edge"),
-], ids=["usable", "a_read_late", "a_latch_off", "no_residual", "no_edges"])
+    ({"slip": {"frameId": 4000}}, "slips at frame 4000"),
+    ({"gate_reason": "latch mapping uncertainty 2.000 ms ..."}, "not trusted"),
+], ids=["usable", "a_read_late", "a_latch_off", "no_residual", "no_edges", "a_slip",
+        "an_untrusted_map"])
 def test_a_session_calibrates_only_with_a_floor_under_half_a_read_and_a_frame_on(inputs, why):
     values = {"floor": 0.00025, "read_period": 0.0167, "residual": 0.00015,
               "exposure": 0.000175, "frame_period": 1 / 150, **inputs}
@@ -135,6 +138,37 @@ def test_one_usable_session_is_no_calibration():
     calibration, why = calibrate.aggregate([_session("a", 0.0003, 0.00024)], measured="")
 
     assert calibration is None and "needs two" in why
+
+
+def test_a_session_the_others_cannot_hold_is_dropped_and_named():
+    # Twelve sessions 8 us apart put the others' band (Student's t on 11 degrees of freedom)
+    # about 0.09 ms wide; one 0.3 ms off is not the rig's spread.
+    offsets = [0.0003 + 0.000008 * math.sin(k) for k in range(12)] + [0.0006]
+    sessions = [_session(f"s{k}", offset, 0.00024) for k, offset in enumerate(offsets)]
+
+    calibration, why = calibrate.aggregate(sessions, measured="")
+
+    assert why == "" and calibration.sessions == 12
+    assert calibration.offset_seconds == pytest.approx(np.mean(offsets[:12]))
+    assert "prediction band" in sessions[-1]["reason"]
+    assert all(not s["reason"] for s in sessions[:12])
+
+
+def test_few_sessions_keep_a_wide_band_and_drop_nothing():
+    # With five sessions t is 54 at 1e-6: a 0.3 ms outlier is not yet distinguishable.
+    offsets = (0.000300, 0.000310, 0.000290, 0.000305, 0.000295, 0.000600)
+    sessions = [_session(f"s{k}", offset, 0.00024) for k, offset in enumerate(offsets)]
+
+    calibration, _ = calibrate.aggregate(sessions, measured="")
+
+    assert calibration.sessions == 6
+
+
+def test_sessions_that_agree_to_the_last_digit_give_no_spread_to_scale():
+    calibration, why = calibrate.aggregate(
+        [_session("a", 0.0003, 0.00024), _session("b", 0.0003, 0.00025)], measured="")
+
+    assert calibration is None and "no spread" in why
 
 
 def _live(tmp_path):
@@ -203,3 +237,5 @@ def test_writing_the_calibration_backs_the_file_up_first(tmp_path):
     assert backup.read_bytes() == before
     assert backup.name.startswith("system_configuration_before_delivery_calibration_")
     assert SystemConfiguration.load_yaml_file(path).nidaq_stream.delivery_calibration == calibration
+    # Replaced in one step: nothing staged is left beside it.
+    assert sorted(f.name for f in path.parent.iterdir()) == sorted([path.name, backup.name])

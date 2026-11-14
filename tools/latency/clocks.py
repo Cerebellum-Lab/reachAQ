@@ -79,11 +79,12 @@ LATCH_WINDOW_SECONDS = 30.0
 # little passes a quarter-period test: christielab10's NI stamps, paired with
 # their own blocks, put the edges 16.6 ms early and 50 fps paired a frame off
 # with a 3.39 ms residual; at 200 Hz display refresh (50-sample NI reads) the
-# fit runs a read late and 150 fps paired a frame off at -1.58 ms, inside a
-# quarter period. The loopback (2026-11-12, 27 sessions) put residual +
-# exposure at 0.303 ms, 0.035 ms between sessions. The finalizer's NI-versus-
-# latch lag check sees this same residual again, through the fitted
-# camera-to-NI line, and is judged against the same band.
+# fit ran a read late before block_newest_read_start_index and 150 fps paired
+# a frame off at -1.58 ms, inside a quarter period. The loopback calibration
+# (2026-11-13, 18 sessions, NI reads of 42-167 samples) put residual + exposure
+# at 0.277 ms, 0.029 ms between sessions. The finalizer's NI-versus-latch lag
+# check sees this same residual again, through the fitted camera-to-NI line,
+# and is judged against the same band.
 HOST_ARRIVAL = "host_arrival"
 CAMERA_LATCH = "camera_latch"
 
@@ -325,20 +326,19 @@ def fit_ni_to_host(end_index, seen_perf, sample_rate: float) -> ClockFit:
     """NI sample time (index / rate) -> host perf_counter, from the lower envelope.
 
     Each point pairs a sample with a host time no earlier than when it was
-    taken (ni_block_ends: a recorder copy's stamp, taken before the blocking
-    read, bounds the previous copy's last sample). So each (seen - sample
-    time) is at least the delivery delay. The smallest across the session
-    trace the clock relation with only their minimum left in it, which makes
-    every mapped time late by about that much. A sync pulse (sub-project 2) is
-    what would bound it.
+    taken (block_stamps_from_runs: a recorder copy's stamp, taken before its
+    newest read blocked, bounds the sample before that read). So each (seen -
+    sample time) is at least the delivery delay. The smallest across the
+    session trace the clock relation with only their minimum left in it, which
+    makes every mapped time late by about that much: the delivery floor, which
+    a rig's NI delivery calibration measures by loopback (0.19-0.28 ms on
+    christielab10 at NI reads of 42-167 samples, 2026-11-13).
 
-    That minimum depends on the display refresh rate, which sets the NI read
-    size (sample rate / refresh). While reads are long against the 10 ms copy
-    period, some copies end on the read just before the stamped one and the
-    minimum is the delivery floor. When every copy spans two or more reads,
-    the previous copy ends a whole read or more before the stamp. Simulated
-    (Task 16 review): 60-165 Hz maps about 0.25 ms late, 200 Hz fails the
-    fit, and 240 Hz maps 4.45 ms late. christielab10 runs at 60 Hz.
+    A copy spans two reads or more when reads are under the 10 ms copy period
+    (display refresh, which sets the NI read size, of 100 Hz or more). Paired
+    with the previous copy's end, as nidaq.h5 files without
+    block_newest_read_start_index are, its stamp is a read loose; at 200 Hz
+    and above every copy is, and the fit maps a whole read late (4.4-5.2 ms).
     """
     t, seen, problem = _read_pairs(end_index, seen_perf, sample_rate)
     if problem:
@@ -900,6 +900,75 @@ def coverage_factor() -> float:
     return statistics.NormalDist().inv_cdf(1 - FALSE_ALARM_PROBABILITY / 2)
 
 
+def prediction_factor(sessions) -> float:
+    """How many of a calibration's spreads a new session may lie from its mean,
+    two-sided at FALSE_ALARM_PROBABILITY.
+
+    The mean and the standard deviation both come from `sessions` sessions, so
+    a new one is Student's t on sessions - 1 degrees of freedom, widened by
+    sqrt(1 + 1/sessions) for the mean's own error: 10.1 at 12 sessions, 6.5 at
+    27, coverage_factor() in the limit. inf below two sessions, where there is
+    no spread to scale."""
+    try:
+        sessions = int(sessions)
+    except (TypeError, ValueError):
+        return math.inf
+    if sessions < 2:
+        return math.inf
+    return (_student_t_quantile(1 - FALSE_ALARM_PROBABILITY / 2, sessions - 1)
+            * math.sqrt(1 + 1 / sessions))
+
+
+def _student_t_quantile(probability: float, dof: int) -> float:
+    """The t below which Student's t on dof degrees of freedom falls with probability."""
+    tail = 1 - probability
+
+    def upper(t):  # P(T > t), t >= 0
+        return 0.5 * _regularized_beta(dof / 2, 0.5, dof / (dof + t * t))
+
+    low, high = 0.0, 1.0
+    while upper(high) > tail:
+        low, high = high, high * 2
+    for _ in range(200):
+        middle = (low + high) / 2
+        if upper(middle) > tail:
+            low = middle
+        else:
+            high = middle
+    return (low + high) / 2
+
+
+def _regularized_beta(a: float, b: float, x: float) -> float:
+    """I_x(a, b), by its continued fraction (Lentz), on whichever side converges."""
+    if x <= 0:
+        return 0.0
+    if x >= 1:
+        return 1.0
+    front = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+                     + a * math.log(x) + b * math.log1p(-x))
+    if x < (a + 1) / (a + b + 2):
+        return front * _beta_fraction(a, b, x) / a
+    return 1 - front * _beta_fraction(b, a, 1 - x) / b
+
+
+def _beta_fraction(a: float, b: float, x: float) -> float:
+    tiny = 1e-300
+    c, d = 1.0, 1 - (a + b) * x / (a + 1)
+    d = 1 / (d if abs(d) > tiny else tiny)
+    result = d
+    for m in range(1, 500):
+        for numerator in (m * (b - m) * x / ((a + 2 * m - 1) * (a + 2 * m)),
+                          -(a + m) * (a + b + m) * x / ((a + 2 * m) * (a + 2 * m + 1))):
+            d = 1 + numerator * d
+            d = 1 / (d if abs(d) > tiny else tiny)
+            c = 1 + numerator / c
+            c = c if abs(c) > tiny else tiny
+            result *= c * d
+        if abs(c * d - 1) < 1e-15:
+            break
+    return result
+
+
 def robust_spread(values) -> float:
     """1.4826 times the median absolute deviation of the finite values: the
     standard deviation of a Gaussian, which a few stray values cannot move.
@@ -1328,24 +1397,27 @@ class ResidualBand:
 
 
 def latch_residual_band(frame_period: float, *, exposure: float, delivery_offset: float,
-                        delivery_spread: float, uncertainty: float) -> ResidualBand:
+                        delivery_spread: float, delivery_sessions, uncertainty: float
+                        ) -> ResidualBand:
     """How far the NI path may sit from the latch path.
 
     The camera stamps a frame at the end of its exposure and the NI edge marks
     its start, so a correct pairing's residual (transition minus latched time)
     sits at the rig's delivery offset minus the exposure. delivery_offset and
     delivery_spread are the NI stream's delivery calibration: the mean of
-    residual + exposure over loopback-verified sessions and its standard
-    deviation between them. The band is centred there, coverage_factor()
-    spreads plus the latch map's own uncertainty wide, and never wider than a
-    quarter period. Unjudgeable (a reason, and holds() is False) without a
-    calibration, an exposure, a finite period or a finite map uncertainty: no
-    fixed tolerance stands in for any of them.
+    residual + exposure over delivery_sessions loopback-verified sessions and
+    its standard deviation between them. The band is centred there,
+    prediction_factor(delivery_sessions) spreads plus the latch map's own
+    uncertainty wide, and never wider than a quarter period. Unjudgeable (a
+    reason, and holds() is False) without a calibration of two sessions or
+    more, an exposure, a finite period or a finite map uncertainty: no fixed
+    tolerance stands in for any of them.
     """
     values = [_float_or_nan(value) for value in (frame_period, exposure, delivery_offset,
                                                  delivery_spread, uncertainty)]
     period, exposure, offset, spread, uncertainty = values
-    if not (math.isfinite(offset) and math.isfinite(spread)):
+    factor = prediction_factor(delivery_sessions)
+    if not (math.isfinite(offset) and math.isfinite(spread) and math.isfinite(factor)):
         reason = ("no NI delivery calibration for this rig (nidaqStream.deliveryCalibration; "
                   "tools/hardware/calibrate_ni_delivery.py measures it)")
     elif not math.isfinite(exposure):
@@ -1358,7 +1430,7 @@ def latch_residual_band(frame_period: float, *, exposure: float, delivery_offset
         reason = ""
     if reason:
         return ResidualBand(math.nan, math.nan, reason)
-    half_width = min(coverage_factor() * spread + uncertainty, period / 4)
+    half_width = min(factor * spread + uncertainty, period / 4)
     return ResidualBand(offset - exposure, half_width)
 
 
@@ -1394,7 +1466,7 @@ def latch_clock(latches, ni_fit) -> str:
 def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_times,
                                    frame_period: float, *, ni_residual_rms: float,
                                    clock: str, exposure: float, delivery_offset: float,
-                                   delivery_spread: float) -> Pairing:
+                                   delivery_spread: float, delivery_sessions) -> Pairing:
     """Which exposure transition belongs to which frame, decided by the camera's clock.
 
     The latches place camera time on the host clock named by clock ("perf" or
@@ -1408,8 +1480,8 @@ def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_
     is where the camera stamps a frame relative to the NI edge, plus the NI-to-
     host bias, plus the latch map's error. A Blackfly S stamps a frame at the end
     of its exposure and the NI edge marks its start, so on a correct pairing it
-    sits at the rig's delivery calibration (delivery_offset, delivery_spread)
-    minus the exposure, and a bias near a whole period or a whole NI read moves
+    sits at the rig's delivery calibration (delivery_offset, delivery_spread,
+    delivery_sessions) minus the exposure, and a bias near a whole period or a whole NI read moves
     it by milliseconds. So a residual outside latch_residual_band(), or a shift
     that changes partway through (find_slip), marks the pairing ambiguous, and
     so does a band that cannot be judged: no calibration, no exposure (NaN for
@@ -1453,7 +1525,8 @@ def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_
     residual = transition_times[numbers[inside]] - expected[inside]
     median_residual = float(numpy.median(residual)) if residual.size else math.nan
     band = latch_residual_band(frame_period, exposure=exposure, delivery_offset=delivery_offset,
-                               delivery_spread=delivery_spread, uncertainty=fit.uncertainty)
+                               delivery_spread=delivery_spread,
+                               delivery_sessions=delivery_sessions, uncertainty=fit.uncertainty)
     residual_ambiguous = not band.holds(median_residual)
     gate_ok = latch_gate_ok(fit, ni_residual_rms, frame_period)
     slip = find_slip(voters, votes, shift)

@@ -467,7 +467,8 @@ PERIOD_150 = 1 / 150
 CAMERA_BEHIND_HOST = 40.0  # camera clock = host perf_counter - 40 s
 # These camera stamps fall on the exposure itself and its NI edge has no delay, so a correct
 # pairing's residual is 0: a rig whose delivery calibration is 0 with 20 us between sessions.
-CALIBRATED = {"exposure": 0.0, "delivery_offset": 0.0, "delivery_spread": 20e-6}
+CALIBRATED = {"exposure": 0.0, "delivery_offset": 0.0, "delivery_spread": 20e-6,
+              "delivery_sessions": 27}
 
 
 def _camera_clock(host):
@@ -614,7 +615,7 @@ def test_a_correct_pairing_with_a_small_residual_is_accepted():
                                                     transition_perf + 0.0001, PERIOD_150,
                                                     ni_residual_rms=0.00002, clock="perf",
                                                     exposure=0.0002, delivery_offset=0.0003,
-                                                    delivery_spread=20e-6)
+                                                    delivery_spread=20e-6, delivery_sessions=27)
 
     assert pairing.shift == 995 and not pairing.ambiguous, pairing.reason
     assert pairing.median_residual == pytest.approx(0.0001, abs=1e-6)
@@ -658,7 +659,7 @@ def test_the_camera_clock_flags_a_run_that_reverts():
 
 
 # christielab10's loopback calibration (2026-11-12) and its 175 us exposure.
-RIG = {"delivery_offset": 0.000303, "delivery_spread": 0.000035}
+RIG = {"delivery_offset": 0.000303, "delivery_spread": 0.000035, "delivery_sessions": 27}
 
 
 def test_the_residual_band_is_centred_on_the_calibration_minus_the_exposure():
@@ -666,12 +667,13 @@ def test_the_residual_band_is_centred_on_the_calibration_minus_the_exposure():
 
     assert band.reason == ""
     assert band.centre == pytest.approx(0.000303 - 0.000175)
-    assert band.half_width == pytest.approx(clocks.coverage_factor() * 0.000035 + 0.00012)
+    assert band.half_width == pytest.approx(clocks.prediction_factor(27) * 0.000035 + 0.00012)
 
 
 def test_the_residual_band_is_never_wider_than_a_quarter_period():
     band = clocks.latch_residual_band(PERIOD_150, exposure=0.0, uncertainty=0.0,
-                                      delivery_offset=0.0, delivery_spread=0.01)
+                                      delivery_offset=0.0, delivery_spread=0.01,
+                                      delivery_sessions=27)
 
     assert band.half_width == pytest.approx(PERIOD_150 / 4)
 
@@ -694,7 +696,10 @@ def test_the_measured_sessions_fall_where_the_loopback_put_them(residual, exposu
     ({"exposure": float("nan")}, "exposure is unknown"),
     ({"frame_period": float("nan")}, "frame period is unknown"),
     ({"uncertainty": float("nan")}, "uncertainty is unknown"),
-], ids=["no_calibration", "no_exposure", "no_period", "no_uncertainty"])
+    ({"delivery_sessions": 1}, "no NI delivery calibration"),
+    ({"delivery_sessions": None}, "no NI delivery calibration"),
+], ids=["no_calibration", "no_exposure", "no_period", "no_uncertainty", "one_session",
+        "no_session_count"])
 def test_a_residual_band_that_cannot_be_judged_holds_nothing(inputs, why):
     values = {"frame_period": PERIOD_150, "exposure": 0.000175, "uncertainty": 0.00012, **RIG,
               **inputs}
@@ -714,7 +719,7 @@ def test_without_a_delivery_calibration_the_camera_clock_pairing_is_refused():
     pairing = clocks.choose_pairing_by_camera_clock(
         ids, camera_ts_ns, latches, transition_perf, PERIOD_150, ni_residual_rms=0.00002,
         clock="perf", exposure=0.0, delivery_offset=float("nan"),
-        delivery_spread=float("nan"))
+        delivery_spread=float("nan"), delivery_sessions=None)
 
     # The shift is still found and reported; nothing may vouch for it.
     assert pairing.shift == 995 and abs(pairing.median_residual) < 1e-5
@@ -1747,3 +1752,17 @@ def test_a_copys_stamp_pairs_with_the_sample_before_its_newest_read():
     # A newest read that began before the previous copy ended pairs with that end.
     assert clocks.block_stamps_from_runs(ends, stamps, newest_read_at_ends=[0, 60, 250]
                                          ).end_index.tolist() == [99, 249]
+
+
+def test_the_prediction_factor_is_students_t_widened_for_the_calibrations_own_mean():
+    # Two sessions: t on one degree of freedom is Cauchy, tan(pi/2 - pi*p/2) in closed form.
+    tail = clocks.FALSE_ALARM_PROBABILITY / 2
+    assert clocks.prediction_factor(2) == pytest.approx(
+        math.tan(math.pi / 2 - math.pi * tail) * math.sqrt(1.5), rel=1e-9)
+    # Eleven degrees of freedom: the two-sided 1e-6 point of t is 9.7014.
+    assert clocks.prediction_factor(12) == pytest.approx(9.7014 * math.sqrt(1 + 1 / 12), rel=1e-4)
+    # Many sessions: the Gaussian factor the per-session limits use.
+    assert clocks.prediction_factor(10 ** 7) == pytest.approx(clocks.coverage_factor(), rel=1e-5)
+    factors = [clocks.prediction_factor(n) for n in (2, 3, 5, 12, 27, 100)]
+    assert factors == sorted(factors, reverse=True)
+    assert math.isinf(clocks.prediction_factor(1)) and math.isinf(clocks.prediction_factor(None))

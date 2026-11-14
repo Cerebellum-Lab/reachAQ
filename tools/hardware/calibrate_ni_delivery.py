@@ -19,13 +19,15 @@ BNC-2090A, the AI pair's switch at SE), both channels unused in the live
 configuration, and nothing else connected to them. reachAQ and SpinView must be
 closed. The live configuration is only read: every session runs from a scratch
 copy (CAN, pellet controller and laser off, the loopback input added) with
-scratch preferences and data under --out, and the live file is fingerprinted
-before and after each session. Only --write changes it, once every session has
-finished, after copying it to a timestamped backup beside it. The AO output is
-left at 0 V.
+scratch preferences and data under --out. The live file is copied to --out
+first and fingerprinted after each session; a change stops the run with both
+versions kept. Only --write changes it, once every session has finished and
+nothing else holds reachAQ, after copying it to a timestamped backup beside it,
+and it is replaced in one step. The AO output ends at 0 V, and Ctrl-C (or
+SIGTERM) shuts the session in hand down before the run stops.
 
-Each session takes its length plus about 40 s; the default plan, 12 sessions of
-120 s, is about half an hour. A report (report.json, and a table on stdout)
+Each session takes its length plus about 40 s; the default plan, 18 sessions of
+120 s, is about 50 minutes. A report (report.json, and a table on stdout)
 records every session, used or not. Exit status 0 only when a calibration was
 measured (and, with --write, written).
 """
@@ -38,6 +40,7 @@ import hashlib
 import json
 import math
 import random
+import os
 import shutil
 import signal
 import statistics
@@ -58,7 +61,7 @@ STEP_SECONDS = (0.04, 0.16)     # the random interval between output steps
 # read (5 ms at 200 Hz display refresh) late.
 MATCH_SECONDS = 0.030
 SESSION_OVERHEAD_SECONDS = 600  # startup, READY and validation, past the recording
-DEFAULT_REFRESH_HZ = (60, 120, 144, 165)
+DEFAULT_REFRESH_HZ = (60, 120, 144, 165, 200, 240)
 DEFAULT_FRAME_RATES = (50, 100, 150)
 LOOPBACK_CHANNEL = "loopback"
 # DAQmx gives the sample-clock-to-convert delay in ticks of the AI convert timebase.
@@ -154,14 +157,17 @@ def delivery_floor(differences, convert_offset: float, rate: float) -> float:
 
 
 def session_verdict(*, floor: float, read_period: float, residual: Optional[float],
-                    exposure: Optional[float], frame_period: Optional[float]) -> str:
+                    exposure: Optional[float], frame_period: Optional[float],
+                    slip=None, gate_reason: str = "") -> str:
     """Why a session cannot calibrate, or "" when it can.
 
     A fit paired a whole NI read off is late by about that read, so a floor of
     half a read or more is no floor; and residual + exposure - floor is the
     camera's own stamp offset, tens of microseconds, which a latch map or
     pairing gone wrong moves by milliseconds, so it must stay under a quarter
-    period."""
+    period. The latch pairing must also hold on its own terms (no slip, a map
+    certain enough to choose transitions by): the scratch sessions have no
+    calibration, so their pairing is refused and nothing else applies those."""
     if not math.isfinite(floor):
         return "no loopback edge was matched"
     if not floor < read_period / 2:
@@ -169,6 +175,10 @@ def session_verdict(*, floor: float, read_period: float, residual: Optional[floa
                 f"({read_period * 1e3:.3f} ms) or more")
     if residual is None or exposure is None or frame_period is None:
         return "no latch residual, exposure or frame period in alignment.json"
+    if slip is not None:
+        return f"the latch pairing slips at frame {slip.get('frameId')}"
+    if gate_reason:
+        return f"the latch map is not trusted: {gate_reason}"
     offset = residual + exposure - floor
     if not abs(offset) < frame_period / 4:
         return (f"the camera's stamp offset reads {offset * 1e3:.3f} ms, a quarter period "
@@ -220,10 +230,19 @@ def analyze_session(run_dir: Path, convert_offset: float, camera_serial: str = "
     out["deliveryFloorSeconds"] = floor
     out["differenceSpreadSeconds"] = spread
     read_period = float(result["read_chunk_samples"]) / rate
+    uncertainty = latch.get("uncertaintySeconds")
+    residual_rms = (alignment.get("niToHost") or {}).get("residual_rms")
+    gate = SimpleNamespace(valid=uncertainty is not None, reason="no latch map",
+                           uncertainty=math.nan if uncertainty is None else float(uncertainty))
     out["reason"] = session_verdict(floor=floor, read_period=read_period,
                                     residual=out["residualSeconds"],
                                     exposure=out["exposureSeconds"],
-                                    frame_period=out["framePeriodSeconds"])
+                                    frame_period=out["framePeriodSeconds"],
+                                    slip=latch.get("slip"),
+                                    gate_reason=clocks.latch_gate_reason(
+                                        gate, math.nan if residual_rms is None else residual_rms,
+                                        math.nan if out["framePeriodSeconds"] is None
+                                        else out["framePeriodSeconds"]))
     out["offsetSeconds"] = (None if out["reason"] else
                             float(out["residualSeconds"]) + float(out["exposureSeconds"]))
     return out
@@ -233,11 +252,31 @@ def aggregate(sessions: Iterable[dict], *, measured: str):
     """The calibration from the sessions that can calibrate, or (None, why)."""
     from autotrainer.core.configuration import NidaqDeliveryCalibration
 
+    from tools.latency import clocks
+
     used = [s for s in sessions if not s.get("reason")]
+    # A session the others' prediction band cannot hold is not the rig's spread: drop the
+    # worst such, one at a time, while three or more are left to judge it by.
+    while len(used) >= 4:
+        worst, excess = None, 0.0
+        for position, session in enumerate(used):
+            others = [o["offsetSeconds"] for k, o in enumerate(used) if k != position]
+            spread = statistics.stdev(others)
+            limit = clocks.prediction_factor(len(others)) * spread
+            beyond = abs(session["offsetSeconds"] - statistics.mean(others)) - limit
+            if spread > 0 and beyond > excess:
+                worst, excess = position, beyond
+        if worst is None:
+            break
+        dropped = used.pop(worst)
+        dropped["reason"] = ("residual + exposure outside the other sessions' prediction band "
+                             f"by {excess * 1e3:.3f} ms")
     if len(used) < 2:
         return None, f"{len(used)} usable session(s); a spread needs two"
     offsets = [s["offsetSeconds"] for s in used]
     floors = [s["deliveryFloorSeconds"] for s in used]
+    if not statistics.stdev(offsets) > 0:
+        return None, "every usable session gave the same offset; there is no spread to scale"
     calibration = NidaqDeliveryCalibration(
         offset_seconds=float(statistics.mean(offsets)),
         spread_seconds=float(statistics.stdev(offsets)),
@@ -263,7 +302,9 @@ def write_calibration(config_path: Path, calibration) -> Path:
         f"{config_path.stem}_before_delivery_calibration_{datetime.now():%Y%m%d_%H%M%S}.yaml")
     shutil.copy2(config_path, backup)
     live.nidaq_stream = dataclasses.replace(live.nidaq_stream, delivery_calibration=calibration)
-    live.save_file(config_path.with_suffix(""), as_yaml=True)
+    staged = config_path.with_name(f".{config_path.name}.calibrating")
+    staged.write_text(live.dump_yaml())
+    os.replace(staged, config_path)
     reread = SystemConfiguration.load_yaml_file(config_path)
     if reread.nidaq_stream.delivery_calibration != calibration:
         raise RuntimeError(f"{config_path} did not read back the calibration; backup {backup}")
@@ -339,6 +380,10 @@ def _edge_writer(stop, count, out_path, seed, ao, ref_source, ref_rate):
     so the session could not be finalized. A spawned child passes them only
     its own descriptors. Rows (level, perf before, perf after, RAW before, RAW
     after) go to out_path when it ends."""
+    # Ctrl-C is the recording process's to handle: it sets `stop`, and this ends at 0 V.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    import multiprocessing
+    parent = multiprocessing.parent_process()
     rows, errors = [], []
     try:
         import nidaqmx
@@ -355,18 +400,22 @@ def _edge_writer(stop, count, out_path, seed, ao, ref_source, ref_rate):
                 reference_clock_source=ref_source, reference_clock_rate_hz=ref_rate))
             writer = AnalogSingleChannelWriter(task.out_stream, auto_start=False)
             task.start()
-            writer.write_one_sample(0.0)
-            level = 0.0
-            while True:
-                stopping = stop.wait(rng.uniform(*STEP_SECONDS))
-                if stopping and level == 0.0:
-                    break
-                level = 0.0 if stopping else HIGH - level
-                p0, r0 = time.perf_counter(), monotonic_raw_time()
-                writer.write_one_sample(level)
-                r1, p1 = monotonic_raw_time(), time.perf_counter()
-                rows.append((level, p0, p1, r0, r1))
-                count.value = len(rows)
+            try:
+                writer.write_one_sample(0.0)
+                level = 0.0
+                while True:
+                    stopping = (stop.wait(rng.uniform(*STEP_SECONDS))
+                                or (parent is not None and not parent.is_alive()))
+                    if stopping and level == 0.0:
+                        break
+                    level = 0.0 if stopping else HIGH - level
+                    p0, r0 = time.perf_counter(), monotonic_raw_time()
+                    writer.write_one_sample(level)
+                    r1, p1 = monotonic_raw_time(), time.perf_counter()
+                    rows.append((level, p0, p1, r0, r1))
+                    count.value = len(rows)
+            finally:
+                writer.write_one_sample(0.0)
     except BaseException as error:  # noqa: BLE001 - reported to the recording process
         errors.append(repr(error))
     Path(out_path).write_text(json.dumps({"rows": rows, "errors": errors}))
@@ -521,35 +570,39 @@ def _fingerprint(config_path: Path) -> str:
     return hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
 
 
-def _run_session(planned: PlannedSession, cfg: Path, prefs: Path, run_dir: Path, ao: str) -> bool:
-    """Record one session in its own process; False if the run was interrupted.
+def _run_session(planned: PlannedSession, cfg: Path, prefs: Path, run_dir: Path, ao: str) -> str:
+    """Record one session in its own process; why the run must stop, or "".
 
-    An interrupt (SIGINT, or SIGTERM, which main turns into one) is handed on to the
-    session as SIGINT, which closes the app the normal way, and waited for: a session
-    left running after its run would hold the cameras and NI with nobody watching."""
+    The session runs in a process group of its own, so a Ctrl-C at the terminal
+    reaches only this process. An interrupt (SIGINT, or SIGTERM, which main turns
+    into one) is handed on as one SIGINT, which closes the app the normal way, and
+    waited for; a session that hangs is killed with its whole group, and the run
+    stops, since what it left behind is not known."""
     child = subprocess.Popen([sys.executable, "-m", "tools.hardware.calibrate_ni_delivery",
                               "record", str(cfg), str(prefs), str(planned.seconds),
-                              str(planned.refresh_hz), str(planned.fps), str(run_dir), ao])
+                              str(planned.refresh_hz), str(planned.fps), str(run_dir), ao],
+                             start_new_session=True)
     try:
         child.wait(timeout=planned.seconds + SESSION_OVERHEAD_SECONDS)
-        return True
+        return ""
     except subprocess.TimeoutExpired:
         print(f"{planned.name} timed out; stopping it")
-        _stop(child)
-        return True
+        return _stop(child) or f"{planned.name} timed out"
     except KeyboardInterrupt:
-        _stop(child)
-        return False
+        return _stop(child) or f"interrupted during {planned.name}"
 
 
-def _stop(child: subprocess.Popen) -> None:
+def _stop(child: subprocess.Popen) -> str:
+    """SIGINT to the session, then SIGKILL to its group if it does not end; why, if killed."""
     child.send_signal(signal.SIGINT)
     try:
         child.wait(timeout=120)
+        return ""
     except subprocess.TimeoutExpired:
-        print(f"session pid {child.pid} did not stop on SIGINT; killing it")
-        child.kill()
+        os.killpg(child.pid, signal.SIGKILL)
         child.wait()
+        return (f"session pid {child.pid} did not stop on SIGINT and was killed with its "
+                "process group; check the AO output and the cameras before the next run")
 
 
 def _refuse_if_running() -> None:
@@ -647,6 +700,9 @@ def main(argv=None) -> int:
                      f"animal_location={settings / 'animals'}\n\n"
                      f"[softmouse]\nmanifest_path={root / 'no_softmouse_manifest.csv'}\n"
                      f"nightly_refresh=false\n")
+    # The live file as found, kept so that a change during the run can be undone by hand.
+    snapshot = root / "live_config_before.yaml"
+    shutil.copy2(args.config, snapshot)
     before = _fingerprint(args.config)
     for planned in sessions:
         cfg = root / "cfgs" / f"f{planned.fps}_e{planned.exposure_us}.yaml"
@@ -655,13 +711,17 @@ def main(argv=None) -> int:
                                   planned.exposure_us).save_file(cfg.with_suffix(""), as_yaml=True)
         run_dir = root / "runs" / planned.name
         print(f"=== {planned.name} {datetime.now():%H:%M:%S}", flush=True)
-        if not _run_session(planned, cfg, prefs, run_dir, args.ao):
-            report["aborted"] = f"stopped during {planned.name}"
+        stopped = _run_session(planned, cfg, prefs, run_dir, args.ao)
+        if stopped:
+            report["aborted"] = stopped
             (root / "report.json").write_text(json.dumps(report, indent=2, default=str))
-            print(f"stopped; {planned.name} was shut down and nothing was written")
+            print(f"stopped: {stopped}; nothing was written")
             return 130
         if _fingerprint(args.config) != before:
-            report["aborted"] = f"{args.config} changed during {planned.name}"
+            changed = root / "live_config_changed.yaml"
+            shutil.copy2(args.config, changed)
+            report["aborted"] = (f"{args.config} changed during {planned.name}; as found: "
+                                 f"{snapshot}, as changed: {changed}")
             (root / "report.json").write_text(json.dumps(report, indent=2, default=str))
             print(f"ABORT: {report['aborted']}")
             return 1
@@ -689,6 +749,10 @@ def main(argv=None) -> int:
           f"delivery floor {calibration.delivery_floor_min_seconds * 1e3:.3f}-"
           f"{calibration.delivery_floor_max_seconds * 1e3:.3f} ms")
     if args.write:
+        # reachAQ may have been started since the last session, and saves over this file.
+        _refuse_if_running()
+        if _fingerprint(args.config) != before:
+            raise SystemExit(f"{args.config} changed since the run began; not written")
         backup = write_calibration(args.config, calibration)
         report["written"] = {"config": str(args.config), "backup": str(backup)}
         print(f"written to {args.config} (backup {backup})")

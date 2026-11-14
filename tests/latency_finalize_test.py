@@ -43,7 +43,7 @@ SLEW_HALF_WIDTH = 0.2  # seconds either side of mid-session
 # itself, so a correct latch pairing's residual is the envelope's floor: 0.51 ms in the default
 # session, 0.22 ms in a 30 s one (more reads per envelope bin). A rig calibrated across both.
 CALIBRATION = {"exposure_seconds": 0.0, "delivery_offset_seconds": 0.00036,
-               "delivery_spread_seconds": 60e-6}
+               "delivery_spread_seconds": 60e-6, "delivery_sessions": 27}
 
 
 def finalize_session_latency(session_dir, **kwargs):
@@ -986,36 +986,45 @@ def test_a_consecutive_sample_index_is_derived_and_a_gap_uses_the_stored_one(tmp
         assert "values" not in ni and "channels" not in ni  # no samples are retained
 
 
-def test_the_raw_column_is_not_kept_alive_through_the_channel_scans(tmp_path, monkeypatch):
-    # The stamps keep only the run ends, so the whole RAW column (8 bytes a sample, 288 MB
-    # an hour at 10 kHz) must be gone before the channels are scanned.
+def test_no_stamp_column_is_kept_alive_through_the_channel_scans(tmp_path, monkeypatch):
+    # The stamps keep only the run ends, so each whole stamp column (8 bytes a sample, 288 MB
+    # an hour at 10 kHz) must be gone before the channels are scanned, and none may be
+    # held while the next is read.
     path = tmp_path / "nidaq.h5"
     seen = np.arange(10, dtype=np.float64)
+    columns = ("block_observation_perf_time", "block_observation_raw_time",
+               "block_newest_read_start_index")
     _write(path, {"sample_index": (1000 + np.arange(10)).astype(np.int64),
                   "block_observation_perf_time": seen,
                   "block_observation_raw_time": seen + 3.0,
+                  "block_newest_read_start_index": (1000 + np.arange(10)).astype(np.int64),
                   "values": np.array([[0, 0, 1, 1, 0, 0, 1, 1, 0, 0]], dtype=np.float32)},
            {"channel_names": np.array([b"cam_frames"]), "sample_rate_hz": 1000.0})
-    raw_arrays, alive_during_scan = [], []
-    real_stamps, real_transitions = finalize.clocks.ni_block_stamps, finalize.clocks.transitions
+    read, alive_when_read, alive_during_scan = [], [], []
+    real_read, real_transitions = finalize._read_inflated, finalize.clocks.transitions
 
-    def stamps(index, observed, raw=None, newest=None):
-        raw_arrays.append(weakref.ref(raw))
-        return real_stamps(index, observed, raw, newest)
+    def inflated(dataset, row=None):
+        gc.collect()
+        alive_when_read.append(sum(ref() is not None for ref in read))
+        data = real_read(dataset, row)
+        if dataset.name.lstrip("/") in columns:
+            read.append(weakref.ref(data))
+        return data
 
     def transitions(channel):
         gc.collect()
-        alive_during_scan.append(raw_arrays[0]() is not None)
+        alive_during_scan.append(sum(ref() is not None for ref in read))
         return real_transitions(channel)
 
-    monkeypatch.setattr(finalize.clocks, "ni_block_stamps", stamps)
+    monkeypatch.setattr(finalize, "_read_inflated", inflated)
     monkeypatch.setattr(finalize.clocks, "transitions", transitions)
 
     ni = finalize._read_nidaq(path)
 
     assert ni["transitions"].tolist() == [1002, 1004, 1006, 1008]
     assert np.isfinite(ni["block_stamps"].raw).all()  # the RAW stamps were read and kept
-    assert alive_during_scan == [False]
+    assert len(read) == 3
+    assert alive_when_read[:3] == [0, 0, 0] and alive_during_scan == [0]
 
 
 def test_latency_h5_is_marked_close_on_exec_while_it_is_written(monkeypatch, tmp_path):
@@ -1151,3 +1160,24 @@ def test_unreadable_streams_share_one_open_retry_budget(tmp_path, monkeypatch):
     assert elapsed < 0.6, f"{elapsed:.2f} s for three unreadable streams"
     # The first file is retried until the deadline, so the budget is spent, not skipped.
     assert elapsed >= 0.3, f"{elapsed:.2f} s: the open retries did not use the budget"
+
+
+def test_a_rebuild_can_take_the_calibration_from_a_configuration(tmp_path, capsys):
+    from autotrainer.core import SystemConfiguration
+    from autotrainer.core.configuration import (NidaqDeliveryCalibration,
+                                                NidaqSignalStreamConfiguration)
+    session = _session(tmp_path / "session")
+    (session / "streams" / "alignment.json").write_text(json.dumps(_alignment(calibration=False)))
+    calibration = NidaqDeliveryCalibration(
+        offset_seconds=CALIBRATION["delivery_offset_seconds"],
+        spread_seconds=CALIBRATION["delivery_spread_seconds"],
+        sessions=CALIBRATION["delivery_sessions"])
+    configuration = tmp_path / "system_configuration.yaml"
+    SystemConfiguration(nidaq_stream=NidaqSignalStreamConfiguration(
+        delivery_calibration=calibration)).save_file(configuration.with_suffix(""), as_yaml=True)
+
+    assert rebuild.main([str(session), "--delivery-calibration-from", str(configuration)]) == 0
+
+    status = json.loads(capsys.readouterr().out)
+    assert status["clocks"]["cameraToNi"]["pairing"]["method"] == "camera_latch"
+    assert status["status"] == "complete"

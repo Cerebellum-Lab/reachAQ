@@ -221,10 +221,19 @@ def test_a_stream_without_a_delivery_calibration_has_none():
 
 @pytest.mark.parametrize(("overrides", "field"), [
     ({"offset_seconds": float("nan")}, "offset_seconds"),
+    ({"offset_seconds": "a lot"}, "offset_seconds"),
     ({"spread_seconds": 0.0}, "spread_seconds"),
     ({"spread_seconds": float("inf")}, "spread_seconds"),
     ({"sessions": 1}, "two sessions"),
+    ({"sessions": 2.5}, "whole number"),
+    ({"exposures_seconds": (0.000175, float("nan"))}, "exposures_seconds"),
+    ({"delivery_floor_max_seconds": float("inf")}, "delivery_floor_max_seconds"),
 ])
 def test_a_delivery_calibration_refuses_what_no_gate_can_use(overrides, field):
     with pytest.raises(ValueError, match=field):
         _calibration(**overrides)
+
+
+def test_a_delivery_calibration_number_written_as_text_is_read_as_a_number():
+    # YAML 1.1 reads 35e-6 (a float without a dot) as text; it is still the number meant.
+    assert _calibration(offset_seconds="35e-6").offset_seconds == pytest.approx(35e-6)

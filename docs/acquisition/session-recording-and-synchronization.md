@@ -78,7 +78,7 @@ evidence contracts are defined in
 [Recording sessions, pellet trials, protocols, and schema migration](session-trials-protocols.md).
 
 The load-cell acquisition, tare, configuration, UI, and automatic recording
-triggers have been removed. System configuration v58 rejects obsolete schemas
+triggers have been removed. System configuration v59 rejects obsolete schemas
 and fields rather than creating a compatibility runtime. Alarm, emergency,
 tunnel, head-fix, magnet, and webcam/top-camera behavior is removed. Pellet
 presence, pellet misplacement, watchdog liveness, structured errors, and safe
@@ -536,7 +536,9 @@ the primary camera's latency stream:
     pairing's `medianResidualSeconds` sits at D̄ − `exposureSeconds`, where D̄
     is the NI-to-host fit's delivery floor plus the camera's own stamp offset.
     `latch.expectedResidualSeconds` is that centre and `latch.limitSeconds`
-    the half-width, min(k·σ_D + `uncertaintySeconds`, P/4); a residual outside
+    the half-width, min(t·σ_D + `uncertaintySeconds`, P/4), where t is
+    Student's t at `FALSE_ALARM_PROBABILITY` for the calibration's session
+    count, widened by √(1 + 1/n) (10.1 at 12 sessions); a residual outside
     it is `ambiguous`, *median residual X ms is Y ms from the expected Z ms,
     over the band's W ms*. A mapping a whole NI read or frame off moves the
     residual by milliseconds, which a quarter-period test alone can miss
@@ -1136,22 +1138,26 @@ latency record pairs by host arrival, `mixed`). See `alignment.json` above.
 2. Run, as the operator, from the repository root:
 
    ```bash
-   conda run --no-capture-output -n reachaq python -m tools.hardware.calibrate_ni_delivery        --ao PXI1Slot5/ao0 --ai PXI1Slot5/ai6
+   conda run --no-capture-output -n reachaq python -m tools.hardware.calibrate_ni_delivery \
+       --ao PXI1Slot5/ao0 --ai PXI1Slot5/ai6
    ```
 
    It refuses to start while reachAQ or SpinView is running, or when the input does
    not follow the output (a missing cable, or the input's switch at DIFF). It
-   then records 12 isolated sessions of 120 s, about half an hour: display
-   refresh 60, 120, 144 and 165 Hz (the NI read size) at 50, 100 and 150 fps, at
-   the live exposure. Each runs from a scratch copy of the configuration with
+   then records 18 isolated sessions of 120 s, about 50 minutes: display
+   refresh 60, 120, 144, 165, 200 and 240 Hz (the NI read size) at 50, 100 and
+   150 fps, at the live exposure. Each runs from a scratch copy of the configuration with
    CAN, the pellet controller and the laser off, under `--out`, while the output
    steps at random times. `--refresh`, `--fps`, `--exposure-us`, `--passes` and
    `--seconds` change the plan.
 3. It prints a table per session: the fit's delivery floor L, the residual, and
    residual + exposure (D). A session whose fit is half an NI read late or more,
-   or whose latch pairing is not where the NI edges are, is left out and named.
-   The mean and standard deviation of D over the rest are the calibration, with
-   at least two sessions.
+   whose latch pairing is not where the NI edges are, slips or rests on a latch
+   map too uncertain to choose transitions by, is left out and named, and so is
+   one the other sessions' prediction band cannot hold. The mean and standard
+   deviation of D over the rest, with the number of sessions, are the
+   calibration (at least two sessions); the gate scales the spread by Student's
+   t for that number.
 4. Add `--write` to put it into `~/Autotrainer/system_configuration.yaml`. The file
    is copied to `system_configuration_before_delivery_calibration_<time>.yaml`
    first and only changed after every session has finished; without `--write`
@@ -1159,10 +1165,10 @@ latency record pairs by host arrival, `mixed`). See `alignment.json` above.
 
 Calibrate again after changing the NI board, the reach cameras, their USB
 attachment or the host, since any of them moves the floor or the stamp offset.
-christielab10, 2026-11-12: L 0.20-0.30 ms at NI reads of 61-167 samples, D
-0.303 ms with 0.035 ms between 27 sessions. At display refresh of 200 Hz or more
-(reads of 50 samples or fewer) the fit maps a whole read late; such sessions are
-refused by the band rather than calibrated.
+christielab10, 2026-11-13: L 0.19-0.28 ms at NI reads of 42-167 samples (display
+refresh 60-240 Hz), D 0.277 ms with 0.029 ms between 18 sessions. A `nidaq.h5`
+from before `block_newest_read_start_index` fits a whole NI read late at display
+refresh of 200 Hz or more, and its latch pairing is then refused by the band.
 
 ## Storage, discovery, and safe hardware boundaries
 

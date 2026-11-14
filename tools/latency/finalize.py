@@ -45,7 +45,7 @@ CLOCK_GROUPS = (("wallToHost", "wall_to_host"), ("niToHost", "ni_to_host"),
 MAX_LISTED_WALL_FITS = 16
 ENVELOPE_BIAS_FLOOR = ("not subtracted; mapped NI times are late by the minimum driver "
                        "delivery delay, whose range a rig's NI delivery calibration records "
-                       "(0.20-0.30 ms on christielab10, loopback 2026-11-12)")
+                       "(0.19-0.28 ms on christielab10, loopback 2026-11-13)")
 SECONDARY_TRIGGER_DELAY = ("unmeasured; a secondary camera's exposure starts a trigger delay "
                            "(microseconds) after the primary's")
 HOST_ARRIVAL_PAIRING = ("camera-to-NI pairing by host arrival assumes exposure→arrival "
@@ -165,6 +165,21 @@ def _read_inflated(dataset, row=None):
     return result
 
 
+def _column_at_ends(store, name: str, dtype, shape, ends) -> tuple:
+    """(nidaq.h5 column `name` at the run ends, or None; why it is unusable, or "").
+
+    Missing is not a problem: older files predate the column."""
+    if name not in store:
+        return None, ""
+    try:
+        column = numpy.asarray(_read_inflated(store[name]), dtype=dtype)
+    except Exception as error:
+        return None, _describe(error)
+    if column.shape != shape:
+        return None, f"{column.size} values against {shape[0]} block_observation_perf_time stamps"
+    return column[ends], ""
+
+
 def _read_nidaq(path: Path) -> dict:
     """What the loops need from nidaq.h5, reduced one array at a time.
 
@@ -182,6 +197,7 @@ def _read_nidaq(path: Path) -> dict:
             "block_stamps": clocks.block_stamps_from_runs(numpy.empty(0, dtype=numpy.int64),
                                                           numpy.empty(0)),
             "transitions": None, "edges": {}, "problems": {}, "raw_problem": "",
+            "newest_read_problem": "",
         }
         if not math.isfinite(rate):
             return result
@@ -196,38 +212,30 @@ def _read_nidaq(path: Path) -> dict:
         index = (numpy.arange(first, first + count, dtype=numpy.int64) if consecutive
                  else stored[()])
         seen = _read_inflated(store["block_observation_perf_time"])
+        # Each stamp column is cut to the copies' run ends as soon as it is read, so no
+        # two sample-sized columns are held at once.
+        ends = clocks.run_ends(seen)
+        perf_at_ends, shape = seen[ends], seen.shape
+        del seen
         # Older sessions have no RAW column; the selector then fits perf alone.
         # A column that is there but unusable costs the RAW bridge, not the file.
-        raw = column = None
-        if "block_observation_raw_time" in store:
-            try:
-                column = numpy.asarray(_read_inflated(store["block_observation_raw_time"]),
-                                       dtype=numpy.float64)
-                if column.shape == seen.shape:
-                    raw = column
-                else:
-                    result["raw_problem"] = (f"{column.size} values against {seen.size} "
-                                             "block_observation_perf_time stamps")
-            except Exception as error:
-                result["raw_problem"] = _describe(error)
-            if result["raw_problem"]:
-                logger.warning("nidaq.h5 block_observation_raw_time is unusable (%s); "
-                               "fitting the perf stamps alone", result["raw_problem"])
+        raw_at_ends, result["raw_problem"] = _column_at_ends(
+            store, "block_observation_raw_time", numpy.float64, shape, ends)
+        if result["raw_problem"]:
+            logger.warning("nidaq.h5 block_observation_raw_time is unusable (%s); "
+                           "fitting the perf stamps alone", result["raw_problem"])
         # Which read each copy's stamps are, so they pair with the sample before it
-        # (clocks.block_stamps_from_runs). Older sessions have none, and pair as before.
-        newest = None
-        if "block_newest_read_start_index" in store:
-            stored_newest = _read_inflated(store["block_newest_read_start_index"])
-            if stored_newest.shape == seen.shape:
-                newest = numpy.asarray(stored_newest, dtype=numpy.int64)
-            else:
-                logger.warning("nidaq.h5 block_newest_read_start_index has %d values against "
-                               "%d stamps; pairing the stamps with the previous copy's end",
-                               stored_newest.size, seen.size)
-            del stored_newest
-        result["block_stamps"] = clocks.ni_block_stamps(index, seen, raw, newest)
-        # column is the same array as raw: left bound it would outlive both through the scans.
-        del seen, raw, column, newest
+        # (clocks.block_stamps_from_runs). Older sessions have none, and pair as before;
+        # an unusable one is named, since the fit is then a read late at 200 Hz and up.
+        newest_at_ends, result["newest_read_problem"] = _column_at_ends(
+            store, "block_newest_read_start_index", numpy.int64, shape, ends)
+        if result["newest_read_problem"]:
+            logger.warning("nidaq.h5 block_newest_read_start_index is unusable (%s); pairing "
+                           "the stamps with the previous copy's end",
+                           result["newest_read_problem"])
+        result["block_stamps"] = clocks.block_stamps_from_runs(
+            index[ends], perf_at_ends, raw_at_ends, newest_at_ends)
+        del ends, perf_at_ends, raw_at_ends, newest_at_ends
         if consecutive:
             index = None
 
@@ -391,10 +399,11 @@ class _Delivery:
     exposure: float = math.nan
     offset: float = math.nan
     spread: float = math.nan
+    sessions: Optional[int] = None
 
     def pairing_inputs(self) -> dict:
         return {"exposure": self.exposure, "delivery_offset": self.offset,
-                "delivery_spread": self.spread}
+                "delivery_spread": self.spread, "delivery_sessions": self.sessions}
 
 
 def _seconds(value) -> float:
@@ -430,6 +439,10 @@ class _Context:
                 if self.nidaq["raw_problem"]:
                     status["reasons"].append(
                         f"nidaq.h5 RAW stamps unusable: {self.nidaq['raw_problem']}")
+                if self.nidaq.get("newest_read_problem"):
+                    status["reasons"].append(
+                        "nidaq.h5 newest-read index unusable, so the NI fit pairs each stamp "
+                        f"with the previous copy: {self.nidaq['newest_read_problem']}")
             except Exception as error:
                 logger.exception("nidaq.h5 could not be read for the latency record")
                 self.faults["nidaq"] = f"unreadable: {_describe(error)}"
@@ -858,7 +871,8 @@ def finalize_session_latency(session_dir, *, primary_camera: str,
                              unwritten: Optional[Mapping[str, str]] = None,
                              exposure_seconds: Optional[float] = None,
                              delivery_offset_seconds: Optional[float] = None,
-                             delivery_spread_seconds: Optional[float] = None) -> dict:
+                             delivery_spread_seconds: Optional[float] = None,
+                             delivery_sessions: Optional[int] = None) -> dict:
     """Analyse one session's latency streams; never raises.
 
     `unwritten` maps the stem of a raw stream whose writer failed (e.g. "events") to why it
@@ -866,9 +880,10 @@ def finalize_session_latency(session_dir, *, primary_camera: str,
     "complete" or "absent".
 
     The camera-latch pairing is judged against a band centred on the rig's NI delivery
-    calibration (delivery_offset_seconds, delivery_spread_seconds: nidaqStream's
-    deliveryCalibration) minus the primary camera's exposure_seconds. With any of the three
-    missing the band cannot be judged, the latch pairing is refused, and host arrival pairs.
+    calibration (delivery_offset_seconds, delivery_spread_seconds and delivery_sessions:
+    nidaqStream's deliveryCalibration) minus the primary camera's exposure_seconds. With any
+    of them missing the band cannot be judged, the latch pairing is refused, and host
+    arrival pairs.
     """
     status = {"status": "failed", "output": None, "loops": {}, "clocks": {}, "reasons": [],
               "unreadable": [], "unwritten": []}
@@ -876,7 +891,7 @@ def finalize_session_latency(session_dir, *, primary_camera: str,
         _finalize(session_dir, primary_camera, output_name, session_id, status,
                   dict(unwritten or {}),
                   _Delivery(_seconds(exposure_seconds), _seconds(delivery_offset_seconds),
-                            _seconds(delivery_spread_seconds)))
+                            _seconds(delivery_spread_seconds), delivery_sessions))
     except Exception as error:
         logger.exception("Latency finalization failed")
         status["status"] = "failed"
