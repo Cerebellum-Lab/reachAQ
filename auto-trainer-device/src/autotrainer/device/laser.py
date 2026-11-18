@@ -6,7 +6,7 @@ import math
 import numbers
 import threading
 import time
-from typing import Dict, Mapping, Optional, Protocol, Tuple, Union
+from typing import Dict, Mapping, Optional, Protocol, Tuple, Union, runtime_checkable
 
 from autotrainer.core import (
     LaserChannelConfiguration,
@@ -266,6 +266,7 @@ class LaserDiodePowerCurve:
         return self.points[-1].command_volts
 
 
+@runtime_checkable
 class LaserControllerProtocol(Protocol):
     """Application-facing contract for laser control implementations."""
 
