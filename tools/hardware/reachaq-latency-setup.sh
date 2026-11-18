@@ -100,7 +100,8 @@ rtprio_enable() {
         groupadd "$RT_GROUP"
         echo "created group $RT_GROUP"
     fi
-    local target_user="${SUDO_USER:-christielab10}"
+    # The operator account that ran sudo; there is no default user to fall back on.
+    local target_user="${SUDO_USER:?run with sudo from the operator account, which gets real-time priority}"
     if ! id -nG "$target_user" | tr ' ' '\n' | grep -qx "$RT_GROUP"; then
         usermod -aG "$RT_GROUP" "$target_user"
         echo "added $target_user to $RT_GROUP"
