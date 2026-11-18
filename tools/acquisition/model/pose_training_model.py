@@ -104,6 +104,56 @@ def run_training(dataset_path: str, run_dir: str, epochs: int, resume: bool,
         messages.put(("log", traceback.format_exc()))
 
 
+# -- one-off GPU jobs --------------------------------------------------------
+#
+# Pre-labelling, evaluation and the speed check load a model onto the GPU. They
+# run in a spawned process like training does, so CUDA is never initialised in
+# the acquisition process and the memory is returned when the job ends.
+
+def prelabel_frames(model_path: str, dataset_path: str,
+                    frames: typing.Sequence[str]) -> typing.Dict[str, list]:
+    """Live-model predictions for these frames, parts below the gate absent."""
+    import numpy
+
+    from autotrainer.inference.keypoint.dataset import PoseDataset
+    from autotrainer.inference.keypoint.evaluate import match_parts, open_model, predict_with
+
+    dataset = PoseDataset.open(dataset_path)
+    model, gate = open_model(model_path, batch_size=1)
+    images = numpy.stack([dataset.image(frame) for frame in frames])
+    predicted, _ = match_parts(predict_with(model, images), model.body_parts, dataset.bodyparts)
+    points = predicted[..., :2].copy()
+    points[predicted[..., 2] < gate] = numpy.nan
+    return {frame: points[i].tolist() for i, frame in enumerate(frames)}
+
+
+def evaluate_models(dataset_path: str, model_paths: typing.Sequence[str]) -> typing.List[dict]:
+    """Score each model on the dataset's held-out frames; a failure is reported, not raised."""
+    from autotrainer.inference.keypoint.dataset import PoseDataset
+    from autotrainer.inference.keypoint.evaluate import evaluate_model
+
+    dataset = PoseDataset.open(dataset_path)
+    results = []
+    for path in model_paths:
+        try:
+            results.append(evaluate_model(path, dataset))
+        except Exception as err:  # noqa: BLE001 - shown in the table
+            results.append({"model": path, "error": f"{type(err).__name__}: {err}"})
+    return results
+
+
+def measure_model_speed(model_path: str) -> dict:
+    from autotrainer.inference.keypoint.evaluate import measure_speed
+    return measure_speed(model_path)
+
+
+def run_job(function, *args):
+    """Run one of the jobs above in a spawned process and return its result."""
+    import concurrent.futures
+    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=get_mp_ctx()) as pool:
+        return pool.submit(function, *args).result()
+
+
 # -- deploy history ---------------------------------------------------------
 
 def _read_history(models_root: str) -> typing.List[dict]:
@@ -159,6 +209,10 @@ class PoseTrainingModel(ObservableObject):
         self.result: dict = {}
         self.last_started: dict = {}
         self.log_lines: typing.List[str] = []
+
+    def is_ready(self) -> bool:
+        """Whether the GPU may be used now: no session is recording."""
+        return bool(self._is_ready())
 
     @property
     def state(self) -> TrainingState:
