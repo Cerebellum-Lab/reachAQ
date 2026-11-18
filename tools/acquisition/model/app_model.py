@@ -62,6 +62,7 @@ from autotrainer.core.interfaces import RecordingEndingReason, CaptureAnalysisRe
 from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
 from autotrainer.core.configuration import SystemConfigurationDumper, DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.multiproc import no_op_timer
+from autotrainer.core.simulation import is_simulation
 from autotrainer.core.logging import (
     get_verbose_logger,
     log_hardware_initialization,
@@ -11529,6 +11530,16 @@ class AppModel(ObservableObject):
                 # clock fits it used, and why anything is missing.
                 "latency": dict(self._latency_status),
             }
+            if is_simulation():
+                # Marks the session so simulated data is never taken for a recording.
+                out["simulation"] = {
+                    "enabled": True,
+                    "bus": os.environ.get("REACHAQ_SIM_BUS"),
+                    "backends": {
+                        "camera": "sim", "nidaq": "simulated",
+                        "laser": "simulated", "can": "emulation",
+                    },
+                }
         out = _metadata_without_nonfinite_numbers(out)
         json_path = Path(file_name + ".json")
         yaml_path = Path(file_name + ".yaml")

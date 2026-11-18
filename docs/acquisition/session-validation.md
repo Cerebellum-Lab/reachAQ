@@ -35,11 +35,17 @@ Current stable rule IDs:
 
 | Area | Rules |
 |---|---|
-| Publication | `session.layout`, `session.schema`, `session.generation`, `session.manifest`, `metadata.mirror` |
+| Publication | `session.layout`, `session.schema`, `session.generation`, `session.manifest`, `metadata.mirror`, `session.provenance` |
 | Sources/media | `sources.contract`, `camera.frames`, `camera.ledger` |
 | NI | `nidaq.continuity`, `nidaq.timing_graph`, `alignment.frames` |
 | Events | `events.alignment`, `events.frames`, `events.tones`, `events.laser`, `events.board_time`, `stim.evidence` |
 | Trials | `trials.lifecycle`, `trials.protocol` |
+
+`session.provenance` warns "simulated session: no hardware was recorded" when the
+session metadata carries a `simulation` block with `enabled` true, and passes
+("recorded on hardware backends") when it has none. Only a simulation run
+(`REACHAQ_SIMULATION=1`) writes the block, so a warning here means the data is not
+from hardware.
 
 `sources.contract` checks each file a source lists. Pose is recorded as one
 `raw2D_live.h5` per camera, and each missing one is named. Validator versions

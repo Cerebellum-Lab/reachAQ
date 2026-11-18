@@ -64,6 +64,7 @@ def validate_session(
         _generation_rule,
         _manifest_rule,
         _metadata_mirror_rule,
+        _provenance_rule,
         _source_contract_rule,
         _camera_rule,
         _camera_ledger_rule,
@@ -340,6 +341,20 @@ def _metadata_mirror_rule(context):
     return _result("metadata.mirror", status, f"JSON/YAML metadata semantic match: {status}")
 _metadata_mirror_rule.RULE_ID = "metadata.mirror"
 _metadata_mirror_rule.MINIMUM = ValidationProfile.FAST
+
+
+def _provenance_rule(context):
+    manifest = context.json("manifest.json")
+    metadata = context.json(manifest["authoritativeMetadata"])
+    simulation = metadata.get("simulation")
+    if isinstance(simulation, dict) and simulation.get("enabled") is True:
+        return _result(
+            "session.provenance", "warning",
+            "simulated session: no hardware was recorded",
+            observed=simulation,
+        )
+    return _result("session.provenance", "pass", "recorded on hardware backends")
+_provenance_rule.RULE_ID = "session.provenance"
 
 
 def _source_contract_rule(context):
