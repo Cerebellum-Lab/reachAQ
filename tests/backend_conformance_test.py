@@ -157,9 +157,9 @@ def spin_cam(monkeypatch):
             if faked:
                 # Later tests must find Spinnaker missing again, not this module bound to the fake.
                 sys.modules.pop(spinnaker_cam.__name__, None)
-        camera_package = sys.modules["autotrainer.video.camera"]
-        if getattr(camera_package, "spinnaker_cam", None) is spinnaker_cam:
-            delattr(camera_package, "spinnaker_cam")
+                camera_package = sys.modules["autotrainer.video.camera"]
+                if getattr(camera_package, "spinnaker_cam", None) is spinnaker_cam:
+                    delattr(camera_package, "spinnaker_cam")
 
 
 @pytest.fixture
