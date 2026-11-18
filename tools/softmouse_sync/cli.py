@@ -10,9 +10,6 @@ from pathlib import Path
 from tools.acquisition.model.softmouse_spreadsheet_source import (
     SoftMouseSpreadsheetSource,
 )
-from tools.acquisition.model.animal_metadata_sync import (
-    DEFAULT_SOFTMOUSE_PUBLICATION_DIRECTORY,
-)
 
 from .https_source import (
     SoftMouseCredentials,
@@ -24,28 +21,40 @@ from .publisher import SoftMouseExportPublisher
 
 DEFAULT_KEYRING_SERVICE = "reachAQ-softmouse-publisher"
 KEYRING_USERNAME_ACCOUNT = "__username__"
-ISILON_MOUNT_ROOT = Path("/mnt/isilon")
-DEFAULT_PUBLICATION_DIRECTORY = DEFAULT_SOFTMOUSE_PUBLICATION_DIRECTORY
 
 
 logger = logging.getLogger(__name__)
 
 
+def _preferred_publication() -> tuple[Path | None, Path | None]:
+    """The directory and mount the app's SoftMouse preferences name.
+
+    The directory is the one holding softmouse/manifest_path, so the publisher
+    writes where the app reads; the mount is softmouse/publication_mount.
+    Either is None when its preference is empty.
+    """
+    from tools.acquisition.model.user_preferences import UserPreferences
+
+    preferences = UserPreferences()
+    manifest = preferences.softmouse_manifest_path
+    mount = preferences.softmouse_publication_mount
+    return (Path(manifest).parent if manifest else None), (Path(mount) if mount else None)
+
+
 def _ensure_publication_directory(
-    destination: Path = DEFAULT_PUBLICATION_DIRECTORY,
+    destination: Path,
     *,
-    mount_root: Path = ISILON_MOUNT_ROOT,
+    mount_root: Path | None = None,
     is_mount=os.path.ismount,
 ) -> Path:
     destination = Path(destination)
-    mount_root = Path(mount_root)
-    if not is_mount(mount_root):
+    if mount_root is not None and not is_mount(Path(mount_root)):
         raise RuntimeError(
-            f"Isilon is not mounted at {mount_root}; publication stopped"
+            f"The publication mount {mount_root} is not mounted; publication stopped"
         )
     if not destination.parent.is_dir():
         raise RuntimeError(
-            f"Isilon publication parent does not exist: {destination.parent}"
+            f"Publication parent does not exist: {destination.parent}"
         )
     destination.mkdir(exist_ok=True)
     return destination
@@ -150,12 +159,24 @@ def main(argv=None) -> int:
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         )
     parser = argparse.ArgumentParser(
-        description="Publish the Christie SoftMouse active-animal export to Isilon"
+        description="Publish the Christie SoftMouse active-animal export to the shared publication directory"
     )
     parser.add_argument(
         "--setup",
         action="store_true",
         help="prompt once for the SoftMouse username and password",
+    )
+    parser.add_argument(
+        "--destination",
+        type=Path,
+        help="publication directory (default: the folder of the app's "
+             "softmouse/manifest_path preference)",
+    )
+    parser.add_argument(
+        "--require-mount",
+        type=Path,
+        help="refuse to publish unless this path is a mount point (default: "
+             "the softmouse/publication_mount preference; none when empty)",
     )
     parser.add_argument(
         "--configure-credentials",
@@ -179,7 +200,17 @@ def main(argv=None) -> int:
             return 0
 
         credentials = _credentials_from_keyring()
-        destination = _ensure_publication_directory()
+        destination, mount_root = args.destination, args.require_mount
+        if destination is None or mount_root is None:
+            preferred_destination, preferred_mount = _preferred_publication()
+            destination = destination or preferred_destination
+            mount_root = mount_root or preferred_mount
+        if destination is None:
+            raise RuntimeError(
+                "No SoftMouse publication directory is configured; set the "
+                "Shared publication preference or pass --destination"
+            )
+        destination = _ensure_publication_directory(destination, mount_root=mount_root)
         logger.info(
             "SoftMouse publication requested: colony=%s destination=%s",
             SoftMouseHttpsConfiguration().colony_name,

@@ -30,7 +30,8 @@ class SoftMousePublicationController(QObject):
         super().__init__(parent)
         self._app_model = app_model
         self._program = program or sys.executable
-        self._arguments = arguments or ("-m", "tools.softmouse_sync.cli")
+        # None: the publisher, pointed at this app's SoftMouse preferences.
+        self._arguments = arguments
         self._working_directory = Path(
             working_directory or Path(__file__).resolve().parents[3]
         )
@@ -77,7 +78,7 @@ class SoftMousePublicationController(QObject):
             self._set_status("SoftMouse sync is unavailable during recording")
             return False
         self._process.setProgram(self._program)
-        self._process.setArguments(list(self._arguments))
+        self._process.setArguments(list(self._arguments or self._publisher_arguments()))
         self._process.setWorkingDirectory(self._working_directory.as_posix())
         self._set_status("Starting SoftMouse sync…")
         logger.info(
@@ -88,6 +89,19 @@ class SoftMousePublicationController(QObject):
         self._process.start()
         self.running_changed.emit(True)
         return True
+
+    def _publisher_arguments(self) -> tuple[str, ...]:
+        # Passed explicitly so the publisher follows this app's preferences,
+        # including a -p preferences file it would not otherwise read.
+        preferences = self._app_model.preferences
+        arguments = ("-m", "tools.softmouse_sync.cli")
+        manifest = preferences.softmouse_manifest_path
+        if manifest:
+            arguments += ("--destination", Path(manifest).parent.as_posix())
+        mount = preferences.softmouse_publication_mount
+        if mount:
+            arguments += ("--require-mount", mount)
+        return arguments
 
     def _on_started(self) -> None:
         logger.info("SoftMouse publisher process started: pid=%s", self._process.processId())

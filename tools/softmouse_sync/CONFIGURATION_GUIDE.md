@@ -1,14 +1,17 @@
 # SoftMouse/RFID operator checklist
 
-The website paths, colony, export rules, and Isilon destination are built in.
-Only the SoftMouse username and password are entered by the operator.
+The website paths, colony and export rules are built in. The operator enters
+the SoftMouse username and password, and once per computer the lab's shared
+publication in **Preferences â†’ Animal metadata**: **Shared publication** (the
+manifest's path) and, when it is on a network mount, **Publication mount**. See
+the README's "Lab settings".
 
 ## Install once on every computer
 
 From the repository, run the normal reachAQ installer:
 
 ```bash
-cd /home/christielab10/Documents/reachAQ
+cd ~/Documents/reachAQ
 ./tools/install/reachaq-linux-install.sh
 ```
 
@@ -21,7 +24,7 @@ command. The final report should show `PASS` for **Verify SoftMouse runtime**,
 ## Every computer allowed to publish
 
 ```bash
-cd /home/christielab10/Documents/reachAQ
+cd ~/Documents/reachAQ
 conda activate reachaq
 python -m tools.softmouse_sync.cli --setup
 ```
@@ -30,10 +33,10 @@ Type the SoftMouse username and password at the prompts. Nothing appears while
 typing the password; that is normal. The operating system keyring stores both
 values. Repeat this command to replace either value.
 
-Confirm Isilon is mounted and test publication:
+Confirm the publication mount is mounted, then test publication:
 
 ```bash
-findmnt /mnt/isilon
+findmnt /path/to/the/mount
 python -m tools.softmouse_sync.cli
 ```
 

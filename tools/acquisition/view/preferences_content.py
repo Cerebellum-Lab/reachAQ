@@ -646,8 +646,27 @@ class PreferencesContent(QWidget):
         self._softmouse_manifest_edit.setText(
             self._preferences.softmouse_manifest_path
         )
-        self._softmouse_manifest_edit.setReadOnly(True)
+        self._softmouse_manifest_edit.setPlaceholderText(
+            "Not configured: the publication's .manifest.json"
+        )
+        self._softmouse_manifest_edit.editingFinished.connect(
+            lambda: self._set_animal_metadata_preference(
+                "softmouse_manifest_path", self._softmouse_manifest_edit.text()
+            )
+        )
         form.addRow("Shared publication:", self._softmouse_manifest_edit)
+        mount = self._softmouse_mount_edit = QLineEdit()
+        mount.setText(self._preferences.softmouse_publication_mount)
+        mount.setPlaceholderText("None: publish without a mount check")
+        mount.setToolTip(
+            "Sync from SoftMouse refuses to publish unless this path is mounted."
+        )
+        mount.editingFinished.connect(
+            lambda: self._set_animal_metadata_preference(
+                "softmouse_publication_mount", mount.text()
+            )
+        )
+        form.addRow("Publication mount:", mount)
 
         external = QLineEdit("Physical Tag")
         external.setReadOnly(True)
@@ -688,7 +707,9 @@ class PreferencesContent(QWidget):
             )
         )
         form.addRow("", nightly)
-        self._softmouse_editable_controls = (name_field, nightly)
+        self._softmouse_editable_controls = (
+            self._softmouse_manifest_edit, mount, name_field, nightly
+        )
 
         buttons = QHBoxLayout()
         self._softmouse_refresh_button = QPushButton("Refresh local cache")
@@ -705,7 +726,7 @@ class PreferencesContent(QWidget):
         self._softmouse_publish_button = QPushButton("Sync from SoftMouse")
         self._softmouse_publish_button.setToolTip(
             "Download the current Christie animal list, safely replace the shared "
-            "Isilon publication, and refresh this computer's local cache."
+            "publication, and refresh this computer's local cache."
         )
         self._softmouse_publish_button.clicked.connect(
             self._softmouse_publication_controller.start
@@ -804,6 +825,16 @@ class PreferencesContent(QWidget):
         self._softmouse_publish_button.setEnabled(enabled)
         for control in self._softmouse_editable_controls:
             control.setEnabled(enabled)
+
+    def _set_animal_metadata_preference(self, name, value):
+        if value.strip() == getattr(self._preferences, name):
+            return
+        try:
+            self._app_model.update_user_preference(name, value)
+        except Exception as exc:
+            self._softmouse_status.setText(f"Configuration failed: {exc}")
+            return
+        self._apply_animal_metadata_preferences()
 
     def _apply_animal_metadata_preferences(self):
         try:

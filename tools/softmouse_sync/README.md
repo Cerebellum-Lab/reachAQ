@@ -25,7 +25,7 @@ do not need a SoftMouse login.
 Run the repository's portable installer on every acquisition computer:
 
 ```bash
-cd /home/christielab10/Documents/reachAQ
+cd ~/Documents/reachAQ
 ./tools/install/reachaq-linux-install.sh
 ```
 
@@ -52,9 +52,22 @@ These values are built into the application and are not operator configuration:
 - Permanent external identity: `Physical Tag`
 - Default name for a newly created local animal: `Physical Tag`
 - Publication format: normalized CSV plus a JSON completion manifest
-- Shared directory: `/mnt/isilon/Data/ReachingData/SoftMouse`
-- Shared manifest:
-  `/mnt/isilon/Data/ReachingData/SoftMouse/SoftMouse-AnimalList-current.manifest.json`
+- Manifest file name: `SoftMouse-AnimalList-current.manifest.json`
+
+## Lab settings
+
+Where the publication lives belongs to the lab, so nothing is built in. Both
+are set in **Preferences â†’ Animal metadata** and kept in the user preferences
+file (`[softmouse]` section of `~/.config/Colorado/Auto Trainer.conf`):
+
+| Field | Preference | Empty means |
+|---|---|---|
+| Shared publication | `manifest_path`: the manifest's full path; the publisher writes into its folder | SoftMouse is "Not configured" and the publisher refuses to run |
+| Publication mount | `publication_mount`: a path that must be a mount point before anything is published | no mount check |
+
+The Christie lab's values are in [the reference rig's profile](../../docs/rigs/christielab10.md).
+`python -m tools.softmouse_sync.cli --destination DIR --require-mount PATH`
+overrides either for one run.
 
 The new-animal name field remains selectable in **Preferences → Animal
 metadata**. It supplies the editable default in the first-scan dialog;
@@ -66,7 +79,7 @@ From the repository in the reachAQ environment, run once on each machine that
 may publish:
 
 ```bash
-cd /home/christielab10/Documents/reachAQ
+cd ~/Documents/reachAQ
 conda activate reachaq
 python -m tools.softmouse_sync.cli --setup
 ```
@@ -114,7 +127,7 @@ meaning; it is not the systemd publication schedule.
 Run the following only on the designated publisher computer:
 
 ```bash
-cd /home/christielab10/Documents/reachAQ
+cd ~/Documents/reachAQ
 mkdir -p ~/.config/systemd/user
 cp tools/softmouse_sync/systemd/reachaq-softmouse-publisher.service \
   tools/softmouse_sync/systemd/reachaq-softmouse-publisher.timer \
@@ -128,8 +141,17 @@ The timer runs at midnight in `America/Denver`, allows up to two minutes of
 randomized delay, and is persistent. If the user timer was unavailable at
 midnight, systemd runs the missed job after it next starts. The tracked service
 uses `~/Documents/reachAQ`, finds the `reachaq` environment in the standard
-Anaconda, Miniconda, or Mambaforge locations, and requires `/mnt/isilon` to be
-mounted. Edit the installed unit's `WorkingDirectory` only when the checkout
+Anaconda, Miniconda, or Mambaforge locations, and reads the destination and
+mount guard from the preferences above. When the publication is on a network
+mount, add a drop-in so systemd waits for it
+(`systemctl --user edit reachaq-softmouse-publisher.service`):
+
+```ini
+[Unit]
+RequiresMountsFor=/path/to/the/mount
+```
+
+Edit the installed unit's `WorkingDirectory` only when the checkout
 uses a nonstandard path.
 
 Verify or run the installed job with:
@@ -234,8 +256,11 @@ publication.
   `sudo`.
 - **No credentials are stored:** rerun `python -m tools.softmouse_sync.cli
   --setup` on that computer.
-- **Isilon is not mounted:** restore `/mnt/isilon`; the publisher deliberately
-  will not create a look-alike local directory.
+- **The publication mount is not mounted:** restore the mount named by
+  **Publication mount**; the publisher deliberately will not create a
+  look-alike local directory.
+- **No SoftMouse publication directory is configured:** set **Shared
+  publication** in Preferences, or pass `--destination`.
 - **No valid RFID-tagged active animals:** add permanent 15-digit ISO 11784 RFID
   values to the active animals' SoftMouse `Plate ID` fields. The current publication is
   preserved.

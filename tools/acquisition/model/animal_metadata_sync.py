@@ -23,13 +23,10 @@ from .softmouse_spreadsheet_source import (
 logger = get_verbose_logger(__name__)
 
 
-DEFAULT_SOFTMOUSE_PUBLICATION_DIRECTORY = Path(
-    "/mnt/isilon/Data/ReachingData/SoftMouse"
-)
-DEFAULT_SOFTMOUSE_MANIFEST_PATH = (
-    DEFAULT_SOFTMOUSE_PUBLICATION_DIRECTORY
-    / "SoftMouse-AnimalList-current.manifest.json"
-)
+#: The manifest the publisher writes in its publication directory. Where that
+#: directory is belongs to the lab: the softmouse/manifest_path preference, empty
+#: (SoftMouse not configured) on a fresh install.
+SOFTMOUSE_MANIFEST_NAME = "SoftMouse-AnimalList-current.manifest.json"
 
 
 @dataclass(frozen=True)

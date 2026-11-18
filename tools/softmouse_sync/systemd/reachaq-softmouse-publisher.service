@@ -3,7 +3,9 @@ Description=Publish a complete SoftMouse animal export for reachAQ
 # Install this user unit on the single designated publisher computer only.
 After=network-online.target
 Wants=network-online.target
-RequiresMountsFor=/mnt/isilon
+# The destination and mount guard come from the app's SoftMouse preferences.
+# A lab whose publication is on a network mount adds RequiresMountsFor= for it
+# in a drop-in (systemctl --user edit reachaq-softmouse-publisher.service).
 
 [Service]
 Type=oneshot
