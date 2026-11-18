@@ -90,7 +90,7 @@ class PreferencesContent(QWidget):
         # slot of the object being destroyed, so a bound method here never
         # ran. The closed window then stayed subscribed, and the next
         # ready -> arming called it on deleted tabs and left Record stuck at
-        # arming (christielab10, 2026-10-02).
+        # arming (reference rig, 2026-10-02).
         app_model = self._app_model
         callback = self._session_status_callback
 

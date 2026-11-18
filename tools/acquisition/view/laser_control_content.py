@@ -90,7 +90,7 @@ _TRACE_SIGNALS_EXPLANATION = (
     "after their ports are assigned in Edit → Edit DAQ Ports."
 )
 # Sized so the whole Pulse page, every section open, fits the docked panel
-# (440 x 860 px on christielab10's 1920x1080 screen) with no scroll bar.
+# (440 x 860 px on the reference rig's 1920x1080 screen) with no scroll bar.
 _TRACE_PLOT_MINIMUM_HEIGHT = 140
 _TRIGGER_PLOT_HEIGHT = 76
 # Short enough for the Board trigger status line's two lines at the docked
@@ -169,7 +169,7 @@ class _RunPulsePress:
     The press arms the pulse and the click fires it (Ben, 2026-10-02,
     decision 1 = D): the click is then one start, its edge about 0.6 ms
     later, where arming, writing and starting it after the click took 12-18
-    ms (session004; christielab10, M3 B). The Qt thread has the press, the
+    ms (session004; the reference rig, M3 B). The Qt thread has the press, the
     click and the release; the laser_operation thread arms the pulse and
     waits for its end. Under one lock, exactly one of them fires it, and only
     after its click:
@@ -477,7 +477,7 @@ class _LaserChannelTab(QWidget):
         # Internal by default, even when the channel has a trigger route. This
         # used to switch to external whenever one was configured, so Run pulse
         # armed the output for a board STIM pulse that nothing on this tab
-        # sends, and failed with a DAQmx timeout (christielab10, 2026-09-24).
+        # sends, and failed with a DAQmx timeout (reference rig, 2026-09-24).
         # The route stays filled in for choosing external deliberately.
         self._trigger_source = QLineEdit(channel.trigger_source or "")
         self._trigger_source.setPlaceholderText("NI-DAQ trigger route")
@@ -578,7 +578,7 @@ class _LaserChannelTab(QWidget):
         self._ramp_steps.setValue(11)
         self._ramp_samples_per_step = QSpinBox()
         self._ramp_samples_per_step.setRange(1, 1000000)
-        # 5 ms at christielab10's 100 kHz: its slower diode was still rising
+        # 5 ms at the reference rig's 100 kHz: its slower diode was still rising
         # through the second half of a 1 ms step (H2b).
         self._ramp_samples_per_step.setValue(500)
         # Taken when the operator finishes typing, or leaves the field, not at
@@ -1625,7 +1625,7 @@ class LaserControlContent(ContentWidget):
         self.setObjectName("LaserControlContent")
         # One smaller font for the whole panel, set here rather than per
         # widget: at the application font the laser page needed a scroll
-        # bar in the docked panel (christielab10, 2026-09-24). Dialogs it
+        # bar in the docked panel (reference rig, 2026-09-24). Dialogs it
         # opens keep the application font.
         self.setStyleSheet(
             compact_font_style_sheet("LaserControlContent")
@@ -2196,7 +2196,7 @@ class LaserControlContent(ContentWidget):
             # The operation is why nothing can be fired, and the footer says
             # "Running ..." until its outcome. The first refusal found here
             # was an unmapped laser's, "Laser 3 has no hardware channel ..."
-            # on christielab10, and it replaced "Running ..." for the whole
+            # on the reference rig, and it replaced "Running ..." for the whole
             # operation.
             return
         # Nothing can be fired and the buttons alone do not say why, so the

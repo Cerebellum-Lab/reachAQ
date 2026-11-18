@@ -256,7 +256,7 @@ and `pulseClockLine`, from every laser `triggerSource` line and PXI_Trig
 `triggerRouteSource`, and from every `triggerListenerInputs` line; Run and the
 stream's own start, Idle's included, refuse a clash, once for each, and the DAQ
 Monitor lists it. The DAQ Monitor window's own stream is configured without the
-laser, so it refuses only one export line against the other. christielab10
+laser, so it refuses only one export line against the other. The reference rig
 keeps every input on the 6221 and sets neither field. This path is tested
 against a DAQmx stand-in only and is not yet verified on hardware.
 
@@ -266,7 +266,7 @@ only picks a saved profile or the builder's unsaved draft and fires it.
 
 Laser Control uses a smaller font (7.5 pt, graph axes 7 pt) so that each
 page fits the docked right-side panel without scrolling; the dialogs it opens
-keep the application font. On christielab10 that panel is 440 x 860 px. Each
+keep the application font. On the reference rig that panel is 440 x 860 px. Each
 channel has **Pulse** and **Calibration** tabs.
 The panel's footer shows its status and, in red, every error or refusal it
 reports: Run Pulse, Test stim, Run Ramp, a profile no longer saved, a Pulse

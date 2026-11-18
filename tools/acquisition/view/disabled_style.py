@@ -1,7 +1,7 @@
 """Make disabled controls obvious without changing any control's size.
 
 Under Fusion a disabled button, field or box looked almost the same as an
-enabled one (Ben, christielab10, 2026-10-02). A style sheet rule for
+enabled one (Ben, the reference rig, 2026-10-02). A style sheet rule for
 :disabled would replace Fusion's frame with a box model of its own and can
 change a control's size as it is enabled and disabled, which moves the tightly
 fitted Laser Control layout. This draws on top of Fusion instead: a dashed grey

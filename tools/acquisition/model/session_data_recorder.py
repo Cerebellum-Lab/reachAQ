@@ -72,7 +72,7 @@ _PRESSURE_FIELDS = (
 )
 
 # Threads that deflate nidaq.h5's chunks. Deflated one chunk at a time inside
-# h5py, a 45-minute session's 27M samples took 17 s of Stop on christielab10;
+# h5py, a 45-minute session's 27M samples took 17 s of Stop on the reference rig;
 # on eight threads it took under 3 s.
 _NIDAQ_DEFLATE_THREADS = 8
 
@@ -2640,7 +2640,7 @@ class SessionDataRecorder:
         diagnostics["endCoverageMissingSeconds"] = last_missing
         # The saved samples are the ones inside the boundary, so the first can
         # fall up to one sample period after it, and the last one period
-        # before, with none lost: 88 us at 10 kHz on christielab10 on
+        # before, with none lost: 88 us at 10 kHz on the reference rig on
         # 2026-09-24 was reported as missing coverage. perf_time advances by
         # exactly one period per sample, so a gap of a period or more is a
         # sample that is not there.

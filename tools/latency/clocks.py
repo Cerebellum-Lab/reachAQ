@@ -34,7 +34,7 @@ FALSE_ALARM_PROBABILITY = 1e-6
 # NI-to-host is fitted window by window, joined at the knots, because the
 # host clock is slewed by NTP: timesyncd polls every 2048 s and the kernel
 # steps the rate by up to about 6.5 ppm, decaying over 512 s. Simulated on
-# christielab10's settings (ntp/pll_sim.py, 2026-10-07): one line per session
+# The reference rig's settings (ntp/pll_sim.py, 2026-10-07): one line per session
 # leaves p95 errors of 1.9-4.3 ms at 1 h; 120 s windows leave under 0.4 ms.
 # A window with fewer envelope points than MIN_WINDOW_POINTS (a short tail, a
 # gap) merges into its neighbour rather than fitting noise.
@@ -59,7 +59,7 @@ PIECEWISE_LINE = "piecewise_line"
 BRIDGE_WINDOW_SECONDS = 1.0
 BRIDGE_TAIL_SECONDS = 5.0
 BRIDGE_MIN_RAW_COVERAGE = 0.9
-# A camera clock latch is one USB round trip: christielab10's BFS-U3-16S2M
+# A camera clock latch is one USB round trip: the reference rig's BFS-U3-16S2M
 # brackets it in 0.14-0.58 ms inside the running app (60 latches, median
 # 0.27 ms) and in about 0.20 ms with the app closed; the widest in the
 # 2026-11-03 sweep was 1.78 ms. No width is refused: fit_latches fits through
@@ -76,7 +76,7 @@ LATCH_WINDOW_SECONDS = 30.0
 # camera's own stamp offset, minus the exposure, and a bias of whole periods or
 # whole NI reads moves it by milliseconds. That residual gate is the safeguard
 # against whole-period mispairing, because a bias of whole periods plus a
-# little passes a quarter-period test: christielab10's NI stamps, paired with
+# little passes a quarter-period test: the reference rig's NI stamps, paired with
 # their own blocks, put the edges 16.6 ms early and 50 fps paired a frame off
 # with a 3.39 ms residual; at 200 Hz display refresh (50-sample NI reads) the
 # fit ran a read late before block_newest_read_start_index and 150 fps paired
@@ -184,7 +184,7 @@ def rising_edges(values, *, min_swing: float) -> EdgeResult:
 
     Laser pulses are sparse, so the baseline is the median and the peak the
     maximum. A channel whose swing is not well clear of its own noise - a
-    floating input such as christielab10's laser-1 diode - is reported
+    floating input such as the reference rig's laser-1 diode - is reported
     unusable rather than producing edges from noise.
     """
     values = numpy.asarray(values, dtype=numpy.float64)
@@ -252,7 +252,7 @@ def block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends=None,
     run's end. Paired with that end instead, every stamp is a read loose, and
     with reads under half the copy interval (display refresh of 200 Hz or more)
     every copy holds two: the fit then maps NI times a whole read late
-    (christielab10 loopback, 2026-11-12: 4.4-5.2 ms against 0.19-0.20 ms).
+    (reference rig loopback, 2026-11-12: 4.4-5.2 ms against 0.19-0.20 ms).
     newest_read_at_ends, each run's newest read's first sample index
     (block_newest_read_start_index), pairs each stamp with the sample before
     it, or with the previous run's end where that is later. Without it, or
@@ -332,7 +332,7 @@ def fit_ni_to_host(end_index, seen_perf, sample_rate: float) -> ClockFit:
     session trace the clock relation with only their minimum left in it, which
     makes every mapped time late by about that much: the delivery floor, which
     a rig's NI delivery calibration measures by loopback (0.19-0.28 ms on
-    christielab10 at NI reads of 42-167 samples, 2026-11-13).
+    the reference rig at NI reads of 42-167 samples, 2026-11-13).
 
     A copy spans two reads or more when reads are under the 10 ms copy period
     (display refresh, which sets the NI read size, of 100 Hz or more). Paired

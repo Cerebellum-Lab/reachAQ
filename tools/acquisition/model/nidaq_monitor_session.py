@@ -206,7 +206,7 @@ class NidaqMonitorSession(ObservableObject):
         """Start the clocked half of the survey.
 
         The static tasks are closed first, and that is not tidiness. Measured
-        on christielab10: with three DI tasks open in this process, spawning
+        on the reference rig: with three DI tasks open in this process, spawning
         the stream worker fails at its first subprocess with "[Errno 14] Bad
         address" naming the Python executable, and with the same tasks closed
         the identical call starts and streams. The cause is somewhere in the

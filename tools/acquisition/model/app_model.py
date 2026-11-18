@@ -327,7 +327,7 @@ _DAQ_PORTS_UPDATE = "DAQ ports update"
 _LASER_CALIBRATION = "laser calibration"
 _LASER_CALIBRATION_REASON = "a laser calibration ramp is running"
 #: How long Record waits for a protocol check another thread is running. A
-#: check of 5000 rows took 0.45 s on christielab10's E-cores; the default
+#: check of 5000 rows took 0.45 s on the reference rig's E-cores; the default
 #: protocol has 15.
 _PROTOCOL_CHECK_RECORD_WAIT_S = 2.0
 #: How much longer than the ramp's own timeout closing waits for it.
@@ -5696,7 +5696,7 @@ class AppModel(ObservableObject):
             # algorithm's thread without waiting, and the relay returns
             # nothing. Wait for this one, so the state below says whether
             # the SEND was taken: unwaited, every protocol Send was failed
-            # here before that thread ran it (christielab10, 2026-10-02).
+            # here before that thread ran it (reference rig, 2026-10-02).
             with BehaviorAlgorithm.set_put_func_call_mode(True):
                 self._behavior.system_machine.pellet.send_pellet(force=force)
             if operation.state is PreparedState.PREPARED:
@@ -5855,7 +5855,7 @@ class AppModel(ObservableObject):
                 raise RuntimeError(
                     "Pre-reveal stimulation requires the pellet cover policy Reveal"
                 )
-            # The laser's own board line: laser 2 on christielab10 is wired
+            # The laser's own board line: laser 2 on the reference rig is wired
             # to STIM2, and a board pulse on STIM3 never triggered it.
             self._behavior.system_machine.pellet.prepare_pre_reveal_stimulus(
                 row["pre_reveal_ms"],
@@ -9019,7 +9019,7 @@ class AppModel(ObservableObject):
         # several steps can raise. A load that stops part-way leaves the cameras
         # on the new configuration and the rest on the old, and save_configuration
         # builds what it writes from those live objects. On 2026-09-17 exactly
-        # that wrote a demo run's playback cameras over christielab10's real
+        # that wrote a demo run's playback cameras over the reference rig's real
         # ones. So nothing may be saved until this load reaches its last line.
         self._configuration_load_incomplete = True
         if location is None:
@@ -9287,7 +9287,7 @@ class AppModel(ObservableObject):
         # Back to the file it was loaded from. The preferences location is only
         # where the application looks when no file is named; saving there meant
         # a run started with -c on a copy overwrote the real configuration on
-        # exit, which on christielab10 wrote a test run's settings into
+        # exit, which on the reference rig wrote a test run's settings into
         # ~/Autotrainer on 2026-09-16.
         loc = self._loaded_configuration_path
         logger.info("Saving configuration to %s", loc)

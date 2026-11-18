@@ -413,8 +413,8 @@ def inspect_configuration(configuration):
 
 
 #: A laser's board-trigger readback: laserN_trigger, as the channel plan
-#: names it, or laserN_trigger_readback, the custom channel christielab10
-#: acquires it as (tests/christielab10_nidaq_blocks.yaml).
+#: names it, or laserN_trigger_readback, the custom channel the reference rig
+#: acquires it as (the NI block fixture under tests/).
 _TRIGGER_READBACK = re.compile(r"laser\d+_trigger(?:_readback)?")
 #: What a trigger readback's check says when nothing here confirmed it.
 TRIGGER_READBACK_NOT_CHECKED = (

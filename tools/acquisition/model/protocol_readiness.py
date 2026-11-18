@@ -467,7 +467,7 @@ def _warnings(firing_rows, configuration, laser_profiles, live) -> List[Readines
         readback = channel.trigger_monitor_input
         if not readback:
             # A custom NI-DAQ channel may record the edge all the same, as
-            # christielab10's laser1_trigger_readback on port0/line6 does;
+            # The reference rig's laser1_trigger_readback on port0/line6 does;
             # nothing ties it to the laser, so the warning must not say the
             # edge goes unrecorded.
             messages.append(

@@ -13,7 +13,7 @@ load with the reason rather than at run with an error code.
 
 One distinction here was measured rather than assumed. DAQmx will not
 *reserve* a backplane trigger line without an identified chassis, but a line
-driven by name works regardless: on christielab10, with the chassis reading
+driven by name works regardless: on the reference rig, with the chassis reading
 4294967295, `connect_terms("/PXI1Slot5/PFI0", "/PXI1Slot5/PXI_Trig0")` and
 arming the far board on its own `/PXI1Slot4/PXI_Trig0` carried the trigger and
 fired the waveform. So an unidentified chassis does not make cross-device

@@ -1,7 +1,7 @@
 """python-can's per-frame logging, off unless asked for.
 
 python-can logs every frame it receives (level 9 on "can.bus") and every frame
-it sends (the socketcan "tx" logger, at DEBUG). On christielab10 that was about
+it sends (the socketcan "tx" logger, at DEBUG). On the reference rig that was about
 270 records a second, each formatted and pickled into the log queue on the CAN
 reader thread. Holding the "can" logger at WARNING also quiets python-can's few
 open and close INFO/DEBUG lines; its warnings still pass. The application's own

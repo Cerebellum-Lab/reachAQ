@@ -517,7 +517,7 @@ install_tensorflow_gpu_runtime() {
     # TensorFlow 2.12 needs CUDA 11.8 and cuDNN 8.6; PyTorch brings CUDA 12 and
     # cuDNN 9. Both arrive as nvidia-* wheels that install into the same
     # site-packages/nvidia directory, so the second install overwrote the
-    # first: on christielab10 libcudnn.so.8 was gone and TensorFlow fell back
+    # first: on the reference rig libcudnn.so.8 was gone and TensorFlow fell back
     # to the CPU without a word. The libraries themselves differ by soname
     # (libcudnn.so.8 and .9, libcublas.so.11 and .12), so TensorFlow's set goes
     # in a directory of its own, reached only through LD_LIBRARY_PATH, and
