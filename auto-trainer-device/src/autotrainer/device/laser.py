@@ -753,16 +753,36 @@ def make_laser_controller(
     timing_plan=None,
     analog_terminal_config: Optional[str] = None,
     hardware_class=None,
+    isolate: Optional[bool] = None,
+    on_fault=None,
 ) -> LaserControllerProtocol:
     """The controller `configuration`'s backend names; the simulated one for NI in a simulation run.
 
+    An NI laser, real or simulated, is opened in a laser process of its own
+    (laser_process.LaserProcessController), which drives it safe when this
+    process dies or hangs; `on_fault` is told why that process failed.
+    `isolate` False opens it here instead, as the laser process itself does;
+    None follows laser_process.isolation_enabled().
+
     `hardware_class` lets a call site pass the NI class it imported, so tests
-    that patch that module attribute keep patching what is constructed.
+    that patch that module attribute keep patching what is constructed. It
+    applies to a controller opened here only.
     """
     backend = configuration.backend
     if backend == "null":
         return NullLaserController(configuration)
     if backend == "nidaq":
+        from . import laser_process
+        if isolate is None:
+            isolate = laser_process.isolation_enabled()
+        if isolate:
+            return laser_process.LaserProcessController(
+                configuration,
+                feedback_reader=feedback_reader,
+                timing_plan=timing_plan,
+                analog_terminal_config=analog_terminal_config,
+                on_fault=on_fault,
+            )
         if is_simulation():
             return SimulatedLaserController(configuration)
         if hardware_class is None:
