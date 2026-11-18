@@ -9,8 +9,9 @@ asked, or to every client if that one has gone.
 import queue
 import socket
 import socketserver
+import sys
 import threading
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, Optional, Set
 
 from ..logging import get_verbose_logger
 from .commands import (
@@ -81,7 +82,9 @@ class _Client:
 
 class _Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # Rebinding after a restart needs SO_REUSEADDR on Linux; on Windows the same
+    # flag lets a second instance bind the port too, so it stays off there.
+    allow_reuse_address = sys.platform != "win32"
 
     def __init__(self, address, service: "RpcService"):
         self.service = service
@@ -107,8 +110,7 @@ class _Handler(socketserver.StreamRequestHandler):
                     break
                 if not line.strip():
                     continue
-                for reply in service._handle_line(line, client):
-                    client.send(reply)
+                service._handle_line(line, client)
         except OSError:
             pass
         finally:
@@ -225,17 +227,19 @@ class RpcService:
                 del self._pending[nonce]
         logger.info("Local API client disconnected: %s", client.address)
 
-    def _handle_line(self, line: bytes, client: _Client) -> List[bytes]:
+    def _handle_line(self, line: bytes, client: _Client) -> None:
         try:
             request = decode_request(line)
         except RequestDecodeError as err:
-            return [encode_response(_error_response(
-                err.nonce, err.command, ApiCommandRequestResult.UNRECOGNIZED, str(err)))]
+            client.send(encode_response(_error_response(
+                err.nonce, err.command, ApiCommandRequestResult.UNRECOGNIZED, str(err))))
+            return
         delegate = self.command_request_delegate
         if delegate is None:
-            return [encode_response(_error_response(
+            client.send(encode_response(_error_response(
                 request.nonce, request.command, ApiCommandRequestResult.FAILED,
-                "the application is not accepting commands", ApiCommandRequestErrorKind.SYSTEM_ERROR))]
+                "the application is not accepting commands", ApiCommandRequestErrorKind.SYSTEM_ERROR)))
+            return
         nonce = request.nonce
         if nonce is not None:
             # Registered before the delegate runs: an asynchronous command may
@@ -250,16 +254,21 @@ class RpcService:
             response = _error_response(
                 nonce, request.command, ApiCommandRequestResult.EXCEPTION,
                 f"{type(err).__name__}: {err}", ApiCommandRequestErrorKind.SYSTEM_ERROR)
-        replies = [encode_response(response)]
-        if nonce is not None:
-            with self._lock:
-                entry = self._pending.get(nonce)
-                if entry is not None and entry[0] is client:
-                    deferred, entry[1] = entry[1], None
-                    replies.extend(deferred)
-                    if deferred or response.result != ApiCommandRequestResult.PENDING_WITH_NOTIFICATION:
-                        del self._pending[nonce]
-        return replies
+        first = encode_response(response)
+        if nonce is None:
+            client.send(first)
+            return
+        # Queued under the lock (send never blocks), so a final response that
+        # send_command_result produces meanwhile cannot overtake this one.
+        with self._lock:
+            client.send(first)
+            entry = self._pending.get(nonce)
+            if entry is not None and entry[0] is client:
+                deferred, entry[1] = entry[1], None
+                for line_out in deferred:
+                    client.send(line_out)
+                if deferred or response.result != ApiCommandRequestResult.PENDING_WITH_NOTIFICATION:
+                    del self._pending[nonce]
 
 
 def create_api_service(options: ApiOptions) -> Optional[RpcService]:

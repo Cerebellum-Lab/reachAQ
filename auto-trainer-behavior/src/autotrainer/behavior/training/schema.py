@@ -155,8 +155,8 @@ class PhaseDocument:
     advance: Optional[Predicate]
     fallback: Optional[Predicate]
     trial_actions: Tuple[TrialAction, ...]
-    # Hash of the phase's source object: saved progress for a phase whose
-    # content has changed since is out of date.
+    # Hash of the phase's rules and actions: saved progress for a phase whose
+    # behaviour has changed since is out of date.
     fingerprint: str
 
 
@@ -211,8 +211,10 @@ def _parse_phase(raw: Any, where: str) -> PhaseDocument:
         advance=_parse_optional_predicate(raw.get("advance"), f"{where}.advance"),
         fallback=_parse_optional_predicate(raw.get("fallback"), f"{where}.fallback"),
         trial_actions=actions,
-        fingerprint=hashlib.sha256(
-            json.dumps(raw, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16],
+        # Renaming or rewording a phase does not make saved progress out of date.
+        fingerprint=hashlib.sha256(json.dumps(
+            {k: v for k, v in raw.items() if k not in ("name", "description")},
+            sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16],
     )
 
 

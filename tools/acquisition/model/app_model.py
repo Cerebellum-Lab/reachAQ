@@ -1,3 +1,4 @@
+import contextlib
 import csv
 import ctypes
 import dataclasses
@@ -816,6 +817,7 @@ class AppModel(ObservableObject):
             Path(preferences.configuration_location).expanduser() / "training_plans"
         )
         self._training_pause_timer: Optional[threading.Timer] = None
+        self._training_pause_lock = threading.RLock()
         self._training_offset_warned = False
         self._training_plan: Optional[TrainingPlan] = None
         self._training_plan_animal: Optional[AnimalSubject] = None
@@ -6313,49 +6315,53 @@ class AppModel(ObservableObject):
 
     def _on_training_trial_recorded(self, attempt_label: str) -> None:
         """Hold automatic SENDs for the current phase's between-trials pause."""
-        self._clear_training_pause()
         directive = self._protocol_runner.next_trial_directive(
             f"{self._protocol_session_seed}:after:{attempt_label}"
         )
-        if directive is None or directive.pause_seconds <= 0.0:
-            return
-        self._send_block_reasons.set(
-            TRAINING_PAUSE_BLOCK_NAME,
-            f"training plan pause {directive.pause_seconds:.1f} s",
-        )
+
         def release():
             # A timer cancelled too late must not release a newer pause.
-            if self._training_pause_timer is timer:
-                self._clear_training_pause()
+            with self._training_pause_lock:
+                if self._training_pause_timer is timer:
+                    self._clear_training_pause()
 
-        timer = threading.Timer(directive.pause_seconds, release)
-        timer.daemon = True
-        self._training_pause_timer = timer
-        timer.start()
+        with self._training_pause_lock:
+            self._clear_training_pause()
+            if directive is None or directive.pause_seconds <= 0.0:
+                return
+            self._send_block_reasons.set(
+                TRAINING_PAUSE_BLOCK_NAME,
+                f"training plan pause {directive.pause_seconds:.1f} s",
+            )
+            timer = threading.Timer(directive.pause_seconds, release)
+            timer.daemon = True
+            self._training_pause_timer = timer
+            timer.start()
         logger.info("Training plan %s phase %s: pausing %.3f s before the next automatic SEND",
                     directive.plan_id, directive.phase_id, directive.pause_seconds)
 
     def _clear_training_pause(self) -> None:
-        timer, self._training_pause_timer = self._training_pause_timer, None
-        if timer is not None:
-            timer.cancel()
-        self._send_block_reasons.clear(TRAINING_PAUSE_BLOCK_NAME)
+        with self._training_pause_lock:
+            timer, self._training_pause_timer = self._training_pause_timer, None
+            if timer is not None:
+                timer.cancel()
+            self._send_block_reasons.clear(TRAINING_PAUSE_BLOCK_NAME)
 
     def _guard_protocol_send(self) -> None:
-        self._apply_training_send_actions()
         if (
-            self._selected_ordered_protocol is None
-            or not self._behavior.algorithm.is_in_session
+            self._selected_ordered_protocol is not None
+            and self._behavior.algorithm.is_in_session
         ):
-            return
-        token = self._recording_session.token()
-        operation = self._trial_action_executor.operation
-        if token is None or operation is None:
-            raise RuntimeError("Ordered protocol SEND has not been prepared")
-        self._trial_action_executor.require_send_permission(
-            operation.recipe.operation_id,
-            token.generation,
-        )
+            token = self._recording_session.token()
+            operation = self._trial_action_executor.operation
+            if token is None or operation is None:
+                raise RuntimeError("Ordered protocol SEND has not been prepared")
+            self._trial_action_executor.require_send_permission(
+                operation.recipe.operation_id,
+                token.generation,
+            )
+        # Only once the SEND is allowed: no cue without a pellet.
+        self._apply_training_send_actions()
 
     def _cancel_protocol_operation(
         self,
@@ -9382,7 +9388,10 @@ class AppModel(ObservableObject):
         # ~/Autotrainer on 2026-09-16.
         loc = self._loaded_configuration_path
         logger.info("Saving configuration to %s", loc)
-        conf = self._create_configuration()
+        # A training phase's device settings are not the operator's configuration.
+        plan = self._attached_plan
+        with contextlib.nullcontext() if plan is None else plan.device_settings_restored():
+            conf = self._create_configuration()
         conf.save_file(loc, as_yaml=True)
 
     @_serialized_session_configuration

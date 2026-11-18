@@ -8,6 +8,7 @@ gives a ``TrialDirective``: the pellet-target offset, tone and pause its trial
 actions call for.
 """
 
+import contextlib
 import dataclasses
 import enum
 import hashlib
@@ -380,6 +381,7 @@ class TrainingPlan(ObservableObject):
         self._algorithm = None
         self._pellet_device = None
         self._saved_device: Dict[str, bool] = {}
+        self._applied_device: Dict[str, bool] = {}
 
     def __repr__(self):
         return f"TrainingPlan({self.plan_id!r})"
@@ -440,18 +442,33 @@ class TrainingPlan(ObservableObject):
         self._algorithm = algorithm
         self._pellet_device = pellet_device
         self._saved_device = {}
+        self._applied_device = {}
         self._apply_device(self.current_phase)
 
     def detach(self) -> None:
         if self.current_phase is not None:
             self.current_phase.progress.progress_paused()
-        algorithm = self._algorithm
-        if algorithm is not None:
-            for attribute, value in self._saved_device.items():
-                setattr(algorithm, attribute, value)
-        self._saved_device = {}
+        self._restore_device(set(self._applied_device))
         self._algorithm = None
         self._pellet_device = None
+
+    @contextlib.contextmanager
+    def device_settings_restored(self):
+        """The configuration's own device values for the duration, e.g. while
+        the configuration is saved, then the phase's values again."""
+        applied = dict(self._applied_device)
+        algorithm = self._algorithm
+        if algorithm is None or not applied:
+            yield
+            return
+        saved = dict(self._saved_device)
+        for attribute in applied:
+            setattr(algorithm, attribute, saved[attribute])
+        try:
+            yield
+        finally:
+            for attribute, value in applied.items():
+                setattr(algorithm, attribute, value)
 
     @property
     def pellet_device(self):
@@ -471,15 +488,31 @@ class TrainingPlan(ObservableObject):
         if algorithm is None or phase is None:
             return
         device: DeviceSettings = phase.document.device
-        for attribute, value in (
-            ("pellet_delivery_enabled", device.pellet_delivery),
-            ("pellet_cover_enabled", device.pellet_cover),
-            ("intersession_pellet_shift_enabled", device.pellet_shift),
-        ):
-            if value is None:
-                continue
+        wanted = {
+            attribute: value
+            for attribute, value in (
+                ("pellet_delivery_enabled", device.pellet_delivery),
+                ("pellet_cover_enabled", device.pellet_cover),
+                ("intersession_pellet_shift_enabled", device.pellet_shift),
+            )
+            if value is not None
+        }
+        # A setting the previous phase set and this one leaves out goes back
+        # to the configuration's value.
+        self._restore_device(set(self._applied_device) - set(wanted))
+        for attribute, value in wanted.items():
             self._saved_device.setdefault(attribute, getattr(algorithm, attribute))
             setattr(algorithm, attribute, value)
+            self._applied_device[attribute] = value
+
+    def _restore_device(self, attributes) -> None:
+        algorithm = self._algorithm
+        for attribute in attributes:
+            applied = self._applied_device.pop(attribute)
+            saved = self._saved_device.pop(attribute)
+            # An operator change made since the plan set it wins.
+            if algorithm is not None and getattr(algorithm, attribute) == applied:
+                setattr(algorithm, attribute, saved)
 
     # Trials.
 
@@ -541,7 +574,7 @@ class TrainingPlan(ObservableObject):
     def deserialize_progress(self, record: Dict[str, Any], *, force_update: bool = False) -> LoadProgressResult:
         try:
             parsed = self._parse_progress(record)
-        except (KeyError, TypeError, ValueError) as err:
+        except (AttributeError, KeyError, TypeError, ValueError) as err:
             logger.warning("%s: unreadable progress (%s)", self.plan_id, err)
             if not force_update:
                 return LoadProgressResult.UNKNOWN_ERROR

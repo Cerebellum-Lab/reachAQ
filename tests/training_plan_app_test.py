@@ -4,6 +4,8 @@ import time
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from autotrainer.behavior.pellet_trial import TrialOutcome
 from autotrainer.behavior.training import TrainingPlan, parse_plan
 from autotrainer.core.animal.animal_subject import AnimalSubject
@@ -113,3 +115,14 @@ def test_no_plan_means_no_send_actions(app_model):
 def test_configuration_brings_its_own_plan_directory(app_model):
     assert app_model.load_configuration() is True
     assert app_model._plan_repo.root == app_model._loaded_config_dir_path / "training_plans"
+
+
+def test_tone_waits_for_the_send_to_be_allowed(app_model, tmp_path):
+    _recording_token(app_model, tmp_path)  # ordered protocol selected, nothing prepared
+    _attach(app_model, _plan([{"action": "tone", "frequencyHz": 4000, "durationMs": 200}]))
+    with mock.patch.object(app_model._behavior.algorithm.__class__, "is_in_session",
+                           new_callable=mock.PropertyMock, return_value=True), \
+            mock.patch.object(app_model._hardware, "play_tone") as play:
+        with pytest.raises(RuntimeError, match="not been prepared"):
+            app_model._guard_protocol_send()
+    play.assert_not_called()

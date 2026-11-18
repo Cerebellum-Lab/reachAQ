@@ -78,7 +78,7 @@ class PlanRepository:
             try:
                 with path.open("r", encoding="utf-8") as fh:
                     document = parse_plan(json.load(fh), source=path.name)
-            except (OSError, json.JSONDecodeError, PlanFormatError) as err:
+            except (OSError, ValueError) as err:  # incl. bad JSON, bad UTF-8, PlanFormatError
                 raise PlanFormatError(f"{path}: {err}") from None
             if document.plan_id in paths:
                 raise PlanFormatError(

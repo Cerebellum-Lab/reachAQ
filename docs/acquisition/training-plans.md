@@ -44,8 +44,10 @@ The full schema is in the docstring of `training/schema.py`. In short:
 
 - **device**: optional settings applied when the phase becomes current:
   `pelletDelivery`, `pelletCover`, `pelletShift` (between-trial pellet shift).
-  A missing key leaves the configuration's value. The values are restored when
-  the plan is detached. `sendOffset` is a DCS offset in mm from the subject's
+  A missing key leaves the configuration's value, also when an earlier phase
+  set it. The configuration's values come back when the plan is detached
+  (unless the operator changed the setting meanwhile), and saving the
+  configuration while a plan is attached saves them, not the phase's. `sendOffset` is a DCS offset in mm from the subject's
   pellet target.
 - **advance / fallback**: predicates over the current visit to the phase. A
   condition is `{"metric", "op", "value"}`; combine with `{"all": [...]}` or
@@ -61,7 +63,8 @@ The full schema is in the docstring of `training/schema.py`. In short:
   - `jitterPelletTarget`: a uniform random offset within `±x/y/z` per trial,
     seeded from the session seed, trial and attempt, so a session is
     reproducible.
-  - `tone`: played on the pellet board right before every SEND.
+  - `tone`: played on the pellet board right before every SEND, once the SEND
+    is allowed.
   - `pause`: holds automatic SENDs for a fixed (`seconds`) or random
     (`minSeconds`-`maxSeconds`) time after each counted trial. A forced manual
     SEND is not held.
@@ -69,7 +72,8 @@ The full schema is in the docstring of `training/schema.py`. In short:
 Pellet-target offsets (`sendOffset`, move, jitter) are applied through an
 ordered protocol's compiled trial, where they add to the base and lane target
 and are recorded in the trial's position evidence (`training_offset_dcs`,
-`training_directive`). A reach-derived automatic target is used as computed.
+`training_directive`). A reach-derived automatic target is used as computed,
+and its evidence says `training_offset_applied: false`.
 Without an ordered protocol a SEND uses the current pellet position, and the
 application logs a warning once.
 
@@ -89,5 +93,6 @@ and the number of visits are kept and shown in the progress panel.
 Progress is saved in the animal file under `training.protocolProgress`, one
 record per plan (`plan_id`, `progressVersion` 1, state, current phase, and each
 phase's visit counters, attempts, lifetime totals and a content fingerprint). If
-a phase's definition has changed since the progress was saved, loading reports
+a phase's rules, device settings or actions have changed since the progress was
+saved (renaming or rewording it does not count), loading reports
 it as out of date; confirming resets that phase's progress and keeps the rest.

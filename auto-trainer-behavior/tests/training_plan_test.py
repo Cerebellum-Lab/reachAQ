@@ -253,3 +253,60 @@ def test_repository_loads_fresh_plans_and_refuses_duplicates(tmp_path):
 def test_repository_without_a_directory_is_empty(tmp_path):
     assert PlanRepository().get_plans() == []
     assert PlanRepository(tmp_path / "missing").get_plans() == []
+
+
+def test_a_setting_the_next_phase_omits_returns_to_the_configuration(plan):
+    algorithm = FakeAlgorithm()
+    plan.attach(algorithm, object(), None)
+    plan.advance()  # phase 2 sets only pelletCover
+    assert algorithm.pellet_cover_enabled is True
+    assert algorithm.pellet_delivery_enabled is False  # phase 1's True reverted
+    assert algorithm.intersession_pellet_shift_enabled is True
+
+
+def test_an_operator_change_survives_detach(plan):
+    algorithm = FakeAlgorithm()
+    plan.attach(algorithm, object(), None)
+    algorithm.pellet_delivery_enabled = False  # operator toggled it off again
+    algorithm.intersession_pellet_shift_enabled = True
+    plan.detach()
+    assert algorithm.pellet_delivery_enabled is False
+    assert algorithm.intersession_pellet_shift_enabled is True
+
+
+def test_configuration_values_are_visible_while_saving(plan):
+    algorithm = FakeAlgorithm()
+    plan.attach(algorithm, object(), None)
+    with plan.device_settings_restored():
+        assert algorithm.pellet_delivery_enabled is False
+        assert algorithm.intersession_pellet_shift_enabled is True
+    assert algorithm.pellet_delivery_enabled is True
+    assert algorithm.intersession_pellet_shift_enabled is False
+    with TrainingPlan(parse_plan(_document())).device_settings_restored():
+        pass  # not attached: nothing to do
+
+
+def test_rewording_a_phase_keeps_its_progress(plan):
+    plan.record_trial(SUCCESS)
+    saved = plan.serialize_progress()
+    document = _document()
+    document["phases"][0]["name"] = "Renamed"
+    document["phases"][0]["description"] = "Reworded."
+    assert TrainingPlan(parse_plan(document)).deserialize_progress(saved) is LoadProgressResult.OK
+
+
+@pytest.mark.parametrize("record", [
+    ["not", "a", "dict"],
+    {"plan_id": "reach-shaping", "progressVersion": 1, "state": "in_progress",
+     "currentPhaseId": None, "trainingStartedAt": None, "phases": ["shaping-close"]},
+])
+def test_malformed_progress_shapes_are_unknown_errors(plan, record):
+    assert plan.deserialize_progress(record) is LoadProgressResult.UNKNOWN_ERROR
+
+
+def test_a_plan_file_that_is_not_utf8_is_a_format_error(tmp_path):
+    (tmp_path / "bad.json").write_bytes(b'{"name": "\xff"}')
+    repo = PlanRepository(tmp_path)
+    with pytest.raises(PlanFormatError):
+        repo.get_plans()
+    assert repo.get_plan("anything") is None

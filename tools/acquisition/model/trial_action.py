@@ -432,6 +432,10 @@ class TrialActionCompiler:
                     "automatic target DCS",
                 )
                 position_evidence["automatic_status"] = "applied"
+                if context.training_directive is not None:
+                    # The reach-derived target is absolute; the plan's offset
+                    # only moved the baseline it replaced.
+                    position_evidence["training_offset_applied"] = False
         else:
             target = baseline
         motor = _finite_vector(self._dcs_to_motor(target), "motor target")
