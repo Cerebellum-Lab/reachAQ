@@ -8057,10 +8057,26 @@ class AppModel(ObservableObject):
         self._set_subsystem_status(
             SubsystemId.LASER,
             SubsystemState.READY,
-            reason="laser controller connected",
+            reason=self._laser_ready_reason(),
             generation=generation,
         )
         return True
+
+    def _laser_ready_reason(self) -> str:
+        """READY's reason; it says so when an NI laser can only hold a DC command.
+
+        With hardwareTimed false the NI controller refuses every pulse train
+        and the calibration ramp (NidaqLaserController.run_synchronized_pulse_train),
+        which a protocol, Test stim and Run Pulse all need.
+        """
+        configuration = self._laser.configuration
+        if configuration.backend == "nidaq" and not configuration.hardware_timed:
+            logger.warning(
+                "The NI laser is configured with hardwareTimed: false, so pulse "
+                "trains, Test stim, Run Pulse and the calibration ramp are refused")
+            return ("laser controller connected; hardwareTimed is false, so pulses "
+                    "and the calibration ramp are refused")
+        return "laser controller connected"
 
     def _laser_analog_terminal_config(self):
         """The stream's analogTerminalConfig, which the laser's own inputs use.
@@ -9976,7 +9992,7 @@ class AppModel(ObservableObject):
             self._set_subsystem_status(
                 SubsystemId.LASER,
                 SubsystemState.READY,
-                reason="laser controller connected",
+                reason=self._laser_ready_reason(),
             )
         elif self._laser.configuration.backend != "disabled":
             current = self._acquisition.subsystems.get(SubsystemId.LASER)
