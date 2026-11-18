@@ -47,6 +47,11 @@ session metadata carries a `simulation` block with `enabled` true, and passes
 (`REACHAQ_SIMULATION=1`) writes the block, so a warning here means the data is not
 from hardware.
 
+`camera.ledger` reads each camera's `frame_present_` column by the name the merge
+writes it under: lowercased, with other characters as `_` (`frame_present_stimcam`
+for `stimCam`). Validator versions before 2026-11-18 looked the name up as
+given and failed every session that recorded a mixed-case camera.
+
 `sources.contract` checks each file a source lists. Pose is recorded as one
 `raw2D_live.h5` per camera, and each missing one is named. Validator versions
 before 2026-09-24 reported `pose: artifact missing` for every session that
