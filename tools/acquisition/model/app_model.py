@@ -4523,6 +4523,7 @@ class AppModel(ObservableObject):
         session_control = self._behavior.algorithm.active_config.session_control
         session_control.automatic_protocol_advance_enabled = enabled
         self._protocol_runner.automatic_advance = enabled
+        self.save_configuration()
         if self._attached_plan is not None:
             self._attached_plan.is_automatic = enabled
             self._on_property_changed(
@@ -4599,6 +4600,7 @@ class AppModel(ObservableObject):
         """Apply a Preferences mutation through the session-state boundary."""
         self._require_session_ready_for_configuration(action)
         update(self._behavior.algorithm)
+        self.save_configuration()
 
     @_serialized_session_configuration
     def set_live_inference_enabled(self, enabled: bool) -> None:
@@ -4606,6 +4608,10 @@ class AppModel(ObservableObject):
             "Changing live inference"
         )
         self._inference.is_enabled = bool(enabled)
+        # The operator's choice replaces a --live-inference override, which
+        # would otherwise keep the file at its loaded value.
+        self._runtime_live_inference_override = None
+        self.save_configuration()
 
     @_serialized_session_configuration
     def set_inference_model_location(self, value: str) -> None:
@@ -4613,6 +4619,7 @@ class AppModel(ObservableObject):
             "Changing the inference model"
         )
         self._inference.model_location = str(value)
+        self.save_configuration()
 
     @_serialized_session_configuration
     def update_user_preference(self, name: str, value) -> None:
@@ -4637,6 +4644,9 @@ class AppModel(ObservableObject):
         logger.success("Set new project to %s", dataclasses.asdict(new_prj))
         log_path = new_prj.get_log_file_path(auto_new=False)
         self.set_log_location(log_path)
+        # A load sets it from the file it is reading; only an edit saves.
+        if not self._configuration_load_incomplete:
+            self.save_configuration()
 
     @property
     def animal_name(self) -> str:
@@ -6321,6 +6331,7 @@ class AppModel(ObservableObject):
             )
             if control.trial_count_basis == TrialCountBasis.SCORED.value:
                 control.trial_count_basis = TrialCountBasis.COMPLETED.value
+        self.save_configuration()
         self._notify_trial_protocol_state()
         return True
 
@@ -6335,6 +6346,7 @@ class AppModel(ObservableObject):
             raise ValueError(f"Unknown session-control option: {field}")
         candidate = dataclasses.replace(control, **{str(field): value})
         setattr(control, str(field), getattr(candidate, str(field)))
+        self.save_configuration()
         self._notify_trial_protocol_state()
         return True
 
@@ -9610,7 +9622,11 @@ class AppModel(ObservableObject):
         # mp_mgr.join()
 
         self._preferences.save()
-        self.save_configuration()
+        # No configuration save here. Each operator edit of a stored setting
+        # saved itself when it was made; what changed while running (a stim
+        # session's camera mode, a CLI override, the protocol's progress) is
+        # the session's, and its metadata records it. Saving on exit wrote
+        # that runtime state over the file every run.
         unregister_fatal_exception_callback(self._on_fatal_exception)
 
     def _on_fatal_exception(self, source: str, exception: BaseException) -> None:

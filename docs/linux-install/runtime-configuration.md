@@ -75,9 +75,19 @@ stable reader path from the same menu. These controls are unavailable after
 acquisition leaves Idle.
 
 Settings are saved to the file reachAQ loaded: the one named with `-c`, or the
-Preferences default when none is named. That happens on exit and whenever an
-idle edit is applied (camera settings, DAQ ports, plot selections, **File →
-Hardware**). Nothing is saved when the last load failed or did not complete, so
+Preferences default when none is named. They are saved only when the operator
+changes a stored setting while idle, at the moment of the change: leaving
+camera edit mode, a Camera binning choice, **Edit DAQ Ports** OK, **File →
+Hardware**, an NI-DAQ plot selection, and each Preferences or Behavior edit
+(data location, inference model, live inference, session and pellet options).
+Starting, recording, stopping and exiting write nothing to the file, so what a
+run changes on its own (a stim session's camera mode, a `--live-inference`
+override, the protocol's progress) is not carried into the next start; each
+session's metadata records the configuration it ran with. Turning live
+inference on or off in Preferences replaces a `--live-inference` override and
+is saved. A `-c` file that does not exist is refused rather than created with
+defaults; with no `-c`, a missing default file is still created on first start.
+Nothing is saved when the last load failed or did not complete, so
 a broken file is not overwritten with a half-applied one; the log says
 `Not saving configuration: the last configuration load did not complete`. A run
 started with `--random-cameras` is never saved either.
