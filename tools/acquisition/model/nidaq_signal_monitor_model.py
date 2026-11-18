@@ -27,6 +27,7 @@ from autotrainer.core.logging import (
 from autotrainer.core.multiproc import get_nidaq_mp_ctx
 from autotrainer.core.project import ProjectDependentProtocol
 from autotrainer.device import NidaqSignalStreamController
+from autotrainer.device.nidaq_input_backend import make_nidaq_input_backend
 from tools.acquisition.model.nidaq_sample_ring import SharedNidaqSampleRing
 from tools.acquisition.model.nidaq_channel_plan import with_display_channels
 from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
@@ -112,9 +113,10 @@ def _nidaq_signal_stream_worker(
 
     controller = None
     try:
-        controller = NidaqSignalStreamController(
+        controller = make_nidaq_input_backend(
             configuration,
             timing_plan=timing_plan,
+            hardware_class=NidaqSignalStreamController,
         )
         controller.start()
         _put_worker_message(message_queue, (_WORKER_READY, None))

@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 from autotrainer.core import NidaqSignalStreamConfiguration, NidaqTimingPlan
 from autotrainer.core.multiproc import get_nidaq_mp_ctx
 from autotrainer.device import NidaqSignalStreamController
+from autotrainer.device.nidaq_input_backend import make_nidaq_input_backend
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,9 +56,10 @@ def _preflight_worker(configuration, timing_plan, result_queue):
                 else timing_plan
             )
             try:
-                controller = NidaqSignalStreamController(
+                controller = make_nidaq_input_backend(
                     configuration,
                     timing_plan=combined_plan,
+                    hardware_class=NidaqSignalStreamController,
                 )
                 verified = controller.verify_tasks(commit=True)
                 multidevice_status = "verified"
@@ -89,9 +91,10 @@ def _preflight_worker(configuration, timing_plan, result_queue):
                 if isinstance(timing_plan, NidaqTimingPlan)
                 else timing_plan
             )
-            controller = NidaqSignalStreamController(
+            controller = make_nidaq_input_backend(
                 configuration,
                 timing_plan=selected_plan,
+                hardware_class=NidaqSignalStreamController,
             )
             verified = controller.verify_tasks(commit=True)
         result = NidaqPreflightResult(
