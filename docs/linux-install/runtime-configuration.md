@@ -263,6 +263,7 @@ bump past 58 is acceptable.
 
 | Variable | Default | Effect |
 |---|---|---|
+| `REACHAQ_CONFIG_DIR` | `~/Autotrainer` | The per-computer settings directory: `system_configuration.yaml`, the motor and move files, `animals/`, the 3D calibration and the hardware tools' records. Every default that names one of those files is built from it (`autotrainer.core.config_directory`). Read at start-up. The installer uses it when `REACHAQ_INSTALL_CONFIG_DIR` is unset. Put it in `runtime.env` so the launcher exports it. |
 | `REACHAQ_STIM_RT_PRIORITY` | `80` | SCHED_FIFO priority for the stim capture loop. `0`, `off` or `false` disables it. See the [latency tuning guide](latency-tuning.md). |
 | `REACHAQ_POSE_BACKEND` | `tensorflow` | Selects the engine a DeepLabCut model runs on: `tensorflow` or `torch`. Both are installed. A YOLO model ignores it and always runs on `torch`. Also selects which GPU runtime the live-inference preflight probes, so the two cannot disagree. |
 | `REACHAQ_POSE_CONFIDENCE_THRESHOLD` | per backend | Confidence a keypoint needs to count as present and to enter 3D triangulation. Defaults to 0.9 for `tensorflow` and 0.6 for `torch`, because the engines report on different scales: TensorFlow saturates its likelihood at 1.0 while PyTorch reports a real distribution around 0.77. The PyTorch default is provisional and should be re-derived on held-out frames. |
@@ -341,7 +342,8 @@ Last documentation update 2026-09-24. Entries marked (verified) were re-checked
 on the workstation on that date; the hardware entries are from 2026-09-09.
 
 - Dell Precision 3660 Tower; Ubuntu 22.04.5 LTS, x86_64; kernel
-  `6.8.0-136-generic`. 12th Gen Core i9-12900: 8 P-cores on CPU 0-15 at
+  `6.8.0-136-generic`, booted with `intel_iommu=off` so the NI boards can DMA
+  ([NI-DAQ guide](ni-daq-pxi.md#iommu-and-dma-boot-with-intel_iommuoff)). 12th Gen Core i9-12900: 8 P-cores on CPU 0-15 at
   5000-5100 MHz, 8 E-cores on CPU 16-23 at 3800 MHz.
 - Conda environment `reachaq`, built by the portable installer on 2026-09-24
   (verified): Python 3.10.21; torch 2.7.1+cu128 (CUDA 12.8, cuDNN 9.7);

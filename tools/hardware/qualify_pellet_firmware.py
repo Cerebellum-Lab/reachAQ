@@ -75,8 +75,8 @@ from tools.hardware.verify_nidaq_wiring import (  # noqa: E402
     matches,
 )
 
-DEFAULT_CONFIG = Path.home() / "Autotrainer" / "system_configuration.yaml"
-DEFAULT_RECORD_DIR = Path.home() / "Autotrainer" / "pellet_firmware_qualification"
+DEFAULT_CONFIG = SystemConfiguration.DEFAULT_PATH.expanduser()
+DEFAULT_RECORD_DIR = SystemConfiguration.DEFAULT_CONFIG_DIR.expanduser() / "pellet_firmware_qualification"
 
 EPERM = 1
 #: jerrycan_gpio_pulse_phase_t in reachAQ-hardware's jerrycan_types.h.

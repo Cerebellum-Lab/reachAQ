@@ -628,6 +628,8 @@ def _print_table(sessions: Sequence[dict]) -> None:
 
 
 def main(argv=None) -> int:
+    from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR
+
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command")
     record = sub.add_parser("record", help=argparse.SUPPRESS)
@@ -636,7 +638,7 @@ def main(argv=None) -> int:
     parser.add_argument("--ao", help="the loopback output, e.g. PXI1Slot5/ao0")
     parser.add_argument("--ai", help="the loopback input, e.g. PXI1Slot5/ai6")
     parser.add_argument("--config", type=Path,
-                        default=Path.home() / "Autotrainer" / "system_configuration.yaml")
+                        default=DEFAULT_CONFIG_DIR.expanduser() / "system_configuration.yaml")
     parser.add_argument("--out", type=Path, default=None,
                         help="where sessions, data and the report go (default /tmp/reachaq_delivery_<time>)")
     parser.add_argument("--refresh", type=float, nargs="+", default=list(DEFAULT_REFRESH_HZ),

@@ -94,7 +94,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         description="Hold the laser output in one state and die on a SIGUSR1 cue.",
         allow_abbrev=False)
     parser.add_argument(
-        "--config", default=os.path.expanduser("~/Autotrainer/system_configuration.yaml"))
+        "--config", default=str(SystemConfiguration.DEFAULT_PATH.expanduser()))
     parser.add_argument("--laser", type=int, default=1)
     parser.add_argument("--timing", choices=TIMINGS, required=True)
     parser.add_argument("--waveform", choices=WAVEFORMS, required=True)

@@ -17,6 +17,7 @@ from typing import Tuple, Union, Dict, Optional, Type, TypeVar
 from typing_extensions import Self
 
 from autotrainer.core import MotorConfigurations
+from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR
 from autotrainer.core.logging import get_verbose_logger
 
 from .device_interface import ServoConfig, StepperConfig, Motor
@@ -32,7 +33,7 @@ class MotorConfigurationFile(MotorConfigurations):
     Implement MotorConfigurations Protocol
     """
 
-    DEFAULT_LOCATION = Path("~/Autotrainer/motor_config.yaml")  # you shall use .expanduser() when you use it
+    DEFAULT_LOCATION = DEFAULT_CONFIG_DIR / "motor_config.yaml"  # you shall use .expanduser() when you use it
 
     _load_config: ServoConfig
     _cover_config: ServoConfig

@@ -76,8 +76,8 @@ from tools.acquisition.model.nidaq_wiring_verification import (  # noqa: E402
     wiring_points,
 )
 
-DEFAULT_CONFIG = Path.home() / "Autotrainer" / "system_configuration.yaml"
-DEFAULT_RECORD = Path.home() / "Autotrainer" / "nidaq_wiring_verification.json"
+DEFAULT_CONFIG = SystemConfiguration.DEFAULT_PATH.expanduser()
+DEFAULT_RECORD = SystemConfiguration.DEFAULT_CONFIG_DIR.expanduser() / "nidaq_wiring_verification.json"
 
 #: Ports holding every digital line worth watching. port1 and port2 are the
 #: PFI pins on an M-series board, which is where a stimulus trigger lands.

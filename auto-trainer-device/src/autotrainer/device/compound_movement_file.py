@@ -13,6 +13,7 @@ import enum
 from pathlib import Path
 import yaml
 
+from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR
 from autotrainer.core.logging import get_verbose_logger
 
 from .motor_steps import MotorSteps, CompoundMovementDataSet
@@ -43,7 +44,7 @@ class CompoundMovements(CompoundMovementDataSet):
     Presents the data in the form of a CompoundMovementDataSet Protocol
     """
 
-    DEFAULT_LOCATION = Path("~/Autotrainer/move_config.yaml")  # you shall use .expanduser() when you use it
+    DEFAULT_LOCATION = DEFAULT_CONFIG_DIR / "move_config.yaml"  # you shall use .expanduser() when you use it
 
     def __init__(self):
         """

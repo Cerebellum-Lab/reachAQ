@@ -60,6 +60,7 @@ from autotrainer.core import (
 from autotrainer.core.configuration.json_compat import SystemConfigurationJSONEncoder
 from autotrainer.core.interfaces import RecordingEndingReason, CaptureAnalysisResult
 from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
+from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR
 from autotrainer.core.configuration import SystemConfigurationDumper, DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.multiproc import no_op_timer
 from autotrainer.core.logging import (
@@ -2223,7 +2224,7 @@ class AppModel(ObservableObject):
 
     def reload_calib(self, calib_dir: Optional[Path]):
         calib_src_dir = (
-            Path(f"~/Autotrainer/{DEFAULT_3D_CALIB_DIR_NAME}") if calib_dir is None
+            DEFAULT_CONFIG_DIR / DEFAULT_3D_CALIB_DIR_NAME if calib_dir is None
             else calib_dir
         ).expanduser()
         logger.info("loading calib from %s", calib_src_dir)

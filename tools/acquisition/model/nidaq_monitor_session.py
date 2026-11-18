@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
 from autotrainer.core import ObservableObject
+from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR
 
 from tools.acquisition.model.nidaq_breakout import breakout_for_device
 from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
@@ -527,7 +528,7 @@ class NidaqMonitorSession(ObservableObject):
             return Path(path())
         if path:
             return Path(path)
-        return Path.home() / "Autotrainer" / "nidaq_wiring_verification.json"
+        return DEFAULT_CONFIG_DIR.expanduser() / "nidaq_wiring_verification.json"
 
     def wiring_test_command(self, *, open_shutters: bool = False,
                             command_volts: float = 1.0,
