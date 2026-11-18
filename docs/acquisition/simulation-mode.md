@@ -16,6 +16,9 @@ python -m reachAQ.app --simulate --start-mode running     # GUI, System Mode run
 python -m tools.acquisition.headless --simulate           # headless, starts running
 ```
 
+The 3D calibration is copied from files stored in Git LFS. In a checkout without
+them, run `git lfs checkout` first; the simulation refuses to start from pointer files.
+
 | Flag | Effect |
 |---|---|
 | `--simulate` | Use the simulated backends, with configuration, preferences and data in the sim home. |
@@ -50,7 +53,8 @@ Everything is set up in `main()` before `AppModel` exists, because the NI-DAQ
 worker runs in a forkserver child that keeps the environment it started with.
 The variables are `REACHAQ_SIMULATION=1`, `REACHAQ_SIM_BUS`, `REACHAQ_SIM_EPOCH`,
 `REACHAQ_SIM_CAMERA_FPS`, `REACHAQ_SIM_CAMERA_EXPOSURE_S`,
-`REACHAQ_SIM_LINE_ALIASES` and `AUTOTRAINER_CAN_TRANSPORT=emulation`. Use the
+`REACHAQ_SIM_LINE_ALIASES`, `AUTOTRAINER_DIAMOND_TRIANGLE_CONFIG` and
+`AUTOTRAINER_CAN_TRANSPORT=emulation`. Use the
 flag rather than setting them by hand: by hand, the configuration, preferences,
 data and lock are not moved into a sim home.
 
@@ -59,6 +63,9 @@ data and lock are not moved into a sim home.
 All of them share one time grid: simulated exposure k starts at
 `epoch + k / fps` on `perf_counter`, which every process on the host reads
 alike, with the epoch and the primary camera's fps passed in the environment.
+Every simulated camera therefore has to run at the primary camera's integer fps:
+the NI `cam_frames` grid takes the primary's fps from `REACHAQ_SIM_CAMERA_FPS`,
+while each camera reads its own fps from its URL.
 
 **Cameras** (`SimulatedCam`, `sim://`). Left (primary), Right and Camera3
 (stimCam), 640x480 at 150 fps, 2 ms exposure. Each frame is a gradient with a
