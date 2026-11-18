@@ -23,7 +23,7 @@ from autotrainer.inference import GpuRuntimeStatus, PoseProcess, InferenceComman
     InferenceStatusMessageKind, PoseAlgorithm, InferenceMode, InferenceStatus, \
     InferenceMonitorDataMsg, detect_gpu_runtime
 from autotrainer.inference.backend_selection import (
-    build_pose_model, confidence_threshold, selected_backend, trained_model_name,
+    build_pose_model, confidence_threshold, selected_backend,
 )
 from autotrainer.inference.pose_result_process import InferenceMonitorDataProc
 from autotrainer.inference.analysis import intersession_process, IntersessionResponse
@@ -719,7 +719,6 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
                     # already handled downstream.
                     pose_algo.set_confidence_threshold(confidence_threshold(
                         selected_backend(model_path=self._model_location),
-                        model_name=trained_model_name(self._model_location),
                         model_path=self._model_location,
                     ))
                     pose_algo.initialize(context)

@@ -17,13 +17,14 @@ import os
 import pytest
 
 from autotrainer.core.pose_elements import SceneElement
+from autotrainer.inference import pose_plugins
 from autotrainer.inference.backend_selection import (
     TENSORFLOW_BACKEND,
     TORCH_BACKEND,
-    YOLO_CONFIDENCE_THRESHOLD,
     confidence_threshold,
     selected_backend,
 )
+from autotrainer.inference.yolo.plugin import YOLO_CONFIDENCE_THRESHOLD
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -146,7 +147,13 @@ def test_a_part_outside_the_frame_is_not_drawn(qapp):
     assert _visible(view) == {"Pellet"}
 
 
-def test_a_yolo_model_is_gated_on_its_own_measured_scale(tmp_path):
+@pytest.fixture
+def engines(monkeypatch):
+    """Every engine importable, as on a site that installed ultralytics."""
+    monkeypatch.setattr(pose_plugins, "_installed", lambda module: True)
+
+
+def test_a_yolo_model_is_gated_on_its_own_measured_scale(tmp_path, engines):
     """Measured at 0.10: 99.1% coverage, 2.04 px median on 33 held-out frames.
 
     The backend default of 0.6 costs 15 points of coverage and takes both
@@ -163,7 +170,7 @@ def test_a_yolo_model_is_gated_on_its_own_measured_scale(tmp_path):
     ) == pytest.approx(YOLO_CONFIDENCE_THRESHOLD)
 
 
-def test_a_yolo_model_is_not_gated_on_the_tensorflow_scale(tmp_path):
+def test_a_yolo_model_is_not_gated_on_the_tensorflow_scale(tmp_path, engines):
     """The live bug: the backend was picked without looking at the model."""
     model = tmp_path / "N_full_p36"
     model.mkdir()
@@ -178,7 +185,7 @@ def test_a_yolo_model_is_not_gated_on_the_tensorflow_scale(tmp_path):
     assert gate < 0.862
 
 
-def test_a_deeplabcut_project_keeps_its_own_threshold(tmp_path):
+def test_a_deeplabcut_project_keeps_its_own_threshold(tmp_path, engines):
     """The YOLO rule must not capture DeepLabCut projects."""
     project = tmp_path / "dlc"
     project.mkdir()

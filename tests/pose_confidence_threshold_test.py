@@ -19,19 +19,41 @@ than to the engine.
 """
 
 import pytest
+import yaml
 
-from autotrainer.inference import backend_selection
+from autotrainer.inference import pose_plugins
 from autotrainer.inference.backend_selection import (
-    DEFAULT_CONFIDENCE_THRESHOLDS,
     POSE_BACKEND_ENV_VAR,
     POSE_CONFIDENCE_THRESHOLD_ENV_VAR,
     TENSORFLOW_BACKEND,
     TORCH_BACKEND,
-    TORCH_MODEL_CONFIDENCE_THRESHOLDS,
     confidence_threshold,
+)
+from autotrainer.inference.dlc.plugin import (
+    DEFAULT_CONFIDENCE_THRESHOLDS,
+    TORCH_MODEL_CONFIDENCE_THRESHOLDS,
     trained_model_name,
 )
 from autotrainer.inference.pose_algorithm import PoseAlgorithm
+
+
+@pytest.fixture
+def engines(monkeypatch):
+    """DeepLabCut and both of its engines, so a project resolves to it."""
+    monkeypatch.setattr(pose_plugins, "_installed", lambda module: True)
+
+
+def _project(root, model_name=None):
+    """A DeepLabCut project, trained under PyTorch on this backbone if given."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "config.yaml").write_text("bodyparts: [a]\n")
+    if model_name is not None:
+        train = (root / "dlc-models-pytorch" / "iteration-2"
+                 / "projectSep18-trainset95shuffle3" / "train")
+        train.mkdir(parents=True)
+        (train / "snapshot-200.pt").write_bytes(b"")
+        _write_backbone(train, model_name)
+    return str(root)
 
 
 def test_each_backend_has_its_own_default():
@@ -51,13 +73,24 @@ def test_the_torch_default_would_not_discard_most_keypoints():
     assert DEFAULT_CONFIDENCE_THRESHOLDS[TORCH_BACKEND] < 0.9
 
 
-def test_the_threshold_follows_the_selected_backend(monkeypatch):
+def test_the_threshold_follows_the_selected_backend(engines, tmp_path):
     # Unset now resolves from what is installed, so pin it: otherwise this
     # asserts TensorFlow's scale on a rig that would run torch.
-    monkeypatch.setattr(backend_selection, "_installed", lambda module: True)
-    assert confidence_threshold(None, {POSE_BACKEND_ENV_VAR: "torch"}) == 0.6
-    assert confidence_threshold(None, {POSE_BACKEND_ENV_VAR: "tensorflow"}) == 0.9
-    assert confidence_threshold(None, {}) == 0.9, "unset prefers TensorFlow"
+    project = _project(tmp_path)
+    assert confidence_threshold(
+        None, {POSE_BACKEND_ENV_VAR: "torch"}, model_path=project) == 0.6
+    assert confidence_threshold(
+        None, {POSE_BACKEND_ENV_VAR: "tensorflow"}, model_path=project) == 0.9
+    assert confidence_threshold(
+        None, {}, model_path=project) == 0.9, "unset prefers TensorFlow"
+
+
+def test_a_project_without_its_engine_falls_back_rather_than_raising(monkeypatch, tmp_path):
+    """The operator is told to install DeepLabCut at pre-validation, not here."""
+    monkeypatch.setattr(pose_plugins, "_installed", lambda module: module != "deeplabcut")
+    project = _project(tmp_path, "cspnext_s")
+    assert confidence_threshold(TORCH_BACKEND, {}, model_path=project) == 0.6
+    assert confidence_threshold(TENSORFLOW_BACKEND, {}, model_path=project) == 0.9
 
 
 def test_an_explicit_override_wins():
@@ -141,10 +174,12 @@ def test_the_env_var_name_is_stable():
 # the RH_grab detections that 0.3 keeps at 1.46 px.
 
 
-def test_a_known_torch_model_refines_the_backend_default():
+def test_a_known_torch_model_refines_the_backend_default(engines, tmp_path):
     """The score scale belongs to the trained model, not to the engine."""
-    assert confidence_threshold(TORCH_BACKEND, {}, model_name="cspnext_s") == 0.1
-    assert confidence_threshold(TORCH_BACKEND, {}, model_name="resnet_50") == 0.3
+    assert confidence_threshold(
+        TORCH_BACKEND, {}, model_path=_project(tmp_path / "a", "cspnext_s")) == 0.1
+    assert confidence_threshold(
+        TORCH_BACKEND, {}, model_path=_project(tmp_path / "b", "resnet_50")) == 0.3
 
 
 def test_the_cspnext_default_does_not_discard_the_whole_model():
@@ -152,30 +187,40 @@ def test_the_cspnext_default_does_not_discard_the_whole_model():
     assert TORCH_MODEL_CONFIDENCE_THRESHOLDS["cspnext_s"] <= 0.15
 
 
-def test_an_unknown_model_falls_back_to_the_backend_default():
+def test_an_unknown_model_falls_back_to_the_backend_default(engines, tmp_path):
     """A retrain on a net_type nobody has measured must not silently shift."""
-    assert confidence_threshold(TORCH_BACKEND, {}, model_name="hrnet_w32") == 0.6
-    assert confidence_threshold(TORCH_BACKEND, {}, model_name=None) == 0.6
-    assert confidence_threshold(TORCH_BACKEND, {}, model_name="") == 0.6
+    assert confidence_threshold(
+        TORCH_BACKEND, {}, model_path=_project(tmp_path / "a", "hrnet_w32")) == 0.6
+    assert confidence_threshold(
+        TORCH_BACKEND, {}, model_path=_project(tmp_path / "b")) == 0.6
+    assert confidence_threshold(
+        TORCH_BACKEND, {}, model_path=_project(tmp_path / "c", "")) == 0.6
 
 
-def test_a_model_name_does_not_move_the_tensorflow_default():
+def test_a_model_name_does_not_move_the_tensorflow_default(engines, tmp_path):
     """These were measured under the PyTorch engine; TensorFlow saturates at 1.0."""
-    assert confidence_threshold(TENSORFLOW_BACKEND, {}, model_name="resnet_50") == 0.9
+    assert confidence_threshold(
+        TENSORFLOW_BACKEND, {}, model_path=_project(tmp_path, "resnet_50")) == 0.9
 
 
-def test_an_explicit_override_still_wins_over_a_per_model_default():
+def test_an_explicit_override_still_wins_over_a_per_model_default(engines, tmp_path):
     environ = {POSE_CONFIDENCE_THRESHOLD_ENV_VAR: "0.25"}
     assert confidence_threshold(
-        TORCH_BACKEND, environ, model_name="cspnext_s") == pytest.approx(0.25)
+        TORCH_BACKEND, environ,
+        model_path=_project(tmp_path, "cspnext_s")) == pytest.approx(0.25)
 
 
-def test_model_name_is_keyword_only():
-    """environ is the second positional argument in every existing call."""
+def test_the_backbone_is_read_by_the_plugin_not_passed_in():
+    """model_name is gone: the DeepLabCut plugin reads the backbone itself.
+
+    model_path stays keyword-only, because environ is the second positional
+    argument in every existing call.
+    """
     import inspect
 
-    parameter = inspect.signature(confidence_threshold).parameters["model_name"]
-    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    parameters = inspect.signature(confidence_threshold).parameters
+    assert "model_name" not in parameters
+    assert parameters["model_path"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def _write_backbone(train_folder, model_name):
@@ -184,8 +229,6 @@ def _write_backbone(train_folder, model_name):
     Serialised with yaml rather than hand-written text so the test exercises the
     real format trained_model_name has to read.
     """
-    import yaml
-
     (train_folder / "pytorch_config.yaml").write_text(
         yaml.safe_dump({"model": {"backbone": {"model_name": model_name}}})
     )
@@ -241,14 +284,16 @@ def test_trained_model_name_ignores_an_untrained_shuffle(tmp_path):
 # so the entry keeps coverage rather than discarding it for no gain.
 
 
-def test_cspnext_m_uses_its_measured_threshold():
-    assert confidence_threshold(TORCH_BACKEND, {}, model_name="cspnext_m") == 0.2
+def test_cspnext_m_uses_its_measured_threshold(engines, tmp_path):
+    assert confidence_threshold(
+        TORCH_BACKEND, {}, model_path=_project(tmp_path, "cspnext_m")) == 0.2
 
 
-def test_rtmpose_keeps_coverage_because_its_gate_buys_nothing():
+def test_rtmpose_keeps_coverage_because_its_gate_buys_nothing(engines, tmp_path):
     """Its error is flat across thresholds, so rejecting only loses keypoints."""
     assert TORCH_MODEL_CONFIDENCE_THRESHOLDS["rtmpose_s"] <= 0.3
-    assert confidence_threshold(TORCH_BACKEND, {}, model_name="rtmpose_s") == 0.3
+    assert confidence_threshold(
+        TORCH_BACKEND, {}, model_path=_project(tmp_path, "rtmpose_s")) == 0.3
 
 
 def test_every_measured_threshold_is_a_usable_probability():

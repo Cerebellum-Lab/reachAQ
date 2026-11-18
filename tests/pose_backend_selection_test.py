@@ -20,14 +20,17 @@ import sys
 import pytest
 
 from autotrainer.inference import backend_selection
-from autotrainer.inference import backend_selection
+from autotrainer.inference import pose_plugins
 from autotrainer.inference.backend_selection import (
     DEFAULT_POSE_BACKEND,
     POSE_BACKEND_ENV_VAR,
     POSE_BACKENDS,
     TENSORFLOW_BACKEND,
     TORCH_BACKEND,
+    AmbiguousPoseModel,
+    PoseBackendNotInstalled,
     build_pose_model,
+    pre_validate_model,
     selected_backend,
 )
 from autotrainer.inference import gpu_runtime
@@ -35,49 +38,62 @@ from autotrainer.inference import gpu_runtime
 
 def _only(monkeypatch, *installed):
     """Pin which engines are importable, so the test does not read this env."""
-    monkeypatch.setattr(backend_selection, "_installed",
+    monkeypatch.setattr(pose_plugins, "_installed",
                         lambda module: module in installed)
 
 
-def test_an_unset_variable_keeps_the_tensorflow_engine(monkeypatch):
+@pytest.fixture
+def project(tmp_path, monkeypatch):
+    """A DeepLabCut project on a rig with DeepLabCut and both engines.
+
+    DeepLabCut claims a directory by its config.yaml, so the engine choice
+    below is only reached for one.
+    """
+    _only(monkeypatch, "deeplabcut", "tensorflow", "torch")
+    (tmp_path / "config.yaml").write_text("bodyparts: [a]")
+    return str(tmp_path)
+
+
+def test_an_unset_variable_keeps_the_tensorflow_engine(project):
     """Preferred when present: deployed rigs run trained TensorFlow snapshots.
 
     Pinned rather than read from the ambient interpreter, because the answer
     now depends on what is installed and the test would otherwise pass on a
     rig with TensorFlow and fail on a torch-only one.
     """
-    _only(monkeypatch, "tensorflow", "torch")
-    assert selected_backend({}) == TENSORFLOW_BACKEND
+    assert selected_backend({}, model_path=project) == TENSORFLOW_BACKEND
     assert DEFAULT_POSE_BACKEND == TENSORFLOW_BACKEND
 
 
-def test_the_variable_selects_the_torch_engine():
-    assert selected_backend({POSE_BACKEND_ENV_VAR: "torch"}) == TORCH_BACKEND
+def test_the_variable_selects_the_torch_engine(project):
+    assert selected_backend({POSE_BACKEND_ENV_VAR: "torch"},
+                            model_path=project) == TORCH_BACKEND
 
 
 @pytest.mark.parametrize("value", ["torch", "pytorch", "pt", "PyTorch", "  TORCH  "])
-def test_torch_spellings_are_accepted(value):
-    assert selected_backend({POSE_BACKEND_ENV_VAR: value}) == TORCH_BACKEND
+def test_torch_spellings_are_accepted(value, project):
+    assert selected_backend({POSE_BACKEND_ENV_VAR: value},
+                            model_path=project) == TORCH_BACKEND
 
 
 @pytest.mark.parametrize("value", ["tensorflow", "tf", "tf1", "TensorFlow"])
-def test_tensorflow_spellings_are_accepted(value):
-    assert selected_backend({POSE_BACKEND_ENV_VAR: value}) == TENSORFLOW_BACKEND
+def test_tensorflow_spellings_are_accepted(value, project):
+    assert selected_backend({POSE_BACKEND_ENV_VAR: value},
+                            model_path=project) == TENSORFLOW_BACKEND
 
 
 @pytest.mark.parametrize("value", ["", "   ", "onnx", "tensorrt", "true"])
-def test_an_unusable_value_falls_back_rather_than_raising(value, monkeypatch):
+def test_an_unusable_value_falls_back_rather_than_raising(value, project):
     """A typo must not be able to stop live inference from starting."""
-    _only(monkeypatch, "tensorflow", "torch")
-    assert selected_backend({POSE_BACKEND_ENV_VAR: value}) == DEFAULT_POSE_BACKEND
+    assert selected_backend({POSE_BACKEND_ENV_VAR: value},
+                            model_path=project) == DEFAULT_POSE_BACKEND
 
 
-def test_the_process_environment_is_the_default_source(monkeypatch):
-    _only(monkeypatch, "tensorflow", "torch")
+def test_the_process_environment_is_the_default_source(monkeypatch, project):
     monkeypatch.setenv(POSE_BACKEND_ENV_VAR, "pytorch")
-    assert selected_backend() == TORCH_BACKEND
+    assert selected_backend(model_path=project) == TORCH_BACKEND
     monkeypatch.delenv(POSE_BACKEND_ENV_VAR)
-    assert selected_backend() == TENSORFLOW_BACKEND
+    assert selected_backend(model_path=project) == TENSORFLOW_BACKEND
 
 
 @pytest.mark.parametrize("backend", POSE_BACKENDS)
@@ -108,39 +124,38 @@ def test_backend_names_match_the_gpu_runtime_probe_names(backend, monkeypatch):
         gpu_runtime.detect_gpu_runtime(required_backend=backend + "-nonexistent")
 
 
-def test_build_pose_model_returns_the_torch_backend():
-    model = build_pose_model("/some/project", backend=TORCH_BACKEND)
+def test_build_pose_model_returns_the_torch_backend(project):
+    model = build_pose_model(project, backend=TORCH_BACKEND)
     assert type(model).__name__ == "DlcTorchPoseModel"
 
 
-def test_build_pose_model_returns_the_tensorflow_backend():
-    model = build_pose_model("/some/project", backend=TENSORFLOW_BACKEND)
+def test_build_pose_model_returns_the_tensorflow_backend(project):
+    model = build_pose_model(project, backend=TENSORFLOW_BACKEND)
     assert type(model).__name__ == "DlcPoseModel"
 
 
-def test_build_pose_model_passes_the_batch_size_through():
+def test_build_pose_model_passes_the_batch_size_through(project):
     """The live batch is sized by the caller; a default would silently pad."""
-    model = build_pose_model("/some/project", 2, 1, 6, backend=TORCH_BACKEND)
+    model = build_pose_model(project, 2, 1, 6, backend=TORCH_BACKEND)
     assert model._shuffle_index == 2
     assert model._training_index == 1
     assert model._model_batch_size == 6
 
 
-def test_build_pose_model_follows_the_environment(monkeypatch):
+def test_build_pose_model_follows_the_environment(monkeypatch, project):
     monkeypatch.setenv(POSE_BACKEND_ENV_VAR, "torch")
-    assert type(build_pose_model("/some/project")).__name__ == "DlcTorchPoseModel"
+    assert type(build_pose_model(project)).__name__ == "DlcTorchPoseModel"
     monkeypatch.setenv(POSE_BACKEND_ENV_VAR, "tensorflow")
-    assert type(build_pose_model("/some/project")).__name__ == "DlcPoseModel"
+    assert type(build_pose_model(project)).__name__ == "DlcPoseModel"
 
 
-def test_an_unset_variable_prefers_tensorflow_when_it_is_installed(monkeypatch):
+def test_an_unset_variable_prefers_tensorflow_when_it_is_installed(monkeypatch, project):
     """Deployed rigs run trained TensorFlow snapshots; leave them alone."""
     monkeypatch.delenv(POSE_BACKEND_ENV_VAR, raising=False)
-    _only(monkeypatch, "tensorflow", "torch")
-    assert backend_selection.selected_backend() == TENSORFLOW_BACKEND
+    assert backend_selection.selected_backend(model_path=project) == TENSORFLOW_BACKEND
 
 
-def test_an_unset_variable_uses_torch_where_tensorflow_is_absent(monkeypatch):
+def test_an_unset_variable_uses_torch_where_tensorflow_is_absent(monkeypatch, project):
     """A torch-only deployment must not be sent to look for TensorFlow.
 
     Answering TensorFlow there makes the GPU probe demand a runtime that was
@@ -149,8 +164,8 @@ def test_an_unset_variable_uses_torch_where_tensorflow_is_absent(monkeypatch):
     needs.
     """
     monkeypatch.delenv(POSE_BACKEND_ENV_VAR, raising=False)
-    _only(monkeypatch, "torch")
-    assert backend_selection.selected_backend() == TORCH_BACKEND
+    _only(monkeypatch, "deeplabcut", "torch")
+    assert backend_selection.selected_backend(model_path=project) == TORCH_BACKEND
 
 
 def test_a_yolo_model_selects_torch_whatever_is_installed(monkeypatch, tmp_path):
@@ -161,40 +176,81 @@ def test_a_yolo_model_selects_torch_whatever_is_installed(monkeypatch, tmp_path)
     TensorFlow installed probes the wrong runtime.
     """
     monkeypatch.delenv(POSE_BACKEND_ENV_VAR, raising=False)
-    _only(monkeypatch, "tensorflow", "torch")
+    _only(monkeypatch, "ultralytics", "tensorflow", "torch")
     (tmp_path / "yolo_pose.yaml").write_text("bodyparts: [a]")
     assert backend_selection.selected_backend(
         model_path=str(tmp_path)) == TORCH_BACKEND
 
 
-def test_an_explicit_variable_still_wins_over_a_yolo_model(monkeypatch, tmp_path):
+def test_a_yolo_model_keeps_torch_over_an_explicit_variable(monkeypatch, tmp_path):
+    """The variable chooses DeepLabCut's engine; YOLO weights have only one.
+
+    This used to answer TensorFlow, and the GPU probe then checked a runtime
+    the model could never run on.
+    """
     monkeypatch.setenv(POSE_BACKEND_ENV_VAR, "tensorflow")
+    _only(monkeypatch, "ultralytics", "tensorflow", "torch")
     (tmp_path / "yolo_pose.yaml").write_text("bodyparts: [a]")
     assert backend_selection.selected_backend(
-        model_path=str(tmp_path)) == TENSORFLOW_BACKEND
+        model_path=str(tmp_path)) == TORCH_BACKEND
 
 
-def test_a_deeplabcut_project_is_not_mistaken_for_yolo(monkeypatch, tmp_path):
+def test_a_deeplabcut_project_is_not_mistaken_for_yolo(monkeypatch, project):
     monkeypatch.delenv(POSE_BACKEND_ENV_VAR, raising=False)
-    _only(monkeypatch, "tensorflow", "torch")
-    (tmp_path / "config.yaml").write_text("bodyparts: [a]")
     assert backend_selection.selected_backend(
-        model_path=str(tmp_path)) == TENSORFLOW_BACKEND
+        model_path=project) == TENSORFLOW_BACKEND
 
 
-def test_a_typo_falls_through_to_detection_rather_than_a_blind_default(monkeypatch):
+def test_a_typo_falls_through_to_detection_rather_than_a_blind_default(monkeypatch, project):
     """Refusing to start over a typo is worse than picking what is installed."""
     monkeypatch.setenv(POSE_BACKEND_ENV_VAR, "tensorflwo")
-    _only(monkeypatch, "torch")
-    assert backend_selection.selected_backend() == TORCH_BACKEND
+    _only(monkeypatch, "deeplabcut", "torch")
+    assert backend_selection.selected_backend(model_path=project) == TORCH_BACKEND
 
 
-def test_with_no_engine_installed_the_failure_names_the_historical_default(monkeypatch):
-    """Nothing to run. Keep the message pointing at what the rig was set up for."""
+def test_with_nothing_resolvable_the_answer_is_torch(monkeypatch, tmp_path):
+    """No model, or one no installed plugin can run: the keypoint runtime.
+
+    Never raises - pre-validation is where the operator is told what to
+    install - so the GPU probe still has a name to ask about.
+    """
     monkeypatch.delenv(POSE_BACKEND_ENV_VAR, raising=False)
     _only(monkeypatch)
-    assert backend_selection.selected_backend() == TENSORFLOW_BACKEND
+    assert backend_selection.selected_backend() == TORCH_BACKEND
+    assert backend_selection.selected_backend({}) == TORCH_BACKEND
+    (tmp_path / "config.yaml").write_text("bodyparts: [a]")
+    assert backend_selection.selected_backend(model_path=str(tmp_path)) == TORCH_BACKEND
     assert backend_selection.available_backends() == ()
+
+
+def test_an_ambiguous_model_selects_torch_but_fails_pre_validation(monkeypatch, tmp_path):
+    _only(monkeypatch, "deeplabcut", "ultralytics", "tensorflow", "torch")
+    (tmp_path / "config.yaml").write_text("bodyparts: [a]")
+    (tmp_path / "yolo_pose.yaml").write_text("bodyparts: [a]")
+    assert backend_selection.selected_backend(model_path=str(tmp_path)) == TORCH_BACKEND
+    with pytest.raises(AmbiguousPoseModel, match="deeplabcut"):
+        pre_validate_model(str(tmp_path))
+    with pytest.raises(AmbiguousPoseModel, match="yolo"):
+        build_pose_model(str(tmp_path))
+
+
+def test_a_model_without_its_engine_fails_where_the_operator_sees_it(monkeypatch, tmp_path):
+    _only(monkeypatch, "tensorflow", "torch")
+    (tmp_path / "config.yaml").write_text("bodyparts: [a]")
+    with pytest.raises(PoseBackendNotInstalled, match="reachaq-plugin-install.sh deeplabcut"):
+        pre_validate_model(str(tmp_path))
+    with pytest.raises(PoseBackendNotInstalled, match="deeplabcut"):
+        build_pose_model(str(tmp_path))
+
+
+def test_available_backends_names_each_usable_plugin_with_its_runtimes(monkeypatch):
+    """The preflight message: what this rig could run, and on which runtime."""
+    _only(monkeypatch, "deeplabcut", "tensorflow", "torch")
+    assert backend_selection.available_backends() == (
+        "keypoint (torch)", "deeplabcut (tensorflow, torch)")
+    _only(monkeypatch, "deeplabcut", "ultralytics", "torch")
+    assert backend_selection.available_backends() == (
+        "keypoint (torch)", "deeplabcut (torch)", "yolo (torch)")
 
 
 def test_build_pose_model_rejects_an_explicit_unknown_backend():
@@ -203,11 +259,11 @@ def test_build_pose_model_rejects_an_explicit_unknown_backend():
         build_pose_model("/some/project", backend="onnx")
 
 
-def test_both_backends_satisfy_the_pose_model_contract():
+def test_both_backends_satisfy_the_pose_model_contract(project):
     from autotrainer.inference.pose_model import PoseModel
 
     for backend in POSE_BACKENDS:
-        model = build_pose_model("/some/project", backend=backend)
+        model = build_pose_model(project, backend=backend)
         assert isinstance(model, PoseModel)
         assert callable(model.load)
         assert callable(model.predict)

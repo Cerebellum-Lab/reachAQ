@@ -11,9 +11,10 @@ import pathlib
 
 import pytest
 
-from autotrainer.inference import backend_selection
+from autotrainer.inference import pose_plugins
 from autotrainer.inference.backend_selection import (
     POSE_BACKEND_ENV_VAR,
+    PoseBackendNotInstalled,
     pre_validate_model,
 )
 
@@ -33,25 +34,39 @@ def test_a_yolo_model_is_checked_against_the_yolo_layout(tmp_path, monkeypatch):
     ultralytics is an optional extra now, so the test stands in for a site
     that installed it.
     """
-    monkeypatch.setattr(backend_selection, "_installed", lambda module: True)
+    monkeypatch.setattr(pose_plugins, "_installed", lambda module: True)
     (tmp_path / "yolo_pose.yaml").write_text(
         "imgsz: 256\nweights: best.pt\nbodyparts:\n  - Nose\n")
     (tmp_path / "best.pt").write_bytes(b"not a real checkpoint")
     pre_validate_model(str(tmp_path))
 
 
-def test_a_yolo_model_missing_its_weights_still_fails(tmp_path):
+def test_a_yolo_model_missing_its_weights_still_fails(tmp_path, monkeypatch):
     """Routing must not turn the check into a rubber stamp."""
+    monkeypatch.setattr(pose_plugins, "_installed", lambda module: True)
     (tmp_path / "yolo_pose.yaml").write_text(
         "imgsz: 256\nweights: best.pt\nbodyparts:\n  - Nose\n")
-    with pytest.raises(Exception):
+    with pytest.raises(FileNotFoundError, match="best.pt"):
         pre_validate_model(str(tmp_path))
 
 
 def test_a_deeplabcut_project_is_still_checked_as_one(tmp_path, monkeypatch):
     """The DeepLabCut path keeps the check it always had."""
+    from autotrainer.inference.dlc import DlcPoseModel
+
+    monkeypatch.setattr(pose_plugins, "_installed", lambda module: True)
     monkeypatch.setenv(POSE_BACKEND_ENV_VAR, "tensorflow")
-    with pytest.raises(Exception, match="config.yaml"):
+    checked = []
+    monkeypatch.setattr(DlcPoseModel, "pre_validate",
+                        classmethod(lambda cls, location: checked.append(location)))
+    (tmp_path / "config.yaml").write_text("bodyparts: [a]")
+    pre_validate_model(str(tmp_path))
+    assert checked == [str(tmp_path)]
+
+
+def test_a_directory_no_backend_recognises_is_refused(tmp_path):
+    """No config.yaml and no sidecar: refused, naming what is installed."""
+    with pytest.raises(PoseBackendNotInstalled, match="keypoint"):
         pre_validate_model(str(tmp_path))
 
 

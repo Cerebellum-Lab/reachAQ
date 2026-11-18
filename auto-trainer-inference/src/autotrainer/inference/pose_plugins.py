@@ -10,7 +10,9 @@ a model from the filesystem and reports what it needs with find_spec, and only
 build() imports the engine.
 
 The keypoint backend is built in and always listed first, so a rig with no
-plugin distribution installed still has one engine.
+plugin distribution installed still has one engine. DeepLabCut and YOLO are
+still in core for now, wrapped as in-tree plugins and listed after the
+entry-point ones; an installed distribution of the same name replaces them.
 
 A plugin that fails to load must not take live inference down with it: a
 half-removed distribution would otherwise stop every rig that merely has it
@@ -19,6 +21,7 @@ so the operator-facing message can say why a model was refused.
 """
 
 import functools
+import glob
 import importlib.metadata
 import importlib.util
 import os
@@ -94,6 +97,14 @@ class PoseBackendPlugin:
         engine's scale."""
         raise NotImplementedError
 
+    def runtimes(self) -> typing.Tuple[str, ...]:
+        """Every runtime this engine could run on here, for diagnostics.
+
+        Optional: the default is the one runtime() answers without a model,
+        which is all an engine with a fixed runtime has.
+        """
+        return (self.runtime(None, os.environ),)
+
 
 class _KeypointPlugin(PoseBackendPlugin):
     """The built-in keypoint backend.
@@ -144,6 +155,18 @@ def _entry_points() -> typing.Iterable[typing.Any]:
     return importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)
 
 
+def _in_tree_plugins() -> typing.Tuple[PoseBackendPlugin, ...]:
+    """The engines still shipped inside core, until each moves to its own
+    distribution.
+
+    Imported here rather than at module scope so that importing this module
+    stays cheap; neither plugin module imports its engine.
+    """
+    from .dlc.plugin import DLC_PLUGIN
+    from .yolo.plugin import YOLO_PLUGIN
+    return (DLC_PLUGIN, YOLO_PLUGIN)
+
+
 def _load(entry_point: typing.Any) -> PoseBackendPlugin:
     """Resolve one entry point to a plugin instance, or raise with the reason.
 
@@ -162,21 +185,44 @@ def _load(entry_point: typing.Any) -> PoseBackendPlugin:
     return loaded
 
 
+def _skip(entry_point_name: str, reason: str) -> None:
+    _broken.append((entry_point_name, reason))
+    logger.warning("pose backend plugin %r skipped: %s", entry_point_name, reason)
+
+
 @functools.cache
 def discover_plugins() -> typing.Tuple[PoseBackendPlugin, ...]:
-    """The usable plugins: keypoint first, then the installed ones by name."""
+    """The usable plugins: keypoint first, then the installed ones by name,
+    then the in-tree ones no installed plugin replaces."""
     _broken.clear()
-    found: typing.List[PoseBackendPlugin] = []
-    for entry_point in _entry_points():
+    try:
+        # Sorted so that which of two same-named plugins wins does not depend
+        # on the order the distributions happened to be installed in.
+        entry_points = sorted(_entry_points(), key=lambda point: point.name)
+    except Exception as err:  # noqa: BLE001 - broken distribution metadata can raise anything
+        # Losing the third-party plugins is bad; losing the built-in ones with
+        # them would stop every rig that has a damaged environment.
+        _skip(ENTRY_POINT_GROUP, f"{type(err).__name__}: {err}")
+        entry_points = []
+
+    found: typing.Dict[str, PoseBackendPlugin] = {}
+    for entry_point in entry_points:
         try:
-            found.append(_load(entry_point))
+            plugin = _load(entry_point)
         except Exception as err:  # noqa: BLE001 - a third-party plugin can raise anything
-            reason = f"{type(err).__name__}: {err}"
-            _broken.append((entry_point.name, reason))
-            logger.warning("pose backend plugin %r skipped: %s",
-                           entry_point.name, reason)
-    found.sort(key=lambda plugin: plugin.name)
-    return (KEYPOINT_PLUGIN, *found)
+            _skip(entry_point.name, f"{type(err).__name__}: {err}")
+            continue
+        if plugin.name == KEYPOINT_PLUGIN.name:
+            _skip(entry_point.name,
+                  f"plugin name {plugin.name!r} is reserved for the built-in backend")
+        elif plugin.name in found:
+            _skip(entry_point.name, f"plugin name {plugin.name!r} is already provided")
+        else:
+            found[plugin.name] = plugin
+
+    in_tree = [plugin for plugin in _in_tree_plugins() if plugin.name not in found]
+    return (KEYPOINT_PLUGIN, *sorted(found.values(), key=lambda plugin: plugin.name),
+            *in_tree)
 
 
 def broken_plugins() -> typing.Tuple[typing.Tuple[str, str], ...]:
@@ -189,3 +235,134 @@ def reset_discovery() -> None:
     """Forget the cached discovery, for tests."""
     discover_plugins.cache_clear()
     _broken.clear()
+
+
+# --- routing ------------------------------------------------------------------
+
+INSTALL_COMMAND = "tools/install/reachaq-plugin-install.sh"
+
+
+class PoseBackendNotInstalled(ImportError):
+    """No installed plugin can run this model.
+
+    An ImportError because that is what it is, and because callers that
+    already guard the engine import catch it. engine is None when the layout is
+    not one core recognises either.
+    """
+
+    def __init__(self, model_path: typing.Optional[str], engine: typing.Optional[str],
+                 distribution: typing.Optional[str] = None,
+                 missing: typing.Sequence[str] = (), *,
+                 plugin_name: typing.Optional[str] = None,
+                 installed: typing.Sequence[str] = ()):
+        self.model_path = model_path
+        self.engine = engine
+        self.distribution = distribution
+        self.missing = tuple(missing)
+        self.plugin_name = plugin_name
+        self.installed = tuple(installed)
+        super().__init__(self._message())
+
+    def _message(self) -> str:
+        if self.engine is None:
+            return (f"no installed pose backend recognises {self.model_path!r} "
+                    f"(installed: {', '.join(self.installed) or 'none'}). If it is "
+                    f"a model for another engine, install that engine's plugin "
+                    f"with {INSTALL_COMMAND} <name>.")
+        install = (f"Install it with {INSTALL_COMMAND} {self.plugin_name} "
+                   f"(distribution {self.distribution}).")
+        if self.missing:
+            return (f"{self.model_path!r} is a {self.engine} model, and the "
+                    f"{self.engine} pose backend cannot run here: "
+                    f"{', '.join(self.missing)} not installed. {install}")
+        return (f"{self.model_path!r} is a {self.engine} model, and the "
+                f"{self.engine} pose backend plugin is not installed. {install}")
+
+
+class AmbiguousPoseModel(ValueError):
+    """More than one plugin claims the same model directory."""
+
+    def __init__(self, model_path: str, names: typing.Sequence[str]):
+        self.model_path = model_path
+        self.names = tuple(names)
+        super().__init__(
+            f"{model_path!r} is claimed by more than one pose backend "
+            f"({', '.join(self.names)}); remove the marker files of all but one")
+
+
+class KnownLayout(typing.NamedTuple):
+    """A model layout core can name the engine of without its plugin."""
+    engine: str
+    plugin: str
+    distribution: str
+    matches: typing.Callable[[str], bool]
+
+
+def _is_yolo_layout(model_path: str) -> bool:
+    return os.path.isfile(os.path.join(model_path, "yolo_pose.yaml"))
+
+
+def _is_deeplabcut_layout(model_path: str) -> bool:
+    return (os.path.isfile(os.path.join(model_path, "config.yaml"))
+            and any(os.path.isdir(path)
+                    for path in glob.glob(os.path.join(model_path, "dlc-models*"))))
+
+
+# Used only to word the error when nothing installed claims a model, so an
+# operator is told which plugin to install rather than that the model is bad.
+KNOWN_LAYOUTS: typing.Tuple[KnownLayout, ...] = (
+    KnownLayout("YOLO", "yolo", "auto-trainer-pose-yolo", _is_yolo_layout),
+    KnownLayout("DeepLabCut", "deeplabcut", "auto-trainer-pose-deeplabcut",
+                _is_deeplabcut_layout),
+)
+
+
+def _engine_label(plugin_name: str) -> str:
+    for layout in KNOWN_LAYOUTS:
+        if layout.plugin == plugin_name:
+            return layout.engine
+    return plugin_name
+
+
+def _claims(plugin: PoseBackendPlugin, model_path: str) -> bool:
+    try:
+        return bool(plugin.claims(model_path))
+    except Exception as err:  # noqa: BLE001 - a third-party plugin can raise anything
+        logger.warning("pose backend plugin %r failed to answer for %r: %s",
+                       plugin.name, model_path, err)
+        return False
+
+
+def resolve(model_path: typing.Optional[str]) -> PoseBackendPlugin:
+    """The plugin that runs the model at this location, or raise.
+
+    The keypoint sidecar wins outright: it is an explicit declaration, where a
+    config.yaml beside it is only what DeepLabCut happens to look for.
+
+    Raises AmbiguousPoseModel when several plugins claim the directory, and
+    PoseBackendNotInstalled when none can run it.
+    """
+    if KEYPOINT_PLUGIN.claims(model_path or ""):
+        return KEYPOINT_PLUGIN
+    plugins = discover_plugins()
+    claiming = ([plugin for plugin in plugins
+                 if plugin is not KEYPOINT_PLUGIN and _claims(plugin, model_path)]
+                if model_path else [])
+    if len(claiming) > 1:
+        raise AmbiguousPoseModel(model_path, [plugin.name for plugin in claiming])
+    if claiming:
+        (plugin,) = claiming
+        missing = plugin.missing_requirements()
+        if missing:
+            raise PoseBackendNotInstalled(model_path, _engine_label(plugin.name),
+                                          plugin.distribution, missing,
+                                          plugin_name=plugin.name)
+        return plugin
+    if model_path:
+        for layout in KNOWN_LAYOUTS:
+            if layout.matches(model_path):
+                raise PoseBackendNotInstalled(model_path, layout.engine,
+                                              layout.distribution,
+                                              plugin_name=layout.plugin)
+    raise PoseBackendNotInstalled(model_path, None,
+                                  installed=[plugin.name for plugin in plugins])
