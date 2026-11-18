@@ -147,6 +147,34 @@ TORCH_MODEL_CONFIDENCE_THRESHOLDS = {
 # and LH_grab score 0% at every gate including 0.05 - not learned, not gated.
 YOLO_CONFIDENCE_THRESHOLD = 0.1
 
+# The keypoint backend's confidence is the sigmoid of its heatmap peak, a scale
+# of its own again. Measured the same way as YOLO above, on the same 33
+# held-out frames (212 labelled keypoints), for K_full_s1 (2026-11-18):
+#
+#   gate   coverage   median err   RH_grab cov   Tongue_tip cov (n=5)
+#   0.10      99.1%      0.87 px        100%            80%
+#   0.30      95.8%      0.86 px         90%            40%
+#   0.60      92.9%      0.82 px         70%            40%
+#   0.90      63.2%      0.74 px         50%            20%
+#
+# The error barely moves with the gate, so a higher one buys nothing on these
+# frames and costs coverage. On held-out recorded sessions the score drops when
+# a part is out of view - a pellet already taken, or hidden by the paw - where
+# YOLO went on reporting one, so this model's detection rate there is lower by
+# design rather than by miss.
+KEYPOINT_CONFIDENCE_THRESHOLD = 0.1
+
+# YOLO-pose runs on the AGPL ultralytics package, which is not a dependency of
+# this distribution. A YOLO model directory still routes to its backend, so an
+# operator who installed ultralytics themselves can run one; without it the
+# model is refused at pre-validation with this message rather than at the first
+# live frame.
+YOLO_NOT_INSTALLED = (
+    "{path!r} is a YOLO (Ultralytics) model, and the ultralytics package is not "
+    "installed. It is no longer part of reachAQ: retrain the model with "
+    "autotrainer.inference.keypoint.train, or install ultralytics yourself to "
+    "keep using it.")
+
 _MIN_CONFIDENCE_THRESHOLD = 0.0
 _MAX_CONFIDENCE_THRESHOLD = 1.0
 
@@ -173,6 +201,13 @@ def is_yolo_model(model_path: typing.Optional[str]) -> bool:
     if not model_path:
         return False
     return os.path.isfile(os.path.join(model_path, "yolo_pose.yaml"))
+
+
+def is_keypoint_model(model_path: typing.Optional[str]) -> bool:
+    """Whether this location is a keypoint model directory, by its sidecar."""
+    if not model_path:
+        return False
+    return os.path.isfile(os.path.join(model_path, "keypoint_pose.yaml"))
 
 
 def _installed(module: str) -> bool:
@@ -214,8 +249,8 @@ def selected_backend(environ: typing.Optional[typing.Mapping[str, str]] = None,
     the failure this function exists to avoid, so it now answers from what is
     installed and what the model is.
 
-    A YOLO model settles it on its own - those weights are torch and cannot be
-    anything else - which matters because the model can be chosen in the
+    A keypoint or YOLO model settles it on its own - those weights are torch
+    and cannot be anything else - which matters because the model can be chosen in the
     configuration while the backend can only be chosen through the environment.
 
     TensorFlow still wins when both are installed. Deployed rigs run trained
@@ -233,8 +268,8 @@ def selected_backend(environ: typing.Optional[typing.Mapping[str, str]] = None,
                         POSE_BACKEND_ENV_VAR, raw, backend)
             return backend
 
-    if is_yolo_model(model_path):
-        logger.info("%r is a YOLO model; using the %s pose backend",
+    if is_keypoint_model(model_path) or is_yolo_model(model_path):
+        logger.info("%r is a torch-only model; using the %s pose backend",
                     model_path, TORCH_BACKEND)
         return TORCH_BACKEND
 
@@ -341,7 +376,12 @@ def confidence_threshold(
     # A YOLO model runs on the torch engine but not on its scale, and it has no
     # DeepLabCut backbone name for the table below to match, so it is resolved
     # from the model itself before anything else looks at the name.
-    if is_yolo_model(model_path):
+    if is_keypoint_model(model_path):
+        logger.info("keypoint model at %r uses its measured confidence threshold "
+                    "of %.2f rather than the %s default of %.2f",
+                    model_path, KEYPOINT_CONFIDENCE_THRESHOLD, backend, default)
+        default = KEYPOINT_CONFIDENCE_THRESHOLD
+    elif is_yolo_model(model_path):
         logger.info("YOLO model at %r uses its measured confidence threshold "
                     "of %.2f rather than the %s default of %.2f",
                     model_path, YOLO_CONFIDENCE_THRESHOLD, backend, default)
@@ -396,7 +436,13 @@ def pre_validate_model(model_path: str,
     Raises whatever the backend's own pre_validate raises, so the caller still
     reports one failure rather than guessing.
     """
+    if is_keypoint_model(model_path):
+        from .keypoint import KeypointPoseModel
+        KeypointPoseModel.pre_validate(model_path)
+        return
     if is_yolo_model(model_path):
+        if not _installed("ultralytics"):
+            raise ImportError(YOLO_NOT_INSTALLED.format(path=model_path))
         from .yolo import YoloPoseModel
         YoloPoseModel.pre_validate(model_path)
         return
@@ -428,7 +474,12 @@ def build_pose_model(model_path: str, shuffle_index=1, training_index=0, batch_s
     # change and no new setting for an operator to get wrong. DeepLabCut
     # projects are untouched: they have config.yaml and no sidecar, so they
     # never reach this branch.
-    if os.path.isfile(os.path.join(model_path, "yolo_pose.yaml")):
+    if is_keypoint_model(model_path):
+        from .keypoint import KeypointPoseModel
+        return KeypointPoseModel(model_path, batch_size=batch_size)
+    if is_yolo_model(model_path):
+        if not _installed("ultralytics"):
+            raise ImportError(YOLO_NOT_INSTALLED.format(path=model_path))
         from .yolo import YoloPoseModel
         return YoloPoseModel(model_path, batch_size=batch_size)
 
