@@ -36,6 +36,9 @@ NIDAQ_SAMPLE_RATE_HZ = 10000.0
 NIDAQ_READ_CHUNK_SIZE = 500
 #: The laser sample rate the SimDAQ1 laser shape was checked at.
 LASER_SAMPLE_RATE_HZ = 10000.0
+#: The rig's is 5 s. The pose and pose-data processes import TensorFlow and
+#: torch as they spawn, which alone took 5.1-5.7 s from WSL's /mnt/c.
+WATCHDOG_TIMEOUT_S = 20.0
 
 
 def _line(terminal: str) -> str:
@@ -113,4 +116,5 @@ def build_simulation_configuration(home: Union[str, Path]) -> SystemConfiguratio
     config.inference.is_enabled = True
     config.inference.pose_model_location = ""
     config.persistence.output_location = home.joinpath("Data").as_posix()
+    config.watchdog.timeout_trigger_delay = WATCHDOG_TIMEOUT_S
     return config
