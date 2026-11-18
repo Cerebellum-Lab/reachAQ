@@ -14,6 +14,10 @@ the yolo_pose.yaml of a model trained on the same data). OUTPUT receives
 weights.pt (a plain state_dict) and keypoint_pose.yaml, which is everything
 KeypointPoseModel needs.
 
+In the app, training goes through train_arrays() with frames from a
+keypoint.dataset.PoseDataset, which reports progress per epoch and can be
+stopped and resumed exactly from its checkpoint (see train_arrays).
+
 An unlabelled part is trained as absent: its heatmap target is empty. That is
 what lets the confidence fall for a part that is not in view, and it is the
 same treatment DeepLabCut gives a missing label. The cost is that a part an
@@ -31,6 +35,7 @@ those frames rather than measure on them.
 """
 
 import argparse
+import json
 import math
 import os
 import time
@@ -44,6 +49,8 @@ from .network import STRIDE, KeypointNet, decode
 
 SIDECAR = "keypoint_pose.yaml"
 WEIGHTS = "weights.pt"
+CHECKPOINT = "checkpoint.pt"
+HISTORY = "history.json"
 
 
 # -- data -----------------------------------------------------------------
@@ -241,25 +248,71 @@ def summarise(predicted: numpy.ndarray, labels: numpy.ndarray, gate: float = 0.1
 
 # -- training -------------------------------------------------------------
 
-def train(dataset: str, output: str, bodyparts: typing.List[str], epochs: int = 300,
-          batch: int = 32, lr: float = 2e-3, weight_decay: float = 1e-4,
-          seed: int = 0, device: str = "cuda", widths=(32, 64, 128, 192),
-          blocks=(1, 2, 2, 2), neck: int = 64, rotate: float = 25.0,
-          scale: float = 1.25, shift: float = 0.1, sigma: float = 1.0,
-          log=print) -> dict:
-    torch.manual_seed(seed)
-    numpy.random.seed(seed)
+def autocast_dtype(device: str) -> typing.Optional[torch.dtype]:
+    """The reduced precision training runs in on this device, or None for fp32."""
+    if not device.startswith("cuda"):
+        return None
+    return torch.bfloat16
+
+
+def _atomic_save(obj, path: str) -> None:
+    temporary = path + ".tmp"
+    torch.save(obj, temporary)
+    os.replace(temporary, path)
+
+
+def _snapshot(net, optimiser, scheduler, generator, epoch, history, frames, epochs) -> dict:
+    """Everything needed to continue from the start of `epoch`, copied to the CPU."""
+    def cpu(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().to("cpu", copy=True)
+        if isinstance(value, dict):
+            return {key: cpu(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return type(value)(cpu(item) for item in value)
+        return value
+    return {"epoch": epoch, "epochs": epochs, "frames": frames,
+            "net": cpu(net.state_dict()), "optimiser": cpu(optimiser.state_dict()),
+            "scheduler": scheduler.state_dict(), "generator": generator.get_state(),
+            "history": [dict(line) for line in history]}
+
+
+def train_arrays(train_frames: numpy.ndarray, train_points: numpy.ndarray,
+                 val_frames: numpy.ndarray, val_points: numpy.ndarray,
+                 bodyparts: typing.Sequence[str], output: str, *, epochs: int = 300,
+                 batch: int = 32, lr: float = 2e-3, weight_decay: float = 1e-4,
+                 seed: int = 0, device: str = "cuda", widths=(32, 64, 128, 192),
+                 blocks=(1, 2, 2, 2), neck: int = 64, rotate: float = 25.0,
+                 scale: float = 1.25, shift: float = 0.1, sigma: float = 1.0,
+                 progress: typing.Optional[typing.Callable[[int, int, dict], None]] = None,
+                 should_stop: typing.Optional[typing.Callable[[], bool]] = None,
+                 checkpoint_every: int = 10, resume: bool = False,
+                 provenance: typing.Optional[dict] = None, log=print) -> dict:
+    """
+    Train on (N, S, S) uint8 frames with (N, K, 2) pixel labels (NaN absent).
+
+    progress(epoch, epochs, line) is called after every epoch. should_stop()
+    is polled every step; when it answers True the run writes CHECKPOINT,
+    holding the state at the start of the epoch in progress, and returns
+    {"status": "stopped"}. The partial epoch is discarded, so a resumed run
+    (resume=True) replays it from the same generator state and ends exactly
+    where an uninterrupted run would. A checkpoint is also written every
+    checkpoint_every epochs, so a killed process loses little.
+    """
     k = len(bodyparts)
-    train_frames, train_labels, _ = load_split(dataset, "train", k)
-    has_val = os.path.isdir(os.path.join(dataset, "images", "val"))
-    if has_val:
-        val_frames, val_labels, _ = load_split(dataset, "val", k)
+    if len(train_frames) == 0:
+        raise ValueError("there are no labelled training frames")
     size = train_frames.shape[1]
     if size % 32:
         raise ValueError(f"frame size {size} must be a multiple of 32")
+    has_val = len(val_frames) > 0
+    os.makedirs(output, exist_ok=True)
+    checkpoint_path = os.path.join(output, CHECKPOINT)
 
+    torch.manual_seed(seed)
+    numpy.random.seed(seed)
     images = torch.from_numpy(train_frames).to(device).float().div_(255).unsqueeze(1)
-    points = torch.from_numpy(train_labels).to(device)
+    points = torch.from_numpy(train_points.astype("float32")).to(device)
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
 
@@ -275,41 +328,91 @@ def train(dataset: str, output: str, bodyparts: typing.List[str], epochs: int = 
         return 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(1, total - warmup)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, schedule)
+    dtype = autocast_dtype(device)
+    scaler = torch.amp.GradScaler("cuda", enabled=dtype == torch.float16)
+
+    start_epoch, history = 0, []
+    if resume and os.path.isfile(checkpoint_path):
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if state["frames"] != len(images) or state["epochs"] != epochs:
+            raise ValueError(
+                f"the checkpoint was for {state['frames']} frames and {state['epochs']} "
+                f"epochs, not {len(images)} and {epochs}; start a new run instead")
+        net.load_state_dict(state["net"])
+        optimiser.load_state_dict(state["optimiser"])
+        scheduler.load_state_dict(state["scheduler"])
+        generator.set_state(state["generator"])
+        start_epoch, history = state["epoch"], list(state["history"])
+        log(f"resuming at epoch {start_epoch + 1} of {epochs}")
+
     log(f"training {k} parts on {len(images)} frames of {size}px, "
         f"{epochs} epochs x {steps_per_epoch} steps")
     started = time.time()
-    step = 0
-    history = []
-    for epoch in range(epochs):
+    report_every = max(1, epochs // 10)
+    for epoch in range(start_epoch, epochs):
+        snapshot = _snapshot(net, optimiser, scheduler, generator, epoch, history,
+                             len(images), epochs)
+        if epoch > start_epoch and epoch % checkpoint_every == 0:
+            _atomic_save(snapshot, checkpoint_path)
         net.train()
         order = torch.randperm(len(images), generator=generator, device=device)
         for start in range(0, len(images), batch):
+            if should_stop is not None and should_stop():
+                _atomic_save(snapshot, checkpoint_path)
+                log(f"stopped; resumes at epoch {epoch + 1}")
+                return {"status": "stopped", "epoch": epoch, "history": history,
+                        "seconds": time.time() - started}
             index = order[start:start + batch]
             x, p = _augment(images[index], points[index], generator, rotate, scale, shift)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
-                                enabled=device.startswith("cuda")):
+            with torch.autocast(device_type="cuda", dtype=dtype or torch.float32,
+                                enabled=dtype is not None):
                 out = net(x)
             heat, offset = loss_terms(out, p, sigma=sigma)
             loss = heat + offset
             optimiser.zero_grad(set_to_none=True)
-            loss.backward()
-            optimiser.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimiser)
+            scaler.update()
             scheduler.step()
-            step += 1
-        if has_val and (epoch + 1) % max(1, epochs // 10) == 0 or epoch + 1 == epochs:
-            line = {"epoch": epoch + 1, "heat": heat.item(), "offset": offset.item()}
-            if has_val:
-                line.update(summarise(predict_frames(net, val_frames, device), val_labels))
+        line = {"epoch": epoch + 1, "heat": heat.item(), "offset": offset.item()}
+        if has_val and ((epoch + 1) % report_every == 0 or epoch + 1 == epochs):
+            line.update(summarise(predict_frames(net, val_frames, device), val_points))
             history.append(line)
             log(f"{line}  ({time.time() - started:.0f}s)")
+        elif not has_val and epoch + 1 == epochs:
+            history.append(line)
+        if progress is not None:
+            progress(epoch + 1, epochs, line)
 
-    os.makedirs(output, exist_ok=True)
     torch.save(net.state_dict(), os.path.join(output, WEIGHTS))
     sidecar = {"weights": WEIGHTS, "imgsz": size, "network": net.config(),
                "bodyparts": list(bodyparts)}
+    sidecar["training"] = {**(provenance or {}), "epochs": epochs, "seed": seed,
+                           "train_frames": int(len(train_frames)),
+                           "val_frames": int(len(val_frames)),
+                           "torch": str(torch.__version__)}
     with open(os.path.join(output, SIDECAR), "w", encoding="utf-8") as handle:
         yaml.safe_dump(sidecar, handle, sort_keys=False)
-    return {"history": history, "seconds": time.time() - started}
+    with open(os.path.join(output, HISTORY), "w", encoding="utf-8") as handle:
+        json.dump(history, handle, indent=1)
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+    return {"status": "finished", "epoch": epochs, "history": history,
+            "seconds": time.time() - started}
+
+
+def train(dataset: str, output: str, bodyparts: typing.List[str], epochs: int = 300,
+          **kwargs) -> dict:
+    """Train from an exported YOLO-layout directory (images/, labels/)."""
+    k = len(bodyparts)
+    train_frames, train_labels, _ = load_split(dataset, "train", k)
+    if os.path.isdir(os.path.join(dataset, "images", "val")):
+        val_frames, val_labels, _ = load_split(dataset, "val", k)
+    else:
+        val_frames = train_frames[:0]
+        val_labels = train_labels[:0]
+    return train_arrays(train_frames, train_labels, val_frames, val_labels, bodyparts,
+                        output, epochs=epochs, **kwargs)
 
 
 def main(argv=None):
