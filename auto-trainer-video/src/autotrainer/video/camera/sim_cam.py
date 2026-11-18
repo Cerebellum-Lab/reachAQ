@@ -27,6 +27,9 @@ from .camera_base import CameraBase
 
 #: Readout and transfer from the end of exposure to the host.
 TRANSFER_S = 0.001
+#: Frames the host holds before it loses one: Spinnaker's default stream
+#: buffer count, which SpinCam keeps.
+HOST_BUFFER_FRAMES = 10
 
 
 class _SimDefaultParams:
@@ -96,9 +99,10 @@ class SimulatedCam(CameraBase):
         if self._next_k is None:
             # Exposure 0 is the first: ids stay non-negative before the epoch.
             k = max(arrived_k + 1, 0)
-        elif arrived_k - self._next_k >= 1:
-            # More than a period late: jump to the grid, leaving the id gap a
-            # real dropped frame leaves.
+        elif arrived_k - self._next_k >= HOST_BUFFER_FRAMES:
+            # Later than the host buffer holds: jump to the grid, leaving the
+            # id gap a real overflow leaves. A shorter stall is caught up from
+            # the buffer, frame by frame, as SpinCam's OldestFirst stream is.
             k = arrived_k
         else:
             k = self._next_k
@@ -137,6 +141,10 @@ class SimulatedCam(CameraBase):
         if name.lower() == "exposure":
             # Microseconds in the URL, as for Spinnaker.
             self.exposure = float(value) * 1e-6
+            return True
+        if name.lower() == "stim_mode":
+            # The app sets the stim camera's session mode in its URL; a
+            # simulated camera draws the same frames in either mode.
             return True
         return super().set_property(name, value)
 

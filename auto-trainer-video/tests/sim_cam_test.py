@@ -6,7 +6,7 @@ import pytest
 
 from autotrainer.core.simulation import ENV_SIM_EPOCH
 from autotrainer.video.camera.camera_backend import CameraBackend
-from autotrainer.video.camera.sim_cam import SimulatedCam
+from autotrainer.video.camera.sim_cam import HOST_BUFFER_FRAMES, SimulatedCam
 from autotrainer.video.video_manager import CameraKind, VideoManager
 
 FPS = 150
@@ -68,14 +68,25 @@ def test_stamps_sit_on_exposure_grid_end(epoch):
     cam.end_capture()
 
 
-def test_late_capture_leaves_a_frame_id_gap(epoch):
+def test_a_stall_the_buffer_holds_loses_no_frame(epoch):
     cam = _make_cam()
     cam.prepare_capture()
     cam.capture()
     first = cam.frame_id
     time.sleep(5.0 / FPS)
+    for offset in range(1, 7):
+        cam.capture()
+        assert cam.frame_id == first + offset
+
+
+def test_a_stall_past_the_buffer_leaves_a_frame_id_gap(epoch):
+    cam = _make_cam()
+    cam.prepare_capture()
     cam.capture()
-    assert cam.frame_id >= first + 4
+    first = cam.frame_id
+    time.sleep((HOST_BUFFER_FRAMES + 5.0) / FPS)
+    cam.capture()
+    assert cam.frame_id >= first + HOST_BUFFER_FRAMES + 4
 
 
 def test_two_cameras_share_frame_ids_for_same_exposure(epoch):
