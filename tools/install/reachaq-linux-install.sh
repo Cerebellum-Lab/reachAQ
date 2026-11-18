@@ -298,7 +298,6 @@ install_miniconda() {
     local installer_arch
     case "$machine" in
         x86_64) installer_arch=x86_64 ;;
-        aarch64|arm64) installer_arch=aarch64 ;;
         *)
             printf 'Unsupported Miniconda architecture: %s\n' "$machine" >&2
             return 2
@@ -488,9 +487,7 @@ verify_terminal_commands() {
 
 install_tensorflow_gpu_runtime() {
     if [ "$(uname -m)" != "x86_64" ]; then
-        printf '%s\n' \
-            'The automated TensorFlow CUDA runtime install supports x86_64 only.' \
-            'Use the NVIDIA JetPack TensorFlow packages on Jetson/aarch64.' >&2
+        printf '%s\n' 'The automated TensorFlow CUDA runtime install supports x86_64 only.' >&2
         return 2
     fi
 

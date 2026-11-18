@@ -16,7 +16,6 @@ class SpinnakerArtifactError(RuntimeError):
 _MACHINE_ALIASES = {
     "amd64": "x86_64",
     "x64": "x86_64",
-    "arm64": "aarch64",
 }
 
 

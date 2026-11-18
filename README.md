@@ -266,7 +266,6 @@ guidelines are in place for future additions and changes to help with and improv
 * `pip` and `pyproject.toml` are currently used.
   * `pyproject.toml` in modules should be kept up to date if possible.
 * Versions in `pyproject.toml` generally need team-wide notification to update.
-  * There are several dependencies whose version traces back to the specific environment that is currently required on the Jetson.
 * Docstrings should be in the "Google" style.
   * A lot of existing docstrings are in "reStructuredText" (Sphinx) style, which may be confusing.
   * Documentation generation can be assumed to be using `mkdocs`.

@@ -9,7 +9,6 @@ from tools.platform_support import SpinnakerArtifactError, select_spinnaker_whee
     "system,machine,filename",
     [
         ("Linux", "x86_64", "linux_x86_64.whl"),
-        ("Linux", "aarch64", "linux_aarch64.whl"),
         ("Windows", "AMD64", "win_amd64.whl"),
     ],
 )
@@ -35,3 +34,8 @@ def test_reports_unsupported_platform_tuple(tmp_path: Path):
             python_tag="cp38",
             repository_root=tmp_path,
         )
+
+
+def test_aarch64_is_not_bundled():
+    with pytest.raises(SpinnakerArtifactError, match="linux/aarch64/cp310"):
+        select_spinnaker_wheel(system="Linux", machine="aarch64", python_tag="cp310")
