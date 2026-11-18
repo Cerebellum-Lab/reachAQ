@@ -178,3 +178,52 @@ def test_cancelled_train_clears_its_unfired_windows(simulation):
         assert len(cleared) == 1 and events[-1] is cleared[0]
         assert pulses[0].start < cleared[0].start < pulses[-1].start
         assert cleared[0].end >= pulses[-1].end - 1e-9
+
+
+def _record_publish_times(monkeypatch):
+    """Wrap the laser's publish_signal so each event's publish time is kept."""
+    from autotrainer.device import laser
+
+    published = []
+    original = laser.publish_signal
+
+    def publish(line, start, end, value=1.0):
+        published.append((time.perf_counter(), start))
+        original(line, start, end, value)
+
+    monkeypatch.setattr(laser, "publish_signal", publish)
+    return published
+
+
+def test_windows_start_after_they_are_published(simulation, monkeypatch):
+    published = _record_publish_times(monkeypatch)
+    controller = make_laser_controller(_configuration())
+    controller.run_pulse_train(LaserPulseTrain(
+        channel_id=1, amplitude_volts=1.5, duration_ms=2, pulse_count=2,
+        frequency_hz=100))
+    model = LaserModel(controller)
+    operation = model.prepare_pulse_profile(
+        LaserPulseProfile("pulse", 1, 2.5, 5, pulse_count=2, frequency_hz=20),
+        SOFTWARE, _recipe())
+    operation.trigger()
+    assert operation.wait(2).value == "completed"
+    model.close()
+
+    assert len(published) == 8  # two pulses on two lines, blocking then async
+    assert all(start > at for at, start in published)
+
+
+def test_blocking_train_survives_a_bus_write_error(simulation, monkeypatch, caplog):
+    from autotrainer.device import laser
+
+    def broken(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(laser, "publish_signal", broken)
+    controller = make_laser_controller(_configuration())
+    train = LaserPulseTrain(channel_id=1, amplitude_volts=1.5, duration_ms=2)
+    with caplog.at_level("WARNING", logger="autotrainer.device.laser"):
+        controller.run_pulse_train(train)
+        controller.run_pulse_train(train)
+    assert [r.getMessage() for r in caplog.records].count(
+        "simulated laser windows not published on the bus: disk full") == 1

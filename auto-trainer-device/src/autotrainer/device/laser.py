@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import math
 import numbers
 import threading
@@ -14,6 +15,8 @@ from autotrainer.core import (
     normalize_laser_channel_id,
 )
 from autotrainer.core.simulation import is_simulation, publish_signal
+
+logger = logging.getLogger(__name__)
 
 
 def _check_timeout_seconds(timeout_seconds: Optional[float]) -> None:
@@ -650,6 +653,12 @@ def simulated_pulse_windows(train: LaserPulseTrain, started_perf: float) -> Tupl
     )
 
 
+#: A simulated train's published windows start this long after the train
+#: does, so none begins before it is on the bus: the stream truncates an
+#: event published after it has sampled the event's window.
+SIM_WINDOW_LEAD_S = 0.001
+
+
 class SimulatedLaserController(NullLaserController):
     """The NI laser in a simulation run: the null controller, seen on the NI inputs.
 
@@ -672,6 +681,7 @@ class SimulatedLaserController(NullLaserController):
         # feedback_reader, timing_plan and analog_terminal_config are the NI
         # controller's; there is no NI task here for them to configure.
         super().__init__(configuration)
+        self._warned_bus_error = False
 
     @property
     def timing_status(self) -> dict:
@@ -684,8 +694,14 @@ class SimulatedLaserController(NullLaserController):
     def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
         result = super().run_synchronized_pulse_train(pulse_train)
         if pulse_train.wait:
-            # The null train returns at once; its windows start now.
-            self._publish_windows(pulse_train, time.perf_counter())
+            # The null train returns at once; its windows start now. The
+            # train has run, so a bus that cannot be written is no failure of it.
+            try:
+                self._publish_windows(pulse_train, time.perf_counter())
+            except OSError as err:
+                if not self._warned_bus_error:
+                    self._warned_bus_error = True
+                    logger.warning("simulated laser windows not published on the bus: %s", err)
         return result
 
     def _emulated_train_started(self, pulse_train, started_perf: float) -> None:
@@ -696,7 +712,7 @@ class SimulatedLaserController(NullLaserController):
         # earlier one on the stream, so 0 V from now to the train's end
         # clears the pulses that will not now fire.
         now = time.perf_counter()
-        end = started_perf + self._emulated_pulse_duration_seconds(pulse_train)
+        end = started_perf + SIM_WINDOW_LEAD_S + self._emulated_pulse_duration_seconds(pulse_train)
         if end <= now:
             return
         for train in pulse_train.pulse_trains:
@@ -706,7 +722,7 @@ class SimulatedLaserController(NullLaserController):
     def _publish_windows(self, pulse_train: LaserSynchronizedPulseTrain, started_perf: float) -> None:
         for train in pulse_train.pulse_trains:
             lines = self._bus_lines(train.channel_id)
-            for start, end in simulated_pulse_windows(train, started_perf):
+            for start, end in simulated_pulse_windows(train, started_perf + SIM_WINDOW_LEAD_S):
                 for line in lines:
                     publish_signal(line, start, end, float(train.amplitude_volts))
 
