@@ -6,9 +6,9 @@
 # configuration (FLIR Spinnaker, NI-DAQ/PXI, PEAK CAN, NVIDIA kernel drivers,
 # and channel mappings). The single no-argument workflow installs every
 # portable component into a Python 3.10 Conda environment: the application,
-# both pose engines DeepLabCut 3 can run (PyTorch and TensorFlow) and the YOLO
-# runtime, TensorFlow's CUDA user-space runtime kept apart from PyTorch's, and
-# all tracked verification.
+# both pose engines DeepLabCut 3 can run (PyTorch and TensorFlow; PyTorch also
+# runs the live keypoint models), TensorFlow's CUDA user-space runtime kept
+# apart from PyTorch's, and all tracked verification.
 #
 # Rerunning it is the update path. An existing environment on another Python
 # version is kept, renamed <env>-py<version>-<date>, and a fresh one is built.
@@ -713,7 +713,7 @@ import nidaqmx
 import openpyxl
 import requests
 import serial
-import ultralytics
+import torch
 import autotrainer.core
 import autotrainer.device
 import autotrainer.video
