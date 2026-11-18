@@ -9967,6 +9967,9 @@ class AppModel(ObservableObject):
             )
 
     def _on_laser_runtime_property_changed(self, name, value, _old_value):
+        if name == self._laser.CONTROLLER_FAULT:
+            self._on_laser_process_fault(str(value))
+            return
         if name != self._laser.IS_CONNECTED:
             return
         if value:
@@ -10007,6 +10010,19 @@ class AppModel(ObservableObject):
                     return SubsystemState.STOPPED, dict(reason="laser controller disconnected")
 
                 self._set_laser_status_after_close(decide)
+
+    def _on_laser_process_fault(self, reason: str) -> None:
+        """The laser process failed (laser_process): the laser latches FAILED.
+
+        The process drove the laser safe, or the application reset it from a
+        new process; the reason says which, or that it must be made safe by
+        hand. Laser service stays off until the next Run or Refresh Hardware
+        opens a controller again (Ben, 2026-11-18).
+        """
+        error = f"laser process failed: {reason}"
+        self._set_subsystem_status(SubsystemId.LASER, SubsystemState.FAILED, error=error)
+        if self._acquisition.started and not self._acquisition.stopping:
+            self._handle_recording_subsystem_failure(SubsystemId.LASER, error)
 
     def _handle_recording_subsystem_failure(
         self,

@@ -281,6 +281,9 @@ class LaserModel(ObservableObject):
     CONFIGURATION = "configuration"
     IS_CONNECTED = "is_connected"
     LAST_FEEDBACK_SAMPLE = "last_feedback_sample"
+    #: The held controller's laser process failed, with why: the laser is off
+    #: and every command is refused until a controller is opened again.
+    CONTROLLER_FAULT = "controller_fault"
     trace_received: LaserModelEvents.trace_received
 
     def __init__(self, controller: Optional[LaserControllerProtocol] = None):
@@ -437,8 +440,20 @@ class LaserModel(ObservableObject):
                 timing_plan=timing_plan,
                 analog_terminal_config=analog_terminal_config,
                 hardware_class=NidaqLaserController,
+                on_fault=self._on_controller_fault,
             )
         )
+
+    def _on_controller_fault(self, reason: str) -> None:
+        """A laser process failed (laser_process): told only for the controller held.
+
+        A fault before set_controller has installed it is told from there.
+        """
+        controller = self._controller
+        if controller is None or getattr(controller, "fault", None) != reason:
+            logger.critical("Laser process of a controller not held failed: %s", reason)
+            return
+        self._on_property_changed(self.CONTROLLER_FAULT, reason, None)
 
     def open_controller(
         self,
@@ -562,6 +577,9 @@ class LaserModel(ObservableObject):
             self._pmt_margins_ignored.clear()
         self._on_property_changed(self.CONFIGURATION, self._configuration, prev_config)
         self._on_property_changed(self.IS_CONNECTED, True, False)
+        fault = getattr(controller, "fault", None)
+        if isinstance(fault, str) and fault:
+            self._on_property_changed(self.CONTROLLER_FAULT, fault, None)
 
     def set_command_voltage(self, channel_id: Union[LaserChannelId, int], volts: float) -> float:
         applied = self._require_controller().set_command_voltage(channel_id, volts)
