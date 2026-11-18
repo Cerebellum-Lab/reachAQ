@@ -196,16 +196,6 @@ class PelletHardwareProtocol(Protocol):
         """Set autocorrect motor drift"""
 
 
-class TunnelHardwareProtocol(Protocol):
-    """Empty compatibility type for the installed training package.
-
-    ReachAQ no longer implements or supplies tunnel/head-fix hardware. The
-    external training package still imports this type while accepting ``None``
-    for the corresponding attachment.
-    """
-
-#
-
 class BehaviorAlgoEvents:
     """Define the behavior algo events and their signature"""
     # NB: *assigned/defined* here,
