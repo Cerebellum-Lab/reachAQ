@@ -68,7 +68,7 @@ from tools.acquisition.model.trial_protocol_schedule import (
     TrialProtocolDocument,
 )
 
-from autotrainer.api import ApiApplicationMode, ApiTrainingMode
+from autotrainer.core.api import ApiApplicationMode, ApiTrainingMode
 
 import top_fixtures
 

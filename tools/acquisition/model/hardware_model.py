@@ -12,7 +12,7 @@ from queue import Queue
 from uuid import UUID, uuid4
 from typing import Optional, Tuple, Dict, Union, List
 
-from autotrainer.api import ApiEventKind, ApiDetectorKind
+from autotrainer.core.api import ApiEventKind, ApiDetectorKind
 from autotrainer.core import (ObservableObject, SystemCommandKind, MessageHandler, AnimalSubject, Offset3DTuple,
                               get_verbose_logger, Motor, EventManager, HardwareConfiguration,
                               get_perf_now, SystemStatusMessageKind)

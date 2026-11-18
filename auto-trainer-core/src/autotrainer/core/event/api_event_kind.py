@@ -1,5 +1,5 @@
 
-from autotrainer.api import ApiEventKind
+from autotrainer.core.api import ApiEventKind
 
 
 __all__ = ["ApiEventKind"]

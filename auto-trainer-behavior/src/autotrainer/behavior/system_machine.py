@@ -3,7 +3,7 @@ from typing import Optional
 
 from transitions import Machine
 
-from autotrainer.api import ApiEventKind
+from autotrainer.core.api import ApiEventKind
 
 from autotrainer.core import (ProjectInfo, Offset3DTuple,
                               transitions_allow_functions, SystemMessageHandler, get_perf_now)

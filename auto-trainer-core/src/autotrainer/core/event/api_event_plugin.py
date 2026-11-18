@@ -1,6 +1,6 @@
 from typing import Optional
 
-from autotrainer.api import ApiOptions, RpcService, create_api_service
+from autotrainer.core.api import ApiOptions, RpcService, create_api_service
 
 from ..logging import get_verbose_logger
 from ..project import ProjectInfo
@@ -13,11 +13,8 @@ logger = get_verbose_logger(__name__)
 
 class ApiEventPlugin(EventManagerPlugin):
     """
-    An EventManager plugin that sends events to the auto-trainer-api facilities.
-
-    This plugin requires the auto-trainer-api package to be installed.
-
-    See auto-trainer-api for additional details.
+    An EventManager plugin that publishes events on the reachAQ local API
+    (`autotrainer.core.api`) and owns that service's lifetime.
     """
 
     def __init__(self, options: ApiOptions):

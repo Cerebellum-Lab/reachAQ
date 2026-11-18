@@ -28,7 +28,7 @@ from typing import Optional, List, Dict, Callable, Any, Union, ClassVar, Protoco
 import numpy as np
 import yaml
 
-from autotrainer.api import ApiDetectorKind, ApiTrainingMode, \
+from autotrainer.core.api import ApiDetectorKind, ApiTrainingMode, \
     ApiSystemConfiguration, ApiApplicationMode, ApiCommand, ApiCommandRequestErrorKind
 
 from autotrainer.core import (
@@ -115,7 +115,7 @@ from autotrainer.behavior import (
 
 from autotrainer.training import TrainingPlan, TrainingPhase, PlanRepository, PlanInfo, LoadProgressResult
 
-from autotrainer.api import (
+from autotrainer.core.api import (
     RpcService,
     ApiCommandRequest,
     ApiCommandRequestResponse,

@@ -19,7 +19,7 @@ from typing import Callable
 
 from typing_extensions import Self
 
-from autotrainer.api import ApiEventKind
+from autotrainer.core.api import ApiEventKind
 
 from autotrainer.core import ObservableObject, EventManager, post_trigger_enable, Offset3DTuple, \
     AnimalSubject, get_perf_now, calculate_std_dev_manual, ProjectInfo
