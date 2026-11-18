@@ -148,11 +148,15 @@ def spin_cam(monkeypatch):
     cam._acquisition_started = False
     cam._skip_duplicate_frame_copy = False
     cam._width, cam._height, cam._fps = WIDTH, HEIGHT, 150
-    yield cam
-    cam.end_capture()
-    if faked:
-        # Later tests must find Spinnaker missing again, not this module bound to the fake.
-        sys.modules.pop(spinnaker_cam.__name__, None)
+    try:
+        yield cam
+    finally:
+        try:
+            cam.end_capture()
+        finally:
+            if faked:
+                # Later tests must find Spinnaker missing again, not this module bound to the fake.
+                sys.modules.pop(spinnaker_cam.__name__, None)
         camera_package = sys.modules["autotrainer.video.camera"]
         if getattr(camera_package, "spinnaker_cam", None) is spinnaker_cam:
             delattr(camera_package, "spinnaker_cam")

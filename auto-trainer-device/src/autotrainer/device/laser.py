@@ -695,20 +695,27 @@ class SimulatedLaserController(NullLaserController):
     def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
         result = super().run_synchronized_pulse_train(pulse_train)
         if pulse_train.wait:
-            # The null train returns at once; its windows start now. The
-            # train has run, so a bus that cannot be written is no failure of it.
-            try:
-                self._publish_windows(pulse_train, time.perf_counter())
-            except OSError as err:
-                if not self._warned_bus_error:
-                    self._warned_bus_error = True
-                    logger.warning("simulated laser windows not published on the bus: %s", err)
+            # The null train returns at once; its windows start now.
+            self._publish_guarded(self._publish_windows, pulse_train, time.perf_counter())
         return result
 
+    def _publish_guarded(self, publish, *args) -> None:
+        # The train has run (or is running), so a bus that cannot be written
+        # is no failure of it. Once-only warning, as on every path.
+        try:
+            publish(*args)
+        except OSError as err:
+            if not self._warned_bus_error:
+                self._warned_bus_error = True
+                logger.warning("simulated laser windows not published on the bus: %s", err)
+
     def _emulated_train_started(self, pulse_train, started_perf: float) -> None:
-        self._publish_windows(pulse_train, started_perf)
+        self._publish_guarded(self._publish_windows, pulse_train, started_perf)
 
     def _emulated_train_cut_short(self, pulse_train, started_perf: float) -> None:
+        self._publish_guarded(self._clear_windows, pulse_train, started_perf)
+
+    def _clear_windows(self, pulse_train, started_perf: float) -> None:
         # The windows were published ahead; a later event overrides an
         # earlier one on the stream, so 0 V from now to the train's end
         # clears the pulses that will not now fire.

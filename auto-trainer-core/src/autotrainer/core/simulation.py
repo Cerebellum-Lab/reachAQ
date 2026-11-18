@@ -70,6 +70,8 @@ class SimSignalBusReader:
         try:
             with open(self._path, "rb") as f:
                 if os.fstat(f.fileno()).st_size < self._offset:
+                    # Shrink-only: one fresh bus per run, so a file that is
+                    # replaced by a longer one is not detected.
                     self._offset = 0  # truncated or recreated: read it from the start
                 f.seek(self._offset)
                 data = f.read()

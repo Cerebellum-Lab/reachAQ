@@ -103,6 +103,8 @@ class SimulatedCam(CameraBase):
             # Later than the host buffer holds: jump to the grid, leaving the
             # id gap a real overflow leaves. A shorter stall is caught up from
             # the buffer, frame by frame, as SpinCam's OldestFirst stream is.
+            # Unlike OldestFirst, which delivers the oldest and drops the
+            # newest on overflow, this jumps to the newest exposure.
             k = arrived_k
         else:
             k = self._next_k

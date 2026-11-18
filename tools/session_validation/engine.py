@@ -447,7 +447,11 @@ def _frame_ledger_path(context):
 
 
 def _ledger_field_name(camera_name):
-    """The ledger's column suffix for a camera, as AppModel._camera_timing_field_name writes it."""
+    """The ledger's column suffix for a camera, as AppModel._camera_timing_field_name writes it.
+
+    The merge has two fallbacks this does not copy: `camera_{index}` when the
+    normalised name is empty, and a `_2` suffix when two names collide.
+    """
     return re.sub(r"[^0-9A-Za-z]+", "_", camera_name).strip("_").lower()
 
 

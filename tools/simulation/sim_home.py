@@ -18,6 +18,9 @@ Everything the run writes lands in the sim home (default ~/.reachaq-sim):
 
 Protocols, stimulus profiles and the wiring record sit beside the
 configuration, as they do on a rig.
+
+The class-attribute redirections (_redirect_user_defaults) reach the main
+process only; only what is carried in the environment reaches spawned children.
 """
 
 import dataclasses
@@ -59,6 +62,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 #: imported before the diamond-triangle variable is set.
 CALIBRATION_NAME = "4mm_6r_8c_4x"
 _CALIBRATION_FIXTURE = _REPO_ROOT / "auto-trainer-inference" / "tests" / CALIBRATION_NAME
+#: What a checkout without its LFS objects holds in place of each fixture file.
+_LFS_POINTER_PREFIX = b"version https://git-lfs"
 #: What AppModel.reload_calib reads. Of source_videos it lists only the names.
 _CALIBRATION_FILES = ("calibration_userset.yaml", "camera_matrix/stereo_params.pickle", "camera_offsets.pkl")
 
@@ -122,7 +127,7 @@ def _prepare_locked(args, home: Path, reset: bool, instance_lock) -> SimulationR
         if source.is_file() and (reset or not target.is_file()):
             shutil.copyfile(source, target)
     calib_dir = home / CALIBRATION_NAME
-    if reset or not calib_dir.is_dir():
+    if reset or not _calibration_complete(calib_dir):
         _copy_calibration(calib_dir)
 
     if args.configuration is None:
@@ -161,22 +166,46 @@ def _prepare_locked(args, home: Path, reset: bool, instance_lock) -> SimulationR
     )
 
 
+def _calibration_complete(target: Path) -> bool:
+    """Every file AppModel loads is there, so a half-copied directory is redone."""
+    return (target / "source_videos").is_dir() and all(
+        (target / name).is_file() for name in _CALIBRATION_FILES)
+
+
+def _check_calibration_source() -> None:
+    for name in _CALIBRATION_FILES:
+        source = _CALIBRATION_FIXTURE / name
+        if not source.is_file():
+            raise RuntimeError(f"the calibration fixture {source} is missing")
+        with source.open("rb") as handle:
+            if handle.read(len(_LFS_POINTER_PREFIX)) == _LFS_POINTER_PREFIX:
+                raise RuntimeError(
+                    f"{source} is a Git LFS pointer, not the file; run `git lfs checkout` "
+                    "in the repository and start the simulation again")
+
+
 def _copy_calibration(target: Path) -> None:
     """The repository's test calibration, as much of it as AppModel loads.
 
     The source videos are 13 MB that reload_calib only lists by name, so
-    they are empty files here.
+    they are empty files here. The copy is made beside the target and renamed
+    into place, so an interrupted copy never looks complete.
     """
-    if target.exists():
-        shutil.rmtree(target)
+    _check_calibration_source()
+    staging = target.with_name(target.name + ".partial")
+    if staging.exists():
+        shutil.rmtree(staging)
     for name in _CALIBRATION_FILES:
-        destination = target / name
+        destination = staging / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(_CALIBRATION_FIXTURE / name, destination)
-    videos = target / "source_videos"
+    videos = staging / "source_videos"
     videos.mkdir()
     for video in sorted((_CALIBRATION_FIXTURE / "source_videos").glob("*.mp4")):
         videos.joinpath(video.name).touch()
+    if target.exists():
+        shutil.rmtree(target)
+    staging.rename(target)
 
 
 def _write_preferences(home: Path, path: Path) -> None:

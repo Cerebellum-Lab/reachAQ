@@ -370,3 +370,29 @@ def test_run_acquisition_hands_the_sim_calibration_to_the_window(home, tmp_path,
     with pytest.raises(_Stop):
         run_module.run_acquisition(args)
     assert len(windows) == 1 and windows[0]["calib_dir"] == run.calib_dir
+
+
+def test_calibration_pointer_source_is_refused(home, tmp_path, monkeypatch):
+    fixture = tmp_path / "fixture"
+    for name in sim_home._CALIBRATION_FILES:
+        target = fixture / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"version https://git-lfs.github.com/spec/v1" + bytes([10]) + b"oid sha256:00" + bytes([10]))
+    (fixture / "source_videos").mkdir()
+    monkeypatch.setattr(sim_home, "_CALIBRATION_FIXTURE", fixture)
+    with pytest.raises(RuntimeError, match="git lfs checkout"):
+        sim_home._copy_calibration(tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+    with pytest.raises(RuntimeError, match="missing"):
+        monkeypatch.setattr(sim_home, "_CALIBRATION_FIXTURE", tmp_path / "nowhere")
+        sim_home._copy_calibration(tmp_path / "out")
+
+
+def test_half_copied_calibration_is_repaired(home, tmp_path):
+    sim = (tmp_path / "sim").as_posix()
+    run = _prepare(_parse("--sim-home", sim))
+    run.calib_dir.joinpath("camera_offsets.pkl").unlink()
+    assert not sim_home._calibration_complete(run.calib_dir)
+    _prepare(_parse("--sim-home", sim))
+    assert run.calib_dir.joinpath("camera_offsets.pkl").stat().st_size > 0
+    assert sim_home._calibration_complete(run.calib_dir)

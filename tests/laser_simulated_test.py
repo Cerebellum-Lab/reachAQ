@@ -227,3 +227,33 @@ def test_blocking_train_survives_a_bus_write_error(simulation, monkeypatch, capl
         controller.run_pulse_train(train)
     assert [r.getMessage() for r in caplog.records].count(
         "simulated laser windows not published on the bus: disk full") == 1
+
+
+def test_async_train_survives_a_bus_write_error(simulation, monkeypatch, caplog):
+    from autotrainer.device import laser
+
+    def broken(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(laser, "publish_signal", broken)
+    controller = make_laser_controller(_configuration())
+    model = LaserModel(controller)
+    with caplog.at_level("WARNING", logger="autotrainer.device.laser"):
+        operation = model.prepare_pulse_profile(
+            LaserPulseProfile("pulse", 1, 2.5, 5, pulse_count=2, frequency_hz=20),
+            SOFTWARE, _recipe())
+        operation.trigger()
+        assert operation.wait(2).value == "completed"
+        # A cancelled train publishes its clearing window; that one fails too.
+        cancelled = model.prepare_pulse_profile(
+            LaserPulseProfile("pulse", 1, 2.5, 500, pulse_count=2, frequency_hz=20),
+            SOFTWARE, _recipe())
+        cancelled.trigger()
+        time.sleep(0.05)
+        cancelled.cancel()
+        assert cancelled.wait(2).value == "cancelled"
+    model.close()
+    channel = controller._configuration.get_channel(1)
+    assert controller._command_volts[channel.channel_id] == channel.minimum_command_volts
+    assert [r.getMessage() for r in caplog.records].count(
+        "simulated laser windows not published on the bus: disk full") == 1

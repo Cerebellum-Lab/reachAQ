@@ -8,6 +8,8 @@ reader stalls on the fake perf clocks.
 """
 
 import json
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -117,9 +119,18 @@ def test_a_simulated_session_validates_with_only_the_provenance_warning(tmp_path
     home = tmp_path / "sim-home"
     log_path, result_path = tmp_path / "session.log", tmp_path / "session.json"
     with log_path.open("wb") as log:
-        completed = subprocess.run(
+        # Its own session, so a timeout can take the NI worker and its children down too.
+        child = subprocess.Popen(
             [sys.executable, __file__, str(home), str(result_path)],
-            cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT, timeout=240)
+            cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            child.wait(timeout=240)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+            pytest.fail("the simulated session timed out:" + chr(10)
+                        + log_path.read_text(errors="replace")[-6000:])
+    completed = child
     assert completed.returncode == 0, log_path.read_text(errors="replace")[-6000:]
     session_dir = Path(json.loads(result_path.read_text())["session"])
     assert home in session_dir.parents
