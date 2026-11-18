@@ -1,5 +1,8 @@
 import os
+import subprocess
+import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -13,20 +16,23 @@ from tools.acquisition.model.nidaq_channel_plan import build_nidaq_acquisition_c
 from tools.acquisition.model.nidaq_discovery import simulated_nidaq_devices
 from tools.acquisition.model.nidaq_timing import build_nidaq_timing_plan
 from tools.acquisition.model.user_preferences import UserPreferences
-from tools.simulation import profile
-from tools.simulation.profile import SIMULATION_ENVIRONMENT, prepare_simulation
+from tools.acquisition import instance_lock
+from tools.acquisition.instance_lock import AlreadyRunning, acquire_instance_lock
+from tools.simulation import sim_home
+from tools.simulation.sim_home import SIMULATION_ENVIRONMENT, prepare_simulation
 from tools.simulation.sim_configuration import build_simulation_configuration
 
 
+needs_flock = pytest.mark.skipif(instance_lock.fcntl is None, reason="flock is POSIX only")
+
+
 @pytest.fixture
-def home(tmp_path, monkeypatch) -> Path:
+def home(tmp_path, monkeypatch):
     """HOME under tmp, with the environment and the defaults prepare_simulation moves restored after."""
     home = tmp_path.joinpath("operator-home")
     home.mkdir()
-    monkeypatch.setenv("HOME", home.as_posix())
+    before = {name: os.environ.get(name) for name in SIMULATION_ENVIRONMENT}
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-    for name in SIMULATION_ENVIRONMENT:
-        monkeypatch.delenv(name, raising=False)
     for owner, attribute in (
         (PersistenceConfiguration, "DEFAULT_OUTPUT_PATH"),
         (AppModel, "status_file_path"),
@@ -35,11 +41,26 @@ def home(tmp_path, monkeypatch) -> Path:
         (DiamondTriangleOffsetConfig, "DEFAULT_CONFIG_PATH"),
     ):
         monkeypatch.setattr(owner, attribute, getattr(owner, attribute))
-    return home
+    # A whole copy, restored whole: monkeypatch.delenv records nothing for a
+    # variable that is absent, so what prepare_simulation set would outlive the test.
+    with mock.patch.dict(os.environ):
+        os.environ["HOME"] = home.as_posix()
+        for name in SIMULATION_ENVIRONMENT:
+            os.environ.pop(name, None)
+        yield home
+    assert {name: os.environ.get(name) for name in SIMULATION_ENVIRONMENT} == before
 
 
 def _parse(*argv):
     return make_autotrainer_parser().parse_args(["--simulate", *argv])
+
+
+def _prepare(args):
+    """prepare_simulation for a test that does not hold the run: its lock is let go."""
+    run = prepare_simulation(args)
+    if run.instance_lock is not None:
+        run.instance_lock.close()
+    return run
 
 
 def _files(root: Path) -> set:
@@ -48,7 +69,7 @@ def _files(root: Path) -> set:
 
 def test_prepare_writes_only_under_sim_home(home, tmp_path):
     before = _files(tmp_path)
-    run = prepare_simulation(_parse())
+    run = _prepare(_parse())
 
     assert run.home == home.joinpath(".reachaq-sim").resolve()
     created = _files(tmp_path) - before
@@ -76,8 +97,8 @@ def test_prepare_writes_only_under_sim_home(home, tmp_path):
 
 
 def test_second_run_reuses_config_and_reset_regenerates(home, tmp_path):
-    sim_home = tmp_path.joinpath("sim")
-    first = prepare_simulation(_parse("--sim-home", sim_home.as_posix()))
+    sim = tmp_path.joinpath("sim")
+    first = _prepare(_parse("--sim-home", sim.as_posix()))
     edited = first.config_path.read_text().replace("fps: 150", "fps: 100")
     assert edited != first.config_path.read_text()
     first.config_path.write_text(edited)
@@ -85,26 +106,40 @@ def test_second_run_reuses_config_and_reset_regenerates(home, tmp_path):
     preferences.log_level = 10
     preferences.save()
 
-    args = _parse("--sim-home", sim_home.as_posix())
-    second = prepare_simulation(args)
+    args = _parse("--sim-home", sim.as_posix())
+    second = _prepare(args)
     assert second.config_path.read_text() == edited
     assert UserPreferences(settings_file_path=second.preferences_path).log_level == 10
     # The kept file's primary camera sets the simulated grid.
     assert float(os.environ["REACHAQ_SIM_CAMERA_FPS"]) == 100.0
     assert second.bus_path != first.bus_path
 
-    third = prepare_simulation(_parse("--sim-home", sim_home.as_posix(), "--sim-reset"))
+    third = _prepare(_parse("--sim-home", sim.as_posix(), "--sim-reset"))
     assert "fps: 100" not in third.config_path.read_text()
     assert UserPreferences(settings_file_path=third.preferences_path).log_level != 10
     assert float(os.environ["REACHAQ_SIM_CAMERA_FPS"]) == 150.0
 
 
 def test_user_given_files_are_kept(home, tmp_path):
-    config, prefs = tmp_path / "mine.yaml", tmp_path / "mine.ini"
+    mine = tmp_path / "mine"
+    build_simulation_configuration(mine).save_default(mine)
+    config = SystemConfiguration.make_default_yaml_config_path(mine)
+    config.write_text(config.read_text().replace("fps: 150", "fps: 100"))
+    config_text = config.read_text()
+    prefs = tmp_path / "mine.ini"
+    preferences = UserPreferences(settings_file_path=prefs)
+    preferences.log_level = 10
+    preferences.save()
+    prefs_text = prefs.read_text()
+
     args = _parse("--sim-home", (tmp_path / "sim").as_posix(), "-c", config.as_posix(),
                   "--preferences-file", prefs.as_posix())
-    prepare_simulation(args)
+    run = _prepare(args)
     assert args.configuration == config and args.preferences_file == prefs
+    assert config.read_text() == config_text and prefs.read_text() == prefs_text
+    # The user's file is the one the run reads its camera grid from.
+    assert float(os.environ["REACHAQ_SIM_CAMERA_FPS"]) == 100.0
+    assert run.config_path != config and run.config_path.is_file()
 
 
 def test_generated_config_builds_nidaq_plan(tmp_path):
@@ -151,7 +186,7 @@ def test_generated_config_builds_nidaq_plan(tmp_path):
 def test_environment_set(home, tmp_path):
     args = _parse("--sim-home", (tmp_path / "sim").as_posix())
     assert getattr(args, "allow_can_emulation", False) is False
-    run = prepare_simulation(args)
+    run = _prepare(args)
 
     assert os.environ["REACHAQ_SIMULATION"] == "1"
     assert os.environ["REACHAQ_SIM_BUS"] == run.bus_path.as_posix()
@@ -164,4 +199,97 @@ def test_environment_set(home, tmp_path):
     assert args.configuration == run.config_path
     assert args.preferences_file == run.preferences_path
     assert set(SIMULATION_ENVIRONMENT) <= set(os.environ)
-    assert profile.ENV_DIAMOND_TRIANGLE_CONFIG in SIMULATION_ENVIRONMENT
+    assert sim_home.ENV_DIAMOND_TRIANGLE_CONFIG in SIMULATION_ENVIRONMENT
+
+
+def test_environment_is_gone_after_a_run(home):
+    # After test_environment_set, which ran prepare_simulation; the home
+    # fixture's teardown checks the same after every test here.
+    assert not set(SIMULATION_ENVIRONMENT) & set(os.environ)
+
+
+@needs_flock
+def test_run_holds_the_home_lock_and_a_second_run_writes_nothing(home, tmp_path):
+    sim = tmp_path / "sim"
+    run = prepare_simulation(_parse("--sim-home", sim.as_posix()))
+    try:
+        assert run.instance_lock is not None
+        assert run.lock_path.read_text().strip() == str(os.getpid())
+        run.config_path.write_text("held")
+        before = _files(sim)
+        with pytest.raises(AlreadyRunning):
+            prepare_simulation(_parse("--sim-home", sim.as_posix(), "--sim-reset"))
+        assert _files(sim) == before and run.config_path.read_text() == "held"
+    finally:
+        run.instance_lock.close()
+    acquire_instance_lock(run.lock_path).close()  # released with the handle
+
+
+@needs_flock
+def test_a_held_home_refuses_before_creating_it(home, tmp_path):
+    sim = tmp_path / "sim"
+    held = acquire_instance_lock(sim / "app.lock")
+    try:
+        with pytest.raises(AlreadyRunning):
+            prepare_simulation(_parse("--sim-home", sim.as_posix()))
+        assert sorted(path.name for path in sim.iterdir()) == ["app.lock"]
+    finally:
+        held.close()
+
+
+@needs_flock
+@pytest.mark.parametrize("main", ["tools.acquisition.headless", "tools.acquisition.gui"])
+def test_a_main_on_a_held_home_exits_already_running(main, tmp_path, app_launch_env):
+    sim = tmp_path / "sim"
+    held = acquire_instance_lock(sim / "app.lock")
+    try:
+        done = subprocess.run(
+            [sys.executable, "-m", main, "--simulate", "--sim-home", sim.as_posix()],
+            env=app_launch_env, capture_output=True, text=True, timeout=60)
+    finally:
+        held.close()
+    assert done.returncode == instance_lock.ALREADY_RUNNING_EXIT, done.stderr
+    assert "already running" in done.stderr and str(os.getpid()) in done.stderr
+    assert sorted(path.name for path in sim.iterdir()) == ["app.lock"]
+
+
+def test_calibration_is_loaded_from_the_home(home, tmp_path, monkeypatch):
+    from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
+    from autotrainer.inference import calibration_FLIR
+    from types import SimpleNamespace
+
+    import autotrainer.core.logging as core_logging
+    from tools.acquisition import headless
+    from tools.acquisition.model import app_model
+
+    args = _parse("--sim-home", (tmp_path / "sim").as_posix())
+    run = _prepare(args)
+    assert run.calib_dir == run.home / DEFAULT_3D_CALIB_DIR_NAME
+    # What reload_calib reads is there.
+    for name in ("calibration_userset.yaml", "camera_matrix/stereo_params.pickle",
+                 "camera_offsets.pkl"):
+        assert run.calib_dir.joinpath(name).stat().st_size > 0, name
+    assert calibration_FLIR.get_video_list(run.calib_dir.as_posix()) == [
+        "20241029_agx001_session002_left", "20241029_agx001_session002_right"]
+
+    built = []
+
+    class _Stop(Exception):
+        pass
+
+    def fake_app_model(preferences, **kwargs):
+        built.append(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(app_model, "AppModel", fake_app_model)
+    monkeypatch.setattr(core_logging, "get_console_handler",
+                        lambda: SimpleNamespace(setLevel=lambda _level: None))
+    with pytest.raises(_Stop):
+        headless._exec_main(args, calib_dir=run.calib_dir)
+    assert built == [{"calib_dir": run.calib_dir}]
+    assert Path(built[0]["calib_dir"]).resolve().is_relative_to(run.home)
+
+    # --sim-reset puts back a calibration that was changed.
+    run.calib_dir.joinpath("camera_offsets.pkl").write_bytes(b"edited")
+    _prepare(_parse("--sim-home", (tmp_path / "sim").as_posix(), "--sim-reset"))
+    assert run.calib_dir.joinpath("camera_offsets.pkl").read_bytes() != b"edited"

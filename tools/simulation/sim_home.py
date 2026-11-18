@@ -1,7 +1,8 @@
 """Prepare a `--simulate` run: its sim home, its environment and its defaults.
 
 `prepare_simulation` runs in the GUI's and headless' main() right after the
-arguments are parsed, before the instance lock, logging and AppModel. The NI
+arguments are parsed, before logging and AppModel. It takes the home's
+instance lock before it writes anything, in place of the rig's lock. The NI
 worker is a forkserver started in AppModel.__init__, and its children see only
 the environment the forkserver started with, so every variable is set here.
 
@@ -9,6 +10,7 @@ Everything the run writes lands in the sim home (default ~/.reachaq-sim):
 
     system_configuration.yaml   generated on first run, kept after, --sim-reset regenerates
     preferences.ini             the same
+    4mm_6r_8c_4x/               the 3D calibration, from the repository's test fixture; the same
     Data/                       session data and logs (persistence.outputLocation)
     animals/                    the animal registry
     runs/<utc>/signals.jsonl    this run's signal bus
@@ -24,7 +26,7 @@ import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import IO, Optional, Tuple
 
 DEFAULT_SIM_HOME = Path("~/.reachaq-sim")
 
@@ -53,6 +55,12 @@ RUNNING_STATUS_NAME = "autotrainer_running_status.env"
 #: repository's copies so the emulated board gets the same motor setup.
 _MOTOR_FILES = ("motor_config.yaml", "move_config.yaml")
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+#: autotrainer.core.configuration.DEFAULT_3D_CALIB_DIR_NAME, which cannot be
+#: imported before the diamond-triangle variable is set.
+CALIBRATION_NAME = "4mm_6r_8c_4x"
+_CALIBRATION_FIXTURE = _REPO_ROOT / "auto-trainer-inference" / "tests" / CALIBRATION_NAME
+#: What AppModel.reload_calib reads. Of source_videos it lists only the names.
+_CALIBRATION_FILES = ("calibration_userset.yaml", "camera_matrix/stereo_params.pickle", "camera_offsets.pkl")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,16 +70,38 @@ class SimulationRun:
     preferences_path: Path
     bus_path: Path
     lock_path: Path
+    #: The 3D calibration AppModel loads, in place of ~/Autotrainer's.
+    calib_dir: Path
+    #: The held instance lock; keep it for the process's life. None where
+    #: flock does not exist.
+    instance_lock: Optional[IO[str]]
 
 
 def prepare_simulation(args) -> SimulationRun:
-    """Make the sim home, set the simulation environment, and point args at the home.
+    """Lock the sim home, fill it, set the simulation environment, and point args at it.
 
     `args.configuration` and `args.preferences_file` are set to the home's
-    files only when the user left them unset.
+    files only when the user left them unset. Raises
+    tools.acquisition.instance_lock.AlreadyRunning, having written nothing,
+    while another simulation holds the home.
     """
+    from tools.acquisition.instance_lock import acquire_instance_lock
+
     home = Path(getattr(args, "sim_home", None) or DEFAULT_SIM_HOME).expanduser().resolve()
     reset = bool(getattr(args, "sim_reset", False))
+    # Before any file is written: a second run must not regenerate the
+    # configuration under a running one. The lock makes only the home's parent.
+    home.parent.mkdir(parents=True, exist_ok=True)
+    instance_lock = acquire_instance_lock(home / LOCK_NAME)
+    try:
+        return _prepare_locked(args, home, reset, instance_lock)
+    except BaseException:
+        if instance_lock is not None:
+            instance_lock.close()
+        raise
+
+
+def _prepare_locked(args, home: Path, reset: bool, instance_lock) -> SimulationRun:
     for directory in (home, home / "Data", home / "animals"):
         directory.mkdir(parents=True, exist_ok=True)
     # Before autotrainer.core is imported: it imports diamond_triangle_config,
@@ -91,6 +121,9 @@ def prepare_simulation(args) -> SimulationRun:
         source, target = _REPO_ROOT / "tests" / name, home / name
         if source.is_file() and (reset or not target.is_file()):
             shutil.copyfile(source, target)
+    calib_dir = home / CALIBRATION_NAME
+    if reset or not calib_dir.is_dir():
+        _copy_calibration(calib_dir)
 
     if args.configuration is None:
         args.configuration = config_path
@@ -121,7 +154,27 @@ def prepare_simulation(args) -> SimulationRun:
         preferences_path=preferences_path,
         bus_path=bus_path,
         lock_path=home / LOCK_NAME,
+        calib_dir=calib_dir,
+        instance_lock=instance_lock,
     )
+
+
+def _copy_calibration(target: Path) -> None:
+    """The repository's test calibration, as much of it as AppModel loads.
+
+    The source videos are 13 MB that reload_calib only lists by name, so
+    they are empty files here.
+    """
+    if target.exists():
+        shutil.rmtree(target)
+    for name in _CALIBRATION_FILES:
+        destination = target / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(_CALIBRATION_FIXTURE / name, destination)
+    videos = target / "source_videos"
+    videos.mkdir()
+    for video in sorted((_CALIBRATION_FIXTURE / "source_videos").glob("*.mp4")):
+        videos.joinpath(video.name).touch()
 
 
 def _write_preferences(home: Path, path: Path) -> None:
@@ -180,7 +233,9 @@ def _redirect_user_defaults(home: Path) -> None:
     from autotrainer.device.motor_configuration_file import MotorConfigurationFile
     from tools.acquisition.model.app_model import AppModel
 
-    # Where AppModel opens its log before a configuration's outputLocation is loaded.
+    # AppModel's output location until a configuration is loaded. The
+    # output_location field's default was fixed at import and is unchanged;
+    # the generated configuration names its own.
     PersistenceConfiguration.DEFAULT_OUTPUT_PATH = home / "Data"
     AppModel.status_file_path = home / RUNNING_STATUS_NAME
     MotorConfigurationFile.DEFAULT_LOCATION = home / _MOTOR_FILES[0]
