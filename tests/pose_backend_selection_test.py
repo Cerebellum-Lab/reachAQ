@@ -237,3 +237,30 @@ def test_importing_the_selector_pulls_in_neither_framework():
     )
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "", f"imported at module scope: {completed.stdout.strip()}"
+
+
+@pytest.mark.parametrize("simulating, model_location, probed", [
+    ("1", "", False),          # a simulation's MemoryPoseModel runs on the CPU
+    ("1", "/models/dlc", True),  # a simulation with a real model still needs its GPU
+    (None, "", True),          # a rig's empty model is probed as before
+])
+def test_only_a_simulations_in_memory_model_skips_the_gpu_probe(
+        monkeypatch, simulating, model_location, probed):
+    from types import SimpleNamespace
+    from tools.acquisition.model import inference_model
+    from tools.acquisition.model.inference_model import InferenceModel
+
+    if simulating is None:
+        monkeypatch.delenv("REACHAQ_SIMULATION", raising=False)
+    else:
+        monkeypatch.setenv("REACHAQ_SIMULATION", simulating)
+    calls = []
+    unavailable = gpu_runtime.GpuRuntimeStatus(False, backend="tensorflow", error="no GPU")
+    monkeypatch.setattr(inference_model, "detect_gpu_runtime",
+                        lambda **kwargs: calls.append(kwargs) or unavailable)
+    model = SimpleNamespace(_model_location=model_location, _gpu_runtime_status=None)
+
+    status = InferenceModel.check_live_inference_runtime(model)
+
+    assert bool(calls) is probed
+    assert status.is_available is not probed
