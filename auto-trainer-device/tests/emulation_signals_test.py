@@ -4,7 +4,7 @@ import pytest
 
 from autotrainer.core.simulation import SimSignalBusReader
 from autotrainer.device import CanInterface, CanTransportConfiguration
-from autotrainer.device.device_interface import DigitalOutputs
+from autotrainer.device.device_interface import DigitalOutputs, PelletDigitalInputs
 from autotrainer.device.emulation_interface import EmulationInterface
 from autotrainer.device.motor_pellet_backend import MotorPelletBackend
 
@@ -71,6 +71,34 @@ def test_refused_stim_pulse_publishes_nothing(bus, emulator):
     with pytest.raises(ValueError):
         emulator.pulse_digital_output(DigitalOutputs.STIMULUS_1, 1000)
     assert bus.poll() == ()
+
+
+def _status_messages(emulator):
+    emulator._last_status_message = -float("inf")
+    return emulator.read()
+
+
+def test_a_simulation_reads_idle_inputs_stamped_on_receipt(emulator, monkeypatch):
+    # The host decodes stimulus_1 as the tone1 GPIO: a constant high is a tone
+    # the NI never saw. Unstamped, an ack would precede the SEND it answers.
+    monkeypatch.setenv("REACHAQ_SIMULATION", "1")
+    before = time.perf_counter_ns()
+    messages = _status_messages(emulator)
+    after = time.perf_counter_ns()
+
+    (inputs,) = [m for m in messages if isinstance(m, PelletDigitalInputs)]
+    assert not (inputs.stimulus_1 or inputs.stimulus_2 or inputs.stimulus_3 or inputs.stimulus_4)
+    assert all(before <= m.index <= after and m.timestamp_ns > 0 for m in messages)
+
+
+def test_emulation_outside_a_simulation_is_unchanged(emulator, monkeypatch):
+    monkeypatch.delenv("REACHAQ_SIMULATION", raising=False)
+    messages = _status_messages(emulator)
+
+    (inputs,) = [m for m in messages if isinstance(m, PelletDigitalInputs)]
+    assert (inputs.stimulus_1, inputs.stimulus_2, inputs.stimulus_3, inputs.stimulus_4) == (
+        True, False, True, False)
+    assert all(m.index == 0 for m in messages)
 
 
 def test_emulation_interface_is_motor_pellet_backend():

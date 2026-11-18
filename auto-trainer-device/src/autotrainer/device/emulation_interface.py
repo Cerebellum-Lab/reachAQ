@@ -6,7 +6,7 @@ from typing import Union, Tuple
 
 from autotrainer.core import Offset3DTuple
 from autotrainer.core.logging import get_verbose_logger
-from autotrainer.core.simulation import publish_signal
+from autotrainer.core.simulation import is_simulation, publish_signal
 
 from .device_interface import (DeviceInterface, ServoConfig, StepperConfig,
                                StepperStatus, ServoStatus, Target, DigitalOutputs,
@@ -146,9 +146,20 @@ class EmulationInterface(DeviceInterface):
                 ServoStatus(Target.PELLET_DEVICE, Motor.PELLET_LOAD_SERVO,
                             self._positions[Motor.PELLET_LOAD_SERVO]))
 
+            # A simulation reports idle inputs: the host decodes stimulus_1 as
+            # the tone1 GPIO, and a constant high there is a tone the NI never saw.
+            active = not is_simulation()
             messages.append(PelletDigitalInputs(
-                target=Target.PELLET_DEVICE, stimulus_1=True, stimulus_2=False, stimulus_3=True, stimulus_4=False))
+                target=Target.PELLET_DEVICE, stimulus_1=active, stimulus_2=False, stimulus_3=active, stimulus_4=False))
             messages.append(self._color_led)
+
+        if is_simulation():
+            # Stamped on receipt, as CanInterface stamps a frame it reads: a
+            # session times acks and board reports by these, and 0 would put
+            # an ack before the SEND it answers.
+            wall_ns, perf_ns = time.time_ns(), time.perf_counter_ns()
+            for message in messages:
+                message.timestamp_ns, message.index = wall_ns, perf_ns
 
         return messages
 
