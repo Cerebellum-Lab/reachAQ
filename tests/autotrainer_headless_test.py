@@ -294,12 +294,44 @@ def test_a_preferences_edit_saves_when_it_is_made(app_model, config_file_path, t
     app_model.output_location = data
     app_model.set_inference_model_location("/models/other")
     app_model.update_session_control_option("trial_limit", 7)
+    app_model.flush_configuration_save()
 
     saved = SystemConfiguration.load_yaml_file(config_file_path)
     assert saved.persistence.output_location == data
     assert saved.inference.pose_model_location == "/models/other"
     assert saved.behavior.session_control.trial_limit == 7
 
+
+
+def test_a_run_of_preferences_edits_writes_the_file_once(
+    app_model, config_file_path, monkeypatch,
+):
+    assert app_model.load_configuration() is True
+    writes = []
+    save_file = SystemConfiguration.save_file
+    def counted(self, path, *args, **kwargs):
+        writes.append(path)
+        return save_file(self, path, *args, **kwargs)
+    monkeypatch.setattr(SystemConfiguration, "save_file", counted)
+
+    # A spin box stepping from 1 to 9 is nine edits.
+    for limit in range(1, 10):
+        app_model.update_session_control_option("trial_limit", limit)
+    _wait_until(lambda: writes)
+    time.sleep(0.7)  # past another save delay: nothing more is written
+
+    assert len(writes) == 1
+    saved = SystemConfiguration.load_yaml_file(config_file_path)
+    assert saved.behavior.session_control.trial_limit == 9
+
+
+def test_exit_writes_a_preferences_edit_still_waiting(app_model, config_file_path):
+    assert app_model.load_configuration() is True
+    app_model.update_session_control_option("trial_limit", 11)
+    app_model.on_close()
+
+    saved = SystemConfiguration.load_yaml_file(config_file_path)
+    assert saved.behavior.session_control.trial_limit == 11
 
 def test_a_live_inference_edit_replaces_the_cli_override(app_model, config_file_path):
     assert app_model.load_configuration() is True

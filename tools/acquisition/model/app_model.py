@@ -446,6 +446,11 @@ class _BoundedClose:
         return ""
 
 
+# A Preferences edit arrives per keystroke or spin-box step; its save waits
+# this long after the last one, so a run of edits writes the file once.
+_PREFERENCES_SAVE_DELAY_SECONDS = 0.5
+
+
 def _serialized_session_configuration(method):
     """Serialize configuration changes against Record/Stop/Abort commands."""
     @functools.wraps(method)
@@ -815,6 +820,7 @@ class AppModel(ObservableObject):
         self._training_plan_animal: Optional[AnimalSubject] = None
         self._recording_session = RecordingSessionController()
         self._session_lifecycle_command_lock = threading.RLock()
+        self._pending_configuration_save: Optional[threading.Timer] = None
         self._session_stop_policy: Optional[SessionStopPolicy] = None
         self._session_stop_evaluation: Optional[SessionStopEvaluation] = None
         self._recording_ending_reason = RecordingEndingReason.NA
@@ -4523,7 +4529,7 @@ class AppModel(ObservableObject):
         session_control = self._behavior.algorithm.active_config.session_control
         session_control.automatic_protocol_advance_enabled = enabled
         self._protocol_runner.automatic_advance = enabled
-        self.save_configuration()
+        self._save_configuration_soon()
         if self._attached_plan is not None:
             self._attached_plan.is_automatic = enabled
             self._on_property_changed(
@@ -4600,7 +4606,7 @@ class AppModel(ObservableObject):
         """Apply a Preferences mutation through the session-state boundary."""
         self._require_session_ready_for_configuration(action)
         update(self._behavior.algorithm)
-        self.save_configuration()
+        self._save_configuration_soon()
 
     @_serialized_session_configuration
     def set_live_inference_enabled(self, enabled: bool) -> None:
@@ -4611,7 +4617,7 @@ class AppModel(ObservableObject):
         # The operator's choice replaces a --live-inference override, which
         # would otherwise keep the file at its loaded value.
         self._runtime_live_inference_override = None
-        self.save_configuration()
+        self._save_configuration_soon()
 
     @_serialized_session_configuration
     def set_inference_model_location(self, value: str) -> None:
@@ -4619,7 +4625,7 @@ class AppModel(ObservableObject):
             "Changing the inference model"
         )
         self._inference.model_location = str(value)
-        self.save_configuration()
+        self._save_configuration_soon()
 
     @_serialized_session_configuration
     def update_user_preference(self, name: str, value) -> None:
@@ -4646,7 +4652,7 @@ class AppModel(ObservableObject):
         self.set_log_location(log_path)
         # A load sets it from the file it is reading; only an edit saves.
         if not self._configuration_load_incomplete:
-            self.save_configuration()
+            self._save_configuration_soon()
 
     @property
     def animal_name(self) -> str:
@@ -6331,7 +6337,7 @@ class AppModel(ObservableObject):
             )
             if control.trial_count_basis == TrialCountBasis.SCORED.value:
                 control.trial_count_basis = TrialCountBasis.COMPLETED.value
-        self.save_configuration()
+        self._save_configuration_soon()
         self._notify_trial_protocol_state()
         return True
 
@@ -6346,7 +6352,7 @@ class AppModel(ObservableObject):
             raise ValueError(f"Unknown session-control option: {field}")
         candidate = dataclasses.replace(control, **{str(field): value})
         setattr(control, str(field), getattr(candidate, str(field)))
-        self.save_configuration()
+        self._save_configuration_soon()
         self._notify_trial_protocol_state()
         return True
 
@@ -9033,6 +9039,8 @@ class AppModel(ObservableObject):
         # builds what it writes from those live objects. On 2026-09-17 exactly
         # that wrote a demo run's playback cameras over christielab10's real
         # ones. So nothing may be saved until this load reaches its last line.
+        # An edit still waiting belongs to the file it was made on.
+        self.flush_configuration_save()
         self._configuration_load_incomplete = True
         if location is None:
             location = self.get_config_location()
@@ -9281,6 +9289,32 @@ class AppModel(ObservableObject):
                           f"{err}\n\nPrevious plans are retained.")
             return
         self._training_plans = plan_infos
+
+    def _save_configuration_soon(self) -> None:
+        """Save once the edits stop; exit and a load write a pending save first."""
+        with self._session_lifecycle_command_lock:
+            if self._pending_configuration_save is not None:
+                self._pending_configuration_save.cancel()
+            timer = threading.Timer(
+                _PREFERENCES_SAVE_DELAY_SECONDS, self._flush_configuration_save_from_timer)
+            timer.daemon = True
+            self._pending_configuration_save = timer
+            timer.start()
+
+    def _flush_configuration_save_from_timer(self) -> None:
+        try:
+            self.flush_configuration_save()
+        except Exception:
+            logger.exception("Could not save the configuration after a Preferences edit")
+
+    def flush_configuration_save(self) -> None:
+        """Write a Preferences save still waiting; nothing when none is."""
+        with self._session_lifecycle_command_lock:
+            timer, self._pending_configuration_save = self._pending_configuration_save, None
+            if timer is None:
+                return
+            timer.cancel()
+            self.save_configuration()
 
     def save_configuration(self):
         if self._loaded_configuration is None:
@@ -9622,11 +9656,12 @@ class AppModel(ObservableObject):
         # mp_mgr.join()
 
         self._preferences.save()
-        # No configuration save here. Each operator edit of a stored setting
-        # saved itself when it was made; what changed while running (a stim
-        # session's camera mode, a CLI override, the protocol's progress) is
-        # the session's, and its metadata records it. Saving on exit wrote
-        # that runtime state over the file every run.
+        # Only a Preferences edit still waiting for its save is written here.
+        # Each operator edit of a stored setting saves itself; what changed
+        # while running (a stim session's camera mode, a CLI override, the
+        # protocol's progress) is the session's, and its metadata records it.
+        # Saving on exit wrote that runtime state over the file every run.
+        self.flush_configuration_save()
         unregister_fatal_exception_callback(self._on_fatal_exception)
 
     def _on_fatal_exception(self, source: str, exception: BaseException) -> None:

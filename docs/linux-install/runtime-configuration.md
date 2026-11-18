@@ -80,6 +80,9 @@ changes a stored setting while idle, at the moment of the change: leaving
 camera edit mode, a Camera binning choice, **Edit DAQ Ports** OK, **File →
 Hardware**, an NI-DAQ plot selection, and each Preferences or Behavior edit
 (data location, inference model, live inference, session and pellet options).
+A Preferences or Behavior edit is written half a second after the last change,
+so stepping a spin box or typing a path saves once; exiting or loading another
+configuration writes one still waiting.
 Starting, recording, stopping and exiting write nothing to the file, so what a
 run changes on its own (a stim session's camera mode, a `--live-inference`
 override, the protocol's progress) is not carried into the next start; each
