@@ -182,10 +182,12 @@ class SimulatedNidaqStream:
     def _raw_samples(self, channel, times: numpy.ndarray) -> numpy.ndarray:
         digital = channel.kind == "digital"
         if channel.name == CAM_FRAMES_CHANNEL:
-            # High from each exposure's start for the exposure, as the
-            # camera's strobe is: the NI edge marks the start of exposure.
-            phase = numpy.mod(times - self._grid_epoch, self._period)
-            samples = (phase < self._exposure).astype(numpy.float64)
+            # A square wave that changes level at each exposure's start, as
+            # the rig's camera output does: its alternating peaks and troughs
+            # each mark one frame, and the session's frame matching counts
+            # every transition as one. High on odd exposures.
+            k = numpy.floor((times - self._grid_epoch) / self._period)
+            samples = numpy.mod(k, 2.0)
         else:
             samples = numpy.zeros(times.shape, dtype=numpy.float64)
             line = self._bus_lines[channel.name]

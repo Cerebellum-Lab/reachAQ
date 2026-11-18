@@ -52,30 +52,32 @@ def _joined(blocks, name):
 
 
 @pytest.mark.parametrize("fps, exposure", [(None, None), ("100", "0.003")])
-def test_cam_frames_rises_at_each_grid_exposure(monkeypatch, fps, exposure):
+def test_cam_frames_changes_level_at_each_grid_exposure(monkeypatch, fps, exposure):
+    # The rig's camera output is a square wave: every transition, rising or
+    # falling, is one exposure's start.
     grid_epoch = time.perf_counter() - 0.0013
     monkeypatch.setenv("REACHAQ_SIM_EPOCH", repr(grid_epoch))
     if fps is not None:
         monkeypatch.setenv("REACHAQ_SIM_CAMERA_FPS", fps)
         monkeypatch.setenv("REACHAQ_SIM_CAMERA_EXPOSURE_S", exposure)
     period = 1.0 / float(fps or 150)
-    exposure_s = float(exposure or 0.002)
 
     blocks = _read(SimulatedNidaqStream(
         _configuration(("cam_frames", "port0/line0", "digital"))), 3)
     samples = _joined(blocks, "cam_frames")
     epoch_perf = blocks[0].epoch_perf_time
 
-    rises = numpy.flatnonzero((samples[1:] == 1.0) & (samples[:-1] == 0.0)) + 1
+    transitions = numpy.flatnonzero(samples[1:] != samples[:-1]) + 1
     # 150 ms of stream holds 22 exposures at 150 fps, 15 at 100 fps.
-    assert len(rises) >= int(0.15 / period) - 1
-    for index in rises:
+    assert len(transitions) >= int(0.15 / period) - 1
+    for index in transitions:
         t = epoch_perf + index / RATE
         k = round((t - grid_epoch) / period)
-        assert abs(t - (grid_epoch + k * period)) <= 1.0 / RATE
-    falls = numpy.flatnonzero((samples[1:] == 0.0) & (samples[:-1] == 1.0)) + 1
-    widths = [fall - rise for rise, fall in zip(rises, falls[falls > rises[0]])]
-    assert all(abs(width - exposure_s * RATE) <= 1 for width in widths)
+        # The first sample at or after the exposure's start, high on odd exposures.
+        assert 0.0 <= t - (grid_epoch + k * period) < 1.0 / RATE + 1e-9
+        assert samples[index] == k % 2
+    intervals = numpy.diff(transitions) / RATE
+    assert numpy.all(numpy.abs(intervals - period) <= 1.0 / RATE + 1e-9)
 
 
 def test_bus_window_drives_named_digital_line(monkeypatch, tmp_path):
