@@ -1,0 +1,95 @@
+# Local API
+
+ReachAQ publishes its events and accepts a few commands on a local TCP port, so
+another program on the rig can follow a run or start and stop acquisition. The
+service starts with the GUI and with the headless runner
+(`tools/acquisition/headless.py`). It is implemented in
+`auto-trainer-core/src/autotrainer/core/api/`.
+
+## Configuration
+
+The service is configured from the environment, because it is registered before
+any system configuration is loaded.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REACHAQ_API_ENABLED` | `1` | `0`, `false`, `no` or `off` disables the service. |
+| `REACHAQ_API_HOST` | `127.0.0.1` | Address to listen on. |
+| `REACHAQ_API_PORT` | `47611` | Port; `0` picks a free one (tests). |
+
+Keep it on loopback. There is no authentication: any process that can reach the
+port can start or stop acquisition. If the port is taken, the application logs
+an error and runs without the API.
+
+## Protocol
+
+One TCP connection carries newline-delimited JSON: one UTF-8 JSON object per
+line, at most 1 MiB. Every connected client receives every event.
+
+### Requests
+
+```json
+{"type": "request", "nonce": "a1", "command": "GET_STATUS", "customCommand": null, "data": null}
+```
+
+`command` is a name or its integer id:
+
+| Command | Id | Result |
+|---|---:|---|
+| `NONE` | 0 | `success`, no data. |
+| `START_ACQUISITION` | 1 | `pending_with_notification`, then a second response with the outcome. |
+| `STOP_ACQUISITION` | 2 | As for start. |
+| `GET_STATUS` | 3 | `data` is the reachAQ status (`ReachAQSystemStatus`, the same payload as the `systemStatus` event). |
+| `GET_CONFIGURATION` | 4 | `data` has `application_version`, `device_id`, `configuration_location`, `data_location`, `animal_location`, `log_location`, `inference_model`. |
+| `USER_DEFINED` | 100 | Accepted, not yet acted on. |
+
+`nonce` is echoed on every response to the request. Choose a unique one per
+request; the final response of a pending command goes to the connection that
+asked, or to every connection if that one has closed.
+
+### Responses
+
+```json
+{"type": "response", "nonce": "a1", "command": "GET_STATUS", "result": "success",
+ "errorCode": "none", "errorMessage": null, "data": {...}}
+```
+
+`result` is `success`, `failed`, `exception`, `unrecognized` or
+`pending_with_notification`. `errorCode` is `none`, `command_error` or
+`system_error`. Malformed JSON, an unknown command or an unknown message type
+gets `unrecognized` / `command_error`.
+
+### Events
+
+```json
+{"type": "event", "kind": 1331, "name": "sessionStarted", "when": "2026-11-18T12:00:00.123456",
+ "index": 606361223517279, "context": {"session_id": "20261118_rig_001", ...}}
+```
+
+`kind` and `name` are the `ApiEventKind` id and member name, the same values the
+hourly `*_events.csv` files and each session's `streams/events.csv` record.
+`index` is the event's `perf_counter_ns` stamp. In `context`, event enums appear
+by member name (`"mode": "RUNNING"`), times as ISO 8601, non-finite numbers as
+`null`. A client that stops reading for 4096 lines is disconnected.
+
+## Client
+
+`autotrainer.core.api.client.ApiClient` is a small blocking client:
+
+```python
+from autotrainer.core.api.client import ApiClient
+
+with ApiClient() as client:
+    print(client.request("GET_STATUS")["data"]["acquisition_state"])
+    pending = client.request("START_ACQUISITION", nonce="start-1")
+    final = client.wait_response("start-1", timeout=30)
+    event = client.events.get(timeout=5)
+```
+
+## Event ids
+
+Ids that reachAQ rigs have recorded are fixed: changing one would misread old
+event files. `auto-trainer-core/tests/api_recorded_events_test.py` checks every
+id, name and payload repr against rows copied from christielab10's event files.
+Members marked "assigned" in `kinds.py` had never been recorded when reachAQ
+took over the enum, so their ids are reachAQ's choice.
