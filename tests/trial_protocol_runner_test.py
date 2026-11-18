@@ -2,147 +2,123 @@ from types import SimpleNamespace
 from unittest import mock
 
 from autotrainer.behavior.pellet_trial import TrialOutcome
-from autotrainer.training.training_phase import SessionResult
+from autotrainer.behavior.training import TrainingPlan, TrainingProgressState, parse_plan
 
 from tools.acquisition.model.trial_protocol_runner import TrialProtocolRunner
 
 
-class Signal:
-    def __init__(self):
-        self.handlers = []
+def make_plan(*, advance_after=None, fallback_after=None, phases=2, pause=None):
+    def phase(index):
+        document = {"phaseId": f"p{index}", "name": f"Phase {index}"}
+        if advance_after is not None:
+            document["advance"] = {"metric": "trials", "op": ">=", "value": advance_after}
+        if fallback_after is not None:
+            document["fallback"] = {"metric": "consecutiveFailures", "op": ">=", "value": fallback_after}
+        if pause is not None:
+            document["trialActions"] = [{"action": "pause", "seconds": pause}]
+        return document
 
-    def __iadd__(self, handler):
-        self.handlers.append(handler)
-        return self
-
-    def __isub__(self, handler):
-        self.handlers.remove(handler)
-        return self
-
-
-class FakeProgress:
-    def __init__(self):
-        self.session_count = 0
-        self.resumed = 0
-        self.paused = 0
-
-    def progress_resumed(self):
-        self.resumed += 1
-
-    def progress_paused(self):
-        self.paused += 1
-
-
-class FakePhase:
-    def __init__(self, result=SessionResult.NONE):
-        self.progress = FakeProgress()
-        self.result = result
-        self.capture_end_count = 0
-        self.session_end_count = 0
-
-    def capture_ended(self):
-        self.capture_end_count += 1
-        self.progress.progress_paused()
-
-    def session_ended(self, _context):
-        self.session_end_count += 1
-        return self.result
-
-
-class FakePlan:
-    def __init__(self, phase):
-        self.current_phase = phase
-        self._system_context = SimpleNamespace(capture_analysis_result=None)
-        self._on_session_starting = lambda: None
-        self._on_session_capture_ending = lambda reason: None
-        self._on_session_ending = lambda project, result: None
-        self.can_advance = False
-        self.can_fallback = False
-        self.advance = mock.Mock(return_value=True)
-        self.fallback = mock.Mock(return_value=True)
-        self.progress_state = None
-        self.progress_updates = 0
-        self.detached = False
-
-    def attach(self, algorithm, _pellet_device, tunnel_device):
-        assert tunnel_device is None
-        self.algorithm = algorithm
-        algorithm.session_starting += self._on_session_starting
-        algorithm.session_capture_ending += self._on_session_capture_ending
-        algorithm.session_ending += self._on_session_ending
-
-    def detach(self):
-        self.algorithm.session_starting -= self._on_session_starting
-        self.algorithm.session_capture_ending -= self._on_session_capture_ending
-        self.algorithm.session_ending -= self._on_session_ending
-        self.detached = True
-
-    def _on_progress_updated(self):
-        self.progress_updates += 1
+    return TrainingPlan(parse_plan({
+        "schemaVersion": 1,
+        "planId": "runner-plan",
+        "phases": [phase(i) for i in range(phases)],
+    }))
 
 
 def make_algorithm():
     return SimpleNamespace(
-        session_starting=Signal(),
-        session_capture_ending=Signal(),
-        session_ending=Signal(),
+        pellet_delivery_enabled=True,
+        pellet_cover_enabled=False,
+        intersession_pellet_shift_enabled=True,
     )
 
 
-def test_completed_pellet_trial_advances_progress_once():
-    phase = FakePhase()
-    plan = FakePlan(phase)
-    algorithm = make_algorithm()
-    runner = TrialProtocolRunner()
-    runner.attach(plan, algorithm, object())
+def attached(plan, **kwargs):
+    runner = TrialProtocolRunner(**kwargs)
+    runner.attach(plan, make_algorithm(), object())
+    return runner
 
-    assert algorithm.session_starting.handlers == []
+
+def test_completed_pellet_trial_advances_progress_once():
+    plan = make_plan()
+    updates = []
+    plan.progress_updated += lambda: updates.append(1)
+    runner = attached(plan)
+
     assert runner.begin_trial("10.1")
     assert not runner.begin_trial("10.1")
-    assert runner.finish_trial("10.1", TrialOutcome.PENDING_ANALYSIS)
-    assert not runner.finish_trial("10.1", TrialOutcome.PENDING_ANALYSIS)
-    assert phase.progress.session_count == 1
-    assert phase.capture_end_count == 1
-    assert phase.session_end_count == 1
-    assert plan.progress_updates == 1
+    assert runner.finish_trial("10.1", TrialOutcome.SUCCESS, reach_count=2, success_count=1,
+                               consumption_count=1)
+    assert not runner.finish_trial("10.1", TrialOutcome.SUCCESS)
+    progress = plan.current_phase.progress
+    assert (progress.session_count, progress.successes, progress.total_reaches) == (1, 1, 2)
+    assert progress.pellets_consumed == 1
+    assert updates == [1]
 
 
 def test_hardware_error_never_counts_or_evaluates_protocol_trial():
-    phase = FakePhase()
-    plan = FakePlan(phase)
-    runner = TrialProtocolRunner()
-    runner.attach(plan, make_algorithm(), object())
+    plan = make_plan(advance_after=1)
+    runner = attached(plan, automatic_advance=True)
     runner.begin_trial("3.2")
 
     assert not runner.finish_trial("3.2", TrialOutcome.HARDWARE_ERROR)
-    assert phase.progress.session_count == 0
-    assert phase.session_end_count == 0
+    assert plan.current_phase.progress.session_count == 0
+    assert plan.current_phase.phase_id == "p0"
+
+
+def test_pellet_missing_counts_a_trial_without_a_pellet():
+    plan = make_plan()
+    runner = attached(plan)
+    assert runner.record_trial_outcome("4.1", TrialOutcome.PELLET_MISSING)
+    progress = plan.current_phase.progress
+    assert (progress.session_count, progress.pellets_presented) == (1, 0)
+
+
+def test_automatic_advance_and_fallback_change_phase():
+    plan = make_plan(advance_after=1, fallback_after=1)
+    runner = attached(plan, automatic_advance=True)
+    assert runner.record_trial_outcome("1.1", TrialOutcome.FAILURE)  # advance is checked first
+    assert plan.current_phase.phase_id == "p1"
+
+
+def test_manual_mode_only_reports():
+    plan = make_plan(advance_after=1)
+    runner = attached(plan)
+    runner.record_trial_outcome("1.1", TrialOutcome.SUCCESS)
+    assert plan.current_phase.phase_id == "p0"
 
 
 def test_terminal_advance_marks_protocol_complete():
     completed = mock.Mock()
-    phase = FakePhase(SessionResult.ADVANCE)
-    plan = FakePlan(phase)
-    runner = TrialProtocolRunner(
-        automatic_advance=True,
-        on_protocol_complete=completed,
-    )
-    runner.attach(plan, make_algorithm(), object())
+    plan = make_plan(advance_after=1, phases=1)
+    runner = attached(plan, automatic_advance=True, on_protocol_complete=completed)
     runner.begin_trial("7.1")
 
     assert runner.finish_trial("7.1", TrialOutcome.SUCCESS)
     assert runner.protocol_complete
+    assert plan.progress_state is TrainingProgressState.Complete
     completed.assert_called_once_with()
 
 
-def test_detach_restores_callbacks_expected_by_legacy_plan():
-    phase = FakePhase()
-    plan = FakePlan(phase)
+def test_trial_recorded_hook_sees_the_new_phase():
+    seen = []
+    plan = make_plan(advance_after=1, pause=2.5)
+    runner = attached(plan, automatic_advance=True,
+                      on_trial_recorded=lambda label: seen.append((label, plan.current_phase.phase_id)))
+    runner.record_trial_outcome("2.1", TrialOutcome.SUCCESS)
+    runner.record_trial_outcome("2.2", TrialOutcome.ABORTED)
+    assert seen == [("2.1", "p1")]
+    assert runner.next_trial_directive("k").pause_seconds == 2.5
+
+
+def test_detach_drops_the_plan_and_the_active_trial():
+    plan = make_plan()
     algorithm = make_algorithm()
     runner = TrialProtocolRunner()
     runner.attach(plan, algorithm, object())
+    runner.begin_trial("1.1")
 
     runner.detach()
 
-    assert plan.detached
-    assert algorithm.session_starting.handlers == []
+    assert runner.plan is None and runner.active_attempt_label is None
+    assert runner.next_trial_directive("k") is None

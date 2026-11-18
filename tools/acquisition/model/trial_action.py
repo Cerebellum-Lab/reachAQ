@@ -265,6 +265,9 @@ class TrialCompileContext:
     automatic_reach_ids: Tuple[str, ...] = ()
     automatic_policy: Optional[Mapping[str, object]] = None
     automatic_recommendation: Optional[Mapping[str, object]] = None
+    # Offset the attached training plan's trial actions add to the baseline.
+    training_offset_dcs: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    training_directive: Optional[Mapping[str, object]] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -376,7 +379,8 @@ class TrialActionCompiler:
             context.lane_offsets_dcs.get(row.position_lane, (0.0, 0.0, 0.0)),
             f"{row.position_lane.value} lane offset",
         )
-        baseline = _add(base, lane)
+        training = _finite_vector(context.training_offset_dcs, "training plan offset")
+        baseline = _add(_add(base, lane), training)
         position_evidence = {
             "mode": row.position_mode.value,
             "base_dcs": list(base),
@@ -395,6 +399,9 @@ class TrialActionCompiler:
                 else dict(context.automatic_recommendation)
             ),
         }
+        if context.training_directive is not None:
+            position_evidence["training_offset_dcs"] = list(training)
+            position_evidence["training_directive"] = dict(context.training_directive)
         if row.position_mode is PelletPositionMode.FIXED_MANUAL:
             target = _add(baseline, (
                 row.shift_x_mm,

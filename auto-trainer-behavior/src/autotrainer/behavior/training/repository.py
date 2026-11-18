@@ -44,6 +44,8 @@ class PlanRepository:
     def root(self, value: Optional[Path]):
         with self._lock:
             self._root = None if value is None else Path(value)
+            # Never serve another directory's plans after a failed reload.
+            self._documents, self._infos = {}, []
             self._loaded = False
 
     def get_plans(self, *, refresh: bool = False) -> List[PlanInfo]:
@@ -56,7 +58,11 @@ class PlanRepository:
     def get_plan(self, plan_id: str) -> Optional[TrainingPlan]:
         with self._lock:
             if not self._loaded:
-                self.get_plans()
+                try:
+                    self.get_plans()
+                except PlanFormatError as err:
+                    logger.error("Training plans not loaded: %s", err)
+                    return None
             document = self._documents.get(plan_id)
         return None if document is None else TrainingPlan(document)
 

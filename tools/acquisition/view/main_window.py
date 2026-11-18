@@ -42,7 +42,7 @@ from autotrainer.behavior.pellet import PelletState
 
 from autotrainer.pyside.content_widget import InvokeMethod, invoke_method
 
-from autotrainer.training import TrainingPlan, PlanInfo, LoadProgressResult, TrainingPhase
+from autotrainer.behavior.training import TrainingPlan, PlanInfo, LoadProgressResult, TrainingPhase
 
 from autotrainer.pyside.xyz_label import XYZQLabel
 

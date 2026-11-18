@@ -113,7 +113,7 @@ from autotrainer.behavior import (
     TrialOutcome,
 )
 
-from autotrainer.training import TrainingPlan, TrainingPhase, PlanRepository, PlanInfo, LoadProgressResult
+from autotrainer.behavior.training import TrainingPlan, TrainingPhase, PlanRepository, PlanInfo, LoadProgressResult
 
 from autotrainer.core.api import (
     RpcService,
@@ -156,6 +156,8 @@ from tools.acquisition.model.send_block_reasons import SendBlockReasons
 # The name intertrial analysis holds the pellet send under. Inter-trial timing
 # holds under its own name, so neither releases the other.
 INTERTRIAL_ANALYSIS_BLOCK_NAME = "intertrial_analysis"
+# The name a training plan's between-trials pause holds the pellet send under.
+TRAINING_PAUSE_BLOCK_NAME = "training_plan_pause"
 from tools.acquisition.model.coordinate_model import CoordinateModel
 from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.helpers import first_line, get_config_location
@@ -810,7 +812,11 @@ class AppModel(ObservableObject):
 
         self.set_log_location()
 
-        self._plan_repo = PlanRepository()
+        self._plan_repo = PlanRepository(
+            Path(preferences.configuration_location).expanduser() / "training_plans"
+        )
+        self._training_pause_timer: Optional[threading.Timer] = None
+        self._training_offset_warned = False
         self._training_plan: Optional[TrainingPlan] = None
         self._training_plan_animal: Optional[AnimalSubject] = None
         self._recording_session = RecordingSessionController()
@@ -1051,6 +1057,7 @@ class AppModel(ObservableObject):
         self._attached_animal: Optional[AnimalSubject] = None
         self._protocol_runner = TrialProtocolRunner(
             on_protocol_complete=self._on_trial_protocol_complete,
+            on_trial_recorded=self._on_training_trial_recorded,
         )
         self._pellet_cycles = PelletCycleController(
             self._session_api,
@@ -5754,6 +5761,9 @@ class AppModel(ObservableObject):
             automatic = controller.latest
             if automatic is not None and automatic.apply_automatically:
                 controller.accept(automatic.generation)
+        directive = self._protocol_runner.next_trial_directive(
+            self._training_draw_key(trial_id, attempt_id)
+        )
         context = TrialCompileContext(
             session_id=token.session_id,
             session_generation=token.generation,
@@ -5783,6 +5793,10 @@ class AppModel(ObservableObject):
             automatic_recommendation=(
                 None if automatic is None else automatic.to_record()
             ),
+            training_offset_dcs=(
+                (0.0, 0.0, 0.0) if directive is None else directive.target_offset_dcs
+            ),
+            training_directive=None if directive is None else directive.to_record(),
         )
         if (
             row.position_lane.value != "center"
@@ -6257,7 +6271,78 @@ class AppModel(ObservableObject):
         self.request_pellet_send(force=False, automatic=True)
         return False
 
+    def _training_draw_key(self, trial_id, attempt_id) -> str:
+        """Seeds a training plan's random trial actions: one draw per attempt."""
+        return f"{self._protocol_session_seed}:{trial_id}:{attempt_id}"
+
+    def _apply_training_send_actions(self) -> None:
+        """The attached plan's tone, played right before every SEND.
+
+        Pellet-target offsets are applied only through an ordered protocol's
+        compiled trial, whose positioning waits for each axis; a SEND without
+        one is left where the operator put the pellet.
+        """
+        directive = self._protocol_runner.next_trial_directive(
+            self._training_draw_key(self._pellet_cycles.planned_trial_id, "send")
+        )
+        if directive is None:
+            return
+        if directive.tone is not None:
+            # A cue that fails must not stop the SEND it accompanies.
+            try:
+                token = self._hardware.play_tone(
+                    directive.tone.frequency_hz,
+                    directive.tone.duration_ms / 1000.0,
+                )
+            except Exception:
+                logger.exception("Training plan tone failed for phase %s", directive.phase_id)
+            else:
+                if token is None:
+                    logger.warning("Training plan tone was not queued for phase %s", directive.phase_id)
+        if (
+            self._selected_ordered_protocol is None
+            and any(directive.target_offset_dcs)
+            and not self._training_offset_warned
+        ):
+            self._training_offset_warned = True
+            logger.warning(
+                "Training plan %s phase %s moves the pellet target, which needs an "
+                "ordered protocol; this SEND uses the current pellet position",
+                directive.plan_id, directive.phase_id,
+            )
+
+    def _on_training_trial_recorded(self, attempt_label: str) -> None:
+        """Hold automatic SENDs for the current phase's between-trials pause."""
+        self._clear_training_pause()
+        directive = self._protocol_runner.next_trial_directive(
+            f"{self._protocol_session_seed}:after:{attempt_label}"
+        )
+        if directive is None or directive.pause_seconds <= 0.0:
+            return
+        self._send_block_reasons.set(
+            TRAINING_PAUSE_BLOCK_NAME,
+            f"training plan pause {directive.pause_seconds:.1f} s",
+        )
+        def release():
+            # A timer cancelled too late must not release a newer pause.
+            if self._training_pause_timer is timer:
+                self._clear_training_pause()
+
+        timer = threading.Timer(directive.pause_seconds, release)
+        timer.daemon = True
+        self._training_pause_timer = timer
+        timer.start()
+        logger.info("Training plan %s phase %s: pausing %.3f s before the next automatic SEND",
+                    directive.plan_id, directive.phase_id, directive.pause_seconds)
+
+    def _clear_training_pause(self) -> None:
+        timer, self._training_pause_timer = self._training_pause_timer, None
+        if timer is not None:
+            timer.cancel()
+        self._send_block_reasons.clear(TRAINING_PAUSE_BLOCK_NAME)
+
     def _guard_protocol_send(self) -> None:
+        self._apply_training_send_actions()
         if (
             self._selected_ordered_protocol is None
             or not self._behavior.algorithm.is_in_session
@@ -6607,6 +6692,7 @@ class AppModel(ObservableObject):
         plan = self._attached_plan
         if plan is None:
             return
+        self._clear_training_pause()
         self._detach_training_phase()
         plan.property_changed -= self._on_training_plan_property_changed
         plan.progress_updated -= self._on_training_plan_progress_updated
@@ -9235,7 +9321,12 @@ class AppModel(ObservableObject):
         self.output_location = configuration.persistence.output_location
         self._configure_subsystem_intent(configuration)
 
-        self.reload_training_plans(reraise_on_error=True)
+        # A loaded configuration brings its own plans, as it brings its own
+        # protocols. Plan files are operator-written: a bad one is reported
+        # and leaves the library empty rather than failing the load.
+        self._plan_repo.root = self._loaded_config_dir_path / "training_plans"
+        self._training_plans = []
+        self.reload_training_plans()
 
         # and:
         self._load_animals()
