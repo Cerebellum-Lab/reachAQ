@@ -293,3 +293,80 @@ def test_calibration_is_loaded_from_the_home(home, tmp_path, monkeypatch):
     run.calib_dir.joinpath("camera_offsets.pkl").write_bytes(b"edited")
     _prepare(_parse("--sim-home", (tmp_path / "sim").as_posix(), "--sim-reset"))
     assert run.calib_dir.joinpath("camera_offsets.pkl").read_bytes() != b"edited"
+
+
+class _Stop(Exception):
+    pass
+
+
+def _quiet_console(monkeypatch, module):
+    """No console handler is set up in a test; the window and run_acquisition set its level."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(module, "get_console_handler",
+                        lambda: SimpleNamespace(setLevel=lambda _level: None))
+
+
+def _recording_app_model(built):
+    def fake_app_model(*args, **kwargs):
+        built.append((args, kwargs))
+        raise _Stop
+    return fake_app_model
+
+
+@pytest.mark.parametrize("simulate", [True, False])
+def test_main_window_builds_app_model_with_the_home_calibration(simulate, home, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+
+    from tools.acquisition.view import main_window
+
+    app = QApplication.instance() or QApplication([])
+    args = make_autotrainer_parser().parse_args(
+        ["--simulate", "--sim-home", (tmp_path / "sim").as_posix()] if simulate
+        else ["--preferences-file", (tmp_path / "rig.ini").as_posix()])
+    run = _prepare(args) if simulate else None
+    built = []
+    monkeypatch.setattr(main_window, "AppModel", _recording_app_model(built))
+    _quiet_console(monkeypatch, main_window)
+    preferences = UserPreferences(settings_file_path=args.preferences_file)
+    with pytest.raises(_Stop):
+        main_window.MainWindow(app, preferences, args.configuration,
+                               calib_dir=getattr(args, "sim_calib_dir", None))
+    if simulate:
+        assert args.sim_calib_dir == run.calib_dir
+        assert built == [((preferences,), {"calib_dir": run.calib_dir})]
+    else:
+        # A rig run: the same bare call as before.
+        assert getattr(args, "sim_calib_dir", None) is None
+        assert built == [((preferences,), {})]
+
+
+def test_run_acquisition_hands_the_sim_calibration_to_the_window(home, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import PySide6.QtWidgets
+    from autotrainer.model import EnvironmentProvider
+    from tools.acquisition import run_acquisition as run_module
+    from tools.acquisition.view import disabled_style, main_window
+
+    args = _parse("--sim-home", (tmp_path / "sim").as_posix())
+    args.live_inference, args.dev = None, False
+    run = _prepare(args)
+    windows = []
+
+    def fake_window(*window_args, **kwargs):
+        windows.append(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(PySide6.QtWidgets, "QApplication", lambda argv: object())
+    monkeypatch.setattr(disabled_style, "apply_disabled_style", lambda app: None)
+    monkeypatch.setattr(EnvironmentProvider, "enable_can_emulation", lambda enabled: None)
+    _quiet_console(monkeypatch, run_module)
+    monkeypatch.setattr(run_module, "EventManager",
+                        SimpleNamespace(default=lambda: SimpleNamespace(close=lambda: None)))
+    monkeypatch.setattr(run_module, "try_register_api_event_plugin", lambda: None)
+    monkeypatch.setattr(run_module.BehaviorAlgorithm, "close_algorithm_handler", lambda: None)
+    monkeypatch.setattr(main_window, "MainWindow", fake_window)
+    with pytest.raises(_Stop):
+        run_module.run_acquisition(args)
+    assert len(windows) == 1 and windows[0]["calib_dir"] == run.calib_dir

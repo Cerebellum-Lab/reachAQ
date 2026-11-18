@@ -130,6 +130,8 @@ def _prepare_locked(args, home: Path, reset: bool, instance_lock) -> SimulationR
     if args.preferences_file is None:
         args.preferences_file = preferences_path
     args.allow_can_emulation = True
+    # The GUI builds AppModel in MainWindow, so the calibration rides on args.
+    args.sim_calib_dir = calib_dir
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     run_dir = home / "runs" / stamp

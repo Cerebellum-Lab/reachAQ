@@ -95,6 +95,7 @@ def run_acquisition(
             is_dev=args.dev,
             random_cameras=args.random_cameras,
             live_inference=args.live_inference,
+            calib_dir=getattr(args, "sim_calib_dir", None),
         )
     except:
         event_manager.close()

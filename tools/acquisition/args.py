@@ -32,6 +32,8 @@ class AutoTrainerParsedArgs:
     simulate: bool = False
     sim_home: Path = Path("~/.reachaq-sim")
     sim_reset: bool = False
+    #: Set by prepare_simulation: the sim home's 3D calibration.
+    sim_calib_dir: Optional[Path] = None
 
 
 def make_autotrainer_parser(
