@@ -12,7 +12,7 @@ from typing import Callable, Optional, Tuple, Union
 
 from autotrainer.core import NidaqTimingPlan, ObservableObject
 from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization
-from autotrainer.device.laser import LaserPulseCancelled, LaserPulseRefused
+from autotrainer.device.laser import LaserPulseCancelled, LaserPulseRefused, make_laser_controller
 from autotrainer.device.nidaq_laser import CANCELLED_OPERATION_WAIT_S
 from autotrainer.device import (
     LaserControllerProtocol,
@@ -431,11 +431,12 @@ class LaserModel(ObservableObject):
         analog_terminal_config: Optional[str] = None,
     ) -> None:
         self.set_controller(
-            NidaqLaserController(
+            make_laser_controller(
                 configuration,
                 feedback_reader=feedback_reader,
                 timing_plan=timing_plan,
                 analog_terminal_config=analog_terminal_config,
+                hardware_class=NidaqLaserController,
             )
         )
 
@@ -454,14 +455,10 @@ class LaserModel(ObservableObject):
         stays unconnected, and a Run cannot close it under the ramp; the
         caller closes it.
         """
-        if configuration.backend == "null":
-            return NullLaserController(configuration)
-        if configuration.backend == "nidaq":
-            return NidaqLaserController(
-                configuration, timing_plan=timing_plan,
-                analog_terminal_config=analog_terminal_config)
-        raise RuntimeError(
-            f"Laser backend {configuration.backend!r} has no controller to open")
+        return make_laser_controller(
+            configuration, timing_plan=timing_plan,
+            analog_terminal_config=analog_terminal_config,
+            hardware_class=NidaqLaserController)
 
     def load_configuration(
         self,
@@ -860,9 +857,12 @@ class LaserModel(ObservableObject):
             "hardware_synchronized" if hardware_trigger else "software_start"
         )
         observed_status = timing_status.get("status")
+        # The simulated NI laser emulates as the null one does (simulation mode).
         emulated_status = (
             "emulated_software_start"
-            if direct_start and self._configuration.backend == "null"
+            if direct_start and (
+                self._configuration.backend == "null"
+                or timing_status.get("simulated"))
             else None
         )
         accepted_statuses = {required_status}
