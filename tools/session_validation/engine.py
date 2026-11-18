@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import math
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -445,6 +446,11 @@ def _frame_ledger_path(context):
     return candidates[0], candidates
 
 
+def _ledger_field_name(camera_name):
+    """The ledger's column suffix for a camera, as AppModel._camera_timing_field_name writes it."""
+    return re.sub(r"[^0-9A-Za-z]+", "_", camera_name).strip("_").lower()
+
+
 def _camera_ledger_rule(context):
     stream_manifest = context.json("streams/stream_manifest.json")
     cameras = {
@@ -489,7 +495,7 @@ def _camera_ledger_rule(context):
                     errors.append(f"row {line_number}: non-increasing wall time")
                 previous_id, previous_wall = frame_id, wall
                 for name in cameras:
-                    value = row.get(f"frame_present_{name}")
+                    value = row.get(f"frame_present_{_ledger_field_name(name)}")
                     if value is None:
                         errors.append(f"row {line_number}: camera {name} has no presence column")
                     elif int(value):
