@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import shutil
 import threading
 import time
@@ -72,7 +73,6 @@ from tools.acquisition.model.pose_training_model import (
     evaluate_models,
     measure_model_speed,
     prelabel_frames,
-    run_job,
 )
 from tools.acquisition.view.keypoint_label_view import KeypointLabelView, part_colours
 
@@ -80,6 +80,21 @@ logger = get_verbose_logger(__name__)
 
 SESSION_RECORDING_STATUS = "session_recording_status"
 RECORDING_BANNER = "Training is unavailable while a session is recording."
+
+
+def taken_indices(rows, stem: str) -> typing.List[int]:
+    """Frame indices of this video already in the dataset.
+
+    Only frames added from the video itself are named <stem>_<6-digit index>;
+    frames imported from DeepLabCut keep their own names and are not counted.
+    """
+    pattern = re.compile(re.escape(stem) + r"_(\d{6})\.png")
+    found = []
+    for row in rows:
+        match = pattern.fullmatch(os.path.basename(row.frame))
+        if match:
+            found.append(int(match.group(1)))
+    return found
 
 
 class _Bridge(QObject):
@@ -377,8 +392,7 @@ class PoseTrainingWindow(QMainWindow):
             return
         video, count = self._video_preview, self.pick_count.value()
         stem = os.path.splitext(os.path.basename(video))[0]
-        taken = [int(row.frame.rsplit("_", 1)[-1][:-4]) for row in self._dataset.rows
-                 if os.path.basename(row.frame).startswith(stem + "_")]
+        taken = taken_indices(self._dataset.rows, stem)
         self._run_in_background(
             "Picking diverse frames",
             lambda: pick_diverse(video, count, exclude=taken),
@@ -400,7 +414,7 @@ class PoseTrainingWindow(QMainWindow):
             path = self._dataset.path
             self._run_in_background(
                 "Pre-labelling with the live model",
-                lambda: run_job(prelabel_frames, live, path, added),
+                lambda: self._training.run_job(prelabel_frames, live, path, added),
                 self._apply_prelabels)
         self._refresh()
 
@@ -683,16 +697,23 @@ class PoseTrainingWindow(QMainWindow):
                       "Check at least one session on the left.")
         else:
             banner = f"{counts['train']} frames to train on, {counts['val']} held out."
+        blocker = self._training.resume_blocker() if state is TrainingState.PAUSED else ""
         if state is TrainingState.PAUSED and not ready:
             banner = "Paused for the recording. Resume once the session has stopped."
+        elif blocker:
+            banner = f"Paused: {blocker}."
+        elif state is TrainingState.PAUSED:
+            banner = ("Paused. Labelling now stops this run from resuming; "
+                      "it would train on labels it did not start with.")
         elif state is TrainingState.FAILED:
             banner = f"Training failed: {self._training.error}"
         self.training_banner.setText(banner)
         idle = state in (TrainingState.IDLE, TrainingState.FINISHED, TrainingState.FAILED)
         self.start_button.setEnabled(idle and ready and counts["train"] > 0)
         self.pause_button.setEnabled(state is TrainingState.RUNNING)
-        self.resume_button.setEnabled(state is TrainingState.PAUSED and ready)
-        self.cancel_button.setEnabled(state in (TrainingState.RUNNING, TrainingState.PAUSED))
+        self.resume_button.setEnabled(state is TrainingState.PAUSED and ready and not blocker)
+        self.cancel_button.setEnabled(state in (TrainingState.RUNNING, TrainingState.PAUSED,
+                                                TrainingState.FAILED))
         self.epochs_spin.setEnabled(idle)
         self.session_list.setEnabled(idle)
 
@@ -841,7 +862,7 @@ class PoseTrainingWindow(QMainWindow):
                            else [])
         dataset = self._dataset.path
         self._run_in_background("Evaluating on the held-out frames",
-                                lambda: run_job(evaluate_models, dataset, paths),
+                                lambda: self._training.run_job(evaluate_models, dataset, paths),
                                 self._show_evaluation)
 
     def _show_evaluation(self, results: typing.List[dict]) -> None:
@@ -900,7 +921,7 @@ class PoseTrainingWindow(QMainWindow):
                 f"computer's GPU while nothing else used it.")
 
         self._run_in_background("Measuring speed",
-                                lambda: run_job(measure_model_speed, model), show)
+                                lambda: self._training.run_job(measure_model_speed, model), show)
 
     def _deploy(self) -> None:
         model = self._selected_model()

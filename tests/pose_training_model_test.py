@@ -181,3 +181,80 @@ def test_the_real_child_trains_a_dataset_into_a_live_model_directory(tmp_path, m
         training = yaml.safe_load(handle)["training"]
     assert training["content_hash"] == data.content_hash()
     assert training["val_sessions"] == ["s2"]
+
+
+def _ignores_stop(dataset_path, run_dir, epochs, resume, messages, stop_event):
+    stop_event.wait()
+    time.sleep(0.05)
+
+
+def test_a_child_that_exits_after_a_stop_request_is_paused_not_failed(tmp_path):
+    model, _ = _model(tmp_path, target=_ignores_stop)
+    model.start(str(tmp_path / "data"), epochs=5)
+    assert model.pause() is True
+    time.sleep(0.3)
+    assert model.state is TrainingState.PAUSED
+
+
+def test_a_stop_before_training_begins_exits_without_training(tmp_path):
+    import queue
+    import threading
+    pytest.importorskip("torch")
+    numpy = pytest.importorskip("numpy")
+    from autotrainer.inference.keypoint.dataset import FRAME_SIZE, LABELLED, PoseDataset
+    from tools.acquisition.model.pose_training_model import run_training
+    data = PoseDataset.create(str(tmp_path / "sets"), "tiny", ["a"])
+    data.add_image(numpy.zeros((FRAME_SIZE, FRAME_SIZE), "uint8"), "s1", "s1_left",
+                   points=numpy.array([[10, 10]]), status=LABELLED)
+    data.save()
+    messages, stop = queue.Queue(), threading.Event()
+    stop.set()
+    run_training(data.path, str(tmp_path / "run"), 5, False, messages, stop)
+    kinds = []
+    while not messages.empty():
+        kinds.append(messages.get())
+    assert ("done", {"status": "stopped", "epoch": 0, "seconds": 0.0}) in kinds
+    assert not os.path.exists(tmp_path / "run" / "weights.pt")
+
+
+def test_a_gpu_job_is_stopped_when_training_pauses_for_a_recording(tmp_path):
+    import threading
+    from tools.acquisition.model.pose_training_model import JobCancelled
+    model = PoseTrainingModel(str(tmp_path / "models"))
+    outcome = {}
+
+    def job():
+        try:
+            model.run_job(time.sleep, 60)
+            outcome["result"] = "finished"
+        except JobCancelled:
+            outcome["result"] = "cancelled"
+
+    thread = threading.Thread(target=job)
+    started = time.monotonic()
+    thread.start()
+    assert _wait(lambda: model.job_running, timeout=30)
+    assert model.pause() is True
+    thread.join(30)
+    assert outcome.get("result") == "cancelled"
+    assert time.monotonic() - started < 45
+
+
+def test_resume_is_blocked_with_a_reason_once_labels_change(tmp_path):
+    numpy = pytest.importorskip("numpy")
+    from autotrainer.inference.keypoint.dataset import FRAME_SIZE, LABELLED, PoseDataset
+    from tools.acquisition.model.pose_training_model import RUN_FILE
+    data = PoseDataset.create(str(tmp_path / "sets"), "tiny", ["a"])
+    frame = data.add_image(numpy.zeros((FRAME_SIZE, FRAME_SIZE), "uint8"), "s1", "s1_left",
+                           points=numpy.array([[10, 10]]), status=LABELLED)
+    data.save()
+    model, _ = _model(tmp_path)
+    model.start(data.path, epochs=10_000)
+    model.pause()
+    os.makedirs(model.run_dir, exist_ok=True)
+    with open(os.path.join(model.run_dir, RUN_FILE), "w", encoding="utf-8") as handle:
+        yaml.safe_dump({"content_hash": data.content_hash(), "val_sessions": []}, handle)
+    assert model.resume_blocker() == ""
+    data.set_points(frame, numpy.array([[11, 10]]))
+    data.save()
+    assert "changed" in model.resume_blocker()

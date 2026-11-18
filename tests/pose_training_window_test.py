@@ -162,3 +162,24 @@ def test_the_window_opens_on_the_real_app_model_and_follows_recording(qapp, app_
     QApplication.processEvents()
     assert not window.start_button.isEnabled()
     assert "recording" in window.training_banner.text().lower()
+
+
+def test_frames_already_taken_from_a_video_ignore_imported_names():
+    from tools.acquisition.view.pose_training_window import taken_indices
+    from autotrainer.inference.keypoint.dataset import FrameRow
+    stem = "20260101_rig_session001_left"
+    rows = [FrameRow(f"s/{stem}_img0123.png", "s", LABELLED, numpy.zeros((3, 2))),
+            FrameRow(f"s/{stem}_000042.png", "s", PENDING, numpy.zeros((3, 2))),
+            FrameRow("s/other_000007.png", "s", PENDING, numpy.zeros((3, 2)))]
+    assert taken_indices(rows, stem) == [42]
+
+
+def test_cancel_is_available_after_a_failed_run(qapp, tmp_path):
+    from tools.acquisition.model.pose_training_model import TrainingState
+    data = _dataset(tmp_path)
+    app_model = _FakeAppModel(tmp_path)
+    window = PoseTrainingWindow(app_model)
+    window.open_dataset(data.path)
+    app_model.pose_training._set_state(TrainingState.FAILED)
+    window.refresh_training_controls()
+    assert window.cancel_button.isEnabled()

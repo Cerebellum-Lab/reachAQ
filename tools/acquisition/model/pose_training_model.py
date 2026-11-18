@@ -59,7 +59,15 @@ def run_training(dataset_path: str, run_dir: str, epochs: int, resume: bool,
 
     Messages are (kind, payload): ("started", {...}), ("progress", (epoch,
     epochs, line)), ("log", text), ("done", result) or ("error", text).
+
+    A stop requested before training begins - a recording arming while this
+    process is still importing torch or reading frames - ends the run here,
+    before CUDA is initialised, rather than at the first training step.
     """
+    stopped = ("done", {"status": "stopped", "epoch": 0, "seconds": 0.0})
+    if stop_event.is_set():
+        messages.put(stopped)
+        return
     try:
         import torch
 
@@ -85,6 +93,9 @@ def run_training(dataset_path: str, run_dir: str, epochs: int, resume: bool,
 
         train_frames, train_points = dataset.arrays("train")
         val_frames, val_points = dataset.arrays("val")
+        if stop_event.is_set():
+            messages.put(stopped)
+            return
         device = "cuda" if torch.cuda.is_available() else "cpu"
         messages.put(("started", {"resume": resume, "device": device,
                                   "train": len(train_frames), "val": len(val_frames)}))
@@ -147,11 +158,15 @@ def measure_model_speed(model_path: str) -> dict:
     return measure_speed(model_path)
 
 
-def run_job(function, *args):
-    """Run one of the jobs above in a spawned process and return its result."""
-    import concurrent.futures
-    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=get_mp_ctx()) as pool:
-        return pool.submit(function, *args).result()
+class JobCancelled(RuntimeError):
+    """A GPU job was stopped because a recording armed."""
+
+
+def _job_entry(function, args, messages) -> None:
+    try:
+        messages.put(("ok", function(*args)))
+    except BaseException as err:  # noqa: BLE001 - reported to the caller
+        messages.put(("error", f"{type(err).__name__}: {err}"))
 
 
 # -- deploy history ---------------------------------------------------------
@@ -202,6 +217,8 @@ class PoseTrainingModel(ObservableObject):
         self._process = None
         self._stop_event = None
         self._drain_thread = None
+        self._job = None
+        self._job_cancelled = False
         self._dataset_path = ""
         self._epochs = DEFAULT_EPOCHS
         self.run_dir = ""
@@ -213,6 +230,90 @@ class PoseTrainingModel(ObservableObject):
     def is_ready(self) -> bool:
         """Whether the GPU may be used now: no session is recording."""
         return bool(self._is_ready())
+
+    @property
+    def job_running(self) -> bool:
+        job = self._job
+        return job is not None and job.is_alive()
+
+    def run_job(self, function, *args):
+        """Run one of the GPU jobs above in a spawned process; blocks for its result.
+
+        Refused unless the session is READY. pause() - so a recording arming -
+        terminates a running job, which then raises JobCancelled here.
+        """
+        with self._lock:
+            if not self._is_ready():
+                raise RuntimeError("this is unavailable while a session is recording")
+            if self.job_running:
+                raise RuntimeError("another job is still running")
+            context = self._context or get_mp_ctx()
+            messages = context.Queue()
+            job = context.Process(target=_job_entry, args=(function, args, messages),
+                                  name="pose-training-job")
+            job.daemon = True
+            self._job_cancelled = False
+            job.start()
+            self._job = job
+        try:
+            while True:
+                try:
+                    kind, payload = messages.get(timeout=0.2)
+                    break
+                except queue.Empty:
+                    if job.is_alive():
+                        continue
+                try:
+                    kind, payload = messages.get(timeout=0.5)
+                    break
+                except queue.Empty:
+                    if self._job_cancelled:
+                        raise JobCancelled("stopped because a recording started") from None
+                    raise RuntimeError("the job process exited unexpectedly") from None
+        finally:
+            job.join(5)
+            with self._lock:
+                if self._job is job:
+                    self._job = None
+        if kind == "error":
+            raise RuntimeError(payload)
+        return payload
+
+    def cancel_job(self) -> None:
+        with self._lock:
+            job = self._job
+            if job is None or not job.is_alive():
+                return
+            self._job_cancelled = True
+            logger.info("stopping a pose training GPU job")
+            if hasattr(job, "terminate"):
+                job.terminate()
+            job.join(10)
+
+    def resume_blocker(self) -> str:
+        """Why the paused run cannot resume, or "" if it can.
+
+        A run resumes only on the labels and held-out sessions it started with,
+        so its model stays true to what its sidecar says it was trained on.
+        """
+        if self._state is not TrainingState.PAUSED or not self.run_dir:
+            return ""
+        run_file = os.path.join(self.run_dir, RUN_FILE)
+        if not os.path.isfile(run_file):
+            return ""
+        from autotrainer.inference.keypoint.dataset import PoseDataset
+        with open(run_file, encoding="utf-8") as handle:
+            recorded = yaml.safe_load(handle) or {}
+        try:
+            dataset = PoseDataset.open(self._dataset_path)
+            unchanged = (recorded.get("content_hash") == dataset.content_hash()
+                         and recorded.get("val_sessions") == dataset.val_sessions)
+        except (OSError, ValueError) as err:
+            return f"the dataset cannot be read: {err}"
+        if unchanged:
+            return ""
+        return ("the labels or held-out sessions have changed since this run was paused, "
+                "so it cannot resume; cancel it and start a new run to train on them")
 
     @property
     def state(self) -> TrainingState:
@@ -272,8 +373,10 @@ class PoseTrainingModel(ObservableObject):
                     self.run_dir, self._epochs)
 
     def pause(self, timeout: float = PAUSE_TIMEOUT_S) -> bool:
-        """Stop a running training at its checkpoint; True once nothing trains."""
+        """Stop a running training at its checkpoint, and any GPU job; True once
+        nothing uses the GPU."""
         with self._lock:
+            self.cancel_job()
             if self._state is not TrainingState.RUNNING:
                 return True
             stopped = self._stop_child(timeout)
@@ -325,6 +428,12 @@ class PoseTrainingModel(ObservableObject):
                     continue
             finished = self._handle(kind, payload)
         if not finished and self._process is process:
+            if (self._stop_event is not None and self._stop_event.is_set()
+                    and self._state is not TrainingState.FAILED):
+                # Asked to stop and gone without saying so (terminated after a
+                # pause timed out): its last periodic checkpoint still resumes.
+                self._set_state(TrainingState.PAUSED)
+                return
             self.error = self.error or "the training process exited unexpectedly"
             self._set_state(TrainingState.FAILED)
 

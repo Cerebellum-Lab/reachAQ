@@ -346,30 +346,59 @@ def video_frame_count(video: str) -> int:
         capture.release()
 
 
-def read_frames(video: str, indices: typing.Iterable[int]) -> typing.Dict[int, numpy.ndarray]:
-    """Frames by index, decoded in order.
+def read_frames(video: str, indices: typing.Iterable[int],
+                size: typing.Optional[int] = None) -> typing.Dict[int, numpy.ndarray]:
+    """Frames by index; with `size`, shrunk to size x size grey as they are read.
 
-    Read sequentially rather than by seeking: seeking an mp4 lands on the
-    nearest keyframe on some builds, which would silently return a different
-    frame from the one the operator picked.
+    Each frame is reached by seeking, which OpenCV's FFmpeg backend does
+    exactly (it decodes forward from the previous keyframe): on christielab10's
+    recordings every seek matched sequential decoding, at about 1 ms per frame,
+    where decoding from the start would take minutes for a frame late in a long
+    session. If the position after a read is not the frame asked for, the
+    backend cannot seek exactly, and the rest is decoded sequentially instead.
     """
     import cv2
-    wanted = set(int(i) for i in indices)
+    wanted = sorted(set(int(i) for i in indices))
+    found: typing.Dict[int, numpy.ndarray] = {}
     if not wanted:
-        return {}
-    last = max(wanted)
+        return found
+
+    def keep(index, image):
+        if size is not None:
+            image = cv2.resize(_to_grey(image), (size, size), interpolation=cv2.INTER_AREA)
+        found[index] = image
+
     capture = cv2.VideoCapture(video)
     if not capture.isOpened():
         raise OSError(f"cannot open video {video!r}")
-    found = {}
     try:
-        index = 0
+        remaining = list(wanted)
+        while remaining:
+            index = remaining[0]
+            capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, image = capture.read()
+            if not ok:
+                break
+            if int(round(capture.get(cv2.CAP_PROP_POS_FRAMES))) != index + 1:
+                break
+            keep(index, image)
+            remaining.pop(0)
+        else:
+            return found
+    finally:
+        capture.release()
+
+    # Inexact seek, or a read past the end: decode the rest from the start.
+    pending = set(remaining)
+    capture = cv2.VideoCapture(video)
+    try:
+        index, last = 0, max(pending)
         while index <= last:
             ok, image = capture.read()
             if not ok:
                 break
-            if index in wanted:
-                found[index] = image
+            if index in pending:
+                keep(index, image)
             index += 1
     finally:
         capture.release()
@@ -384,20 +413,17 @@ def pick_diverse(video: str, n: int, exclude: typing.Iterable[int] = (),
     32x32, clusters them with k-means and takes the sample nearest each
     centre, as DeepLabCut's kmeans extraction does.
     """
-    import cv2
     total = video_frame_count(video)
     excluded = set(int(i) for i in exclude)
     if total <= 0 or n <= 0:
         return []
     step = max(1, total // samples)
     candidates = [i for i in range(0, total, step) if i not in excluded]
-    decoded = read_frames(video, candidates)
+    decoded = read_frames(video, candidates, size=32)
     candidates = [i for i in candidates if i in decoded]
     if len(candidates) <= n:
         return candidates
-    features = numpy.stack([
-        cv2.resize(_to_grey(decoded[i]), (32, 32), interpolation=cv2.INTER_AREA).reshape(-1)
-        for i in candidates]).astype("float32") / 255
+    features = numpy.stack([decoded[i].reshape(-1) for i in candidates]).astype("float32") / 255
     labels = _kmeans(features, n, seed)
     picked = []
     for cluster in range(n):

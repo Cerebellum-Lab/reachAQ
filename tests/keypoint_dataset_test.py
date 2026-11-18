@@ -208,3 +208,24 @@ def test_pick_diverse_is_deterministic_and_skips_excluded_frames(tmp_path):
     assert first == pick_diverse(str(video), 5, exclude=(0, 1))
     assert len(set(first)) == 5
     assert not {0, 1} & set(first)
+
+
+def test_read_frames_seeks_to_the_same_frames_sequential_decoding_gives(tmp_path):
+    from autotrainer.inference.keypoint.dataset import read_frames
+    video = _video(tmp_path)
+    sequential = {}
+    capture = cv2.VideoCapture(str(video))
+    for index in range(20):
+        sequential[index] = capture.read()[1]
+    capture.release()
+    found = read_frames(str(video), [17, 3, 9])
+    for index in (3, 9, 17):
+        numpy.testing.assert_array_equal(found[index], sequential[index])
+
+
+def test_read_frames_can_shrink_as_it_decodes(tmp_path):
+    from autotrainer.inference.keypoint.dataset import read_frames
+    video = _video(tmp_path)
+    found = read_frames(str(video), [0, 5], size=32)
+    assert found[5].shape == (32, 32)
+    assert found[5].dtype == numpy.uint8
