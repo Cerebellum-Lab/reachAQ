@@ -8,23 +8,22 @@ same exposure the same frame id without talking to each other.
 """
 
 import math
-import os
 import time
 from typing import Any, Dict, Optional, Tuple
 
 import numpy
 
 from autotrainer.core.latency.raw_clock import monotonic_raw_time
-from autotrainer.core.simulation import sim_epoch
+# The same grid as autotrainer.device.nidaq_simulated reads: the camera and
+# the NI stream must agree on it.
+from autotrainer.core.simulation import (
+    DEFAULT_SIM_CAMERA_EXPOSURE_S,
+    sim_camera_exposure_s,
+    sim_camera_fps,
+    sim_epoch,
+)
 
 from .camera_base import CameraBase
-
-# The same variables and defaults as autotrainer.device.nidaq_simulated, which
-# this package cannot import: the camera and the NI stream must share a grid.
-ENV_SIM_CAMERA_FPS = "REACHAQ_SIM_CAMERA_FPS"
-ENV_SIM_CAMERA_EXPOSURE_S = "REACHAQ_SIM_CAMERA_EXPOSURE_S"
-DEFAULT_CAMERA_FPS = 150.0
-DEFAULT_CAMERA_EXPOSURE_S = 0.002
 
 #: Readout and transfer from the end of exposure to the host.
 TRANSFER_S = 0.001
@@ -38,9 +37,9 @@ class _SimDefaultParams:
         return {
             "width": 640,
             "height": 480,
-            "fps": int(round(float(os.environ.get(ENV_SIM_CAMERA_FPS, DEFAULT_CAMERA_FPS)))),
+            "fps": int(round(sim_camera_fps())),
             # In microseconds, as Spinnaker's ExposureTime and the app read it.
-            "exposure": float(os.environ.get(ENV_SIM_CAMERA_EXPOSURE_S, DEFAULT_CAMERA_EXPOSURE_S)) * 1e6,
+            "exposure": sim_camera_exposure_s() * 1e6,
         }
 
 
@@ -50,7 +49,7 @@ class SimulatedCam(CameraBase):
 
     def __init__(self, name: str = ""):
         super().__init__(name)
-        self._exposure = DEFAULT_CAMERA_EXPOSURE_S
+        self._exposure = DEFAULT_SIM_CAMERA_EXPOSURE_S
         self._next_k: Optional[int] = None
         self._background: Optional[numpy.ndarray] = None
         self._disc: Optional[numpy.ndarray] = None

@@ -138,6 +138,16 @@ def test_sample_index_contiguous():
     assert {block.epoch_perf_time for block in blocks} == {blocks[0].epoch_perf_time}
 
 
+def test_restart_after_close_starts_at_sample_zero():
+    stream = SimulatedNidaqStream(_configuration(("cam_frames", "port0/line0", "digital")))
+    first = _read(stream, 2)
+    stream.start()
+    block = stream.read_chunk()
+    stream.close()
+    assert block.sample_index == 0
+    assert block.epoch_perf_time > first[-1].epoch_perf_time
+
+
 def test_verify_tasks_and_telemetry_match_the_real_shape():
     stream = SimulatedNidaqStream(_configuration(("cam_frames", "port0/line0", "digital")))
     assert stream.verify_tasks(commit=True) == (f"simulated:{SIM_NIDAQ_DEVICE}",)

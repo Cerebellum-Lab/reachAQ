@@ -61,7 +61,8 @@ def make_nidaq_input_backend(
     """The simulated stream in a simulation run, else the NI-DAQmx one.
 
     `hardware_class` lets a call site pass the class it imported, so tests that
-    patch that module attribute keep patching what is constructed.
+    patch that module attribute keep patching what is constructed. The
+    production call sites always pass it; the default is for other callers.
     """
     if is_simulation():
         # Imported here so a hardware run never loads the simulated stream.

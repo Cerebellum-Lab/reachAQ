@@ -22,6 +22,8 @@ from autotrainer.core.simulation import (
     ENV_SIM_BUS,
     SimSignalBusReader,
     SimSignalEvent,
+    sim_camera_exposure_s,
+    sim_camera_fps,
     sim_epoch,
 )
 from autotrainer.device.nidaq_signal_stream import (
@@ -34,25 +36,21 @@ logger = logging.getLogger(__name__)
 
 SIM_NIDAQ_DEVICE = "SimDAQ1"
 
-ENV_SIM_CAMERA_FPS = "REACHAQ_SIM_CAMERA_FPS"
-ENV_SIM_CAMERA_EXPOSURE_S = "REACHAQ_SIM_CAMERA_EXPOSURE_S"
 #: JSON object {nidaq channel name: bus line name}, for a channel that reads
 #: a line published under another name (laser1_trigger reading board_stim2).
 ENV_SIM_LINE_ALIASES = "REACHAQ_SIM_LINE_ALIASES"
 
 CAM_FRAMES_CHANNEL = "cam_frames"
-DEFAULT_CAMERA_FPS = 150.0
-DEFAULT_CAMERA_EXPOSURE_S = 0.002
 #: Standard deviation of the noise on every analog sample, in volts.
 ANALOG_NOISE_V = 0.0005
 
 
 def sim_camera_period() -> float:
-    return 1.0 / float(os.environ.get(ENV_SIM_CAMERA_FPS, DEFAULT_CAMERA_FPS))
+    return 1.0 / sim_camera_fps()
 
 
 def sim_camera_exposure() -> float:
-    return float(os.environ.get(ENV_SIM_CAMERA_EXPOSURE_S, DEFAULT_CAMERA_EXPOSURE_S))
+    return sim_camera_exposure_s()
 
 
 def sim_line_aliases() -> Dict[str, str]:
@@ -124,6 +122,8 @@ class SimulatedNidaqStream:
     def start(self) -> None:
         if self._is_started:
             return
+        # Sample 0 is at the new epoch, also after a close() and restart.
+        self._sample_index = 0
         self._epoch_perf_time = time.perf_counter()
         self._epoch_wall_time = time.time()
         self._is_started = True
@@ -146,6 +146,7 @@ class SimulatedNidaqStream:
         read_started = time.perf_counter()
 
         first = self._sample_index
+        # No buffer limit: a stalled consumer never overflows here as a board's buffer would.
         ready_at = self._epoch_perf_time + (first + chunk_size) / rate
         delay = ready_at - time.perf_counter()
         if delay > 0:
