@@ -1022,7 +1022,13 @@ def test_live_intertrial_result_finalizes_attempt_persists_and_syncs_counts(
     assert app_model.behavior.algorithm.pellets_presented == 1
     assert app_model.behavior.algorithm.successful_reaches == 1
     assert app_model.behavior.algorithm.pellets_consumed == 1
-    protocol_outcome.assert_called_once_with("1.1", TrialOutcome.SUCCESS)
+    protocol_outcome.assert_called_once_with(
+        "1.1",
+        TrialOutcome.SUCCESS,
+        reach_count=1,
+        success_count=1,
+        consumption_count=1,
+    )
     update.assert_called_once_with(
         project,
         ledger.to_records(),
