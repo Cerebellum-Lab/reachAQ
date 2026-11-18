@@ -118,3 +118,12 @@ def test_the_output_is_a_live_model_with_its_provenance(tmp_path):
 
 def test_cpu_training_runs_without_autocast():
     assert autocast_dtype("cpu") is None
+
+
+def test_turing_cards_train_in_fp32_and_newer_ones_in_bf16(monkeypatch):
+    # Measured on christielab10's Quadro T1000 (7.5), full network, batch 32:
+    # fp32 126 ms per step, bf16 489, fp16 417. bf16 is emulated before 8.0.
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (7, 5))
+    assert autocast_dtype("cuda") is None
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (8, 9))
+    assert autocast_dtype("cuda") is torch.bfloat16
