@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "planId": "reach-shaping",
+  "name": "Reach shaping",
+  "description": "Example reachAQ plan: close pellet, then the standard position.",
+  "phases": [
+    {
+      "phaseId": "shaping-close",
+      "name": "Close pellet",
+      "description": "Pellet 1 mm closer; moves back 0.25 mm after each success.",
+      "device": {"pelletDelivery": true, "pelletCover": false, "pelletShift": false,
+                 "sendOffset": {"x": 0.0, "y": -1.0, "z": 0.0}},
+      "advance": {"all": [
+        {"metric": "trials", "op": ">=", "value": 4},
+        {"metric": "successRate", "op": ">=", "value": 0.75, "window": 4}
+      ]},
+      "trialActions": [
+        {"action": "movePelletTarget", "when": "success", "dy": 0.25, "limits": {"y": [0.0, 1.0]}},
+        {"action": "tone", "frequencyHz": 4000, "durationMs": 200}
+      ]
+    },
+    {
+      "phaseId": "shaping-standard",
+      "name": "Standard position",
+      "description": "Subject's own pellet target with a small random jitter.",
+      "device": {"pelletCover": true},
+      "advance": {"metric": "successes", "op": ">=", "value": 3},
+      "fallback": {"metric": "consecutiveFailures", "op": ">=", "value": 3},
+      "trialActions": [
+        {"action": "jitterPelletTarget", "x": 0.2, "y": 0.0, "z": 0.1},
+        {"action": "pause", "minSeconds": 2.0, "maxSeconds": 4.0}
+      ]
+    },
+    {
+      "phaseId": "shaping-done",
+      "name": "Maintenance",
+      "description": "No further phases."
+    }
+  ]
+}
