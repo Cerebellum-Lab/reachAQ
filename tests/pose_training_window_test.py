@@ -49,10 +49,6 @@ class _FakeAppModel:
         self._events = ObservableObject()
         self.property_changed = self._events.property_changed
 
-    @property
-    def session_ready(self):
-        return self.ready
-
     def deploy_pose_model(self, path):
         self.deployed.append(path)
 
@@ -146,3 +142,23 @@ def test_session_videos_are_found_under_the_output_location(qapp, tmp_path):
     videos = window.find_session_videos()
     assert [os.path.basename(v) for v in videos] == [
         "20261118_rig_session001_left.mp4", "20261118_rig_session001_right.mp4"]
+
+
+def test_the_window_opens_on_the_real_app_model_and_follows_recording(qapp, app_model, tmp_path):
+    from tools.acquisition.model.app_model_status import SessionRecordingStatus
+    # The fixture's VoidInference has no model location; the real model does.
+    app_model.inference.__dict__["model_location"] = ""
+    app_model.pose_training.datasets_root = str(tmp_path / "sets")
+    app_model.pose_training.models_root = str(tmp_path / "models")
+    data = _dataset(tmp_path)
+    data.set_status(data.rows[0].frame, LABELLED)
+    data.save()
+    window = PoseTrainingWindow(app_model)
+    window.open_dataset(data.path)
+    assert window.start_button.isEnabled()
+    app_model._recording_session.status = SessionRecordingStatus.RECORDING
+    app_model._publish_session_recording_transition(
+        SessionRecordingStatus.READY, SessionRecordingStatus.RECORDING)
+    QApplication.processEvents()
+    assert not window.start_button.isEnabled()
+    assert "recording" in window.training_banner.text().lower()
