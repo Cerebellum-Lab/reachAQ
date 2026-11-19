@@ -272,17 +272,25 @@ archive_conda_environment() {
     printf 'Run the archived environment with: conda run --no-capture-output -n %s python -m reachAQ.app\n' \
         "$archive_name"
     # The new environment is built from nothing; it gets the plugins the one
-    # it replaces had.
-    find_plugins_to_restore "$archive_name"
+    # it replaces had. A failed probe must not stop the new environment being
+    # built: it is reported, and the list read before archiving is kept.
+    if ! find_plugins_to_restore "$archive_name"; then
+        record_result FAIL "Find pose plugins to restore from $archive_name" \
+            "probe failed; kept: ${PLUGINS_TO_RESTORE[*]:-none}"
+    fi
 }
 
 # find_plugins_to_restore <env>: sets PLUGINS_TO_RESTORE to the plugins <env>
 # has registered, plus those inferred from engines installed before the
-# plugins existed. An update never strips an engine.
+# plugins existed. An update never strips an engine, so a probe that fails on
+# an existing environment fails this too and leaves PLUGINS_TO_RESTORE as it
+# was; an environment that does not exist yet has none.
 find_plugins_to_restore() {
     local env=$1
-    local found
-    found=$({ installed_pose_plugins "$env"; legacy_pose_engines "$env"; } | known_plugins_in)
+    local installed legacy found
+    installed=$(installed_pose_plugins "$env") || return
+    legacy=$(legacy_pose_engines "$env") || return
+    found=$(printf '%s\n%s\n' "$installed" "$legacy" | known_plugins_in)
     PLUGINS_TO_RESTORE=()
     if [ -n "$found" ]; then
         mapfile -t PLUGINS_TO_RESTORE <<< "$found"

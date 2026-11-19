@@ -48,6 +48,10 @@ fi
 [ "$1" = python ] || exit 0
 shift
 [ "$1 $2" = "-m pip" ] && exit 0
+if [ -e "$FAKE_ENVS/$env_name/FAIL_PYTHON" ]; then
+    printf 'probe python broke in %s\n' "$env_name" >&2
+    exit 3
+fi
 PYTHONPATH="$FAKE_ENVS/$env_name" exec "$FAKE_PYTHON" -S "$@"
 """
 
@@ -235,6 +239,69 @@ def test_legacy_pose_engines_infers_plugins_from_old_packages(tmp_path):
     assert "both: deeplabcut yolo " in lines
     assert "neither: " in lines
     assert "no-such-env: " in lines
+
+
+def _find_plugins_to_restore_source():
+    source = MAIN_SCRIPT.read_text()
+    function = source[source.index("find_plugins_to_restore() {"):]
+    return function[:function.index("\n}\n") + 3]
+
+
+REPORT_PRELUDE = (
+    'CURRENT_CATEGORY=Test; RESULT_NAMES=(); RESULT_STATES=(); RESULT_DETAILS=()\n'
+    'PASS_COUNT=0; FAIL_COUNT=0; SKIP_COUNT=0\n'
+)
+
+
+def test_a_failed_probe_of_an_existing_env_fails_the_step(tmp_path):
+    # An empty answer from a broken environment would restore nothing and
+    # report PASS; the rebuilt environment would then lose its engines.
+    conda, envs, env = _fake_conda(tmp_path)
+    (_make_env(envs, "broken", packages=("deeplabcut",)) / "FAIL_PYTHON").write_text("")
+
+    completed = _source_lib(
+        REPORT_PRELUDE + _find_plugins_to_restore_source()
+        + 'PLUGINS_TO_RESTORE=(yolo)\n'
+        'installed_pose_plugins broken; echo "installed status=$?"\n'
+        'legacy_pose_engines broken; echo "legacy status=$?"\n'
+        'run_step "Find pose plugins to restore" find_plugins_to_restore broken\n'
+        'echo "states=${RESULT_STATES[*]} kept=${PLUGINS_TO_RESTORE[*]}"\n',
+        env, conda)
+
+    assert completed.returncode == 0, completed.stderr
+    assert "installed status=3" in completed.stdout
+    assert "legacy status=3" in completed.stdout
+    assert "states=FAIL kept=yolo" in completed.stdout
+    assert "probe python broke in broken" in completed.stderr
+    assert "Probing the pose plugins of conda environment broken failed" in completed.stderr
+
+
+def test_a_missing_env_has_no_plugins_to_restore(tmp_path):
+    conda, envs, env = _fake_conda(tmp_path)
+
+    completed = _source_lib(
+        REPORT_PRELUDE + _find_plugins_to_restore_source()
+        + 'installed_pose_plugins no-such-env; echo "installed status=$?"\n'
+        'legacy_pose_engines no-such-env; echo "legacy status=$?"\n'
+        'run_step "Find pose plugins to restore" find_plugins_to_restore no-such-env\n'
+        'echo "states=${RESULT_STATES[*]} count=${#PLUGINS_TO_RESTORE[@]}"\n',
+        env, conda)
+
+    assert completed.returncode == 0, completed.stderr
+    assert "installed status=0" in completed.stdout
+    assert "legacy status=0" in completed.stdout
+    assert "Pose plugins to restore from no-such-env: none" in completed.stdout
+    assert "states=PASS count=0" in completed.stdout
+
+
+def test_a_failed_archive_probe_is_reported_without_stopping_the_rebuild():
+    source = MAIN_SCRIPT.read_text()
+    archive = source[source.index("archive_conda_environment() {"):]
+    archive = archive[:archive.index("\n}\n")]
+
+    assert 'if ! find_plugins_to_restore "$archive_name"; then' in archive
+    assert 'record_result FAIL "Find pose plugins to restore from $archive_name"' in archive
+    assert archive.rstrip().endswith("fi")
 
 
 def test_plugin_library_has_no_side_effects_when_sourced(tmp_path):

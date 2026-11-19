@@ -170,31 +170,50 @@ known_plugins_in() {
     done
 }
 
-# Plugin names registered in <env>'s autotrainer.pose_backends group; nothing
-# when the environment does not exist. The archived environment of an update
-# can be on an older Python, where entry_points() returns a dict, hence both
-# lookups.
+# probe_pose_env <env> <python code>: runs the snippet in <env> and prints the
+# known plugin names it reports. Nothing, with status 0, when <env> does not
+# exist (a fresh host). When it exists but the probe fails, the probe's stderr
+# is shown and the status is nonzero: an empty answer there would silently
+# restore nothing.
+probe_pose_env() {
+    local env=$1
+    local code=$2
+    conda_env_exists "$env" || return 0
+    local output result
+    output=$("$CONDA_BIN" run -n "$env" python -c "$code")
+    result=$?
+    if [ "$result" -ne 0 ]; then
+        printf 'Probing the pose plugins of conda environment %s failed (exit %d).\n' \
+            "$env" "$result" >&2
+        return "$result"
+    fi
+    printf '%s\n' "$output" | known_plugins_in
+}
+
+# Plugin names registered in <env>'s autotrainer.pose_backends group. The
+# archived environment of an update can be on an older Python, where
+# entry_points() returns a dict, hence both lookups.
 installed_pose_plugins() {
-    "$CONDA_BIN" run -n "$1" python -c '
+    probe_pose_env "$1" '
 from importlib.metadata import entry_points
 found = entry_points()
 group = (found.select(group="autotrainer.pose_backends") if hasattr(found, "select")
          else found.get("autotrainer.pose_backends", ()))
 print("\n".join(sorted({entry.name for entry in group})))
-' 2>/dev/null | known_plugins_in
+'
 }
 
 # The first update after DeepLabCut and YOLO left core: no environment has a
 # plugin distribution yet, but one that already has deeplabcut or ultralytics
 # ran that engine, so it gets the matching plugin and nothing more.
 legacy_pose_engines() {
-    "$CONDA_BIN" run -n "$1" python -c '
+    probe_pose_env "$1" '
 from importlib.util import find_spec
 if find_spec("deeplabcut") is not None:
     print("deeplabcut")
 if find_spec("ultralytics") is not None:
     print("yolo")
-' 2>/dev/null | known_plugins_in
+'
 }
 
 # The lines of one optional-dependencies extra of a pyproject.toml. setup.py
