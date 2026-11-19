@@ -198,9 +198,10 @@ from tools.acquisition.model.animal_reconciliation import (
 )
 from tools.acquisition.model.animal_registry import AnimalRegistry
 from tools.acquisition.model.rfid_metadata_controller import RfidMetadataController
-from tools.acquisition.model.softmouse_spreadsheet_source import (
-    SoftMouseMappingProfile,
-    SoftMouseSpreadsheetSource,
+from tools.acquisition.model.animal_sources.config import (
+    build_source,
+    load_source_configuration,
+    publish_target,
 )
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 from tools.acquisition.model.session_telemetry import (
@@ -3076,7 +3077,7 @@ class AppModel(ObservableObject):
                 "home the pellet axes to clear it"
             )
         if self.animal_metadata_refresh_busy:
-            blockers.append("SoftMouse animal metadata refresh is still running")
+            blockers.append("Animal metadata refresh is still running")
         if self._recording_session.status is not SessionRecordingStatus.READY:
             blockers.append(
                 f"recording state: {self._recording_session.status.value}"
@@ -3639,7 +3640,12 @@ class AppModel(ObservableObject):
         self._animal_registry = None
         self._animal_metadata_sync = None
         self._rfid_metadata_controller = None
-        manifest_value = getattr(self._preferences, "softmouse_manifest_path", "")
+        try:
+            source_configuration = load_source_configuration(self._preferences)
+            source_error = None
+        except Exception as exc:
+            logger.exception("Animal metadata source configuration is unreadable")
+            source_configuration, source_error = None, exc
         hardware_configuration = (
             None if self._loaded_configuration is None
             else self._loaded_configuration.hardware
@@ -3649,9 +3655,9 @@ class AppModel(ObservableObject):
             and hardware_configuration.rfid_reader_enabled
         )
         logger.info(
-            "Configuring SoftMouse/RFID services: manifest_configured=%s "
+            "Configuring animal metadata/RFID services: source=%s "
             "rfid_enabled=%s rfid_device=%s",
-            bool(manifest_value),
+            "none" if source_configuration is None else source_configuration.kind,
             reader_enabled,
             (
                 "not configured"
@@ -3659,12 +3665,12 @@ class AppModel(ObservableObject):
                 else hardware_configuration.rfid_device
             ),
         )
-        if not manifest_value and not reader_enabled:
+        if source_configuration is None and source_error is None and not reader_enabled:
             self._set_animal_metadata_status("Not configured")
             self._set_subsystem_status(
                 SubsystemId.ANIMAL_REGISTRY,
                 SubsystemState.DISABLED,
-                reason="SoftMouse/RFID not configured",
+                reason="animal metadata source/RFID not configured",
                 required_for_recording=False,
             )
             self._set_subsystem_status(
@@ -3674,13 +3680,14 @@ class AppModel(ObservableObject):
                 required_for_recording=False,
             )
             return
+        # The directory keeps its first name so existing caches carry over.
         cache_directory = Path(self._preferences.configuration_location) / "softmouse"
         try:
             registry = self._animal_registry = AnimalRegistry(
                 cache_directory / "animal-registry.sqlite3"
             )
         except Exception as exc:
-            logger.exception("SoftMouse animal registry initialization failed")
+            logger.exception("Animal registry initialization failed")
             self._set_animal_metadata_status(f"Registry unavailable: {exc}")
             self._set_subsystem_status(
                 SubsystemId.ANIMAL_REGISTRY,
@@ -3702,7 +3709,7 @@ class AppModel(ObservableObject):
                 f"{registry.recovered_corrupt_path.name}"
             )
             logger.warning(
-                "Recovered corrupt SoftMouse registry: backup=%s",
+                "Recovered corrupt animal registry: backup=%s",
                 registry.recovered_corrupt_path,
             )
         self._set_subsystem_status(
@@ -3711,21 +3718,29 @@ class AppModel(ObservableObject):
             reason=registry_reason,
             required_for_recording=False,
         )
-        if manifest_value:
-            profile = SoftMouseMappingProfile(
-                new_animal_name_column=getattr(
-                    self._preferences, "softmouse_name_column", "Physical Tag"
+        source_status = None
+        if source_error is not None:
+            source_status = f"Source setup unreadable: {source_error}"
+        elif source_configuration is not None:
+            try:
+                configured = build_source(source_configuration)
+            except Exception as exc:
+                logger.exception(
+                    "Animal metadata source unavailable: kind=%s", source_configuration.kind
                 )
-            )
-            self._animal_metadata_sync = AnimalMetadataSyncService(
-                manifest_path=Path(manifest_value),
-                local_staging_directory=cache_directory / "source",
-                source=SoftMouseSpreadsheetSource(profile),
-                registry=registry,
-                can_refresh=lambda: (
-                    self.session_recording_status is SessionRecordingStatus.READY
-                ),
-            )
+                source_status = f"Source unavailable: {exc}"
+            else:
+                publish_directory, publish_mount = publish_target(source_configuration)
+                self._animal_metadata_sync = AnimalMetadataSyncService(
+                    configured=configured,
+                    local_staging_directory=cache_directory / "source",
+                    registry=registry,
+                    can_refresh=lambda: (
+                        self.session_recording_status is SessionRecordingStatus.READY
+                    ),
+                    publish_directory=publish_directory,
+                    publish_mount=publish_mount,
+                )
         if reader_enabled:
             self._rfid_metadata_controller = RfidMetadataController(
                 app_model=self,
@@ -3750,11 +3765,19 @@ class AppModel(ObservableObject):
                 required_for_recording=False,
             )
         previous = registry.last_complete_import()
-        if previous is None:
-            self._set_animal_metadata_status("Ready; no export imported yet")
+        if source_status is not None:
+            self._set_animal_metadata_status(source_status)
+            self._set_subsystem_status(
+                SubsystemId.ANIMAL_REGISTRY,
+                SubsystemState.FAILED,
+                error=source_status,
+                required_for_recording=False,
+            )
+        elif previous is None:
+            self._set_animal_metadata_status("Ready; nothing imported yet")
         else:
             self._set_animal_metadata_status(
-                f"Cache has {previous['accepted_rows']} tagged animals; "
+                f"Cache has {previous['accepted_rows']} animals; "
                 f"last refresh {previous['imported_utc']}; "
                 f"source {previous['source_file_sha256'][:12]}"
             )
@@ -3771,7 +3794,7 @@ class AppModel(ObservableObject):
     ) -> bool:
         service = self._animal_metadata_sync
         if service is None:
-            raise RuntimeError("Configure a SoftMouse publication manifest first")
+            raise RuntimeError("Set up an animal metadata source first")
         if self.session_recording_status is not SessionRecordingStatus.READY:
             with self._animal_metadata_refresh_lock:
                 self._animal_metadata_refresh_deferred = True
@@ -3782,7 +3805,7 @@ class AppModel(ObservableObject):
             if self._animal_metadata_refresh_busy:
                 self._animal_metadata_refresh_deferred = True
                 self._animal_metadata_refresh_reason = str(reason)
-                logger.info("SoftMouse refresh coalesced while another refresh is active")
+                logger.info("Animal metadata refresh coalesced while another refresh is active")
                 return False
             self._animal_metadata_refresh_busy = True
             self._animal_metadata_refresh_deferred = False
@@ -3791,21 +3814,21 @@ class AppModel(ObservableObject):
             self.Props.ANIMAL_METADATA_REFRESH_BUSY, True, False,
         )
         logger.info(
-            "SoftMouse local-cache refresh requested: manifest=%s reason=%s",
-            service.manifest_path,
+            "Animal metadata refresh requested: source=%s reason=%s",
+            service.describe(),
             reason,
         )
         self._set_animal_metadata_status("Refreshing…")
         self._set_subsystem_status(
             SubsystemId.ANIMAL_REGISTRY,
             SubsystemState.STARTING,
-            reason="refreshing SoftMouse cache",
+            reason="refreshing animal metadata cache",
             required_for_recording=False,
         )
         thread = threading.Thread(
             target=self._run_animal_metadata_refresh,
             args=(service, bool(only_if_due)),
-            name="softmouse-cache-refresh",
+            name="animal-metadata-refresh",
             daemon=True,
         )
         self._animal_metadata_refresh_thread = thread
@@ -3828,7 +3851,7 @@ class AppModel(ObservableObject):
     ) -> None:
         if error is not None:
             logger.error(
-                "SoftMouse local-cache refresh failed: %s",
+                "Animal metadata refresh failed: %s",
                 error,
                 exc_info=(type(error), error, error.__traceback__),
             )
@@ -3866,8 +3889,9 @@ class AppModel(ObservableObject):
 
     def _publish_animal_metadata_refresh_result(self, result) -> None:
         batch = result.preview.batch
+        with_rfid = sum(record.physical_rfid is not None for record in batch.records)
         status = (
-            f"Imported {batch.accepted_rows} tagged animals; "
+            f"Imported {batch.accepted_rows} animals ({with_rfid} with RFID); "
             f"ignored {batch.ignored_missing_rfid_rows} without RFID and "
             f"{batch.ignored_ended_rows} ended"
         )
@@ -3877,6 +3901,9 @@ class AppModel(ObservableObject):
             f"; source {batch.source_file_sha256[:12]}; "
             f"refreshed {batch.imported_utc}"
         )
+        publication = getattr(result, "publication", None)
+        if publication is not None:
+            status += f"; published {publication.manifest_path}"
         self._set_animal_metadata_status(status)
         previous_preview, self._animal_metadata_preview = (
             self._animal_metadata_preview,
@@ -3894,7 +3921,7 @@ class AppModel(ObservableObject):
             required_for_recording=False,
         )
         logger.info(
-            "SoftMouse local-cache refresh complete: import_id=%s total_rows=%d "
+            "Animal metadata refresh complete: import_id=%s total_rows=%d "
             "tagged_rows=%d ignored_missing_rfid=%d ignored_ended=%d unchanged=%s "
             "source_sha256=%s",
             batch.import_id,
@@ -3912,14 +3939,14 @@ class AppModel(ObservableObject):
                 "scheduled catch-up", only_if_due=True,
             )
         except Exception as exc:
-            logger.warning("Scheduled SoftMouse catch-up refresh failed: %s", exc)
+            logger.warning("Scheduled animal metadata catch-up refresh failed: %s", exc)
 
     def _request_animal_metadata_catchup(self) -> None:
         self._run_animal_metadata_catchup()
 
     def apply_animal_metadata_preferences(self) -> None:
         if self.animal_metadata_refresh_busy:
-            raise RuntimeError("SoftMouse settings cannot change during a cache refresh")
+            raise RuntimeError("Animal metadata settings cannot change during a refresh")
         self._configure_animal_metadata_services()
         if self._rfid_metadata_controller is not None:
             self._rfid_metadata_controller.start()

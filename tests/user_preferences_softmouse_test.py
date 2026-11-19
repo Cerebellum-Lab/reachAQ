@@ -9,6 +9,17 @@ def test_a_fresh_install_has_no_softmouse_publication(tmp_path):
 
     assert preferences.softmouse_manifest_path == ""
     assert preferences.softmouse_publication_mount == ""
+    assert preferences.animal_metadata_source == ""
+
+
+def test_the_animal_metadata_source_persists_per_user(tmp_path):
+    settings_path = tmp_path / "settings.ini"
+    preferences = UserPreferences(settings_file_path=settings_path)
+    value = '{"kind": "spreadsheet", "settings": {"path": "C:/lab, animals.csv"}}'
+    preferences.animal_metadata_source = value
+    preferences.save()
+
+    assert UserPreferences(settings_file_path=settings_path).animal_metadata_source == value
 
 
 def test_softmouse_publication_settings_persist(tmp_path):

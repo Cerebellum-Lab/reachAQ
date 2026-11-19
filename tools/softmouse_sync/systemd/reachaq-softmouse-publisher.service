@@ -1,9 +1,9 @@
 [Unit]
-Description=Publish a complete SoftMouse animal export for reachAQ
+Description=Publish this computer's reachAQ animal metadata source
 # Install this user unit on the single designated publisher computer only.
 After=network-online.target
 Wants=network-online.target
-# The destination and mount guard come from the app's SoftMouse preferences.
+# The source, destination and mount guard come from `reachaq-animal-metadata setup`.
 # A lab whose publication is on a network mount adds RequiresMountsFor= for it
 # in a drop-in (systemctl --user edit reachaq-softmouse-publisher.service).
 
@@ -12,7 +12,7 @@ Type=oneshot
 # Support the Anaconda, Miniconda, and Mambaforge locations recognized by the
 # portable installer. /usr/bin/env resolves conda using this explicit path.
 Environment="PATH=%h/anaconda3/bin:%h/miniconda3/bin:%h/mambaforge/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=/usr/bin/env conda run --no-capture-output -n reachaq python -m tools.softmouse_sync.cli
+ExecStart=/usr/bin/env conda run --no-capture-output -n reachaq python -m tools.acquisition.model.animal_sources.cli publish
 WorkingDirectory=%h/Documents/reachAQ
 PrivateTmp=true
 NoNewPrivileges=true

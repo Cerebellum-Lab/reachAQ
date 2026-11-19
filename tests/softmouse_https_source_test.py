@@ -9,6 +9,10 @@ from tools.softmouse_sync.https_source import (
 )
 
 
+#: A made-up colony: no lab's values belong in code or tests.
+COLONY = "Example Colony"
+
+
 class Response:
     def __init__(self, *, url, content=b"", status=200, json_value=None):
         self.url = url
@@ -37,13 +41,16 @@ class Session:
         self.animals_content = b'<a id="exportMouseMenuButton">Export</a>'
         self.home_content = (
             b'<a href="smdb/mouseline/list.do?reqCode=gotoMouselinelist&amp;ownerCode=34867">'
-            b"Jason Christie</a>"
+            b"Example Colony</a>"
+            b'<a href="smdb/mouseline/list.do?reqCode=gotoMouselinelist&amp;ownerCode=55">'
+            b"Other  Colony</a>"
+            b'<a href="help.do">Help</a>'
         )
         self.list_rows = [
             {
                 "id": 1,
                 "ownerId": 34867,
-                "owner": "Jason Christie",
+                "owner": COLONY,
                 "mousestate": "Stock",
                 "physicaltag": "PT-1",
                 "plateIdPattern": "360002353933099",
@@ -51,7 +58,7 @@ class Session:
             {
                 "id": 2,
                 "ownerId": 34867,
-                "owner": "Jason Christie",
+                "owner": COLONY,
                 "mousestate": "Mating",
                 "physicaltag": "PT-2",
                 "plateIdPattern": "360002353933101",
@@ -93,10 +100,10 @@ class Session:
         raise AssertionError((method, url, kwargs))
 
 
-def test_https_source_selects_christie_active_scope_and_writes_csv(tmp_path):
+def test_https_source_selects_the_colony_active_scope_and_writes_csv(tmp_path):
     session = Session()
     source = SoftMouseHttpsSource(
-        SoftMouseHttpsConfiguration(),
+        SoftMouseHttpsConfiguration(colony_name=COLONY),
         SoftMouseCredentials("ben", "secret"),
         session=session,
     )
@@ -125,7 +132,7 @@ def test_https_source_rejects_interactive_authentication_challenge(tmp_path):
     session = Session()
     session.animals_content = b"Enter verification code for two-factor login"
     source = SoftMouseHttpsSource(
-        SoftMouseHttpsConfiguration(),
+        SoftMouseHttpsConfiguration(colony_name=COLONY),
         SoftMouseCredentials("ben", "secret"),
         session=session,
         sleep=lambda _seconds: None,
@@ -135,31 +142,31 @@ def test_https_source_rejects_interactive_authentication_challenge(tmp_path):
         source.download(tmp_path)
 
 
-def test_https_source_requires_exact_christie_colony(tmp_path):
+def test_https_source_requires_the_exact_colony(tmp_path):
     session = Session()
     session.home_content = b'<a href="other">Another Lab</a>'
     source = SoftMouseHttpsSource(
-        SoftMouseHttpsConfiguration(),
+        SoftMouseHttpsConfiguration(colony_name=COLONY),
         SoftMouseCredentials("ben", "secret"),
         session=session,
         sleep=lambda _seconds: None,
     )
 
-    with pytest.raises(RuntimeError, match="Jason Christie"):
+    with pytest.raises(RuntimeError, match="Example Colony"):
         source.download(tmp_path)
 
 
-def test_https_source_rejects_non_christie_export_scope(tmp_path):
+def test_https_source_rejects_another_owners_export_scope(tmp_path):
     session = Session()
     session.list_rows[0]["ownerId"] = 999
     source = SoftMouseHttpsSource(
-        SoftMouseHttpsConfiguration(),
+        SoftMouseHttpsConfiguration(colony_name=COLONY),
         SoftMouseCredentials("ben", "secret"),
         session=session,
         sleep=lambda _seconds: None,
     )
 
-    with pytest.raises(RuntimeError, match="non-Christie owner"):
+    with pytest.raises(RuntimeError, match="another colony owner"):
         source.download(tmp_path)
 
 
@@ -185,7 +192,7 @@ def test_https_source_fetches_every_active_page(tmp_path):
 
     session.request = paged_request
     source = SoftMouseHttpsSource(
-        SoftMouseHttpsConfiguration(page_size=1),
+        SoftMouseHttpsConfiguration(colony_name=COLONY, page_size=1),
         SoftMouseCredentials("ben", "secret"),
         session=session,
     )
@@ -211,6 +218,7 @@ def test_https_source_retries_transient_network_failure_on_safe_get(tmp_path):
     session.request = transient_request
     source = SoftMouseHttpsSource(
         SoftMouseHttpsConfiguration(
+            colony_name=COLONY,
             transient_retry_initial_seconds=0,
         ),
         SoftMouseCredentials("ben", "secret"),
@@ -222,3 +230,29 @@ def test_https_source_retries_transient_network_failure_on_safe_get(tmp_path):
 
     assert failed_once
     assert path.read_text(encoding="utf-8").startswith("SoftMouse ID,")
+
+
+def test_list_colonies_names_every_colony_link_after_login():
+    source = SoftMouseHttpsSource(
+        SoftMouseHttpsConfiguration(),
+        SoftMouseCredentials("ben", "secret"),
+        session=Session(),
+        sleep=lambda _seconds: None,
+    )
+
+    assert source.list_colonies() == ["Example Colony", "Other Colony"]
+
+
+def test_download_needs_a_colony_chosen_at_setup(tmp_path):
+    source = SoftMouseHttpsSource(
+        SoftMouseHttpsConfiguration(),
+        SoftMouseCredentials("ben", "secret"),
+        session=Session(),
+    )
+
+    with pytest.raises(ValueError, match="colony must be chosen"):
+        source.download(tmp_path)
+
+
+def test_the_default_configuration_names_no_lab():
+    assert SoftMouseHttpsConfiguration().colony_name == ""

@@ -11,17 +11,22 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from tools.acquisition.model.app_model_status import SessionRecordingStatus  # noqa: E402
-from tools.acquisition.model.user_preferences import UserPreferences  # noqa: E402
-from tools.acquisition.view.softmouse_publication_controller import (  # noqa: E402
-    SoftMousePublicationController,
+from tools.acquisition.model.animal_sources import cli as animal_metadata_cli  # noqa: E402
+from tools.acquisition.model.animal_sources.config import (  # noqa: E402
+    SourceConfiguration,
+    load_source_configuration,
+    save_source_configuration,
 )
+from tools.acquisition.model.animal_sources.mapping import softmouse_mapping  # noqa: E402
+from tools.acquisition.model.animal_sources.publication import (  # noqa: E402
+    ensure_publication_directory,
+)
+from tools.acquisition.model.user_preferences import UserPreferences  # noqa: E402
 from tools.softmouse_sync import cli  # noqa: E402
 
 
@@ -50,8 +55,7 @@ def fresh_preferences(tmp_path):
 def _use_preferences(monkeypatch, path):
     """Point the publisher's own preference lookup at a given file."""
     monkeypatch.setattr(
-        "tools.acquisition.model.user_preferences.UserPreferences",
-        lambda: UserPreferences(settings_file_path=path),
+        animal_metadata_cli, "_preferences", lambda _path: UserPreferences(settings_file_path=path)
     )
 
 
@@ -121,39 +125,64 @@ def test_christielab10_preferences_resolve_to_the_built_in_publication(christiel
     assert Path(preferences.softmouse_publication_mount) == BEFORE_MOUNT
 
 
-def test_christielab10s_scheduled_publisher_writes_where_it_did(monkeypatch, christielab10_preferences):
+def test_christielab10_reads_its_publication_through_the_source_interface(
+    christielab10_preferences,
+):
+    configuration = load_source_configuration(
+        UserPreferences(settings_file_path=christielab10_preferences)
+    )
+
+    assert configuration.kind == "publication"
+    assert Path(configuration.settings["manifest"]) == BEFORE_MANIFEST
+    assert configuration.mapping == softmouse_mapping()
+
+
+def _set_up_softmouse_publisher(path):
+    """What `reachaq-animal-metadata setup --kind softmouse` saves on the publisher."""
+    preferences = UserPreferences(settings_file_path=path)
+    save_source_configuration(
+        preferences,
+        SourceConfiguration(
+            kind="softmouse",
+            settings={"username": "lab-user", "colony": "Lab colony"},
+            mapping=softmouse_mapping(),
+            publish_directory=str(BEFORE_PUBLICATION_DIRECTORY),
+            publish_mount=str(BEFORE_MOUNT),
+        ),
+    )
+    preferences.save()
+
+
+def test_christielab10s_scheduled_publisher_writes_where_it_did(
+    monkeypatch, christielab10_preferences
+):
+    _set_up_softmouse_publisher(christielab10_preferences)
     _use_preferences(monkeypatch, christielab10_preferences)
-    monkeypatch.setattr(cli, "_credentials_from_keyring", lambda: object())
     calls = []
 
     def ensure(destination, *, mount_root=None):
         calls.append((Path(destination), mount_root and Path(mount_root)))
         raise RuntimeError("stop before publishing")
 
-    monkeypatch.setattr(cli, "_ensure_publication_directory", ensure)
+    monkeypatch.setattr(animal_metadata_cli, "ensure_publication_directory", ensure)
 
     # The systemd unit runs the publisher with no arguments.
     assert cli.main([]) == 1
     assert calls == [(BEFORE_PUBLICATION_DIRECTORY, BEFORE_MOUNT)]
 
 
-def test_christielab10s_sync_button_passes_the_same_publication(christielab10_preferences):
-    app_model = SimpleNamespace(
-        session_recording_status=SessionRecordingStatus.READY,
-        preferences=UserPreferences(settings_file_path=christielab10_preferences),
-    )
-    controller = SoftMousePublicationController(app_model)
+def test_a_computer_reading_the_publication_has_nothing_to_publish(
+    monkeypatch, capsys, christielab10_preferences
+):
+    _use_preferences(monkeypatch, christielab10_preferences)
 
-    assert controller._publisher_arguments() == (
-        "-m", "tools.softmouse_sync.cli",
-        "--destination", BEFORE_PUBLICATION_DIRECTORY.as_posix(),
-        "--require-mount", BEFORE_MOUNT.as_posix(),
-    )
+    assert cli.main([]) == 1
+    assert "nothing to publish" in capsys.readouterr().err
 
 
 def test_the_mount_guard_still_refuses_an_unmounted_isilon(tmp_path):
     with pytest.raises(RuntimeError, match="not mounted"):
-        cli._ensure_publication_directory(
+        ensure_publication_directory(
             BEFORE_PUBLICATION_DIRECTORY, mount_root=BEFORE_MOUNT,
             is_mount=lambda _path: False,
         )
@@ -161,30 +190,27 @@ def test_the_mount_guard_still_refuses_an_unmounted_isilon(tmp_path):
 
 def test_a_fresh_install_publishes_nowhere(monkeypatch, capsys, fresh_preferences):
     _use_preferences(monkeypatch, fresh_preferences)
-    monkeypatch.setattr(cli, "_credentials_from_keyring", lambda: object())
 
     assert cli.main([]) == 1
-    assert "No SoftMouse publication directory is configured" in capsys.readouterr().err
-
-    app_model = SimpleNamespace(preferences=UserPreferences(settings_file_path=fresh_preferences))
-    assert SoftMousePublicationController(app_model)._publisher_arguments() == (
-        "-m", "tools.softmouse_sync.cli",
-    )
+    assert "No animal metadata source is set up" in capsys.readouterr().err
+    assert load_source_configuration(
+        UserPreferences(settings_file_path=fresh_preferences)
+    ) is None
 
 
-def test_an_explicit_destination_needs_no_preferences(monkeypatch, tmp_path, fresh_preferences):
-    _use_preferences(monkeypatch, fresh_preferences)
-    monkeypatch.setattr(cli, "_credentials_from_keyring", lambda: object())
+def test_an_explicit_destination_overrides_setup(monkeypatch, tmp_path, christielab10_preferences):
+    _set_up_softmouse_publisher(christielab10_preferences)
+    _use_preferences(monkeypatch, christielab10_preferences)
     calls = []
 
     def ensure(destination, *, mount_root=None):
-        calls.append((Path(destination), mount_root))
+        calls.append((Path(destination), mount_root and Path(mount_root)))
         raise RuntimeError("stop before publishing")
 
-    monkeypatch.setattr(cli, "_ensure_publication_directory", ensure)
+    monkeypatch.setattr(animal_metadata_cli, "ensure_publication_directory", ensure)
 
     assert cli.main(["--destination", str(tmp_path / "pub")]) == 1
-    assert calls == [(tmp_path / "pub", None)]
+    assert calls == [(tmp_path / "pub", BEFORE_MOUNT)]
 
 
 def test_shipped_files_name_no_christie_rig_mount():

@@ -748,14 +748,18 @@ import keyring
 import openpyxl
 import requests
 
+from tools.acquisition.model.animal_sources import available_source_kinds
+from tools.acquisition.model.animal_sources.credentials import CredentialStore
 from tools.softmouse_sync.https_source import SoftMouseHttpsSource
-from tools.softmouse_sync.publisher import SoftMouseExportPublisher
 
-backend = keyring.get_keyring()
-priority = backend.priority
-if priority <= 0:
-    raise SystemExit(f"No usable OS keyring backend is available: {backend}")
-print(f"SoftMouse HTTPS, spreadsheet, and keyring runtime ok ({backend})")
+kinds = ", ".join(available_source_kinds())
+store = CredentialStore()
+if store.uses_keyring:
+    secrets = f"OS keyring {keyring.get_keyring()}"
+else:
+    # Not fatal: sources fall back to a user-only file. Say so.
+    secrets = f"no usable OS keyring; secrets go to {store.fallback_path} (mode 600)"
+print(f"Animal metadata sources ok ({kinds}); {secrets}")
 PY
 }
 
@@ -800,6 +804,11 @@ run_focused_tests() {
             auto-trainer-inference/tests/gpu_runtime_test.py \
             tests/acquisition_args_test.py \
             tests/animal_metadata_sync_test.py \
+            tests/animal_metadata_cli_test.py \
+            tests/animal_source_setup_dialog_test.py \
+            tests/animal_sources_test.py \
+            tests/animal_sources_publication_test.py \
+            tests/animal_sources_softmouse_test.py \
             tests/autotrainer_headless_test.py::test_cli_help \
             tests/autotrainer_headless_test.py::test_load_config \
             tests/autotrainer_headless_test.py::test_gpu_preflight_failure_does_not_block_cameras_and_hardware \
@@ -814,10 +823,7 @@ run_focused_tests() {
             tests/reachaq_linux_install_test.py \
             tests/rfid_app_model_test.py \
             tests/signal_stream_ui_test.py \
-            tests/softmouse_cli_test.py \
             tests/softmouse_https_source_test.py \
-            tests/softmouse_publication_controller_test.py \
-            tests/softmouse_publisher_test.py \
             tests/softmouse_registry_test.py \
             tests/user_preferences_softmouse_test.py \
             -q

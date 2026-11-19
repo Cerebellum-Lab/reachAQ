@@ -92,10 +92,10 @@ class AnimalDetailsDialog(QDialog):
     ) -> None:
         form.addRow("RFID:", self._value_label(scanned_rfid))
         form.addRow(
-            "SoftMouse linked name:",
+            "Source name:",
             self._value_label(record.new_animal_name_candidate),
         )
-        form.addRow("SoftMouse subject ID:", self._value_label(record.identity.subject_id))
+        form.addRow("Source subject ID:", self._value_label(record.identity.subject_id))
         form.addRow("Sex:", self._value_label(record.sex))
         form.addRow("Date of birth:", self._value_label(record.date_of_birth))
         form.addRow("Cage:", self._value_label(record.cage))
@@ -109,7 +109,7 @@ class AnimalDetailsDialog(QDialog):
             self._value_label(None if metadata is None else metadata.rfid),
         )
         form.addRow(
-            "SoftMouse subject ID:",
+            "Source subject ID:",
             self._value_label(
                 None
                 if animal.external_identity is None

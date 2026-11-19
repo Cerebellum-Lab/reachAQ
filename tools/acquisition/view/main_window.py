@@ -1118,7 +1118,7 @@ class MainWindow(QMainWindow):
         action = self.animal_metadata_action = QAction(
             _toolbar_icon("fa5s.id-card"), "RFID links…", self
         )
-        action.setToolTip("Manually link or reconcile reachAQ and SoftMouse animals")
+        action.setToolTip("Manually link or reconcile reachAQ animals and source records")
         action.triggered.connect(self._show_animal_metadata)
 
         action = self.edit_camera_settings_action = QAction(_toolbar_icon("fa5s.edit"), "Edit Camera Settings", self)
@@ -2136,7 +2136,7 @@ class MainWindow(QMainWindow):
             self._rfid_status_label.setText("RFID: unlinked")
             self._rfid_status_label.setStyleSheet("color: #b36b00;")
             self._rfid_status_label.setToolTip(
-                f"Subject: {animal.name}\nNo SoftMouse/RFID link"
+                f"Subject: {animal.name}\nNo RFID linked"
             )
 
     @invoke_method

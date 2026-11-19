@@ -196,7 +196,8 @@ def test_portable_installer_covers_softmouse_rfid_requirements():
     assert 'run_step "Verify SoftMouse runtime"' in source
     assert 'run_step "Verify RFID runtime"' in source
     assert 'run_step "Verify SoftMouse systemd units"' in source
-    assert "tests/softmouse_cli_test.py" in source
+    assert "tests/animal_metadata_cli_test.py" in source
+    assert "tests/animal_sources_test.py" in source
     assert "tests/softmouse_https_source_test.py" in source
     assert "auto-trainer-device/tests/rfid_reader_test.py" in source
     assert "resolves outside the current checkout" in source

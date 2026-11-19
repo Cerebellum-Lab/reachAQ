@@ -34,9 +34,14 @@ class RegistrySchemaError(RuntimeError):
 
 
 class AnimalRegistry:
-    """Per-computer, rebuildable cache of current external animal records."""
+    """Per-computer, rebuildable cache of current external animal records.
 
-    SCHEMA_VERSION = 1
+    It holds one source's current records at a time: an import from another
+    provider retires the previous provider's records.
+    """
+
+    #: 2: physical_rfid may be NULL (a record with no RFID).
+    SCHEMA_VERSION = 2
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -61,13 +66,13 @@ class AnimalRegistry:
                     os.replace(sidecar, Path(str(recovery) + suffix))
             self.recovered_corrupt_path = recovery
             logger.warning(
-                "SoftMouse registry was corrupt and rebuilt: path=%s backup=%s",
+                "Animal registry was corrupt and rebuilt: path=%s backup=%s",
                 self.path,
                 recovery,
             )
             self._initialize()
         logger.info(
-            "SoftMouse registry ready: path=%s recovered=%s",
+            "Animal registry ready: path=%s recovered=%s",
             self.path,
             self.recovered_corrupt_path is not None,
         )
@@ -110,7 +115,7 @@ class AnimalRegistry:
                     provider TEXT NOT NULL,
                     subject_id_kind TEXT NOT NULL,
                     subject_id TEXT NOT NULL,
-                    physical_rfid TEXT NOT NULL,
+                    physical_rfid TEXT,
                     name_candidate TEXT,
                     state TEXT NOT NULL,
                     record_json TEXT NOT NULL,
@@ -135,21 +140,64 @@ class AnimalRegistry:
                     WHERE active = 1;
                 """
             )
+            if version == 1:
+                self._migrate_v1_rfid_nullable(db)
             db.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
             check = db.execute("PRAGMA quick_check").fetchone()[0]
             if check != "ok":
                 raise sqlite3.DatabaseError(f"SQLite quick_check failed: {check}")
 
+    @staticmethod
+    def _migrate_v1_rfid_nullable(db: sqlite3.Connection) -> None:
+        # SQLite cannot drop NOT NULL in place; rebuild the table with its rows.
+        columns = [row[1] for row in db.execute("PRAGMA table_info(external_animals)")]
+        if not columns:
+            return
+        notnull = {
+            row[1]: bool(row[3]) for row in db.execute("PRAGMA table_info(external_animals)")
+        }
+        if not notnull.get("physical_rfid"):
+            return
+        names = ", ".join(columns)
+        db.executescript(
+            f"""
+            ALTER TABLE external_animals RENAME TO external_animals_v1;
+            CREATE TABLE external_animals (
+                provider TEXT NOT NULL,
+                subject_id_kind TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                physical_rfid TEXT,
+                name_candidate TEXT,
+                state TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                first_seen_import_id TEXT NOT NULL,
+                last_seen_import_id TEXT NOT NULL,
+                current INTEGER NOT NULL CHECK(current IN (0, 1)),
+                PRIMARY KEY(provider, subject_id_kind, subject_id)
+            );
+            INSERT INTO external_animals ({names}) SELECT {names} FROM external_animals_v1;
+            DROP TABLE external_animals_v1;
+            """
+        )
+        logger.info("Animal registry migrated to schema 2: RFID is optional")
+
     def replace(self, batch: NormalizedAnimalBatch) -> RegistryImportResult:
         with self._lock, self._connect() as db:
-            existing = db.execute(
-                "SELECT import_id FROM imports WHERE provider=? AND "
-                "source_file_sha256=? AND status='complete'",
-                (batch.provider, batch.source_file_sha256),
+            latest = db.execute(
+                "SELECT import_id, provider, source_file_sha256 FROM imports "
+                "WHERE status='complete' ORDER BY imported_utc DESC, rowid DESC LIMIT 1"
             ).fetchone()
+            existing = (
+                latest
+                if latest is not None
+                and latest["provider"] == batch.provider
+                and latest["source_file_sha256"] == batch.source_file_sha256
+                else None
+            )
             if existing is not None:
                 logger.info(
-                    "SoftMouse registry import unchanged: import_id=%s records=%d "
+                    "Animal registry import unchanged: import_id=%s records=%d "
                     "source_sha256=%s",
                     existing["import_id"],
                     len(batch.records),
@@ -160,13 +208,16 @@ class AnimalRegistry:
                 )
             try:
                 db.execute("BEGIN IMMEDIATE")
+                # One active source: every provider's records are retired, so
+                # a computer that switches sources keeps no stale RFIDs.
+                db.execute("UPDATE external_animals SET current=0")
+                db.execute("UPDATE external_identifiers SET active=0")
+                # Re-importing an earlier snapshot of this provider (after a
+                # switch away and back) replaces its old ledger row.
                 db.execute(
-                    "UPDATE external_animals SET current=0 WHERE provider=?",
-                    (batch.provider,),
-                )
-                db.execute(
-                    "UPDATE external_identifiers SET active=0 WHERE provider=?",
-                    (batch.provider,),
+                    "DELETE FROM imports WHERE provider=? AND source_file_sha256=? "
+                    "AND status='complete'",
+                    (batch.provider, batch.source_file_sha256),
                 )
                 for record in batch.records:
                     encoded = json.dumps(self._record_to_dict(record), sort_keys=True)
@@ -197,6 +248,8 @@ class AnimalRegistry:
                             batch.import_id,
                         ),
                     )
+                    if record.physical_rfid is None:
+                        continue
                     db.execute(
                         """
                         INSERT INTO external_identifiers(
@@ -240,7 +293,7 @@ class AnimalRegistry:
             except Exception:
                 db.rollback()
                 logger.exception(
-                    "SoftMouse registry replacement rolled back: import_id=%s "
+                    "Animal registry replacement rolled back: import_id=%s "
                     "records=%d source_sha256=%s",
                     batch.import_id,
                     len(batch.records),
@@ -248,7 +301,7 @@ class AnimalRegistry:
                 )
                 raise
         logger.info(
-            "SoftMouse registry replaced: import_id=%s records=%d source_sha256=%s",
+            "Animal registry replaced: import_id=%s records=%d source_sha256=%s",
             batch.import_id,
             len(batch.records),
             batch.source_file_sha256,
@@ -268,8 +321,7 @@ class AnimalRegistry:
                   ON animal.provider=identifier.provider
                  AND animal.subject_id_kind=identifier.subject_id_kind
                  AND animal.subject_id=identifier.subject_id
-                WHERE identifier.provider='softmouse'
-                  AND identifier.identifier_kind='rfid'
+                WHERE identifier.identifier_kind='rfid'
                   AND identifier.normalized_value=?
                   AND identifier.active=1 AND animal.current=1
                 """,
@@ -277,7 +329,7 @@ class AnimalRegistry:
             ).fetchone()
         record = None if row is None else self._record_from_dict(json.loads(row[0]))
         logger.info(
-            "SoftMouse registry RFID lookup: rfid=%s matched=%s subject_id=%s",
+            "Animal registry RFID lookup: rfid=%s matched=%s subject_id=%s",
             normalized,
             record is not None,
             None if record is None else record.identity.subject_id,
@@ -296,7 +348,7 @@ class AnimalRegistry:
         with self._lock, self._connect() as db:
             return db.execute(
                 "SELECT * FROM imports WHERE status='complete' "
-                "ORDER BY imported_utc DESC LIMIT 1"
+                "ORDER BY imported_utc DESC, rowid DESC LIMIT 1"
             ).fetchone()
 
     @staticmethod
@@ -320,7 +372,7 @@ class AnimalRegistry:
     def _record_from_dict(value) -> ExternalAnimalRecord:
         return ExternalAnimalRecord(
             identity=ExternalIdentity.from_dict(value["identity"]),
-            physical_rfid=value["physicalRfid"],
+            physical_rfid=value.get("physicalRfid"),
             new_animal_name_candidate=value.get("newAnimalNameCandidate"),
             state=value["state"],
             source_payload=value.get("sourcePayload") or {},

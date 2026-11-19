@@ -131,7 +131,8 @@ def test_reader_health_is_visible_but_never_a_recording_blocker(app_model):
 
 def test_launch_catchup_refreshes_only_when_manifest_is_new(app_model):
     class Sync:
-        manifest_path = "manifest.json"
+        def describe(self):
+            return "test source"
 
         def __init__(self, due):
             self.due = due
@@ -165,7 +166,8 @@ def test_refresh_runs_off_caller_thread_and_coalesces_duplicates(app_model):
     caller_thread = threading.get_ident()
 
     class Sync:
-        manifest_path = "manifest.json"
+        def describe(self):
+            return "test source"
 
         def __init__(self):
             self.thread_ids = []
@@ -199,7 +201,8 @@ def test_refresh_is_deferred_until_session_is_ready(app_model):
     calls = []
 
     class Sync:
-        manifest_path = "manifest.json"
+        def describe(self):
+            return "test source"
 
         def refresh_now(self):
             calls.append("refresh")
