@@ -338,7 +338,7 @@ These steps are not part of the deploy window. Do them only after Ben's live che
 - Once no live model needs YOLO, remove the AGPL plugin for good. Uninstall both the
   distribution and its engine, otherwise the next installer run restores it:
   `conda run -n reachaq python -m pip uninstall -y auto-trainer-pose-yolo ultralytics ultralytics-thop`.
-- `~/claude-phaseb` stays: the live DLC model's `test/pose_cfg.yaml` points into it.
+- The dataset directory the live DLC model's `test/pose_cfg.yaml` points into stays.
 
 ## Rolling back
 
@@ -380,10 +380,11 @@ After the new build has run a study:
 - `conda env remove -n reachaq-v301-<date>`;
 - `~/deploy-backups/<date>-phase1`;
 - the rig scratch left by the Phase 1 sessions, which is Ben's call:
-  - `~/p1val` (14 GB, including the `env-cleanroom` env);
   - `~/pose-training-1p7` and `~/pt-scratch` (keep the model
     `~/pt-scratch/models/christie/20261118-161624` until it has been reviewed);
   - `~/pt_accept.py`, `~/pt_accept.log`, `~/pt_bench.py`, `~/pt_bench.log` and `~/pt-eval.log`;
   - `~/cleanroom-api-training` and the `*.bundle` files in `~`.
 
-Keep `~/claude-phaseb` and `~/reachaq_probe` (see the rig clean-up keep list).
+Keep the live DLC model's dataset directory (the path in its `test/pose_cfg.yaml`) and
+`~/reachaq_probe` (see the rig clean-up keep list). `~/p1val` was already removed on
+2026-11-19.
