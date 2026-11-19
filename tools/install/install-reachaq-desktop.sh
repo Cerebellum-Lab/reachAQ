@@ -63,7 +63,7 @@ mkdir -p \
     "$USER_BIN_DIR" \
     "$USER_CONFIG_DIR" \
     "$USER_DATA_DIR/applications" \
-    "$USER_DATA_DIR/icons/hicolor/192x192/apps" \
+    "$USER_DATA_DIR/icons/hicolor/scalable/apps" \
     "$DESKTOP_DIR"
 
 install -m 0755 "$SCRIPT_DIR/desktop/reachaq-launcher" \
@@ -72,8 +72,16 @@ install -m 0755 "$SCRIPT_DIR/desktop/reachaq-launcher" \
 # and update the same checkout the desktop icon runs.
 install -m 0755 "$SCRIPT_DIR/bin/reachaq" "$USER_BIN_DIR/reachaq"
 install -m 0755 "$SCRIPT_DIR/bin/reachaq-sync" "$USER_BIN_DIR/reachaq-sync"
-install -m 0644 "$INSTALL_REPO/tools/acquisition/view/autotrainer.png" \
-    "$USER_DATA_DIR/icons/hicolor/192x192/apps/reachaq.png"
+# The icon as a scalable SVG, plus PNGs rendered from it so small sizes get
+# exact pixels.
+icon_dir="$INSTALL_REPO/tools/acquisition/view/icons"
+install -m 0644 "$icon_dir/reachaq.svg" \
+    "$USER_DATA_DIR/icons/hicolor/scalable/apps/reachaq.svg"
+for icon_size in 16 22 24 32 48 64 96 128 192 256 512; do
+    mkdir -p "$USER_DATA_DIR/icons/hicolor/${icon_size}x${icon_size}/apps"
+    install -m 0644 "$icon_dir/reachaq-$icon_size.png" \
+        "$USER_DATA_DIR/icons/hicolor/${icon_size}x${icon_size}/apps/reachaq.png"
+done
 
 config_tmp=$(mktemp "$USER_CONFIG_DIR/launcher.conf.XXXXXX") || exit 5
 desktop_tmp=$(mktemp "$USER_CONFIG_DIR/reachaq.desktop.XXXXXX") || {

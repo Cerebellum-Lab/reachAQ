@@ -247,6 +247,10 @@ def test_desktop_launcher_installer_creates_terminal_entry(tmp_path):
     entry = (desktop / "reachAQ.desktop").read_text()
     assert "Terminal=true" in entry
     assert "Icon=reachaq" in entry
+    icons = home / ".local/share/icons/hicolor"
+    assert (icons / "scalable/apps/reachaq.svg").is_file()
+    for size in (16, 48, 192, 512):
+        assert (icons / f"{size}x{size}/apps/reachaq.png").is_file()
     assert str(home / ".local/bin/reachaq-launcher") in entry
     assert not (desktop / "ReachAQ-startup").exists()
     assert os.access(home / ".local/bin/reachaq-launcher", os.X_OK)
