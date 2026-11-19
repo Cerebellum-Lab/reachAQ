@@ -52,6 +52,13 @@ writes it under: lowercased, with other characters as `_` (`frame_present_stimca
 for `stimCam`). Validator versions before 2026-11-18 looked the name up as
 given and failed every session that recorded a mixed-case camera.
 
+Each camera's present count is checked against `presentFrames` in
+`streams/camera_alignment.json`, the frames the camera delivered. A dropped frame
+is written to the video as a blank, so `sampleCount` counts it but the ledger
+marks it absent; the rule warns with the number of blanks instead of failing.
+Sessions without `presentFrames` are checked against `sampleCount`. Validator
+versions before 2026-11-19 failed every session with a real dropped frame.
+
 `sources.contract` checks each file a source lists. Pose is recorded as one
 `raw2D_live.h5` per camera, and each missing one is named. Validator versions
 before 2026-09-24 reported `pose: artifact missing` for every session that

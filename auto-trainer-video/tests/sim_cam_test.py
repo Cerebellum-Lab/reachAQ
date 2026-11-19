@@ -131,3 +131,17 @@ def test_frames_differ_as_the_disc_moves(epoch):
     second, _ = cam.capture()
     assert not numpy.array_equal(first, second)
     assert first is not second
+
+
+def test_latch_raw_bracket_is_the_simulated_clock_on_a_slewing_host(epoch, monkeypatch):
+    # The simulated camera clock is perf_counter, so its RAW bracket is perf
+    # reads too; a real RAW read would carry the host's perf-vs-RAW slew into
+    # the RAW latch fit, which a real camera's oscillator does not have.
+    from autotrainer.video.camera import sim_cam
+
+    monkeypatch.setattr(sim_cam, "monotonic_raw_time", lambda: time.perf_counter() * 0.998 + 5.0,
+                        raising=False)
+    cam = _make_cam()
+    perf_before, camera_ns, perf_after, raw_before, raw_after = cam.latch_clock()
+    assert raw_before <= camera_ns / 1e9 <= raw_after
+    assert (raw_before, raw_after) == (perf_before, perf_after)

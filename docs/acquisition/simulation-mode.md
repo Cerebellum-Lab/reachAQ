@@ -58,6 +58,11 @@ The variables are `REACHAQ_SIMULATION=1`, `REACHAQ_SIM_BUS`, `REACHAQ_SIM_EPOCH`
 flag rather than setting them by hand: by hand, the configuration, preferences,
 data and lock are not moved into a sim home.
 
+The local API listens on its own OS-picked port, so a simulation runs beside
+the rig's instance without taking its API, and its discovery record says
+`"simulated": true`. Connect with `ApiClient(simulated=True)`
+([local-api.md](local-api.md#finding-an-instance)).
+
 ## What each simulated backend produces
 
 All of them share one time grid: simulated exposure k starts at
@@ -138,17 +143,17 @@ simulated data.
 - **No realistic reaches.** `MemoryPoseModel` returns a constant output, so
   trials run and end but are not scored, and automatic sends follow whatever
   that output implies. Send a trial with the Send button.
-- **The external API's ports** (5556, 5557) are fixed. With another reachAQ
-  instance on the host, the second logs "failed to start api service" and runs
-  without the API.
 - **Refresh Hardware's camera scan** looks for Spinnaker cameras and logs a
   failure where PySpin is not installed. The simulated cameras are unaffected.
-- **Host clocks.** In WSL, `perf_counter` (CLOCK_MONOTONIC) was measured
-  running 2.0-2.4% slow against CLOCK_MONOTONIC_RAW. The simulated NI clock is
-  `perf_counter`, so the session's NI-to-RAW fit normally fails and the
-  perf fit is used. Occasionally the RAW fit passes with a residual too coarse
-  for frame pairing, and `alignment.frames` warns `ambiguous_hardware_edge`.
-  A host whose two clocks agree, as a rig's do, is not affected.
+- **Host clocks.** The simulated NI board and cameras run on `perf_counter`,
+  so their RAW stamps (the NI block's `raw_time`, the latch's RAW bracket) are
+  `perf_counter` reads too, not CLOCK_MONOTONIC_RAW. A real board's or
+  camera's oscillator is smooth against RAW. `perf_counter` is not where NTP
+  slews it: in WSL it ran 0.34% fast against RAW, easing to 0.10% over 10 s.
+  Before 2026-11-19 the sim stamped real RAW, so that slew went into the
+  NI-to-RAW and latch fits. They passed or failed by chance, and about 2% of
+  e2e runs warned `ambiguous_hardware_edge` in `alignment.frames`. A
+  simulated session's RAW column is therefore not a host RAW reading.
 
 ## Tests
 

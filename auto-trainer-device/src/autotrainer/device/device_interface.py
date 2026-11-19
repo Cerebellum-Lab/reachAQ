@@ -66,7 +66,7 @@ class DigitalOutputs(IntEnum):
 #: mapped one. So 5 kHz raises tone1, 6 kHz raises tone2, and every other
 #: frequency sounds a tone that no line confirms.
 #:
-#: Verified on christielab10 against firmware 2.2.0: 5000 Hz raised
+#: Verified on the reference rig against firmware 2.2.0: 5000 Hz raised
 #: port0/line0, 6000 Hz raised port0/line1, and 8000 Hz raised nothing.
 #: Play a tone at any other frequency and the absence of a confirmation
 #: means the frequency was unmapped, not that the tone failed.

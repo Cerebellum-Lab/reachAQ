@@ -186,3 +186,29 @@ def test_factory_returns_simulated_stream_when_simulating(monkeypatch):
     )
     assert isinstance(backend, SimulatedNidaqStream)
     assert isinstance(backend, NidaqInputBackend)
+
+
+def _slewing_raw_clock(monkeypatch, module):
+    # A host whose perf_counter is slewed against CLOCK_MONOTONIC_RAW, as WSL's
+    # was measured: perf ran 0.34% fast, easing to 0.10% over 10 s.
+    start = time.perf_counter()
+
+    def raw():
+        t = time.perf_counter() - start
+        return 1000.0 + t - 0.0024 * 5.0 * (1.0 - numpy.exp(-t / 5.0)) - 0.001 * t
+
+    monkeypatch.setattr(module, "monotonic_raw_time", raw, raising=False)
+
+
+def test_raw_stamps_follow_the_simulated_clock_on_a_slewing_host(monkeypatch):
+    # The simulated board's samples run on perf_counter, so its RAW stamp is a
+    # perf read: a real RAW read would put the host's slew into the NI-to-RAW
+    # fit, which a real board's oscillator does not have, and the fit then
+    # passed or failed by chance (the e2e flake on WSL).
+    from autotrainer.device import nidaq_simulated
+
+    _slewing_raw_clock(monkeypatch, nidaq_simulated)
+    blocks = _read(SimulatedNidaqStream(
+        _configuration(("cam_frames", "port0/line0", "digital"))), 4)
+    for block in blocks:
+        assert block.raw_time == block.perf_time

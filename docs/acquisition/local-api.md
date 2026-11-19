@@ -15,11 +15,32 @@ any system configuration is loaded.
 |---|---|---|
 | `REACHAQ_API_ENABLED` | `1` | `0`, `false`, `no` or `off` disables the service. |
 | `REACHAQ_API_HOST` | `127.0.0.1` | Address to listen on. |
-| `REACHAQ_API_PORT` | `47611` | Port; `0` picks a free one (tests). |
+| `REACHAQ_API_PORT` | `0` | Port. `0` lets the OS pick a free one; set a number to pin it. |
+| `REACHAQ_API_DISCOVERY_DIR` | see below | Where the running service publishes its record. |
+| `REACHAQ_SIMULATION` | unset | Set by `--simulate`; recorded as `simulated` in the record. |
 
 Keep it on loopback. There is no authentication: any process that can reach the
-port can start or stop acquisition. If the port is taken, the application logs
-an error and runs without the API.
+port can start or stop acquisition. A pinned port that is taken is logged as an
+error and the application runs without the API.
+
+## Finding an instance
+
+Each instance listens on a port the OS picks, so two instances on one host (a
+`--simulate` run beside the rig's, say) never collide. While it listens, the
+service writes `instance-<pid>.json` to the discovery directory and removes it
+on stop:
+
+```json
+{"schemaVersion": 1, "pid": 1234, "processStartTime": 1763560000.12,
+ "host": "127.0.0.1", "port": 41877, "simulated": false}
+```
+
+The directory is `$XDG_RUNTIME_DIR/reachaq/api`, or
+`<tmp>/reachaq-runtime-<uid>/reachaq/api` without one (beside the application
+lock), and `%LOCALAPPDATA%eachAQpi` on Windows. A record whose process has
+ended, or whose pid now belongs to another process, is ignored and removed by the
+next reader. `autotrainer.core.api.discovery.list_api_instances()` lists the live
+ones. The log line "Local API listening on ..." names the port and the record.
 
 ## Protocol
 
@@ -74,7 +95,10 @@ by member name (`"mode": "RUNNING"`), times as ISO 8601, non-finite numbers as
 
 ## Client
 
-`autotrainer.core.api.client.ApiClient` is a small blocking client:
+`autotrainer.core.api.client.ApiClient` is a small blocking client. With no
+`port` it connects to the one running instance, or to the one matching
+`simulated=True` or `False`; when none or several match it raises
+`ApiInstanceNotFound` listing them. `ApiClient(port=...)` skips discovery.
 
 ```python
 from autotrainer.core.api.client import ApiClient

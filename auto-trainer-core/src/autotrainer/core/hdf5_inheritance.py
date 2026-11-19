@@ -11,7 +11,7 @@ NI-DAQmx's CEIP client does exactly that from the process that uses it: the
 first task the process makes and the first it closes each launch
 /opt/ni-ceip/niceip under ni-wine, whose helpers live about 4 s. In v3.0.1 they
 held the NI spool's lock as Stop read it, and the session lost its nidaq.h5
-(christielab10, 2026-11-13).
+(reference rig, 2026-11-13).
 """
 
 import logging
@@ -25,7 +25,7 @@ def mark_close_on_exec(store) -> bool:
 
     Call it straight after the open: a process started between the open and
     this call still inherits the file (0.25-0.43 ms for a "w" open on
-    christielab10). Off POSIX it does nothing and returns False. A store with
+    the reference rig). Off POSIX it does nothing and returns False. A store with
     no single descriptor, or one the call fails on, is logged and left usable:
     the file is still written, only no longer kept from child processes.
     """

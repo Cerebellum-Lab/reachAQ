@@ -197,6 +197,78 @@ def test_ledger_reads_a_mixed_case_camera_by_the_column_the_merge_writes(tmp_pat
     assert result.observed["camera_counts"] == {"stimCam": 2}
 
 
+def test_ledger_accepts_a_real_dropped_frame_and_warns(tmp_path):
+    # A dropped frame: the capture writes a blank in its place (video_capture.py),
+    # so the writer, timestamp rows and sampleCount count it, but it has no arrival
+    # time and the merge marks it frame_present_left=0. camera_alignment.json
+    # records presentFrames, the frames the camera actually delivered.
+    root = _session(tmp_path)
+    stream_path = root / "streams/stream_manifest.json"
+    stream = json.loads(stream_path.read_text(encoding="utf-8"))
+    stream["enabledSources"] = [{
+        "id": "camera.left",
+        "kind": "camera",
+        "path": "left.mp4",
+        "sampleCount": 3,
+        "persistenceStatus": "written",
+        "diagnostics": {
+            "writer_frame_count": 3,
+            "timestamp_row_count": 3,
+            "decoded_frame_count": 3,
+        },
+    }]
+    _write(stream_path, json.dumps(stream))
+    _write(root / "streams/camera_alignment.json", json.dumps({
+        "primaryCamera": "left",
+        "primaryFrameCount": 3,
+        "synchronizationComplete": True,
+        "cameras": {"left": {
+            "firstFrameId": 10, "lastFrameId": 12, "timestampRows": 3,
+            "presentFrames": 2, "frameIdGapCount": 0,
+            "missingPrimaryFrameIds": [], "extraFrameIds": [],
+            "earlyFrameIds": [], "lateFrameIds": [],
+        }},
+    }))
+    _write(
+        root / "session001_frame_timing.csv",
+        "frame_id,utc_when,frame_when_left,frame_present_left\n"
+        "10,1000.0,5.0,1\n11,1000.01,,0\n12,1000.02,5.02,1\n",
+    )
+
+    report = validate_session(
+        root, profile=ValidationProfile.FAST, selected_rules=("camera.ledger",))
+
+    result = next(item for item in report.results if item.rule_id == "camera.ledger")
+    assert result.status.value == "warning", result.message
+    assert "camera left: 1 dropped frame(s)" in result.message
+    assert result.observed["camera_counts"] == {"left": 2}
+
+
+def test_ledger_fails_when_presence_disagrees_with_the_alignment(tmp_path):
+    root = _session(tmp_path)
+    stream_path = root / "streams/stream_manifest.json"
+    stream = json.loads(stream_path.read_text(encoding="utf-8"))
+    stream["enabledSources"] = [{
+        "id": "camera.left", "kind": "camera", "path": "left.mp4",
+        "sampleCount": 3, "persistenceStatus": "written",
+    }]
+    _write(stream_path, json.dumps(stream))
+    _write(root / "streams/camera_alignment.json", json.dumps({
+        "cameras": {"left": {"timestampRows": 3, "presentFrames": 3}},
+    }))
+    _write(
+        root / "session001_frame_timing.csv",
+        "frame_id,utc_when,frame_present_left\n10,1000.0,1\n11,1000.01,0\n12,1000.02,1\n",
+    )
+
+    report = validate_session(
+        root, profile=ValidationProfile.FAST, selected_rules=("camera.ledger",))
+
+    result = next(item for item in report.results if item.rule_id == "camera.ledger")
+    assert result.status.value == "fail"
+    assert "camera left: ledger=2 expected=3" in result.message
+
+
 def test_validator_reconciles_trial_and_protocol_operation(tmp_path):
     root = _session(tmp_path)
     recipe = {

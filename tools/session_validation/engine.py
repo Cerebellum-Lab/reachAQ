@@ -506,11 +506,26 @@ def _camera_ledger_rule(context):
                         present_counts[name] += 1
             except (KeyError, TypeError, ValueError) as error:
                 errors.append(f"row {line_number}: {error}")
+    # sampleCount counts the blank the capture writes for each dropped frame
+    # (video_capture.py), which the merge marks absent. camera_alignment.json's
+    # presentFrames is the frames the camera delivered; a session written before
+    # it existed falls back to sampleCount.
+    try:
+        aligned = context.json("streams/camera_alignment.json").get("cameras", {})
+    except (OSError, ValueError):
+        aligned = {}
     for name, source in cameras.items():
-        expected = int(source.get("sampleCount", -1))
+        sample_count = int(source.get("sampleCount", -1))
+        present = (aligned.get(name) or {}).get("presentFrames")
+        expected = sample_count if present is None else int(present)
         if present_counts[name] != expected:
             errors.append(
                 f"camera {name}: ledger={present_counts[name]} expected={expected}"
+            )
+        elif sample_count > expected:
+            warnings.append(
+                f"camera {name}: {sample_count - expected} dropped frame(s) "
+                "recorded as blanks"
             )
     if cameras and row_count != max(present_counts.values(), default=0):
         warnings.append(

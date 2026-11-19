@@ -231,13 +231,13 @@ class LaserSystemConfiguration:
     #: driven onto when a laser's output sits on a different board from the
     #: clock producer, and the calibration ramp's clock too. Never a line a
     #: trigger takes (clock_line_clashes): two drivers on one line corrupt
-    #: both, and DAQmx does not see it across christielab10's boards.
+    #: both, and DAQmx does not see it across the reference rig's boards.
     backplane_clock_line: str = "PXI_Trig1"
     #: Bare backplane line every pulse train drives its analog output's own
     #: sample clock onto, for a clocked digital line (PMT shutter, trigger or
     #: timing trigger output) on another board. That line cannot wait for the
     #: pulse's start trigger: an M Series board's clocked digital output takes
-    #: none (christielab10: do_trig_usage empty, -200452 at verify), so it runs
+    #: none (reference rig: do_trig_usage empty, -200452 at verify), so it runs
     #: on the clock that ticks only once the output has triggered.
     #: backplane_clock_line carries the shared clock in a synchronized pulse,
     #: so this is a line of its own, and a free one (clock_line_clashes).

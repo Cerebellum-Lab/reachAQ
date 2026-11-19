@@ -11,6 +11,7 @@ import socket
 import socketserver
 import sys
 import threading
+from pathlib import Path
 from typing import Callable, Dict, Optional, Set
 
 from ..logging import get_verbose_logger
@@ -20,6 +21,7 @@ from .commands import (
     ApiCommandRequestResponse,
     ApiCommandRequestResult,
 )
+from .discovery import publish_instance, withdraw_instance
 from .event import ApiEvent
 from .options import ApiOptions
 from .wire import MAX_LINE_BYTES, RequestDecodeError, decode_request, encode_event, encode_response
@@ -133,6 +135,7 @@ class RpcService:
         self._clients: Set[_Client] = set()
         # nonce -> [client, lines deferred while its request is still in the delegate]
         self._pending: Dict[str, list] = {}
+        self._record: Optional[Path] = None
         self.command_request_delegate: Optional[CommandRequestDelegate] = None
 
     def __repr__(self):
@@ -168,7 +171,16 @@ class RpcService:
             self._thread = threading.Thread(
                 target=server.serve_forever, kwargs=dict(poll_interval=0.2), daemon=True, name="LocalApiServer")
             self._thread.start()
-        logger.info("Local API listening on %s:%s", self._options.host, self.port)
+            port = server.server_address[1]
+            if self._options.discovery_dir is not None:
+                try:
+                    self._record = publish_instance(
+                        self._options.discovery_dir, self._options.host, port, self._options.simulated)
+                except OSError as err:
+                    logger.warning("Local API on port %s could not publish its record in %s: %s",
+                                   port, self._options.discovery_dir, err)
+        logger.info("Local API listening on %s:%s%s", self._options.host, port,
+                    "" if self._record is None else f" (record {self._record})")
         return True
 
     def stop(self) -> None:
@@ -177,6 +189,8 @@ class RpcService:
             thread, self._thread = self._thread, None
             clients, self._clients = self._clients, set()
             self._pending.clear()
+            record, self._record = self._record, None
+        withdraw_instance(record)
         if server is None:
             return
         server.shutdown()

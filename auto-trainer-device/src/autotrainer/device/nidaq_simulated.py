@@ -17,7 +17,6 @@ from typing import Dict, List, Optional, Tuple
 import numpy
 
 from autotrainer.core import NidaqSignalStreamConfiguration, NidaqTimingPlan
-from autotrainer.core.latency.raw_clock import monotonic_raw_time
 from autotrainer.core.simulation import (
     ENV_SIM_BUS,
     SimSignalBusReader,
@@ -142,7 +141,12 @@ class SimulatedNidaqStream:
         rate = cfg.sample_rate_hz
         wall_time = time.time()
         perf_time = time.perf_counter()
-        raw_time = monotonic_raw_time()
+        # The RAW stamp is the simulated board's own clock, perf_counter. A real
+        # board's oscillator is smooth against CLOCK_MONOTONIC_RAW; this one is
+        # perf_counter, so a real RAW read would carry the host's perf-vs-RAW
+        # slew (0.1-0.34% and changing, measured in WSL) into the NI-to-RAW fit,
+        # which then passed or failed by chance from session to session.
+        raw_time = perf_time
         read_started = time.perf_counter()
 
         first = self._sample_index

@@ -5,7 +5,7 @@ poll; the RAW clock is the same oscillator without the corrections. A RAW
 value taken right beside a perf stamp lets the frame alignment and the latency
 record relate NI time to a clock that only drifts, and bridge back to
 perf_counter through the recorded pairs. It costs 40 ns a read on
-christielab10. Where the platform has no such clock (Windows) it is NaN, so
+the reference rig. Where the platform has no such clock (Windows) it is NaN, so
 every stamp keeps its shape.
 """
 

@@ -21,7 +21,7 @@ def get_nidaq_mp_ctx():
     result, which is what the exact-task preflight reported and how the
     signal stream came to refuse to start at all.
 
-    Measured on christielab10, in one process moments apart: spawn works
+    Measured on the reference rig, in one process moments apart: spawn works
     before the laser loads and fails after it, while a forkserver works
     either side, including one first used after the laser is resident. A
     forkserver rather than plain fork because the server is a clean child

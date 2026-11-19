@@ -31,7 +31,7 @@ CAMERA_FPS = 150
 #: Microseconds, as Spinnaker's ExposureTime and the sim camera's URL read it.
 CAMERA_EXPOSURE_US = 2000
 
-#: As christielab10's stream (tests/christielab10_nidaq_blocks.yaml).
+#: As the reference rig's stream (tests/christielab10_nidaq_blocks.yaml).
 NIDAQ_SAMPLE_RATE_HZ = 10000.0
 NIDAQ_READ_CHUNK_SIZE = 500
 #: The laser sample rate the SimDAQ1 laser shape was checked at.
