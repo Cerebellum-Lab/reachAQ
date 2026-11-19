@@ -1,7 +1,7 @@
 import math
 from typing import Optional, Tuple, List
 
-from autotrainer.api import ApiDetectorKind
+from autotrainer.core.api import ApiDetectorKind
 from autotrainer.core.configuration.pellet_misplaced_config import PelletMisplacedDetectorConfiguration
 
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig

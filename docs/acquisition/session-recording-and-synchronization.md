@@ -668,8 +668,8 @@ embedded under `configuration` so each recording is independently reproducible.
 values are normalized to JSON/YAML null; finalized metadata is never written
 with non-standard `NaN` tokens.
 
-The pinned `auto-trainer-api` 0.11.0 lifecycle supports explicit session and
-pellet-attempt events. ReachAQ's status schema contains no alarm, emergency,
+The [local API](local-api.md) publishes explicit session and pellet-attempt
+events. ReachAQ's status schema contains no alarm, emergency,
 tunnel, head-fix, or magnet placeholders. Session events identify the continuous
 recording boundary; trial events identify pellet attempts, never recordings.
 Session metadata, analysis outputs, and the pellet-trial ledger remain the

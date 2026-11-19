@@ -1,0 +1,38 @@
+"Time","Index","EventId","EventName","Data","Repeat"
+"2026-08-10 11:46:19.709655",1532623644196322,201,"ApiEventKind.applicationLaunched","{'version': '2.1.24.dev164+g6b8e975d'}",0
+"2026-08-10 11:44:42.681738",1532526616284277,202,"ApiEventKind.applicationTerminating","{'reason': 'exit-requested'}",0
+"2026-08-10 11:44:42.596954",1532526531498776,301,"ApiEventKind.applicationModeChanged","{'mode': <ApiApplicationMode.IDLE: 0>}",0
+"2026-08-10 11:46:59.830455",1532663764994919,301,"ApiEventKind.applicationModeChanged","{'mode': <ApiApplicationMode.RUNNING: 100>}",0
+"2026-07-29 16:22:28.229690",512392164228668,601,"ApiEventKind.systemStatus","{'application_mode': <ApiApplicationMode.IDLE: 0>, 'training_mode': <ApiTrainingMode.MANUAL: 100>, 'animal': None, 'project': {'day_path': '/home/christielab10/Documents/rawdatalocal/20260729/christielab10', 'session_index': 1}, 'alarms': [], 'detectors': [{'detector_id': <ApiDetectorKind.pelletMisplaced: 301>, 'is_active': False, 'is_enabled': False}], 'pellet_device': {'dcs_send_x': nan, 'dcs_send_y': nan, 'dcs_send_z': nan, 'dcs_x': nan, 'dcs_y': nan, 'dcs_z': nan, 'load_arm': nan, 'barrier_arm': nan, 'is_barrier_arm_active': False}, 'tunnel_device': {'magnet_intensity': nan, 'gate_open': False, 'is_gate_open': False, 'is_fan_on': False}, 'behavior': {'baseline_magnet_intensity': nan, 'reaches': {'pellets_presented': 0, 'pellets_consumed': 0, 'reaches': 0, 'successful_reaches': 0}}}",0
+"2026-11-10 12:20:54.244300",602768176173633,701,"ApiEventKind.projectChanged","{'root': '/tmp/reachaq_x264pin/data', 'device_id': 'christielab10', 'day': '20261110', 'session': 1}",0
+"2026-07-29 16:22:29.094882",512393029421223,702,"ApiEventKind.projectSessionChanged","{'root': '/home/christielab10/Documents/rawdatalocal', 'session': 2}",0
+"2026-11-13 18:44:27.784964",884981716837133,1202,"ApiEventKind.pelletLoadBegin","{'context': 'load-1'}",0
+"2026-08-13 13:09:28.975371",168238964031831,1203,"ApiEventKind.pelletLoadEnd","{'context': UUID('ac0daf83-cd24-41fc-874d-c0b8fb303676')}",0
+"2026-10-01 13:40:08.935968",1115221872915784,1205,"ApiEventKind.pelletSendBegin","{'context': 'token'}",0
+"2026-08-13 13:08:45.873247",168195861908497,1206,"ApiEventKind.pelletSendEnd","{'context': UUID('c104d771-ae55-4d58-8451-04f0d001e3c4')}",0
+"2026-11-13 18:44:26.309042",884980240916163,1208,"ApiEventKind.pelletCoverBegin","{'context': 'cover_pellet-1'}",0
+"2026-08-13 13:08:55.166791",168205155451370,1209,"ApiEventKind.pelletCoverEnd","{'context': UUID('5ea66bb7-044f-413f-a793-15d7dfcae9a8')}",0
+"2026-11-13 18:44:28.135640",884982067513855,1211,"ApiEventKind.pelletReleaseBegin","{'context': 'release_pellet-1'}",0
+"2026-08-13 13:08:50.675336",168200663997338,1212,"ApiEventKind.pelletReleaseEnd","{'context': UUID('4126d60f-df3d-46c8-8a77-91d67d3372d1')}",0
+"2026-08-10 11:46:59.597754",1532663532298058,1214,"ApiEventKind.pelletHomeBegin","{'context': UUID('d5036efd-9780-4039-a2c2-533bbb89952e')}",0
+"2026-08-10 11:46:59.978961",1532663913502425,1215,"ApiEventKind.pelletHomeEnd","{'context': UUID('d5036efd-9780-4039-a2c2-533bbb89952e')}",0
+"2026-08-13 15:46:43.811765",177673800427474,1220,"ApiEventKind.pelletRetractBegin","{'context': UUID('baddc40f-db8a-452a-8a91-10538ae72a80')}",0
+"2026-08-13 15:46:44.291477",177674280141466,1221,"ApiEventKind.pelletRetractEnd","{'context': UUID('baddc40f-db8a-452a-8a91-10538ae72a80')}",0
+"2026-07-29 16:22:29.097871",512393032410443,1301,"ApiEventKind.trialStarted","{'trial_id': 2, 'reason': 'manual'}",0
+"2026-08-10 12:35:23.523090",662461299477,1305,"ApiEventKind.trialCaptureEnded","{'trial_id': 2, 'reason': <RecordingEndingReason.MANUAL_STOP: 'ManualStop'>}",0
+"2026-08-10 12:35:23.536450",662474656577,1311,"ApiEventKind.trialEnded","{'result': <CaptureAnalysisResult.CAPTURE_ONLY: 'capture_only'>}",0
+"2026-08-10 17:53:40.897176",19759835380433,1331,"ApiEventKind.sessionStarted","{'session_id': '20260810_christielab10_001', 'is_analysis_deferred': True, 'recording_scope': 'continuous_session'}",0
+"2026-11-13 14:28:04.736106",869598667979565,1332,"ApiEventKind.sessionEnded","{'session_id': '20261113_christielab10_002', 'capture_trial_count': 0, 'analysis_trial_count': 0, 'failed_trial_count': 0, 'aborted': True}",0
+"2026-07-29 16:22:28.616048",512392550591235,1800,"ApiEventKind.pelletPresentedCountChanged","{'change': 2, 'count': 2}",0
+"2026-07-29 16:22:28.616137",512392550676651,1802,"ApiEventKind.pelletConsumedCountChanged","{'change': 1, 'count': 1}",0
+"2026-07-29 16:22:28.616192",512392550730411,1803,"ApiEventKind.reachCountChanged","{'change': 3, 'count': 3}",0
+"2026-07-29 16:22:28.616225",512392550764095,1804,"ApiEventKind.successfulReachesCountChanged","{'change': 1, 'count': 1}",0
+"2026-08-10 11:46:35.211057",1532639145597931,2001,"ApiEventKind.deviceCommandSend","{'context': None}",0
+"2026-08-10 11:46:35.020727",1532638955268065,2002,"ApiEventKind.deviceCommandAcknowledge","{'context': 'f521ec0c-abaf-4d30-85a2-f614945bc42c'}",0
+"2026-08-10 16:16:32.351058",13931289266074,5001,"ApiEventKind.trainingModeChanged","{'training_mode': <ApiTrainingMode.MANUAL: 100>}",0
+"2026-08-10 17:05:50.089921",16889028125297,5101,"ApiEventKind.trainingPlanLoad","{'training_plan_id': None}",0
+"2026-11-13 18:41:48.235252",884822167125873,6001,"ApiEventKind.detectorChanged","{'detector_id': <ApiDetectorKind.pelletStatusMessageInterruption: 411>, 'is_active': True, 'is_enabled': True}",0
+"2026-07-29 17:04:38.275155",514922209693966,6501,"ApiEventKind.alarmChanged","{'alarm_id': <ApiAlarmKind.systemFault: 501>, 'is_active': True, 'is_enabled': True, 'is_stop_condition': True, 'is_auto_resume_enabled': False}",0
+"2026-08-11 11:54:36.465141",84615403345411,7001,"ApiEventKind.animalCreated","{'identifier': '201acbb7-2f5a-45d3-a5d4-9d316b11cd19', 'name': 'one', 'pellet': {'coordinateSpace': 'device', 'position': {'x': 0, 'y': 0, 'z': 0}}, 'targetYLimit': None, 'selectedProtocol': None}",0
+"2026-08-11 15:04:39.823038",2349811701822,7003,"ApiEventKind.animalSelected","None",0
+"2026-07-23 16:57:36.011163",1526060873085,6001,"ApiEventKind.detectorChanged","{'detector_id': <ApiDetectorKind.deviceAckTimeOut: 401>, 'is_active': True, 'is_enabled': True}",0

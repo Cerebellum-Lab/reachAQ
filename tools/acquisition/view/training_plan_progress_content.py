@@ -7,7 +7,7 @@ from PySide6.QtWidgets import QGridLayout, QLabel, QVBoxLayout, QWidget, QStacke
 from autotrainer.core.logging import get_verbose_logger
 
 from autotrainer.pyside import CardWidget
-from autotrainer.training import TrainingPlan
+from autotrainer.behavior.training import TrainingPlan
 
 from autotrainer.pyside.content_widget import invoke_method
 

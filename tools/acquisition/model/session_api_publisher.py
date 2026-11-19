@@ -7,7 +7,7 @@ import functools
 import threading
 from typing import Optional, Set
 
-from autotrainer.api import ApiEventKind
+from autotrainer.core.api import ApiEventKind
 from autotrainer.core.event.event_manager import EventQueueFullError
 
 

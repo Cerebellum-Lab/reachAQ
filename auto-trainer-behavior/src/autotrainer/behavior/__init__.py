@@ -2,10 +2,6 @@ from dataclasses import dataclass
 from typing import Protocol, Optional
 
 from autotrainer.core import ProjectInfo
-from autotrainer.core.interfaces import (  # noqa
-    # actually for autotrainer.training only
-    CaptureAnalysisResult, RecordingEndingReason
-)
 
 
 # keeping top level atm, given not quite sure where to put

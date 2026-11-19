@@ -7,7 +7,7 @@ from typing import Callable, Optional, get_type_hints, Protocol
 
 from transitions import Machine
 
-from autotrainer.api import ApiEventKind
+from autotrainer.core.api import ApiEventKind
 
 from autotrainer.core import transitions_allow_functions, SystemMessageHandler, get_perf_now
 from autotrainer.core.logging import get_verbose_logger

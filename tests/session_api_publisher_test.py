@@ -1,6 +1,6 @@
 from unittest import mock
 
-from autotrainer.api import ApiEventKind
+from autotrainer.core.api import ApiEventKind
 from autotrainer.behavior import PelletTrialLedger, TrialOutcome
 from autotrainer.core.event.event_manager import EventQueueFullError
 

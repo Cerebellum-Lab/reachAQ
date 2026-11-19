@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from autotrainer.api import ApiEvent
+from autotrainer.core.api import ApiEvent
 
 
 @dataclass(frozen=True)

@@ -1,8 +1,8 @@
 
 from typing import Optional, Any
 
-from autotrainer.api import ApiEventKind
-from autotrainer.api.api_options import create_default_api_options
+from autotrainer.core.api import ApiEventKind
+from autotrainer.core.api import create_default_api_options
 
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.event.api_event_plugin import ApiEventPlugin
@@ -23,10 +23,11 @@ __all__ = [
 
 def try_register_api_event_plugin() -> Optional[ApiEventPlugin]:
     """
-    Attempt to register the Autotrainer External API plugin with the default instance of the event manager.
+    Attempt to register the local API plugin with the default instance of the event manager.
 
     Returns:
-        bool: True if the plugin was successfully registered, False otherwise.
+        The registered plugin, or None if creating or registering it failed. Its `service` is None when
+        the API is disabled (REACHAQ_API_ENABLED=0).
     """
     try:
         # NB: keeping import here,

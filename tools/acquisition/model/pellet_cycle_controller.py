@@ -357,6 +357,9 @@ class PelletCycleController:
             self._protocol_runner.record_trial_outcome(
                 finalized.attempt_label,
                 finalized.outcome,
+                reach_count=finalized.reach_count,
+                success_count=finalized.success_count,
+                consumption_count=finalized.consumption_count,
             )
         self._session_data_recorder.persist_trial_ledger(
             project,
@@ -463,6 +466,9 @@ class PelletCycleController:
             self._protocol_runner.record_trial_outcome(
                 finalized.attempt_label,
                 finalized.outcome,
+                reach_count=finalized.reach_count,
+                success_count=finalized.success_count,
+                consumption_count=finalized.consumption_count,
             )
         self._session_data_recorder.persist_trial_ledger(
             project,
