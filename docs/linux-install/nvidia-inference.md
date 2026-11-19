@@ -46,12 +46,35 @@ environment:
 
 | Engine | Version | CUDA / cuDNN | Runs |
 |---|---|---|---|
-| PyTorch | 2.7, CUDA 12.8 build | 12.8 / 9 | YOLO models, DeepLabCut PyTorch models |
+| PyTorch | 2.7, CUDA 12.8 build | 12.8 / 9 | Keypoint models (the live default), DeepLabCut PyTorch models |
 | TensorFlow | 2.12 | 11.8 / 8.6 | DeepLabCut TensorFlow models |
 
-A YOLO model always runs on PyTorch. A DeepLabCut model runs on the engine
+A keypoint model always runs on PyTorch. A DeepLabCut model runs on the engine
 `REACHAQ_POSE_BACKEND` selects (`tensorflow` by default); see the
 [runtime guide](runtime-configuration.md#environment-variables).
+
+### Keypoint models
+
+A keypoint model is a directory holding `weights.pt` and `keypoint_pose.yaml`.
+Point `poseModelLocation` at the directory; the sidecar is how the backend is
+recognised. Train one from labelled frames with:
+
+```bash
+python -m autotrainer.inference.keypoint.train DATASET OUTPUT --bodyparts NAMES
+```
+
+`DATASET` holds `images/{train,val}/*.png` and `labels/{train,val}/*.txt` (one
+line per frame: class, box, then `x y v` per part as fractions of the frame,
+`v` 0 for unlabelled). `NAMES` lists the part names in label order, one per
+line, or is a YAML file with a `bodyparts` key. The 623-frame reach dataset
+trains in about 3.5 minutes (300 epochs) on an RTX 5060 Ti.
+
+### YOLO (Ultralytics) models
+
+reachAQ no longer installs `ultralytics`: it is AGPL-3.0. A YOLO model
+directory (`yolo_pose.yaml`) is refused at start-up with a message saying so.
+Retrain it as a keypoint model, or install the optional extra yourself
+(`pip install "auto-trainer-inference[yolo]"`) to keep running it.
 
 The PyTorch build covers compute capability 7.5 through 12.0: T1000, RTX A2000
 and RTX 5060 Ti.

@@ -21,10 +21,9 @@ dependencies = [
     "auto-trainer-core",
 
     'deeplabcut >= 3.0, < 4',  # famous deeplab; 3.x carries both engines
-    # YOLO-pose models, the live model on christielab10. Imported lazily by
-    # yolo_pose_model, so nothing failed at install time without it - live
-    # inference failed at the first frame instead.
-    'ultralytics >= 8.4, < 9',
+    # The live keypoint backend needs nothing here: its framework comes from
+    # the extra below, and its trainer reads frames with auto-trainer-video's
+    # opencv-python.
 
     'pandas >= 2, < 3',
     'numpy >= 1.23.5, < 2',
@@ -63,6 +62,13 @@ tensorflow = [
     # so we explicitly add them here.
     'imgaug >= 0.4, < 0.5',
     # DeepLabCut 3's TensorFlow engine imports imgaug and does not declare it.
+]
+# YOLO-pose (Ultralytics) models. Not installed by reachAQ: ultralytics is
+# AGPL-3.0, and the live model is the keypoint backend. Kept so a site that
+# installs it themselves can still run an existing YOLO model; without it a
+# YOLO model directory is refused at pre-validation with a message saying so.
+yolo = [
+    'ultralytics >= 8.4, < 9',
 ]
 torch = [
     'torch >= 2.7, < 2.8 ; platform_machine != "aarch64"',

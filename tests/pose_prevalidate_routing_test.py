@@ -27,8 +27,13 @@ def _yolo_dir(tmp_path):
     return tmp_path
 
 
-def test_a_yolo_model_is_checked_against_the_yolo_layout(tmp_path):
-    """A complete YOLO directory passes rather than being reported broken."""
+def test_a_yolo_model_is_checked_against_the_yolo_layout(tmp_path, monkeypatch):
+    """A complete YOLO directory passes rather than being reported broken.
+
+    ultralytics is an optional extra now, so the test stands in for a site
+    that installed it.
+    """
+    monkeypatch.setattr(backend_selection, "_installed", lambda module: True)
     (tmp_path / "yolo_pose.yaml").write_text(
         "imgsz: 256\nweights: best.pt\nbodyparts:\n  - Nose\n")
     (tmp_path / "best.pt").write_bytes(b"not a real checkpoint")

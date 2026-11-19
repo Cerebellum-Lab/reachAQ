@@ -85,10 +85,10 @@ def test_tensorflow_extra_carries_its_helper_packages():
         assert package in extra, f"{package} is required by the DeepLabCut TF engine"
 
 
-def test_yolo_runtime_is_a_hard_dependency():
-    """yolo_pose_model imports ultralytics lazily, so a missing one only failed at
-    the first live frame; christielab10's live model is YOLO."""
-    assert "ultralytics" in _dependencies_block(_text())
+def test_yolo_runtime_is_only_an_optional_extra():
+    """ultralytics is AGPL-3.0: it may be offered as an extra, never required."""
+    assert "ultralytics" not in _dependencies_block(_text())
+    assert "ultralytics" in _extras_block(_text(), "yolo")
 
 
 def test_tensorflow_extra_carries_imgaug():
