@@ -5,7 +5,7 @@ physical subsystem.
 
 Bundled Spinnaker Python artifacts are organized under `vendor/spinnaker` by
 operating system and architecture. `tools.platform_support` resolves Linux
-x86-64, Linux aarch64, and the retained Windows x86-64 artifact from the shared
+x86-64 and the retained Windows x86-64 artifact from the shared
 manifest. Windows hardware operation is not qualified by this repository; the
 artifact and platform-neutral interfaces are retained to avoid an architectural
 rewrite if that deployment is needed later.

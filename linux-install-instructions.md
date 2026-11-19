@@ -4,8 +4,8 @@ This is the entry point for Ubuntu reachAQ setup. Portable, repeatable host
 commands live in a tracked installer; vendor drivers and rig-specific settings
 are separated into focused guides.
 
-Supported reference platform: Ubuntu 22.04 x86_64. Other distributions and
-Jetson/aarch64 require matching vendor packages.
+Supported reference platform: Ubuntu 22.04 x86_64. Other distributions
+require matching vendor packages; Jetson/aarch64 is not supported.
 
 ## Installation map
 

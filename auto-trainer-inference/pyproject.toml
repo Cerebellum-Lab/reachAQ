@@ -47,14 +47,10 @@ dependencies = [
 #     and TensorFlow 2.12.1 ran GPU convolutions and a DeepLabCut model with
 #     numpy 1.26.4 and typing-extensions 4.16.
 tensorflow = [
-    'tensorflow >= 2.12, < 2.13 ; platform_machine != "aarch64"',
+    'tensorflow >= 2.12, < 2.13',
     # Capped below 2.13 deliberately: 2.13 pairs with a keras that moved
     # legacy_tf_layers, which breaks tf_slim's batch_norm and therefore every
     # DeepLabCut model load ("No module named 'keras.legacy_tf_layers'").
-    'tensorflow == 2.12.0+nv23.06 ; platform_machine == "aarch64"',
-    # aarch64 (Jetson) needs NVIDIA's index: a pip.conf extra-index-url or
-    # PIP_EXTRA_INDEX_URL. Retained rather than removed; dropping Jetson
-    # support is a separate scope decision.
 
     'tensorpack >= 0.11, < 1',
     'tf-slim >= 1.1, < 2',
@@ -71,16 +67,13 @@ yolo = [
     'ultralytics >= 8.4, < 9',
 ]
 torch = [
-    'torch >= 2.7, < 2.8 ; platform_machine != "aarch64"',
+    'torch >= 2.7, < 2.8',
     # 2.7 on a CUDA 12.8 build covers compute capability 7.5 through 12.0,
     # which is the whole known fleet: T1000 (7.5), RTX A2000 (8.6),
     # RTX 5060 Ti (12.0). Do not narrow this to one card. Capped below 2.8
     # because 2.7.1+cu128 is the build shown to share a process with
     # TensorFlow; a newer one needs that check repeated before the cap moves.
-    'torch == 2.1.0a0+41361538.nv23.6 ; platform_machine == "aarch64"',
-    # ensure we get/specify the desired version from nvidia for aarch64 ( == Jetson)
-
-    'torchvision >= 0.22, < 0.23 ; platform_machine != "aarch64"',
+    'torchvision >= 0.22, < 0.23',
 ]
 
 [tool.setuptools_scm]
