@@ -100,3 +100,23 @@ def test_torch_extra_covers_the_whole_gpu_fleet():
         f"torch floor {match.group(1)} predates sm_120 support; the RTX 5060 Ti "
         f"needs >= 2.7 with CUDA 12.8+"
     )
+
+
+WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "run_unit_tests.yaml"
+
+
+def test_ci_never_installs_the_yolo_plugin():
+    """The YOLO plugin is AGPL-3.0; CI neither installs nor tests it."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "plugins/yolo" not in text
+    assert "ultralytics" not in text.lower()
+
+
+def test_ci_tests_the_deeplabcut_plugin_in_its_own_job():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert re.search(r"^  deeplabcut-plugin:", text, re.M), "no deeplabcut-plugin job"
+    job = text[text.index("  deeplabcut-plugin:"):]
+    assert "pip install -e plugins/deeplabcut" in job
+    assert "plugins/deeplabcut[" not in job, "the tensorflow extra is not installed in CI"
+    assert "check_licences --allowlist .github/licence-allowlist.txt" in job
+    assert "pytest plugins/deeplabcut/tests" in job
