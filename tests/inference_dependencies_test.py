@@ -65,6 +65,17 @@ def test_core_pandas_and_numpy_stay_required():
         assert package in block, f"{package} should remain a hard dependency"
 
 
+def test_core_declares_what_core_imports():
+    """scipy and scikit-learn are imported by core code (every
+    `import autotrainer.inference` reaches scipy; app_model reaches sklearn).
+    They used to arrive only through deeplabcut, so a fresh install without
+    the plugin lacked them."""
+    requirements = re.findall(r"""^\s*['"]([^'"]+)['"]""", _dependencies_block(_text()), re.M)
+    names = {re.split(r"[\s<>=!~;\[]", r, maxsplit=1)[0].lower() for r in requirements}
+    for package in ("scipy", "scikit-learn"):
+        assert package in names, f"{package} is imported by core but not a hard dependency"
+
+
 def test_both_extras_are_declared():
     """Only torch is left: the tensorflow extra moved to the DeepLabCut plugin."""
     text = _text()
