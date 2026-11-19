@@ -198,8 +198,8 @@ installer with:
 tools/install/install-reachaq-desktop.sh
 ```
 
-The installer places a trusted mouse-icon `reachAQ.desktop` entry on the
-operator's desktop and in the application menu. It starts in Idle through the
+The installer places a trusted `reachAQ.desktop` entry, with the reachAQ camera
+icon, on the operator's desktop and in the application menu. It starts in Idle through the
 configured `reachaq` Conda environment and opens a terminal containing live
 logs. A per-user lock rejects accidental duplicate GUI launches. Startup
 failures remain visible until Enter is pressed.
@@ -209,7 +209,8 @@ The default installed files are:
 ```text
 <XDG desktop directory>/reachAQ.desktop
 ~/.local/share/applications/reachaq.desktop
-~/.local/share/icons/hicolor/192x192/apps/reachaq.png
+~/.local/share/icons/hicolor/scalable/apps/reachaq.svg
+~/.local/share/icons/hicolor/<N>x<N>/apps/reachaq.png   (N = 16 to 512)
 ~/.local/bin/reachaq-launcher
 ~/.local/bin/reachaq
 ~/.local/bin/reachaq-sync

@@ -150,7 +150,9 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(self._title)
 
-        icon = QIcon(_this_dir.joinpath("autotrainer.png").absolute().as_posix())
+        icon = QIcon()
+        for icon_file in sorted(_this_dir.joinpath("icons").glob("reachaq-*.png")):
+            icon.addFile(icon_file.absolute().as_posix())
         self.setWindowIcon(icon)
 
         self._open_dialogs = []
