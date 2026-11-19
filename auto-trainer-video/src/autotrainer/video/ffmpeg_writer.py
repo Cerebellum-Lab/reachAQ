@@ -5,7 +5,7 @@ on a lit rig scene (+24 dB of gain noise) it managed 136 fps per stream with
 two cameras in parallel, below the 150 fps the cameras deliver, so the
 recorder queue filled. libx264 at the ultrafast preset and CRF 18 encoded the
 same frames at 250-276 fps per stream, at 15-19 Mbit/s and a mean error of
-0.8-0.9 grey levels (christielab10, 2026-10-06).
+0.8-0.9 grey levels (reference rig, 2026-10-06).
 """
 import functools
 import os
@@ -33,7 +33,7 @@ X264_OUTPUT_ARGS = (
 # x264's CRF rate control weighs each frame by its duration: it divides the
 # frame's complexity by the duration over 40 ms, with durations clipped at
 # 10 ms. The same frames are therefore quantized more coarsely the higher the
-# frame rate: P-frame QP 17 at 50 fps against 20 at 150 fps on christielab10's
+# frame rate: P-frame QP 17 at 50 fps against 20 at 150 fps on the reference rig's
 # 1024x1024 scene, where 98% of macroblocks were then skipped and a faint
 # (+4 grey) moving target was placed about twice as far off (2026-11-09).
 # Above this rate x264 rate-controls as if at this rate, so a recording keeps
@@ -49,7 +49,7 @@ X264_RATE_CONTROL_FPS = 50
 ENCODER_NICENESS = 10
 
 # Hybrid Intel processors (Alder Lake and later) list their efficiency cores
-# here. On christielab10 (i9-12900: CPUs 0-15 are the 8 performance cores'
+# here. On the reference rig (i9-12900: CPUs 0-15 are the 8 performance cores'
 # hyperthreads, 16-23 the 8 efficiency cores), with the CPUs at EPP
 # balance_power, x264 running on the performance cores cut live pose at
 # 1024x1024 to 59% of frames (5.89 ms inference); confined to the efficiency

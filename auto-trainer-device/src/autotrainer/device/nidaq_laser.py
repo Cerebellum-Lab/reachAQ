@@ -46,7 +46,7 @@ _OPERATION_CANCEL_TIMEOUT_S = 5.0
 #: How long a path that cancels a pulse and goes on waits for it to end,
 #: so that what it does next finds the board free; the one bound for every
 #: such path, the application's too. The abort ends it in milliseconds
-#: (christielab10: the wait woke 21-35 ms after the cancel, H8a and H8c on
+#: (reference rig: the wait woke 21-35 ms after the cancel, H8a and H8c on
 #: 56f58866); this bounds a sick driver.
 CANCELLED_OPERATION_WAIT_S = 2.0
 #: How long a stop or close keeps trying while an abort is still finishing.
@@ -127,7 +127,7 @@ class NidaqLaserOperation:
         #: given by the controller, as abort_task(task, name, running), the
         #: name the one the task was bound with. A stop() from another thread
         #: waits behind the operation's own wait on the task, until it ends or the
-        #: wait times out (christielab10, H5a, 2026-09-29); an abort wakes the
+        #: wait times out (reference rig, H5a, 2026-09-29); an abort wakes the
         #: wait with -88709 in about 36 ms (H5b), and before a start it is
         #: harmless (H5c).
         self._abort_task = abort_task
@@ -255,7 +255,7 @@ class NidaqLaserOperation:
                     logger.debug("Laser task abort during cancellation failed", exc_info=True)
         # A deferred pulse is woken only now: woken before the aborts had
         # returned, its cleanup stopped a task still being aborted, -88710
-        # (christielab10, H8b).
+        # (reference rig, H8b).
         self._start_requested.set()
         return True
 
@@ -267,7 +267,7 @@ class NidaqLaserOperation:
         start that the driver refuses is the operation's failure, which the
         pulse's own thread ends it with, and is not raised here. Through an
         Event to the pulse's thread the start came 8.2 ms p50 later under a
-        GIL hog, against 0.6 ms on the deciding thread (christielab10, M3 C
+        GIL hog, against 0.6 ms on the deciding thread (reference rig, M3 C
         and D). Nothing is called in the driver under the lock, as in
         cancel(): a start hung in the driver holds this caller, and not a
         cancel or close().
@@ -951,7 +951,7 @@ class NidaqLaserController:
         Nothing else is asked of the driver: `name` is the one its owner made
         the task with. Task.name is a driver query, and the owner,
         woken by this abort, can have cleared the task before the abort
-        returns (-200088, christielab10, H8c). Aborting a running task warns,
+        returns (-200088, reference rig, H8c). Aborting a running task warns,
         DaqWarning 200010 (H5b, H8a), the abort doing what was asked: one
         filter, set as the driver loads, keeps that warning, by its text, off
         stderr (_ignore_the_aborts_warning), and this line says it can come.
@@ -1052,7 +1052,7 @@ class NidaqLaserController:
         max_waveform_samples = max(len(waveform) for waveform in waveforms)
         # Each waveform is even (_pulse_train_samples), but the PMT
         # margins together may be odd, which the 6713 refuses (-200692 at
-        # 105,741 samples, christielab10, 2026-10-01): one more sample at
+        # 105,741 samples, reference rig, 2026-10-01): one more sample at
         # each channel's minimum after them.
         parity_samples = (pre_samples + max_waveform_samples + post_samples) % 2
         total_samples = pre_samples + max_waveform_samples + post_samples + parity_samples
@@ -1063,7 +1063,7 @@ class NidaqLaserController:
         # ms at 105,742 samples and 28.6 ms at 490,502 on the Run Pulse click's
         # path. The array takes 0.74 and 4.0 ms to build (the builder, the
         # allocation, the fill and the copy), and the checks below 0.15 and
-        # 0.68 ms more (medians on christielab10's E-cores, from the review of
+        # 0.68 ms more (medians on the reference rig's E-cores, from the review of
         # this change; its host benchmark, which timed the builder alone, gave
         # 0.07 and 0.19 ms).
         timed_waveforms = numpy.empty((len(channels), total_samples), dtype=numpy.float64)
@@ -1079,7 +1079,7 @@ class NidaqLaserController:
         # - each row ends on its own laser's minimum. After a finite
         #   generation the 6713 holds its last sample, so a row that ended on
         #   the amplitude would leave the laser on until the cleanup's reset
-        #   (23 ms pulses ran 28.45-35.0 ms, christielab10, 2026-10-01);
+        #   (23 ms pulses ran 28.45-35.0 ms, reference rig, 2026-10-01);
         # - samples times channels is even, which the 6713 refuses otherwise
         #   (-200692). The count above is even by construction, so this is the
         #   same refusal made earlier, as a LaserPulseRefused.
@@ -1168,7 +1168,7 @@ class NidaqLaserController:
                         # lag after the light ends. High on it, the line
                         # stayed high until the cleanup's reset, which
                         # comes last of all, as the analog output held its
-                        # last pulse (christielab10, 2026-10-01).
+                        # last pulse (reference rig, 2026-10-01).
                         [True] * (total_samples - 1) + [False],
                         sample_rate_hz,
                         total_samples,
@@ -1228,9 +1228,9 @@ class NidaqLaserController:
                 # line takes it: then the lines, then the AO. A deferred
                 # output is committed at its arm with or without lines, so
                 # that its start is all the trigger has left to do: with none,
-                # as on christielab10, its start() committed it itself. M3's
+                # as on the reference rig, its start() committed it itself. M3's
                 # pre-armed start, 0.58 ms p50, was a committed task's
-                # (christielab10, 2026-10-02); an uncommitted one was not
+                # (reference rig, 2026-10-02); an uncommitted one was not
                 # measured. The commit reserves the output from the arm: a
                 # command write to it is refused (-50103) while it is armed.
                 ao_task.control(self._nidaqmx.constants.TaskMode.TASK_COMMIT)
@@ -1408,13 +1408,13 @@ class NidaqLaserController:
         trigger: that clock ticks only once the output has triggered, and the
         lines start before the output, so each samples on its edges. A line
         cannot wait for a trigger instead: an M Series board's clocked
-        digital output takes none (christielab10's 6221 and 6713 report an
+        digital output takes none (the reference rig's 6221 and 6713 report an
         empty do_trig_usage, and TASK_VERIFY refuses one with -200452,
         2026-09-25).
 
         On the output's own board the clock is named there, as it always was.
         On another board naming it is an implicit cross-board route, refused
-        on christielab10's unidentified chassis (-89125), and a clocked line
+        on the reference rig's unidentified chassis (-89125), and a clocked line
         has to sit on the 6221 there: the clock is driven onto
         pulse_clock_line for the pulse and read on the line's board.
         backplane_clock_line is not used for it, since in a synchronized
@@ -1501,7 +1501,7 @@ class NidaqLaserController:
                 samps_per_chan=len(waveform),
             )
             # The command's sample clock, as each input board can see it. On
-            # christielab10 the command is on the 6713 and the diode on the
+            # the reference rig the command is on the 6713 and the diode on the
             # 6221: named across the boards, the clock needed a route DAQmx
             # reserves a backplane line for, and it refuses that on this
             # unidentified chassis (-89125). _shared_clock_for drives it onto
@@ -2376,7 +2376,7 @@ class NidaqLaserController:
         """An input of this controller's, referenced as the stream's are.
 
         With no terminal configuration given, DAQmx picks per channel, which
-        on christielab10's 6221 made ai3, ai4 and ai5 differential, paired
+        on the reference rig's 6221 made ai3, ai4 and ai5 differential, paired
         with ai11-ai13, where the stream reads them single-ended (hardware
         check, phase 2 final).
         """
@@ -2505,7 +2505,7 @@ class NidaqLaserController:
     ) -> List[bool]:
         # All but the output's last sample at most. A pulse that filled the
         # output ended high, and the line held that after the generation, as
-        # the analog output held its last pulse (christielab10, 2026-10-01);
+        # the analog output held its last pulse (reference rig, 2026-10-01);
         # nothing writes a trigger line low after it.
         pulse_samples = min(total_samples - 1, max(1, _samples_from_ms(pulse_ms, sample_rate_hz)))
         return [True] * pulse_samples + [False] * (total_samples - pulse_samples)
@@ -2650,13 +2650,13 @@ def _pulse_train_samples(
         # Ended on the amplitude, with no post-stim: after a finite
         # generation the 6713 holds its last sample, so the last pulse
         # ran on until the cleanup's reset. 23 ms pulses measured
-        # 28.45-35.0 ms, 5 ms ones 12.0-12.4 ms (christielab10,
+        # 28.45-35.0 ms, 5 ms ones 12.0-12.4 ms (reference rig,
         # 2026-10-01). One sample at the minimum ends it on time.
         length += 1
     if length % 2:
         # The 6713 refuses a buffer whose samples per channel times
         # channels is odd: B2's 105,740 samples plus the one above,
-        # 105,741, were refused with -200692 (christielab10,
+        # 105,741, were refused with -200692 (reference rig,
         # 2026-10-01). Even per channel, it is even for any number of
         # channels.
         length += 1

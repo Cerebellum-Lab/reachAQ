@@ -431,7 +431,7 @@ class VideoRecord(Thread):
         else:
             # Grayscale frames, which every reach camera delivers, go to a grayscale
             # writer: expanding them to three channels first cost 2.2 ms per
-            # 1024x1024 frame and roughly halved mp4v throughput (christielab10,
+            # 1024x1024 frame and roughly halved mp4v throughput (reference rig,
             # 2026-10-06).
             vid_writer = cv2.VideoWriter(
                 self._video_file, cv2.VideoWriter_fourcc(*'mp4v'), self._fps, size, isColor=is_color)  # noqa

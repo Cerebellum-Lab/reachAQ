@@ -351,7 +351,7 @@ def read_frames(video: str, indices: typing.Iterable[int],
     """Frames by index; with `size`, shrunk to size x size grey as they are read.
 
     Each frame is reached by seeking, which OpenCV's FFmpeg backend does
-    exactly (it decodes forward from the previous keyframe): on christielab10's
+    exactly (it decodes forward from the previous keyframe): on the reference rig's
     recordings every seek matched sequential decoding, at about 1 ms per frame,
     where decoding from the start would take minutes for a frame late in a long
     session. If the position after a read is not the frame asked for, the
