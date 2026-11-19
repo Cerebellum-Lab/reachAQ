@@ -1,113 +1,53 @@
-# SoftMouse/RFID operator checklist
+# Animal metadata and RFID operator checklist
 
-The website paths, colony and export rules are built in. The operator enters
-the SoftMouse username and password, and once per computer the lab's shared
-publication in **Preferences â†’ Animal metadata**: **Shared publication** (the
-manifest's path) and, when it is on a network mount, **Publication mount**. See
-the README's "Lab settings".
+Nothing about the lab is built in. Each user sets up the source this computer
+reads: SoftMouse with their own login, a spreadsheet, a database, or the
+shared publication another computer writes. The full guide is
+[Animal metadata sources](../../docs/acquisition/animal-metadata-sources.md).
 
 ## Install once on every computer
-
-From the repository, run the normal reachAQ installer:
 
 ```bash
 cd ~/Documents/reachAQ
 ./tools/install/reachaq-linux-install.sh
 ```
 
-It installs the SoftMouse HTTPS, spreadsheet, and operating-system keyring
-dependencies plus the RFID serial package and `dialout` permission. If it says
-the account was added to `dialout`, log out and back in, then rerun the same
-command. The final report should show `PASS` for **Verify SoftMouse runtime**,
-**Verify RFID runtime**, and **Verify SoftMouse systemd units**.
+It installs the SoftMouse HTTPS, spreadsheet and keyring dependencies plus the
+RFID serial package and `dialout` permission. If it says the account was added
+to `dialout`, log out and back in, then rerun it. The final report should show
+`PASS` for **Verify SoftMouse runtime**, **Verify RFID runtime** and **Verify
+SoftMouse systemd units**.
 
-## Every computer allowed to publish
+## Set up the source, once per user
+
+In reachAQ: **Preferences → Animal metadata → Set up…**. Choose the source,
+fill its settings (for SoftMouse: username, password, then **List** and pick
+the colony), click **Read columns**, check the column mapping, and **Save**.
+Then click **Refresh now**.
+
+Or from a terminal, as the operator and not with `sudo`:
 
 ```bash
 cd ~/Documents/reachAQ
 conda activate reachaq
-python -m tools.softmouse_sync.cli --setup
+reachaq-animal-metadata setup
+reachaq-animal-metadata refresh
 ```
 
-Type the SoftMouse username and password at the prompts. Nothing appears while
-typing the password; that is normal. The operating system keyring stores both
-values. Repeat this command to replace either value.
+Passwords go to the OS keyring, or to a user-only file when the computer has
+none. `reachaq-animal-metadata status` says which.
 
-Confirm the publication mount is mounted, then test publication:
+## One computer publishing for the others (optional)
 
-```bash
-findmnt /path/to/the/mount
-python -m tools.softmouse_sync.cli
-```
+On that computer, fill **Publish to** (and **Only if mounted** for a network
+share) in setup, then install the nightly timer as in the guide's "Sharing one
+source between computers". On the others, set up **Shared publication** with
+the manifest it writes.
 
-The credential setup requires a logged-in graphical user session so the Linux
-Secret Service can unlock the operator's keyring. Do not run it with `sudo`.
+## RFID reader
 
-Or open **Preferences → Animal metadata** in reachAQ and click **Sync from
-SoftMouse**. The button is available on every acquisition computer; run the
-one-time login setup on each computer that should use it.
-
-The metadata actions remain in that panel:
-
-- **Sync from SoftMouse** updates Isilon and then this computer's cache.
-- **Refresh local cache** only imports the latest existing Isilon publication.
-
-RFID hardware settings are grouped with the other rig-level switches under
-**File → Hardware**. Enable **USB RFID reader** and use **RFID Serial
+Under **File → Hardware**, enable **USB RFID reader** and use **RFID Serial
 Device…** to confirm the stable `/dev/serial/by-id/...` path. Every selection
-takes effect immediately and is written to the `hardware:` block in
-`~/Autotrainer/system_configuration.yaml`. Expand **RFID Reader** under
-**Hardware Status** to view connection and last-scan details.
-
-For a SoftMouse RFID with no existing JSON link, the first scan opens **Set up
-scanned animal**. Choose **Create new animal JSON** or an existing unlinked
-animal name, edit the local subject name and persistent animal notes, then
-Save. Cancel creates nothing. Later scans select the linked subject without
-opening the dialog. The toolbar shows the raw 15-digit RFID beside the linked
-Subject name. **RFID links…** provides simple edit, manual-link, and duplicate-
-condensation workflows; condensation retains the chosen local JSON values,
-transfers the RFID link, archives the duplicate, and opens the survivor for
-editing.
-
-There is no JSON configuration file to create or edit. An old
-`~/.config/reachaq/softmouse-publisher.json` file is ignored and may be removed.
-
-## Designated nightly publisher only
-
-Do this on exactly one computer:
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp tools/softmouse_sync/systemd/reachaq-softmouse-publisher.{service,timer} \
-  ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now reachaq-softmouse-publisher.timer
-systemctl --user list-timers reachaq-softmouse-publisher.timer
-```
-
-Check a run with:
-
-```bash
-systemctl --user start reachaq-softmouse-publisher.service
-journalctl --user -u reachaq-softmouse-publisher.service -n 100 --no-pager
-```
-
-The service runs as the same user who stored the credentials. It automatically
-finds the `reachaq` environment in the standard Anaconda, Miniconda, or
-Mambaforge locations. If the checkout is not at
-`~/Documents/reachAQ`, edit `WorkingDirectory` in the copied file under
-`~/.config/systemd/user/`, run `systemctl --user daemon-reload`, and verify it
-again before enabling the timer.
-
-Do not install or enable that timer on the other computers. Their manual button
-continues to work after local credential setup.
-
-## Expected safety failures
-
-Publication stops without replacing a good snapshot if Isilon is unmounted,
-another publisher holds the lock, SoftMouse returns an incomplete or wrong-
-colony result, or there are no active animals with valid 15-digit ISO 11784 RFID
-values in `Plate ID`.
-
-See [README.md](README.md) for data ownership, RFID acceptance rules, shared
-files, UI behavior, and detailed troubleshooting.
+takes effect immediately and is written to the `hardware:` block of
+`system_configuration.yaml` in the settings directory. Expand **RFID Reader**
+under **Hardware Status** to view connection and last-scan details.

@@ -46,10 +46,11 @@ Vendor drivers and rig-specific hardware configuration remain in separate
 guides selected from the Linux installation map. The portable installer also
 installs the terminal-visible mouse-icon desktop launcher, verifies the
 SoftMouse HTTPS/spreadsheet/keyring dependencies and RFID serial dependency and
-permissions, and installs the tracked publisher systemd units. Credential
-entry and enabling the one designated nightly timer remain explicit
+permissions, and installs the tracked publisher systemd units. Setting up each
+user's animal metadata source (SoftMouse, a spreadsheet, a database or a shared
+publication) and enabling an optional nightly publisher remain explicit
 post-install steps in the
-[SoftMouse/RFID checklist](tools/softmouse_sync/CONFIGURATION_GUIDE.md).
+[animal metadata and RFID checklist](tools/softmouse_sync/CONFIGURATION_GUIDE.md).
 
 ## Applications
 
@@ -131,9 +132,12 @@ Current hardware bring-up tools live under `tools/hardware`:
   application close only closes its own socket. The helper serializes and
   debounces service restart, refuses to reset a channel owned by another
   reachAQ process, and is not a physical emergency stop or board power cycle.
-* [`tools/softmouse_sync/README.md`](tools/softmouse_sync/README.md) - configure
-  SoftMouse publication, per-computer metadata caches, USB RFID readers, the
-  manual UI sync, and the single-host midnight timer.
+* [`docs/acquisition/animal-metadata-sources.md`](docs/acquisition/animal-metadata-sources.md) -
+  set up where animal metadata comes from (SoftMouse, spreadsheet, database,
+  shared publication, or a lab's own source), credentials, refresh, offline
+  behaviour and the optional nightly publisher.
+* [`tools/softmouse_sync/README.md`](tools/softmouse_sync/README.md) - the
+  SoftMouse source, USB RFID readers and metadata ownership.
 
 See [linux-install-instructions.md](linux-install-instructions.md) for the
 installation map and [the PEAK SocketCAN guide](docs/linux-install/peak-socketcan.md)

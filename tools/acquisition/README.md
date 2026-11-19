@@ -410,16 +410,15 @@ model/product number, the configured CAN backend/interface, and the detected
 GPU model, memory, and driver.
 
 The `RFID Reader` category shows its stable serial path, connection state or
-error, and most recent scan result. Configure it under **Preferences → Animal
-metadata**. That panel also separates **Sync from SoftMouse**, which publishes
-to Isilon and refreshes the local cache, from **Refresh local cache**, which
-only consumes the latest completed Isilon publication. Neither action is
-available during recording. See the
-[SoftMouse/RFID guide](../softmouse_sync/README.md) for credentials, reader
-setup, required packages and serial permissions, metadata ownership, safety
-checks, and the single-host nightly timer. The normal portable installer
-installs and verifies these dependencies; credential entry remains a one-time
-per-publisher action.
+error, and most recent scan result. Where animal metadata comes from is set
+under **Preferences → Animal metadata → Set up…**: SoftMouse with the user's
+own login, a spreadsheet, a database, a shared publication, or a lab's own
+source kind. **Refresh now** fetches it into this computer's cache; neither is
+available during recording. See
+[Animal metadata sources](../../docs/acquisition/animal-metadata-sources.md)
+for setup, credentials, refresh, offline behaviour and adding a source, and the
+[SoftMouse/RFID guide](../softmouse_sync/README.md) for the reader, serial
+permissions and metadata ownership.
 
 The Hardware Refresh icon is at the far right of the Hardware Status title bar.
 While idle it repeats discovery and refreshes bindings. While System Mode is

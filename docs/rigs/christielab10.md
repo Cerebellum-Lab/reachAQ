@@ -30,12 +30,27 @@ manifest_path=/mnt/isilon/Data/ReachingData/SoftMouse/SoftMouse-AnimalList-curre
 publication_mount=/mnt/isilon
 ```
 
-Set them in **Preferences → Animal metadata** (**Shared publication** and
-**Publication mount**), or add the section to the file with reachAQ closed. The
-same values are in `tests/christielab10_preferences.ini`. Set them on the rig
-before it runs this code. Without them SoftMouse reports "Not configured", and
-the nightly publisher stops with "No SoftMouse publication directory is
-configured".
+Add the section to the file with reachAQ closed; the same values are in
+`tests/christielab10_preferences.ini`. With pluggable animal metadata sources
+(see [Animal metadata sources](../acquisition/animal-metadata-sources.md)) the
+app reads this publication as a "Shared publication" source with no further
+setup. Without the section the app reports "Not configured".
+
+The nightly publisher no longer knows the colony. On the computer that runs the
+publisher timer, set up the SoftMouse source once as the operator, choosing
+the lab's colony, with **Publish to**
+`/mnt/isilon/Data/ReachingData/SoftMouse` and **Only if mounted**
+`/mnt/isilon`:
+
+```bash
+cd ~/Documents/reachAQ
+conda activate reachaq
+reachaq-animal-metadata setup --kind softmouse
+```
+
+The password stored by the old publisher is still found, so it can be left
+empty. Until this is done the timer's run stops with "This computer reads a
+shared publication, so it has nothing to publish".
 
 The nightly publisher unit no longer waits for `/mnt/isilon` by itself. Restore
 that with a drop-in:
