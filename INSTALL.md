@@ -36,6 +36,10 @@ any time, with the same kind of report:
 The DeepLabCut plugin also installs TensorFlow's CUDA runtime and checks
 TensorFlow on the GPU and both engines in one process.
 
+`REACHAQ_POSE_BACKEND` (`tensorflow` or `torch`) applies to DeepLabCut models only; a
+keypoint or YOLO model always runs on PyTorch. To write a plugin for another
+engine, see [plugins/README.md](plugins/README.md).
+
 Install the NVIDIA driver first, so the GPU checks can pass; see the
 [NVIDIA guide](docs/linux-install/nvidia-inference.md). If the installer adds
 you to `dialout` or the real-time group, log out and back in once and run it
@@ -68,7 +72,8 @@ installer again. Rerunning is always safe:
 - the pose plugins the environment had are reinstalled from the checkout, into
   the rebuilt environment too. An environment from before the plugins existed
   gets the DeepLabCut plugin if it has `deeplabcut` installed and the YOLO
-  plugin if it has `ultralytics`.
+  plugin if it has `ultralytics`. If the installer cannot tell which plugins
+  the environment has, it reports a FAIL for that step rather than restoring none.
 
 To run an archived environment instead:
 
