@@ -9,6 +9,7 @@ import verboselogs
 
 from autotrainer.behavior.pellet_shift import ShiftXYZBufferHandler
 from autotrainer.core import get_verbose_logger, ProjectInfo
+from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.configuration.behavior_configuration import ShiftXYZBufferHandlerConfig
 from autotrainer.core.logging import setup_logging, get_console_handler
@@ -25,7 +26,7 @@ def main():
     parser.add_argument("session", type=int)
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--calib-dir", type=Path,
-                        default=Path.home().joinpath("Autotrainer", DEFAULT_3D_CALIB_DIR_NAME))
+                        default=DEFAULT_CONFIG_DIR.expanduser().joinpath(DEFAULT_3D_CALIB_DIR_NAME))
     parser.add_argument("--log-level", type=lambda val: int(val) if val.isdigit() else val,
                         default=logging.WARNING)
     parser.add_argument("--analysis-debug-level", type=int, help="integer", default=0)

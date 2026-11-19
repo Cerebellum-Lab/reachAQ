@@ -5,10 +5,29 @@ import openpyxl
 import pytest
 
 from tools.acquisition.model.animal_registry import AnimalRegistry, RegistrySchemaError
-from tools.acquisition.model.softmouse_spreadsheet_source import (
+from tools.acquisition.model.animal_sources.mapping import (
+    AnimalTableMapper,
+    ColumnMapping,
     ImportGuardrails,
-    SoftMouseSpreadsheetSource,
+    SourceTable,
+    read_table_file,
+    softmouse_mapping,
 )
+
+
+class SoftMouseSpreadsheetSource:
+    """The SoftMouse mapping applied to an export file, as a source does."""
+
+    def __init__(self, guardrails=ImportGuardrails()):
+        self.mapper = AnimalTableMapper(softmouse_mapping(), guardrails, provider="softmouse")
+
+    def _read(self, path):
+        return read_table_file(path)
+
+    def preview(self, path, *, previous_source_row_count=None):
+        return self.mapper.preview_table(
+            self._read(path), previous_source_row_count=previous_source_row_count
+        )
 
 
 TAG_A = "360002353933099"
@@ -78,10 +97,11 @@ def test_source_rejects_numeric_rfid_cells_to_prevent_precision_loss(tmp_path):
     # CSV values are text by definition; exercise the spreadsheet cell guard
     # without requiring openpyxl in the test environment.
     source = SoftMouseSpreadsheetSource()
-    source._read_rows = lambda _path: (
-        HEADERS,
-        [tuple(row("PT-1", 12345678901234567890123456))],
-        "Animal List",
+    source._read = lambda _path: SourceTable(
+        headers=HEADERS,
+        rows=[tuple(row("PT-1", 12345678901234567890123456))],
+        content_sha256="0" * 64,
+        source_name="numeric.xlsx",
     )
     with pytest.raises(ValueError, match="numeric cell"):
         source.preview(path)
@@ -190,3 +210,88 @@ def test_registry_readers_see_old_or_new_transaction_not_partial_state(tmp_path)
         writer.close()
 
     assert registry.resolve_rfid(TAG_A) is None
+
+
+def test_a_v1_cache_migrates_in_place_and_keeps_its_records(tmp_path):
+    path = tmp_path / "cache.sqlite3"
+    export = tmp_path / "animals.csv"
+    write_export(export, [row("PT-1", TAG_A)])
+    registry = AnimalRegistry(path)
+    registry.replace(SoftMouseSpreadsheetSource().preview(export).batch)
+    with sqlite3.connect(path) as db:
+        # Recreate the v1 table, where physical_rfid was NOT NULL.
+        db.executescript(
+            """
+            ALTER TABLE external_animals RENAME TO new_table;
+            CREATE TABLE external_animals (
+                provider TEXT NOT NULL, subject_id_kind TEXT NOT NULL,
+                subject_id TEXT NOT NULL, physical_rfid TEXT NOT NULL,
+                name_candidate TEXT, state TEXT NOT NULL, record_json TEXT NOT NULL,
+                source_hash TEXT NOT NULL, first_seen_import_id TEXT NOT NULL,
+                last_seen_import_id TEXT NOT NULL,
+                current INTEGER NOT NULL CHECK(current IN (0, 1)),
+                PRIMARY KEY(provider, subject_id_kind, subject_id)
+            );
+            INSERT INTO external_animals SELECT * FROM new_table;
+            DROP TABLE new_table;
+            PRAGMA user_version=1;
+            """
+        )
+
+    migrated = AnimalRegistry(path)
+
+    assert migrated.resolve_rfid(TAG_A).identity.subject_id == "PT-1"
+    with sqlite3.connect(path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        notnull = {r[1]: r[3] for r in db.execute("PRAGMA table_info(external_animals)")}
+    assert notnull["physical_rfid"] == 0
+
+
+def _generic_batch(rows, provider="spreadsheet"):
+    mapper = AnimalTableMapper(
+        ColumnMapping(
+            external_identity_column="Physical Tag",
+            new_animal_name_column="Physical Tag",
+            rfid_column="Plate ID",
+            state_column="State",
+        ),
+        provider=provider,
+    )
+    return mapper.preview_table(
+        SourceTable(
+            headers=("Physical Tag", "Plate ID", "State"),
+            rows=rows,
+            content_sha256=str(len(rows)) * 64,
+            source_name="lab.csv",
+        )
+    ).batch
+
+
+def test_records_without_rfid_are_cached_and_listed_but_not_resolvable(tmp_path):
+    registry = AnimalRegistry(tmp_path / "cache.sqlite3")
+
+    registry.replace(_generic_batch([("M-1", "", "Stock"), ("M-2", TAG_A, "Stock")]))
+
+    records = {r.identity.subject_id: r for r in registry.list_current_records()}
+    assert set(records) == {"M-1", "M-2"}
+    assert records["M-1"].physical_rfid is None
+    assert registry.resolve_rfid(TAG_A).identity.subject_id == "M-2"
+
+
+def test_switching_sources_retires_the_previous_providers_records(tmp_path):
+    export = tmp_path / "animals.csv"
+    write_export(export, [row("PT-1", TAG_A)])
+    registry = AnimalRegistry(tmp_path / "cache.sqlite3")
+    softmouse = SoftMouseSpreadsheetSource().preview(export).batch
+    registry.replace(softmouse)
+
+    registry.replace(_generic_batch([("M-9", TAG_B, "Stock")]))
+
+    assert registry.resolve_rfid(TAG_A) is None
+    assert [r.identity.subject_id for r in registry.list_current_records()] == ["M-9"]
+
+    # Switching back to the same SoftMouse snapshot imports it again.
+    result = registry.replace(SoftMouseSpreadsheetSource().preview(export).batch)
+    assert not result.unchanged
+    assert registry.resolve_rfid(TAG_A).identity.subject_id == "PT-1"
+    assert registry.resolve_rfid(TAG_B) is None

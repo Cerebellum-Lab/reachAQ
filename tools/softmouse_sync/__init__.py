@@ -1,4 +1,4 @@
-"""Browserless SoftMouse export publication job."""
+"""The SoftMouse HTTPS client used by the SoftMouse animal metadata source."""
 
 import sys
 from pathlib import Path
@@ -26,12 +26,9 @@ from .https_source import (
     SoftMouseHttpsConfiguration,
     SoftMouseHttpsSource,
 )
-from .publisher import PublicationResult, SoftMouseExportPublisher
 
 __all__ = [
-    "PublicationResult",
     "SoftMouseCredentials",
-    "SoftMouseExportPublisher",
     "SoftMouseHttpsConfiguration",
     "SoftMouseHttpsSource",
 ]

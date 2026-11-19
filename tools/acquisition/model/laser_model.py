@@ -101,7 +101,7 @@ class ArmedManualPulse:
     """A manual Run Pulse armed while its button is pressed (LaserModel.arm_manual_pulse).
 
     fire() starts it at the click, on the thread that decides, the Qt thread:
-    one DAQmx start, its edge about 0.6 ms later (christielab10, M3 A), where
+    one DAQmx start, its edge about 0.6 ms later (reference rig, M3 A), where
     a click that armed, wrote and started the train took 12-18 ms (session004;
     M3 B). disarm() asks for it to be let go unfired. finish(), on the thread
     that armed it, makes that cancel, waits for its end and tells how it
@@ -775,7 +775,7 @@ class LaserModel(ObservableObject):
         With no line the margins are ignored, so the pulse fires without
         them, and that is said once for each laser of each controller. Run
         Pulse followed a checkbox of its own, and a trial with margins failed
-        on christielab10, which has no PMT line ("PMT shutter output
+        on the reference rig, which has no PMT line ("PMT shutter output
         requested, but laser pmt_shutter_output is not configured").
         """
         lead_ms = float(profile.pmt_open_lead_ms)

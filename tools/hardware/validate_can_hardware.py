@@ -134,7 +134,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--motor-config",
         type=Path,
-        default=Path("~/Autotrainer/motor_config.yaml"),
+        default=MotorConfigurationFile.DEFAULT_LOCATION,
         help="Motor configuration YAML used by write-motor-config.",
     )
     parser.add_argument("--position", type=float, default=0.0, help="Position for set/move actions.")

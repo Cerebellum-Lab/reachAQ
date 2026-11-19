@@ -97,7 +97,7 @@ def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str
             # it is as soon as the laser loads - starting a child with the
             # inherited environment fails at exec with "[Errno 14] Bad
             # address" naming the Python executable. Measured on
-            # christielab10: default run fails, env=os.environ.copy()
+            # The reference rig: default run fails, env=os.environ.copy()
             # succeeds, in the same process moments apart. Passing an
             # environment makes CPython build a fresh envp rather than hand
             # the child the one NI has been in.
@@ -313,7 +313,7 @@ def _analog_output_readbacks(physical_channel_class, device
 
     NI names the internal channel `<device>/_ao<n>_vs_aognd`, and does not
     list it among the physical channels, so the only way to know whether one
-    exists is to name it and see. Measured on christielab10: a PXI-6221
+    exists is to name it and see. Measured on the reference rig: a PXI-6221
     answers for ao0 and ao1, and a PXI-6713 answers for none of its eight -
     it has no analog input subsystem to route them through, so its outputs
     can only be seen by a cable back into another board.

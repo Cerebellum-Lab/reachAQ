@@ -6,7 +6,9 @@ import pytest
 
 from tools.acquisition.model.animal_metadata_sync import AnimalMetadataSyncService
 from tools.acquisition.model.animal_registry import AnimalRegistry
-from tools.acquisition.model.softmouse_spreadsheet_source import SoftMouseSpreadsheetSource
+from tools.acquisition.model.animal_sources.config import SourceConfiguration, build_source
+from tools.acquisition.model.animal_sources.credentials import CredentialStore
+from tools.acquisition.model.animal_sources.mapping import softmouse_mapping
 
 
 TAG = "360002353933099"
@@ -36,10 +38,13 @@ def publish(directory, *, digest_override=None, total_rows=None, tagged_rows=Non
 
 
 def service(tmp_path, manifest, can_refresh=lambda: True):
+    configured = build_source(
+        SourceConfiguration("publication", {"manifest": str(manifest)}, softmouse_mapping()),
+        credentials=CredentialStore(keyring_backend=False, fallback_path=tmp_path / "secrets.json"),
+    )
     return AnimalMetadataSyncService(
-        manifest_path=manifest,
+        configured=configured,
         local_staging_directory=tmp_path / "local",
-        source=SoftMouseSpreadsheetSource(),
         registry=AnimalRegistry(tmp_path / "registry.sqlite3"),
         can_refresh=can_refresh,
     )

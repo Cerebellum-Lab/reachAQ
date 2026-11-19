@@ -12,7 +12,7 @@ from PySide6 import QtCore
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QWidget, QFormLayout, QLineEdit, QComboBox, QLabel, QHBoxLayout, QPushButton,
                                QTabWidget, QVBoxLayout, QCheckBox, QDoubleSpinBox, QSpinBox, QGridLayout,
-                               QLayout, QSizePolicy, QGroupBox, QFileDialog)
+                               QLayout, QSizePolicy, QGroupBox, QFileDialog, QDialog)
 
 from autotrainer.behavior.pellet_trial import (
     AttemptAssignmentPolicy,
@@ -29,9 +29,11 @@ from autotrainer.pyside.content_widget import invoke_method
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import SessionRecordingStatus
 from tools.acquisition.model.user_preferences import UserPreferences
-from tools.acquisition.view.softmouse_publication_controller import (
-    SoftMousePublicationController,
+from tools.acquisition.model.animal_sources.config import (
+    build_source,
+    load_source_configuration,
 )
+from tools.acquisition.view.animal_source_setup_dialog import AnimalSourceSetupDialog
 
 logger = get_verbose_logger(__name__)
 
@@ -90,7 +92,7 @@ class PreferencesContent(QWidget):
         # slot of the object being destroyed, so a bound method here never
         # ran. The closed window then stayed subscribed, and the next
         # ready -> arming called it on deleted tabs and left Record stuck at
-        # arming (christielab10, 2026-10-02).
+        # arming (reference rig, 2026-10-02).
         app_model = self._app_model
         callback = self._session_status_callback
 
@@ -642,96 +644,57 @@ class PreferencesContent(QWidget):
         form = QFormLayout(None)
         form.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
 
-        self._softmouse_manifest_edit = QLineEdit()
-        self._softmouse_manifest_edit.setText(
-            self._preferences.softmouse_manifest_path
+        source_row = QHBoxLayout()
+        self._animal_source_label = QLabel(self._animal_source_description())
+        self._animal_source_label.setWordWrap(True)
+        source_row.addWidget(self._animal_source_label, 1)
+        self._animal_source_setup_button = QPushButton("Set up…")
+        self._animal_source_setup_button.setToolTip(
+            "Choose where this computer reads animal metadata from: SoftMouse, a "
+            "spreadsheet, a database or a shared publication"
         )
-        self._softmouse_manifest_edit.setReadOnly(True)
-        form.addRow("Shared publication:", self._softmouse_manifest_edit)
+        self._animal_source_setup_button.clicked.connect(self._set_up_animal_source)
+        source_row.addWidget(self._animal_source_setup_button)
+        form.addRow("Source:", source_row)
 
-        external = QLineEdit("Physical Tag")
-        external.setReadOnly(True)
-        form.addRow("Permanent external ID:", external)
-        rfid = QLineEdit("Plate ID")
-        rfid.setReadOnly(True)
-        form.addRow("RFID field:", rfid)
-
-        name_field = self._softmouse_name_field = QComboBox()
-        name_field.setEditable(True)
-        for header in (
-            "Physical Tag",
-            "Plate ID",
-            "Cage Tag",
-            "Comment",
-        ):
-            name_field.addItem(header)
-        current = self._preferences.softmouse_name_column
-        index = name_field.findText(current)
-        if index < 0:
-            name_field.addItem(current)
-            index = name_field.findText(current)
-        name_field.setCurrentIndex(index)
-        name_field.currentTextChanged.connect(
-            lambda value: self._app_model.update_user_preference(
-                "softmouse_name_column",
-                value,
-            )
+        daily = self._animal_metadata_daily = QCheckBox(
+            "Refresh this computer's local cache daily"
         )
-        form.addRow("New-animal name field:", name_field)
-
-        nightly = QCheckBox("Refresh this computer's local cache daily")
-        nightly.setChecked(self._preferences.softmouse_nightly_refresh)
-        nightly.toggled.connect(
+        daily.setChecked(self._preferences.softmouse_nightly_refresh)
+        daily.toggled.connect(
             lambda value: self._app_model.update_user_preference(
                 "softmouse_nightly_refresh",
                 value,
             )
         )
-        form.addRow("", nightly)
-        self._softmouse_editable_controls = (name_field, nightly)
+        form.addRow("", daily)
 
         buttons = QHBoxLayout()
-        self._softmouse_refresh_button = QPushButton("Refresh local cache")
-        self._softmouse_refresh_button.clicked.connect(self._refresh_animal_metadata)
-        buttons.addWidget(self._softmouse_refresh_button)
+        self._animal_metadata_refresh_button = QPushButton("Refresh now")
+        self._animal_metadata_refresh_button.setToolTip(
+            "Fetch the source now and replace this computer's local cache"
+        )
+        self._animal_metadata_refresh_button.clicked.connect(self._refresh_animal_metadata)
+        buttons.addWidget(self._animal_metadata_refresh_button)
+        buttons.addStretch(1)
         form.addRow("", buttons)
 
-        self._softmouse_publication_controller = (
-            SoftMousePublicationController.for_model(
-                self._app_model,
-                QtCore.QCoreApplication.instance(),
-            )
-        )
-        self._softmouse_publish_button = QPushButton("Sync from SoftMouse")
-        self._softmouse_publish_button.setToolTip(
-            "Download the current Christie animal list, safely replace the shared "
-            "Isilon publication, and refresh this computer's local cache."
-        )
-        self._softmouse_publish_button.clicked.connect(
-            self._softmouse_publication_controller.start
-        )
-        form.addRow("SoftMouse:", self._softmouse_publish_button)
-        self._softmouse_publication_status = QLabel(
-            self._softmouse_publication_controller.status
-        )
-        self._softmouse_publication_status.setWordWrap(True)
-        form.addRow("Publication:", self._softmouse_publication_status)
-
-        self._softmouse_status = QLabel(self._app_model.animal_metadata_status)
-        self._softmouse_status.setWordWrap(True)
-        form.addRow("Status:", self._softmouse_status)
-        self._softmouse_counts = QLabel("No import preview available")
-        self._softmouse_counts.setWordWrap(True)
-        form.addRow("Rows:", self._softmouse_counts)
-        self._softmouse_mapped_columns = QLabel("—")
-        self._softmouse_mapped_columns.setWordWrap(True)
-        form.addRow("Mapped columns:", self._softmouse_mapped_columns)
-        self._softmouse_ignored_columns = QLabel("—")
-        self._softmouse_ignored_columns.setWordWrap(True)
-        form.addRow("Other columns:", self._softmouse_ignored_columns)
+        self._animal_metadata_status = QLabel(self._app_model.animal_metadata_status)
+        self._animal_metadata_status.setWordWrap(True)
+        form.addRow("Status:", self._animal_metadata_status)
+        self._animal_metadata_counts = QLabel("No import preview available")
+        self._animal_metadata_counts.setWordWrap(True)
+        form.addRow("Rows:", self._animal_metadata_counts)
+        self._animal_metadata_mapped_columns = QLabel("—")
+        self._animal_metadata_mapped_columns.setWordWrap(True)
+        form.addRow("Mapped columns:", self._animal_metadata_mapped_columns)
+        self._animal_metadata_ignored_columns = QLabel("—")
+        self._animal_metadata_ignored_columns.setWordWrap(True)
+        form.addRow("Other columns:", self._animal_metadata_ignored_columns)
         note = QLabel(
-            "Imports are complete/unfiltered snapshots. Rows without RFID and "
-            "animals whose State is Ended are intentionally excluded."
+            "Each refresh is a complete snapshot of the source. Animals whose State "
+            "is ended are left out, and so are animals without an RFID when the "
+            "source is set up to require one."
         )
         note.setWordWrap(True)
         form.addRow("", note)
@@ -740,13 +703,7 @@ class PreferencesContent(QWidget):
             self._on_animal_metadata_model_changed
         )
         self._app_model.property_changed += self._animal_metadata_model_callback
-        self._softmouse_publication_controller.status_changed.connect(
-            self._softmouse_publication_status.setText
-        )
-        self._softmouse_publication_controller.running_changed.connect(
-            self._update_softmouse_button_states
-        )
-        self._update_softmouse_button_states()
+        self._update_animal_metadata_button_states()
         tab = QWidget(None)
         tab.setLayout(form)
         def unsubscribe(*_args):
@@ -763,60 +720,71 @@ class PreferencesContent(QWidget):
             )
         return tab
 
+    def _animal_source_description(self) -> str:
+        try:
+            configuration = load_source_configuration(self._preferences)
+            if configuration is None:
+                return "Not set up"
+            return build_source(configuration).source.describe()
+        except Exception as exc:
+            return f"Setup unreadable: {exc}"
+
     @invoke_method
     def _on_animal_metadata_model_changed(self, name, value, _old):
         if name == self._app_model.Props.ANIMAL_METADATA_STATUS:
-            self._softmouse_status.setText(value)
+            self._animal_metadata_status.setText(value)
         elif name == self._app_model.Props.ANIMAL_METADATA_PREVIEW:
             self._show_animal_metadata_preview(value)
         elif name in {
             self._app_model.Props.SESSION_RECORDING_STATUS,
             self._app_model.Props.ANIMAL_METADATA_REFRESH_BUSY,
         }:
-            self._update_softmouse_button_states()
+            self._update_animal_metadata_button_states()
 
     def _show_animal_metadata_preview(self, preview):
         batch = preview.batch
-        self._softmouse_counts.setText(
-            f"{batch.total_source_rows} total · {batch.accepted_rows} tagged · "
-            f"{batch.ignored_missing_rfid_rows} without RFID · "
-            f"{batch.ignored_ended_rows} ended"
+        with_rfid = sum(record.physical_rfid is not None for record in batch.records)
+        self._animal_metadata_counts.setText(
+            f"{batch.total_source_rows} total · {batch.accepted_rows} imported "
+            f"({with_rfid} with RFID) · {batch.ignored_missing_rfid_rows} skipped "
+            f"without RFID · {batch.ignored_ended_rows} ended"
         )
-        self._softmouse_mapped_columns.setText(
+        self._animal_metadata_mapped_columns.setText(
             ", ".join(preview.mapped_columns) or "—"
         )
-        self._softmouse_ignored_columns.setText(
+        self._animal_metadata_ignored_columns.setText(
             ", ".join(preview.ignored_columns) or "—"
         )
-        for header in preview.source_headers:
-            if header and self._softmouse_name_field.findText(header) < 0:
-                self._softmouse_name_field.addItem(header)
 
-    def _update_softmouse_button_states(self, _running=None):
+    def _update_animal_metadata_button_states(self, _running=None):
         ready = (
             self._app_model.session_recording_status
             is SessionRecordingStatus.READY
         )
-        publishing = self._softmouse_publication_controller.is_running
-        refreshing = self._app_model.animal_metadata_refresh_busy
-        enabled = ready and not publishing and not refreshing
-        self._softmouse_refresh_button.setEnabled(enabled)
-        self._softmouse_publish_button.setEnabled(enabled)
-        for control in self._softmouse_editable_controls:
-            control.setEnabled(enabled)
+        enabled = ready and not self._app_model.animal_metadata_refresh_busy
+        self._animal_metadata_refresh_button.setEnabled(enabled)
+        self._animal_source_setup_button.setEnabled(enabled)
+        self._animal_metadata_daily.setEnabled(enabled)
+
+    def _set_up_animal_source(self):
+        dialog = AnimalSourceSetupDialog(self._preferences, self._animal_source_setup_button)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._animal_source_label.setText(self._animal_source_description())
+        self._apply_animal_metadata_preferences()
 
     def _apply_animal_metadata_preferences(self):
         try:
             self._app_model.apply_animal_metadata_preferences()
         except Exception as exc:
-            self._softmouse_status.setText(f"Configuration failed: {exc}")
+            self._animal_metadata_status.setText(f"Configuration failed: {exc}")
 
     def _refresh_animal_metadata(self):
         try:
             self._app_model.apply_animal_metadata_preferences()
             self._app_model.request_animal_metadata_refresh("manual button")
         except Exception as exc:
-            self._softmouse_status.setText(f"Refresh failed: {exc}")
+            self._animal_metadata_status.setText(f"Refresh failed: {exc}")
 
     def _create_session_control_group(self, algo):
         """Build the operator-facing controls for continuous recording sessions."""

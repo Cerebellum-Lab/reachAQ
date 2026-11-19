@@ -7,6 +7,7 @@ from typing import List, Dict, Optional, Union, ClassVar, TextIO, Type, Any
 from typing_extensions import Self
 import yaml
 
+from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR
 from autotrainer.core.logging import get_verbose_logger
 from . import GenericSafeLoader, SystemConfigurationLoader, SystemConfigurationDumper
 from .watchdog_config import WatchdogConfig
@@ -33,7 +34,7 @@ class SystemConfiguration:
     manage transitions and maintain a consistent interface to applications.
     """
 
-    DEFAULT_CONFIG_DIR: ClassVar[Path] = Path("~/Autotrainer")  # caller/user must expanduser() on it
+    DEFAULT_CONFIG_DIR: ClassVar[Path] = DEFAULT_CONFIG_DIR  # caller/user must expanduser() on it
     DEFAULT_NAME: ClassVar[str] = "system_configuration"
 
     DEFAULT_PATH: ClassVar[Path] = DEFAULT_CONFIG_DIR.joinpath(f"{DEFAULT_NAME}.yaml")  # caller/user must expanduser() on it

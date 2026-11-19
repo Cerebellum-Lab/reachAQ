@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
 from autotrainer.core import ObservableObject
+from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR
 
 from tools.acquisition.model.nidaq_breakout import breakout_for_device
 from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
@@ -206,7 +207,7 @@ class NidaqMonitorSession(ObservableObject):
         """Start the clocked half of the survey.
 
         The static tasks are closed first, and that is not tidiness. Measured
-        on christielab10: with three DI tasks open in this process, spawning
+        on the reference rig: with three DI tasks open in this process, spawning
         the stream worker fails at its first subprocess with "[Errno 14] Bad
         address" naming the Python executable, and with the same tasks closed
         the identical call starts and streams. The cause is somewhere in the
@@ -527,7 +528,7 @@ class NidaqMonitorSession(ObservableObject):
             return Path(path())
         if path:
             return Path(path)
-        return Path.home() / "Autotrainer" / "nidaq_wiring_verification.json"
+        return DEFAULT_CONFIG_DIR.expanduser() / "nidaq_wiring_verification.json"
 
     def wiring_test_command(self, *, open_shutters: bool = False,
                             command_volts: float = 1.0,

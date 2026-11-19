@@ -45,7 +45,7 @@ CLOCK_GROUPS = (("wallToHost", "wall_to_host"), ("niToHost", "ni_to_host"),
 MAX_LISTED_WALL_FITS = 16
 ENVELOPE_BIAS_FLOOR = ("not subtracted; mapped NI times are late by the minimum driver "
                        "delivery delay, whose range a rig's NI delivery calibration records "
-                       "(0.19-0.28 ms on christielab10, loopback 2026-11-13)")
+                       "(0.19-0.28 ms on the reference rig, loopback 2026-11-13)")
 SECONDARY_TRIGGER_DELAY = ("unmeasured; a secondary camera's exposure starts a trigger delay "
                            "(microseconds) after the primary's")
 HOST_ARRIVAL_PAIRING = ("camera-to-NI pairing by host arrival assumes exposureâ†’arrival "
@@ -53,7 +53,7 @@ HOST_ARRIVAL_PAIRING = ("camera-to-NI pairing by host arrival assumes exposureâ†
 HOST_ARRIVAL_PAIRING_REASON = f"{HOST_ARRIVAL_PAIRING} (no camera clock latch)"
 # Threads that inflate nidaq.h5's gzip chunks. Read through h5py one chunk at a
 # time, the two stamp columns and five channels of a 45-minute session took
-# 1.6 s of Stop on christielab10.
+# 1.6 s of Stop on the reference rig.
 INFLATE_THREADS = 8
 
 

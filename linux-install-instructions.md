@@ -16,7 +16,7 @@ Complete only the hardware categories present on the target rig.
 | 1 | Repository | Clone the checkout |
 | 2 | Portable host setup | Run `tools/install/reachaq-linux-install.sh` |
 | 3a | FLIR cameras | [Spinnaker guide](docs/linux-install/flir-spinnaker.md) |
-| 3b | NI DAQ/PXI | [NI-DAQmx and PXI/MXI guide](docs/linux-install/ni-daq-pxi.md) |
+| 3b | NI DAQ/PXI | [NI-DAQmx and PXI/MXI guide](docs/linux-install/ni-daq-pxi.md), including the `intel_iommu=off` boot parameter Intel hosts need for NI DMA |
 | 3c | Pellet CAN | [PEAK SocketCAN guide](docs/linux-install/peak-socketcan.md) |
 | 3d | Live inference | [NVIDIA guide](docs/linux-install/nvidia-inference.md) |
 | 3e | SoftMouse/RFID | [SoftMouse/RFID guide](tools/softmouse_sync/CONFIGURATION_GUIDE.md) |

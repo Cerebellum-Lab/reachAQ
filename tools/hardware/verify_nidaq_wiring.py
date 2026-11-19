@@ -76,8 +76,8 @@ from tools.acquisition.model.nidaq_wiring_verification import (  # noqa: E402
     wiring_points,
 )
 
-DEFAULT_CONFIG = Path.home() / "Autotrainer" / "system_configuration.yaml"
-DEFAULT_RECORD = Path.home() / "Autotrainer" / "nidaq_wiring_verification.json"
+DEFAULT_CONFIG = SystemConfiguration.DEFAULT_PATH.expanduser()
+DEFAULT_RECORD = SystemConfiguration.DEFAULT_CONFIG_DIR.expanduser() / "nidaq_wiring_verification.json"
 
 #: Ports holding every digital line worth watching. port1 and port2 are the
 #: PFI pins on an M-series board, which is where a stimulus trigger lands.
@@ -413,8 +413,8 @@ def inspect_configuration(configuration):
 
 
 #: A laser's board-trigger readback: laserN_trigger, as the channel plan
-#: names it, or laserN_trigger_readback, the custom channel christielab10
-#: acquires it as (tests/christielab10_nidaq_blocks.yaml).
+#: names it, or laserN_trigger_readback, the custom channel the reference rig
+#: acquires it as (the NI block fixture under tests/).
 _TRIGGER_READBACK = re.compile(r"laser\d+_trigger(?:_readback)?")
 #: What a trigger readback's check says when nothing here confirmed it.
 TRIGGER_READBACK_NOT_CHECKED = (

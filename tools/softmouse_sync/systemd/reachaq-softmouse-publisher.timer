@@ -1,5 +1,5 @@
 [Unit]
-Description=Run the reachAQ SoftMouse publisher nightly
+Description=Run the reachAQ animal metadata publisher nightly
 
 [Timer]
 # Midnight Mountain Time; Persistent runs a missed job after the user timer starts.

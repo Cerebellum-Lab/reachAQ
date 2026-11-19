@@ -10,6 +10,7 @@ from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.pose_elements import SceneElement
 from autotrainer.core.reach_event import ReachEvent
 
+from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 
 from autotrainer.inference.analysis.prepare_jetson_data import process_raw_data
@@ -44,7 +45,7 @@ def intersession_process(
     location, _, _ = project.get_session_path()
     logger.info("process intersession pose data using %s", location)
     calib_src_dir = (
-        Path(f"~/Autotrainer/{DEFAULT_3D_CALIB_DIR_NAME}") if calib_dir is None else calib_dir
+        DEFAULT_CONFIG_DIR / DEFAULT_3D_CALIB_DIR_NAME if calib_dir is None else calib_dir
     ).expanduser()
     if not calib_src_dir.is_dir():
         logger.warning("calib_src_dir %s is not a directory",  calib_src_dir)

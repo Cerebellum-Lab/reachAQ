@@ -556,11 +556,11 @@ def test_disabling_analysis_changes_scored_counting_to_completed(app_model):
     assert control.trial_count_basis == "completed"
 
 
-def test_softmouse_refresh_is_a_temporary_recording_blocker(app_model):
+def test_animal_metadata_refresh_is_a_temporary_recording_blocker(app_model):
     with app_model._animal_metadata_refresh_lock:
         app_model._animal_metadata_refresh_busy = True
 
-    assert "SoftMouse animal metadata refresh is still running" in (
+    assert "Animal metadata refresh is still running" in (
         app_model.recording_blockers
     )
 
