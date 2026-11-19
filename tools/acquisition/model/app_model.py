@@ -185,6 +185,11 @@ from tools.acquisition.model.nidaq_wiring_verification import (
 )
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 from tools.acquisition.model.nidaq_stream_autostart import NidaqStreamAutoStart
+from tools.acquisition.model.pose_training_model import (
+    PoseTrainingModel,
+    last_deploy,
+    record_deploy,
+)
 from tools.acquisition.model.nidaq_timing import (
     remap_nidaq_physical_channel,
     resolve_nidaq_device_aliases,
@@ -4661,6 +4666,50 @@ class AppModel(ObservableObject):
         )
         self._inference.model_location = str(value)
         self._save_configuration_soon()
+
+    @property
+    def pose_training(self) -> PoseTrainingModel:
+        """The in-app pose training run, created on first use.
+
+        It may only train while the session is READY, and it is paused when a
+        recording arms: every route into a recording passes through ARMING,
+        and the transition is published synchronously on the thread that
+        starts the recording, so the cameras do not start until the training
+        process has checkpointed and exited.
+        """
+        # Not getattr: Events answers any unknown attribute with an event.
+        training = self.__dict__.get("_pose_training")
+        if training is None:
+            training = self._pose_training = PoseTrainingModel(
+                is_ready=lambda: (
+                    self._recording_session.status is SessionRecordingStatus.READY
+                ),
+            )
+            self.property_changed += self._pause_pose_training_for_recording
+        return training
+
+    def _pause_pose_training_for_recording(self, name, value, _previous) -> None:
+        if (
+            name == self.Props.SESSION_RECORDING_STATUS
+            and value is SessionRecordingStatus.ARMING
+            and not self._pose_training.pause()
+        ):
+            logger.error("pose training did not stop before the recording started")
+
+    def deploy_pose_model(self, path: str) -> None:
+        """Make a trained model the live one, remembering the model it replaces."""
+        self._require_session_ready_for_configuration("Changing the inference model")
+        previous = self._inference.model_location
+        self.set_inference_model_location(path)
+        record_deploy(self.pose_training.models_root, previous, str(path))
+
+    def revert_pose_model(self) -> str:
+        """Go back to the model the last deploy replaced; returns its location."""
+        entry = last_deploy(self.pose_training.models_root)
+        if entry is None:
+            raise RuntimeError("no pose model has been deployed from pose training")
+        self.deploy_pose_model(entry["previous"])
+        return entry["previous"]
 
     @_serialized_session_configuration
     def update_user_preference(self, name: str, value) -> None:

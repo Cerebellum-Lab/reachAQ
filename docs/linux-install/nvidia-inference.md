@@ -67,7 +67,9 @@ authors: [plugins/README.md](../../plugins/README.md).
 
 A keypoint model is a directory holding `weights.pt` and `keypoint_pose.yaml`.
 Point `poseModelLocation` at the directory; the sidecar is how the backend is
-recognised. Train one from labelled frames with:
+recognised. Operators label, train and deploy one inside the app with
+**Tools → Pose Training…** ([guide](../acquisition/pose-training.md)). From a
+terminal, train one from an exported dataset with:
 
 ```bash
 python -m autotrainer.inference.keypoint.train DATASET OUTPUT --bodyparts NAMES

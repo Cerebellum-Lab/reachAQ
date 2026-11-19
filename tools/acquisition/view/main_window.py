@@ -1100,6 +1100,31 @@ class MainWindow(QMainWindow):
         window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         window.show()
 
+    def _open_pose_training(self):
+        """Open the pose training window, or raise the one already open.
+
+        Closing it only hides the view: a training run belongs to the app
+        model and keeps going.
+        """
+        existing = getattr(self, "_pose_training_window", None)
+        if existing is not None:
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
+        # Imported here: the window pulls in the keypoint dataset code, which
+        # the rest of the acquisition UI does not need at start-up.
+        from tools.acquisition.view.pose_training_window import PoseTrainingWindow
+        try:
+            window = PoseTrainingWindow(self._app_model, self)
+        except Exception as exc:
+            logger.exception("Pose training could not be opened: %s", exc)
+            self.statusBar().showMessage(
+                f"Pose training could not be opened: {exc}", 8000)
+            return
+        self._pose_training_window = window
+        window.show()
+
     def _show_preferences(self):
         if (
             self._app_model.session_recording_status
@@ -1222,6 +1247,13 @@ class MainWindow(QMainWindow):
             "NI-DAQ input stream pauses while it is open.")
         action.triggered.connect(self._open_daq_monitor)
 
+        action = self.pose_training_action = QAction("Pose Training…", self)
+        action.setToolTip(
+            "Label frames from recorded sessions, train a live pose model, "
+            "compare it with the current one and make it live. Training "
+            "pauses whenever a recording starts.")
+        action.triggered.connect(self._open_pose_training)
+
         action = self.view_diagnostics_action = QAction("Logging", self)
         action.setToolTip("Show or hide the application logging panel")
         action.setCheckable(True)
@@ -1281,6 +1313,7 @@ class MainWindow(QMainWindow):
 
         tools_menu = menu_bar.addMenu("Tools")
         tools_menu.addAction(self.daq_monitor_action)
+        tools_menu.addAction(self.pose_training_action)
         tools_menu.addSeparator()
         tools_menu.addAction(self.calib_diamond_triangle_action)
         tools_menu.addAction(self.make_3d_calib_action)
