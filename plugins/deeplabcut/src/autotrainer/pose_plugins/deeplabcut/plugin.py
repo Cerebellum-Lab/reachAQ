@@ -1,7 +1,7 @@
 """DeepLabCut as a pose backend plugin.
 
-Still shipped inside core; it moves to its own distribution with the rest of
-this package. Nothing here imports DeepLabCut, TensorFlow or torch at module
+Shipped as the auto-trainer-pose-deeplabcut distribution and found through its
+entry point in the autotrainer.pose_backends group. Nothing here imports DeepLabCut, TensorFlow or torch at module
 scope: discovery imports this module on every rig, and only build() may pay for
 an engine.
 """

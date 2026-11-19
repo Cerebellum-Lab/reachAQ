@@ -22,8 +22,9 @@ from autotrainer.inference.pose_plugins import (
     resolve,
 )
 
-# DeepLabCut and YOLO are still in core, registered after the entry points.
-IN_TREE = ["deeplabcut", "yolo"]
+# YOLO is still in core, registered after the entry points. DeepLabCut is not:
+# it is the auto-trainer-pose-deeplabcut distribution, tested in its plugin.
+IN_TREE = ["yolo"]
 
 
 class _FakeEntryPoint:
@@ -157,7 +158,7 @@ def test_an_entry_point_replaces_the_in_tree_plugin_of_its_name(entry_points):
     external = _plugin("yolo")
     entry_points.append(_FakeEntryPoint("yolo", external))
     found = discover_plugins()
-    assert [p.name for p in found] == ["keypoint", "yolo", "deeplabcut"]
+    assert [p.name for p in found] == ["keypoint", "yolo"]
     assert found[1] is external
     assert broken_plugins() == ()
 
@@ -196,22 +197,59 @@ def test_a_known_layout_without_its_plugin_names_the_install_command(
     assert raised.value.model_path == str(tmp_path)
 
 
-def test_a_claiming_plugin_with_a_missing_engine_names_it(
-        tmp_path, entry_points, monkeypatch):
-    monkeypatch.setattr(pose_plugins, "_installed",
-                        lambda module: module != "deeplabcut")
-    (tmp_path / "config.yaml").write_text("bodyparts: [a]\n")
+def test_a_claiming_plugin_with_a_missing_engine_names_it(tmp_path, entry_points):
+    entry_points.append(_FakeEntryPoint("alpha", _plugin(
+        "alpha", requires=("no_such_engine_xyz",),
+        claims=lambda self, model_path: True)))
     with pytest.raises(PoseBackendNotInstalled) as raised:
         resolve(str(tmp_path))
-    assert raised.value.missing == ("deeplabcut",)
-    assert "reachaq-plugin-install.sh deeplabcut" in str(raised.value)
+    assert raised.value.missing == ("no_such_engine_xyz",)
+    assert raised.value.distribution == "dist-alpha"
+    assert "reachaq-plugin-install.sh alpha" in str(raised.value)
 
 
-def test_a_claiming_plugin_with_its_engine_is_returned(
-        tmp_path, entry_points, monkeypatch):
-    monkeypatch.setattr(pose_plugins, "_installed", lambda module: True)
+def test_a_claiming_plugin_with_its_engine_is_returned(tmp_path, entry_points):
+    plugin = _plugin("alpha", claims=lambda self, model_path: True)
+    entry_points.append(_FakeEntryPoint("alpha", plugin))
+    assert resolve(str(tmp_path)) is plugin
+
+
+def test_deeplabcut_is_no_longer_shipped_in_core():
+    """It left with its distribution; core keeps only the layout to name it.
+
+    The sources are checked rather than find_spec, which an editable install
+    of another checkout can still answer; a stale __pycache__ left by a pull
+    does not count.
+    """
+    assert "deeplabcut" not in [p.name for p in pose_plugins._in_tree_plugins()]
+    inference_package = pathlib.Path(pose_plugins.__file__).resolve().parent
+    assert not list((inference_package / "dlc").glob("*.py"))
+
+
+def test_a_deeplabcut_project_without_its_plugin_names_the_distribution(
+        tmp_path, monkeypatch):
+    """Real discovery and the real in-tree list, so nothing core still ships
+    may claim the project.
+
+    The one thing taken away is the plugin's own entry point, so the test
+    means the same on a machine that has auto-trainer-pose-deeplabcut
+    installed as on one without it.
+    """
+    installed = list(pose_plugins._entry_points())
+    monkeypatch.setattr(pose_plugins, "_entry_points", lambda: [
+        point for point in installed if point.name != "deeplabcut"])
     (tmp_path / "config.yaml").write_text("bodyparts: [a]\n")
-    assert resolve(str(tmp_path)).name == "deeplabcut"
+    (tmp_path / "dlc-models-pytorch").mkdir()
+    reset_discovery()
+    try:
+        with pytest.raises(PoseBackendNotInstalled) as raised:
+            resolve(str(tmp_path))
+    finally:
+        reset_discovery()
+    assert raised.value.engine == "DeepLabCut"
+    assert raised.value.distribution == "auto-trainer-pose-deeplabcut"
+    assert raised.value.missing == ()
+    assert "reachaq-plugin-install.sh deeplabcut" in str(raised.value)
 
 
 def test_an_unrecognised_directory_lists_the_installed_plugins(tmp_path, entry_points):

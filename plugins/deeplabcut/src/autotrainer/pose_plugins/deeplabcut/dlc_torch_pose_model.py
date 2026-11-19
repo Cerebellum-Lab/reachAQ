@@ -31,8 +31,8 @@ import numpy
 
 from autotrainer.core.logging import get_verbose_logger
 
-from ..gpu_capability import detect_gpu_capability, resolve_precision
-from ..pose_model import PoseModel
+from autotrainer.inference.gpu_capability import detect_gpu_capability, resolve_precision
+from autotrainer.inference.pose_model import PoseModel
 
 logger = get_verbose_logger(__name__)
 
@@ -124,7 +124,7 @@ class DlcTorchPoseModel(PoseModel):
         if not self.has_trained_snapshot(self._source):
             # Imported here rather than at module scope: backend_selection is
             # this module's caller, and the name is only needed for a message.
-            from ..backend_selection import POSE_BACKEND_ENV_VAR
+            from autotrainer.inference.backend_selection import POSE_BACKEND_ENV_VAR
 
             logger.error(
                 "source: %s has no trained PyTorch snapshot. %s selects the PyTorch "

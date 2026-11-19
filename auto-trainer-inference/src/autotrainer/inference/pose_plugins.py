@@ -10,9 +10,10 @@ a model from the filesystem and reports what it needs with find_spec, and only
 build() imports the engine.
 
 The keypoint backend is built in and always listed first, so a rig with no
-plugin distribution installed still has one engine. DeepLabCut and YOLO are
-still in core for now, wrapped as in-tree plugins and listed after the
-entry-point ones; an installed distribution of the same name replaces them.
+plugin distribution installed still has one engine. DeepLabCut ships as the
+auto-trainer-pose-deeplabcut distribution. YOLO is still in core for now,
+wrapped as an in-tree plugin and listed after the entry-point ones; an installed
+distribution of the same name replaces it.
 
 A plugin that fails to load must not take live inference down with it: a
 half-removed distribution would otherwise stop every rig that merely has it
@@ -160,11 +161,10 @@ def _in_tree_plugins() -> typing.Tuple[PoseBackendPlugin, ...]:
     distribution.
 
     Imported here rather than at module scope so that importing this module
-    stays cheap; neither plugin module imports its engine.
+    stays cheap; the plugin module does not import its engine.
     """
-    from .dlc.plugin import DLC_PLUGIN
     from .yolo.plugin import YOLO_PLUGIN
-    return (DLC_PLUGIN, YOLO_PLUGIN)
+    return (YOLO_PLUGIN,)
 
 
 def _load(entry_point: typing.Any) -> PoseBackendPlugin:

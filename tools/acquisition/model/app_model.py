@@ -83,7 +83,6 @@ from autotrainer.inference import (
     InferenceStatus,
     PoseResponse,
     calibration_FLIR,
-    DlcPoseModel,
 )
 from autotrainer.inference.backend_selection import (
     available_backends,

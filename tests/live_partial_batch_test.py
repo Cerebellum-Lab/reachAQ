@@ -55,18 +55,6 @@ def test_the_default_is_to_require_a_full_batch():
     assert PoseModel().supports_partial_batch is False
 
 
-def test_a_backend_can_declare_that_it_batches_internally():
-    from autotrainer.inference.dlc import DlcTorchPoseModel
-
-    assert DlcTorchPoseModel("/unused").supports_partial_batch is True
-
-
-def test_the_tensorflow_backend_still_requires_a_full_batch():
-    from autotrainer.inference.dlc import DlcPoseModel
-
-    assert DlcPoseModel("/unused").supports_partial_batch is False
-
-
 @pytest.mark.parametrize("supports_partial", [True, False])
 def test_the_crop_decorator_passes_the_capability_through(supports_partial):
     """A decorator answering for itself would strand the capability."""

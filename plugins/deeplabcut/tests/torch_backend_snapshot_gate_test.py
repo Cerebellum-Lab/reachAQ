@@ -14,7 +14,7 @@ torch merely to discover that it cannot run.
 
 import pytest
 
-from autotrainer.inference.dlc import DlcTorchPoseModel
+from autotrainer.pose_plugins.deeplabcut import DlcTorchPoseModel
 
 
 def _project(tmp_path, *, pytorch_snapshot=False, tensorflow_only=False):
@@ -90,12 +90,15 @@ def test_the_check_does_not_import_deeplabcut_or_torch(tmp_path):
     import pathlib
 
     project = _project(tmp_path, pytorch_snapshot=True)
-    repo = pathlib.Path(__file__).resolve().parents[1]
+    # plugins/deeplabcut/tests/torch_backend_snapshot_gate_test.py
+    plugin = pathlib.Path(__file__).resolve().parents[1]
+    repo = plugin.parents[1]
     script = (
         "import sys\n"
         f"sys.path[:0] = [r'{repo / 'auto-trainer-core' / 'src'}', "
-        f"r'{repo / 'auto-trainer-inference' / 'src'}']\n"
-        "from autotrainer.inference.dlc import DlcTorchPoseModel\n"
+        f"r'{repo / 'auto-trainer-inference' / 'src'}', "
+        f"r'{plugin / 'src'}']\n"
+        "from autotrainer.pose_plugins.deeplabcut import DlcTorchPoseModel\n"
         f"assert DlcTorchPoseModel.has_trained_snapshot(r'{project}')\n"
         "leaked = [n for n in ('deeplabcut', 'torch') if n in sys.modules]\n"
         "print(','.join(leaked))\n"
@@ -109,7 +112,7 @@ def test_the_check_does_not_import_deeplabcut_or_torch(tmp_path):
 
 def test_the_tensorflow_backend_is_unaffected(tmp_path):
     """A TensorFlow project must keep validating as it always did."""
-    from autotrainer.inference.dlc import DlcPoseModel
+    from autotrainer.pose_plugins.deeplabcut import DlcPoseModel
 
     project = _project(tmp_path, tensorflow_only=True)
     assert DlcPoseModel(str(project)).is_valid() is True

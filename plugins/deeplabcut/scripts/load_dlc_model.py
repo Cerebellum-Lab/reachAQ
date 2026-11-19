@@ -1,7 +1,8 @@
 import logging
 import sys
 
-from autotrainer.inference import DlcPoseModel, PoseModel, MemoryPoseModel
+from autotrainer.inference import PoseModel, MemoryPoseModel
+from autotrainer.pose_plugins.deeplabcut import DlcPoseModel
 
 logging.getLogger("autotrainer").setLevel(logging.DEBUG)
 

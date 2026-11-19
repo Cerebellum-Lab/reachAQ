@@ -4,7 +4,7 @@ import typing
 
 import numpy
 
-from ..pose_model import PoseModel
+from autotrainer.inference.pose_model import PoseModel
 
 logger = logging.getLogger(__name__)
 

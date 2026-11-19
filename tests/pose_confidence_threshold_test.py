@@ -16,6 +16,10 @@ One constant cannot serve both.
 The threshold is therefore injected, with a per-backend default and an
 environment override, because the scale belongs to the trained model rather
 than to the engine.
+
+The DeepLabCut plugin's per-runtime and per-backbone tables, and the
+measurements behind them, are tested with the plugin
+(plugins/deeplabcut/tests/test_confidence_threshold.py).
 """
 
 import pytest
@@ -29,18 +33,7 @@ from autotrainer.inference.backend_selection import (
     TORCH_BACKEND,
     confidence_threshold,
 )
-from autotrainer.inference.dlc.plugin import (
-    DEFAULT_CONFIDENCE_THRESHOLDS,
-    TORCH_MODEL_CONFIDENCE_THRESHOLDS,
-    trained_model_name,
-)
 from autotrainer.inference.pose_algorithm import PoseAlgorithm
-
-
-@pytest.fixture
-def engines(monkeypatch):
-    """DeepLabCut and both of its engines, so a project resolves to it."""
-    monkeypatch.setattr(pose_plugins, "_installed", lambda module: True)
 
 
 def _project(root, model_name=None):
@@ -62,27 +55,13 @@ def test_each_backend_has_its_own_default():
 
 
 def test_the_tensorflow_default_is_unchanged():
-    """Every deployed rig runs this engine; moving it changes live behaviour."""
-    assert DEFAULT_CONFIDENCE_THRESHOLDS[TENSORFLOW_BACKEND] == 0.9
+    """Every deployed rig runs this engine; moving it changes live behaviour.
+
+    The DeepLabCut plugin's own table is checked in its tests.
+    """
+    assert confidence_threshold(TENSORFLOW_BACKEND, {}) == 0.9
     assert PoseAlgorithm.MIN_CONFIDENCE_PRESENT_THRESHOLD == 0.9
     assert PoseAlgorithm.MIN_CONFIDENCE_PLOT_THRESHOLD == 0.9
-
-
-def test_the_torch_default_would_not_discard_most_keypoints():
-    """At 0.9 the PyTorch engine keeps 8.3% of keypoints; at 0.6 it keeps 91%."""
-    assert DEFAULT_CONFIDENCE_THRESHOLDS[TORCH_BACKEND] < 0.9
-
-
-def test_the_threshold_follows_the_selected_backend(engines, tmp_path):
-    # Unset now resolves from what is installed, so pin it: otherwise this
-    # asserts TensorFlow's scale on a rig that would run torch.
-    project = _project(tmp_path)
-    assert confidence_threshold(
-        None, {POSE_BACKEND_ENV_VAR: "torch"}, model_path=project) == 0.6
-    assert confidence_threshold(
-        None, {POSE_BACKEND_ENV_VAR: "tensorflow"}, model_path=project) == 0.9
-    assert confidence_threshold(
-        None, {}, model_path=project) == 0.9, "unset prefers TensorFlow"
 
 
 def test_a_project_without_its_engine_falls_back_rather_than_raising(monkeypatch, tmp_path):
@@ -175,60 +154,6 @@ def test_the_env_var_name_is_stable():
     assert POSE_CONFIDENCE_THRESHOLD_ENV_VAR == "REACHAQ_POSE_CONFIDENCE_THRESHOLD"
 
 
-# --- per-model thresholds -----------------------------------------------------
-#
-# The per-backend default was provisional: it was measured on 24 frames that
-# were in the training set of both models, which compares the engines fairly
-# but does not calibrate either. Re-measured on the 19 held-out frames of the
-# curated project, scoring every labelled keypoint:
-#
-#   gate   resnet_50 pass / median   cspnext_s pass / median   cspnext RH_grab
-#   0.10        97.5% / 1.56 px           93.4% / 3.73 px            97%
-#   0.30        90.1% / 1.46 px           27.3% / 2.99 px            17%
-#   0.60        76.0% / 1.30 px            1.7% / 1.30 px             0%
-#
-# cspnext_s never scores above 0.33, so the 0.6 default discards 98% of its
-# output and holds rh_grab_seen permanently False - the flag a pose-driven
-# reach gate is built on. resnet_50 at 0.6 is not free either: it drops 42% of
-# the RH_grab detections that 0.3 keeps at 1.46 px.
-
-
-def test_a_known_torch_model_refines_the_backend_default(engines, tmp_path):
-    """The score scale belongs to the trained model, not to the engine."""
-    assert confidence_threshold(
-        TORCH_BACKEND, {}, model_path=_project(tmp_path / "a", "cspnext_s")) == 0.1
-    assert confidence_threshold(
-        TORCH_BACKEND, {}, model_path=_project(tmp_path / "b", "resnet_50")) == 0.3
-
-
-def test_the_cspnext_default_does_not_discard_the_whole_model():
-    """At 0.6 cspnext_s passes 1.7% of keypoints and no RH_grab at all."""
-    assert TORCH_MODEL_CONFIDENCE_THRESHOLDS["cspnext_s"] <= 0.15
-
-
-def test_an_unknown_model_falls_back_to_the_backend_default(engines, tmp_path):
-    """A retrain on a net_type nobody has measured must not silently shift."""
-    assert confidence_threshold(
-        TORCH_BACKEND, {}, model_path=_project(tmp_path / "a", "hrnet_w32")) == 0.6
-    assert confidence_threshold(
-        TORCH_BACKEND, {}, model_path=_project(tmp_path / "b")) == 0.6
-    assert confidence_threshold(
-        TORCH_BACKEND, {}, model_path=_project(tmp_path / "c", "")) == 0.6
-
-
-def test_a_model_name_does_not_move_the_tensorflow_default(engines, tmp_path):
-    """These were measured under the PyTorch engine; TensorFlow saturates at 1.0."""
-    assert confidence_threshold(
-        TENSORFLOW_BACKEND, {}, model_path=_project(tmp_path, "resnet_50")) == 0.9
-
-
-def test_an_explicit_override_still_wins_over_a_per_model_default(engines, tmp_path):
-    environ = {POSE_CONFIDENCE_THRESHOLD_ENV_VAR: "0.25"}
-    assert confidence_threshold(
-        TORCH_BACKEND, environ,
-        model_path=_project(tmp_path, "cspnext_s")) == pytest.approx(0.25)
-
-
 def test_the_backbone_is_read_by_the_plugin_not_passed_in():
     """model_name is gone: the DeepLabCut plugin reads the backbone itself.
 
@@ -252,75 +177,3 @@ def _write_backbone(train_folder, model_name):
         yaml.safe_dump({"model": {"backbone": {"model_name": model_name}}})
     )
 
-
-def test_trained_model_name_reads_the_backbone_from_the_project(tmp_path):
-    train = (tmp_path / "dlc-models-pytorch" / "iteration-2"
-             / "projectSep18-trainset95shuffle3" / "train")
-    train.mkdir(parents=True)
-    (train / "snapshot-200.pt").write_bytes(b"")
-    _write_backbone(train, "cspnext_s")
-    assert trained_model_name(str(tmp_path)) == "cspnext_s"
-
-
-def test_trained_model_name_is_none_when_there_is_nothing_to_read(tmp_path):
-    """Never raises: an unreadable project must fall back, not stop inference."""
-    assert trained_model_name(str(tmp_path)) is None
-    assert trained_model_name(None) is None
-    assert trained_model_name(str(tmp_path / "absent")) is None
-
-
-def test_trained_model_name_ignores_an_untrained_shuffle(tmp_path):
-    """A shuffle with a config but no snapshot is not what would be loaded."""
-    base = tmp_path / "dlc-models-pytorch" / "iteration-2"
-    untrained = base / "projectSep18-trainset95shuffle1" / "train"
-    untrained.mkdir(parents=True)
-    _write_backbone(untrained, "resnet_50")
-    trained = base / "projectSep18-trainset95shuffle3" / "train"
-    trained.mkdir(parents=True)
-    (trained / "snapshot-200.pt").write_bytes(b"")
-    _write_backbone(trained, "cspnext_s")
-    assert trained_model_name(str(tmp_path)) == "cspnext_s"
-
-
-# --- cspnext_m and rtmpose_s -------------------------------------------------
-#
-# Measured the same way, on the project's held-out frames.
-#
-# cspnext_m's score is discriminative - tightening the gate genuinely improves
-# accuracy - so a threshold is a real control on it:
-#
-#   gate   pass    median      gate   pass    median
-#   0.10  99.3%   1.44 px      0.30  84.2%   1.31 px
-#   0.20  96.8%   1.43 px      0.60  51.6%   1.22 px
-#
-# 0.2 keeps 96.8% of keypoints and detects RH_grab in 95%, LH_grab 95%,
-# Pellet 96% and Nose 99% of the frames where they are labelled.
-#
-# rtmpose_s is the opposite and the reason its entry exists at all. Its SimCC
-# head reports 0.325 at the very lowest, so it detects 100% of every bodypart at
-# any gate up to 0.30 - and its error does not move when the gate is tightened:
-# 2.93 px at 0.05 against 2.87 px at 0.90. Rejecting predictions buys nothing,
-# so the entry keeps coverage rather than discarding it for no gain.
-
-
-def test_cspnext_m_uses_its_measured_threshold(engines, tmp_path):
-    assert confidence_threshold(
-        TORCH_BACKEND, {}, model_path=_project(tmp_path, "cspnext_m")) == 0.2
-
-
-def test_rtmpose_keeps_coverage_because_its_gate_buys_nothing(engines, tmp_path):
-    """Its error is flat across thresholds, so rejecting only loses keypoints."""
-    assert TORCH_MODEL_CONFIDENCE_THRESHOLDS["rtmpose_s"] <= 0.3
-    assert confidence_threshold(
-        TORCH_BACKEND, {}, model_path=_project(tmp_path, "rtmpose_s")) == 0.3
-
-
-def test_every_measured_threshold_is_a_usable_probability():
-    for name, value in TORCH_MODEL_CONFIDENCE_THRESHOLDS.items():
-        assert 0.0 < value < 1.0, f"{name} threshold {value} is not usable"
-
-
-def test_the_measured_models_are_the_ones_we_have_trained():
-    """A typo in a key would silently fall back to the backend default."""
-    assert set(TORCH_MODEL_CONFIDENCE_THRESHOLDS) == {
-        "resnet_50", "cspnext_s", "cspnext_m", "rtmpose_s"}

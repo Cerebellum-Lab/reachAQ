@@ -41,7 +41,7 @@ DEFAULT_POSE_BACKEND = TENSORFLOW_BACKEND
 # The gate for a model no plugin can resolve: the DeepLabCut plugin's
 # per-runtime defaults, kept here so a model that cannot run is still gated on
 # the scale of the runtime it was reported under. See
-# autotrainer.inference.dlc.plugin.DEFAULT_CONFIDENCE_THRESHOLDS for the
+# autotrainer.pose_plugins.deeplabcut.plugin.DEFAULT_CONFIDENCE_THRESHOLDS for the
 # measurements.
 _FALLBACK_CONFIDENCE_THRESHOLDS = {
     TENSORFLOW_BACKEND: 0.9,

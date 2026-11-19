@@ -13,7 +13,6 @@ import pytest
 
 from autotrainer.inference import pose_plugins
 from autotrainer.inference.backend_selection import (
-    POSE_BACKEND_ENV_VAR,
     PoseBackendNotInstalled,
     pre_validate_model,
 )
@@ -48,20 +47,6 @@ def test_a_yolo_model_missing_its_weights_still_fails(tmp_path, monkeypatch):
         "imgsz: 256\nweights: best.pt\nbodyparts:\n  - Nose\n")
     with pytest.raises(FileNotFoundError, match="best.pt"):
         pre_validate_model(str(tmp_path))
-
-
-def test_a_deeplabcut_project_is_still_checked_as_one(tmp_path, monkeypatch):
-    """The DeepLabCut path keeps the check it always had."""
-    from autotrainer.inference.dlc import DlcPoseModel
-
-    monkeypatch.setattr(pose_plugins, "_installed", lambda module: True)
-    monkeypatch.setenv(POSE_BACKEND_ENV_VAR, "tensorflow")
-    checked = []
-    monkeypatch.setattr(DlcPoseModel, "pre_validate",
-                        classmethod(lambda cls, location: checked.append(location)))
-    (tmp_path / "config.yaml").write_text("bodyparts: [a]")
-    pre_validate_model(str(tmp_path))
-    assert checked == [str(tmp_path)]
 
 
 def test_a_directory_no_backend_recognises_is_refused(tmp_path):
