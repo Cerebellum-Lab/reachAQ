@@ -5,8 +5,10 @@ longer depends on ultralytics: without this plugin a YOLO model directory is
 refused at pre-validation with a message naming this distribution.
 
 **Licence: AGPL-3.0-only.** This distribution depends on `ultralytics`, which
-is AGPL-3.0, so it is licensed the same way, unlike the rest of reachAQ. It is
-never installed by reachAQ's own installer or CI. Install it only where the
+is AGPL-3.0, so it is licensed the same way, unlike the rest of reachAQ. CI never
+installs it, and reachAQ's installer only when asked
+(`tools/install/reachaq-plugin-install.sh yolo`) or, on an update, into an
+environment that already has it or `ultralytics`. Install it only where the
 AGPL's terms are acceptable; the supported alternative is to retrain the model
 as a keypoint model (`python -m autotrainer.inference.keypoint.train`).
 

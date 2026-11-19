@@ -26,8 +26,8 @@ Complete only the hardware categories present on the target rig.
 The portable installer does **not** install FLIR, NI, PEAK out-of-tree, or
 NVIDIA kernel drivers and does not select camera serials, DAQ channels, CAN
 bitrate, or an inference model. It does install everything that lives in the
-Python environment: both pose engines and their CUDA user-space libraries, and
-the Spinnaker Python binding once the Spinnaker SDK is present. It installs the
+Python environment: PyTorch and its CUDA user-space libraries, the pose plugins
+the environment already had, and the Spinnaker Python binding once the Spinnaker SDK is present. It installs the
 portable `can-utils` and `iproute2` packages, but it does not install or enable
 `reachaq-can.service`; that service is intentionally a separate, reviewed
 hardware step.
@@ -55,7 +55,7 @@ git status --short --branch
 
 The script installs general Ubuntu/Qt/build packages, creates the Python 3.10
 conda environment, installs Python dependencies and the editable project,
-installs both pose engines (PyTorch and TensorFlow) and the YOLO runtime,
+installs PyTorch, reinstalls the pose plugins the environment already had,
 initializes Git LFS, installs the Spinnaker Python binding when the SDK is
 present, creates runtime directories, configures the operator's `dialout`
 membership for USB serial access, and runs generic verification. It also
@@ -71,8 +71,12 @@ cd "$HOME/Documents/reachAQ"
 
 The script accepts no options and attempts every portable category. It
 automatically installs Miniconda when Conda is absent, includes test
-dependencies, runs the focused tests, installs both engines' CUDA user-space
-libraries, and verifies each engine on the GPU, and both in one process. The
+dependencies, runs the focused tests, installs PyTorch's CUDA user-space
+libraries, and verifies PyTorch on the GPU. No pose plugin is installed by
+default; `./tools/install/reachaq-plugin-install.sh deeplabcut` (DeepLabCut,
+with TensorFlow, its CUDA libraries and the GPU checks for both engines) or
+`./tools/install/reachaq-plugin-install.sh yolo` (YOLO-pose, AGPL-3.0) adds one
+to the existing environment at any time. The
 CUDA libraries remain inside the Conda environment; the script does not change
 the kernel driver or install a system-wide CUDA toolkit.
 
@@ -84,6 +88,10 @@ the kernel driver or install a system-wide CUDA toolkit.
   is kept, renamed `reachaq-py<version>-<date>`, and a fresh one is built. Run
   the archive with
   `conda run --no-capture-output -n <archive> python -m reachAQ.app`.
+- The pose plugins the environment had are reinstalled from the checkout, into
+  a rebuilt environment too. An environment from before the plugins existed
+  gets the DeepLabCut plugin if it has `deeplabcut` installed and the YOLO
+  plugin if it has `ultralytics`.
 - `REACHAQ_INSTALL_SYSTEM=0` skips the steps that need root (apt packages,
   groups, limits, systemd) and reports them as `SKIP`. Use it to rerun on a rig
   that already has them, for example after `reachaq-sync`.
@@ -196,8 +204,8 @@ operator selects Running.
   `/etc/default/reachaq-can` retains any intentional rig-specific values.
 - [ ] The application `AUTOTRAINER_CAN_CHANNEL` matches service
   `REACHAQ_CAN_INTERFACE`.
-- [ ] If inference is enabled, the report passes the TensorFlow, PyTorch and
-  both-engines GPU checks.
+- [ ] If inference is enabled, the report passes the PyTorch GPU check, and,
+  with the DeepLabCut plugin, the TensorFlow and both-engines GPU checks.
 - [ ] Configuration contains real serials, aliases, channels, paths, and model.
 - [ ] Output directory exists and is writable by the operator.
 - [ ] GUI launches idle and hardware initialization emits `HARDWARE INIT`

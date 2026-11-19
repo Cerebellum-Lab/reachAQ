@@ -15,8 +15,8 @@ cd "$HOME/Documents/reachAQ"
 That builds everything into a Python 3.10 Conda environment named `reachaq`:
 
 - the application, its Ubuntu and Qt packages, and Git LFS assets;
-- both pose engines DeepLabCut 3 runs, PyTorch and TensorFlow, and the YOLO
-  runtime, each verified on the GPU and together in one process;
+- PyTorch for the built-in keypoint models, verified on the GPU, and the pose
+  plugins the environment already had (see below);
 - the Spinnaker camera binding, when the Spinnaker SDK is installed;
 - closed-loop latency tuning, the `dialout` group for the RFID reader, and
   the desktop icon plus the `reachaq` and `reachaq-sync` commands;
@@ -24,6 +24,17 @@ That builds everything into a Python 3.10 Conda environment named `reachaq`:
 
 It takes no options. Every step is attempted, failures do not stop later
 ones, and a report at the end lists each step as PASS, FAIL or SKIP.
+
+No pose plugin is installed by default. Add one to the existing environment at
+any time, with the same kind of report:
+
+```bash
+./tools/install/reachaq-plugin-install.sh deeplabcut   # DeepLabCut, with its TensorFlow engine
+./tools/install/reachaq-plugin-install.sh yolo         # YOLO-pose; installs AGPL-3.0 ultralytics
+```
+
+The DeepLabCut plugin also installs TensorFlow's CUDA runtime and checks
+TensorFlow on the GPU and both engines in one process.
 
 Install the NVIDIA driver first, so the GPU checks can pass; see the
 [NVIDIA guide](docs/linux-install/nvidia-inference.md). If the installer adds
@@ -53,7 +64,11 @@ installer again. Rerunning is always safe:
 - one on another Python is kept, renamed `reachaq-py<version>-<date>`, and a
   fresh `reachaq` is built beside it;
 - `REACHAQ_INSTALL_SYSTEM=0 ./tools/install/reachaq-linux-install.sh` skips
-  the steps that need root, for a rig that already has them.
+  the steps that need root, for a rig that already has them;
+- the pose plugins the environment had are reinstalled from the checkout, into
+  the rebuilt environment too. An environment from before the plugins existed
+  gets the DeepLabCut plugin if it has `deeplabcut` installed and the YOLO
+  plugin if it has `ultralytics`.
 
 To run an archived environment instead:
 

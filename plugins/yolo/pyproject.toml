@@ -34,3 +34,7 @@ yolo = "autotrainer.pose_plugins.yolo.plugin:YOLO_PLUGIN"
 [tool.setuptools_scm]
 root = "../.."
 git_describe_command = "git describe --tags --dirty --match 'v*' --abbrev=8"
+# Without git metadata (a worktree read from WSL, an sdist) setuptools_scm
+# cannot work out a version and the build fails; the plugin's version is not
+# used for anything, so build as 0.0.0 instead.
+fallback_version = "0.0.0"

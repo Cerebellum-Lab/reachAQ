@@ -35,7 +35,7 @@ and local acquisition data should be configured under
 Install, start and update in three commands - see [INSTALL.md](INSTALL.md):
 
 ```bash
-./tools/install/reachaq-linux-install.sh   # install, or repair; Python 3.10, both pose engines
+./tools/install/reachaq-linux-install.sh   # install, or repair; Python 3.10, PyTorch
 reachaq                                    # start
 reachaq-sync                               # update the checkout
 ```
