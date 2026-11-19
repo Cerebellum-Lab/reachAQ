@@ -35,7 +35,7 @@ and local acquisition data should be configured under
 Install, start and update in three commands - see [INSTALL.md](INSTALL.md):
 
 ```bash
-./tools/install/reachaq-linux-install.sh   # install, or repair; Python 3.10, both pose engines
+./tools/install/reachaq-linux-install.sh   # install, or repair; Python 3.10, PyTorch
 reachaq                                    # start
 reachaq-sync                               # update the checkout
 ```
@@ -100,10 +100,10 @@ utilities. Run them from the repository root in the configured environment.
   hardware.
 * `scripts/can_measure_counts.py` - decoded message-rate diagnostic using the
   same environment-selected CAN transport as reachAQ.
-* `scripts/load_dlc_model.py` - load a DeepLabCut model and print its body-part
-  metadata.
-* `scripts/run_dlc_model.py` - run a DeepLabCut model against paired recorded
-  videos.
+* `plugins/deeplabcut/scripts/load_dlc_model.py` - load a DeepLabCut model and
+  print its body-part metadata. Needs the DeepLabCut plugin installed.
+* `plugins/deeplabcut/scripts/run_dlc_model.py` - run a DeepLabCut model against
+  paired recorded videos. Needs the DeepLabCut plugin installed.
 
 ## Additional Tools
 

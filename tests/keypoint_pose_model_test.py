@@ -12,7 +12,7 @@ import yaml
 
 torch = pytest.importorskip("torch")
 
-from autotrainer.inference import backend_selection  # noqa: E402
+from autotrainer.inference import backend_selection, pose_plugins  # noqa: E402
 from autotrainer.inference.backend_selection import (  # noqa: E402
     KEYPOINT_CONFIDENCE_THRESHOLD,
     TORCH_BACKEND,
@@ -123,13 +123,18 @@ def test_a_keypoint_model_missing_its_weights_fails_pre_validation(tmp_path):
         pre_validate_model(str(tmp_path))
 
 
-def test_a_yolo_model_without_ultralytics_says_why(tmp_path, monkeypatch):
-    """ultralytics is not a dependency any more; the refusal has to name it."""
+def test_a_yolo_model_without_its_plugin_says_why(tmp_path, monkeypatch):
+    """ultralytics is not a dependency any more; the refusal has to name the
+    plugin that carries it and the keypoint trainer that replaces it."""
     (tmp_path / "yolo_pose.yaml").write_text("weights: best.pt\nbodyparts: [Nose]\n")
     (tmp_path / "best.pt").write_bytes(b"")
-    monkeypatch.setattr(backend_selection, "_installed",
-                        lambda module: module != "ultralytics")
-    with pytest.raises(ImportError, match="ultralytics"):
-        pre_validate_model(str(tmp_path))
-    with pytest.raises(ImportError, match="retrain"):
-        build_pose_model(str(tmp_path))
+    monkeypatch.setattr(pose_plugins, "_entry_points", lambda: [])
+    pose_plugins.reset_discovery()
+    try:
+        with pytest.raises(ImportError, match="auto-trainer-pose-yolo") as raised:
+            pre_validate_model(str(tmp_path))
+        assert "autotrainer.inference.keypoint.train" in str(raised.value)
+        with pytest.raises(ImportError, match="reachaq-plugin-install.sh yolo"):
+            build_pose_model(str(tmp_path))
+    finally:
+        pose_plugins.reset_discovery()

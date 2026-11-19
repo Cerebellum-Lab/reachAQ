@@ -10,7 +10,7 @@ from pstats import SortKey, Stats
 import cv2
 import numpy
 
-from autotrainer.inference import DlcPoseModel
+from autotrainer.pose_plugins.deeplabcut import DlcPoseModel
 from numpy import fromfile
 
 logging.basicConfig(level=logging.INFO)

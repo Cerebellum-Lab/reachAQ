@@ -278,8 +278,8 @@ bump past 58 is acceptable.
 |---|---|---|
 | `REACHAQ_CONFIG_DIR` | `~/Autotrainer` | The per-computer settings directory: `system_configuration.yaml`, the motor and move files, `animals/`, the 3D calibration and the hardware tools' records. Every default that names one of those files is built from it (`autotrainer.core.config_directory`). Read at start-up. The installer uses it when `REACHAQ_INSTALL_CONFIG_DIR` is unset. Put it in `runtime.env` so the launcher exports it. |
 | `REACHAQ_STIM_RT_PRIORITY` | `80` | SCHED_FIFO priority for the stim capture loop. `0`, `off` or `false` disables it. See the [latency tuning guide](latency-tuning.md). |
-| `REACHAQ_POSE_BACKEND` | `tensorflow` | Selects the engine a DeepLabCut model runs on: `tensorflow` or `torch`. Both are installed. A keypoint or YOLO model ignores it and always runs on `torch`. Also selects which GPU runtime the live-inference preflight probes, so the two cannot disagree. |
-| `REACHAQ_POSE_CONFIDENCE_THRESHOLD` | per backend | Confidence a keypoint needs to count as present and to enter 3D triangulation. Defaults to 0.9 for `tensorflow` and 0.6 for `torch`, because the engines report on different scales: TensorFlow saturates its likelihood at 1.0 while PyTorch reports a real distribution around 0.77. The PyTorch default is provisional and should be re-derived on held-out frames. |
+| `REACHAQ_POSE_BACKEND` | `tensorflow` where installed, else `torch` | Selects the engine a DeepLabCut model runs on: `tensorflow` or `torch`. It applies to DeepLabCut models only, which need the optional DeepLabCut plugin (`tensorflow` also needs the plugin's TensorFlow engine, which its installer adds). A keypoint or YOLO model ignores it and always runs on `torch`. For a model no installed plugin can run, or no model, it still selects the GPU runtime the live-inference preflight probes, so the two cannot disagree. |
+| `REACHAQ_POSE_CONFIDENCE_THRESHOLD` | per engine | Confidence a keypoint needs to count as present and to enter 3D triangulation. The default comes from the pose backend that runs the model, because every engine reports on its own scale: 0.1 for keypoint and YOLO models, and for DeepLabCut 0.9 on `tensorflow` (which saturates its likelihood at 1.0) and 0.6 on `torch`, with measured per-backbone refinements. The DeepLabCut PyTorch default is provisional and should be re-derived on held-out frames. |
 | `REACHAQ_INFERENCE_ROI` | unset | `x,y,width,height`. Crops live frames to this window before inference and shifts the returned coordinates back into full-frame space. Unset means full frame. |
 | `REACHAQ_CAN_FRAME_LOG` | unset | `1` turns python-can's per-frame log lines back on: every received frame, and the socketcan "tx" line for every sent one. Unset, python-can's logger is held at WARNING, because those lines were about 270 log records a second on the CAN reader thread; python-can's few open and close INFO/DEBUG lines go quiet with them, and its warnings still pass. The application's own CAN lines, such as "CAN reader throughput", and the kernel receive stamps in `device.csv` are unaffected. Applies to `reachaq`, `auto-trainer-local` and `auto-trainer-headless`; `can_console.py` and the pellet-delivery tool still log every frame. Read at start-up, so a diagnostic run needs a restart. |
 
@@ -361,7 +361,9 @@ on the workstation on that date; the hardware entries are from 2026-09-09.
 - Conda environment `reachaq`, built by the portable installer on 2026-09-24
   (verified): Python 3.10.21; torch 2.7.1+cu128 (CUDA 12.8, cuDNN 9.7);
   TensorFlow 2.12.1 with its CUDA 11.8 / cuDNN 8.6 in
-  `lib/reachaq-tensorflow-cuda11`; DeepLabCut 3.0.2; ultralytics 8.4; numpy
+  `lib/reachaq-tensorflow-cuda11`; DeepLabCut 3.0.2; ultralytics 8.4 (both engines were
+  installed then; today no engine is installed by default, see the
+  [pose plugin installer](nvidia-inference.md)); numpy
   1.26.4; PySide6 6.6.3.1; nidaqmx 1.6.0; spinnaker-python 3.2.0.62. Both
   engines pass their GPU checks, alone and in one process; the live YOLO model
   runs at about 4 ms/frame and the DeepLabCut TensorFlow model

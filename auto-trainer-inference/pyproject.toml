@@ -20,7 +20,10 @@ dependencies = [
 
     "auto-trainer-core",
 
-    'deeplabcut >= 3.0, < 4',  # famous deeplab; 3.x carries both engines
+    # DeepLabCut is not here: it ships in the auto-trainer-pose-deeplabcut
+    # plugin (plugins/deeplabcut), with its TensorFlow extra.
+    # Nor is YOLO (an AGPL-3.0 engine): it ships in the
+    # auto-trainer-pose-yolo plugin (plugins/yolo).
     # The live keypoint backend needs nothing here: its framework comes from
     # the extra below, and its trainer reads frames with auto-trainer-video's
     # opencv-python.
@@ -28,44 +31,17 @@ dependencies = [
     'pandas >= 2, < 3',
     'numpy >= 1.23.5, < 2',
 
+    # Core imports both (analysis/prepare_jetson_data.py, calibration_FLIR.py);
+    # they used to arrive only as deeplabcut's transitive dependencies.
+    'scipy >= 1.10, < 2',
+    'scikit-learn >= 1.3, < 2',
+
 ]
 
 [project.optional-dependencies]
-# Both extras are installed together by tools/install/reachaq-linux-install.sh,
-# which is the supported way to build an environment. Three conditions make
-# that work, each found on the reference rig on 2026-09-24:
-#   - TensorFlow's CUDA 11.8 / cuDNN 8.6 go in a directory of their own, not
-#     site-packages/nvidia. The two frameworks' nvidia-* wheels install into
-#     the same directory and the later one overwrote the earlier: TensorFlow
-#     lost libcudnn.so.8 and fell back to the CPU without a word.
-#   - torch must be a CUDA 12.8 build (the installer takes it from the PyTorch
-#     cu128 index). DeepLabCut 3 imports torch on import, so the TensorFlow
-#     engine always shares a process with it, and the CUDA 13 build aborted
-#     TensorFlow there ("stack smashing detected").
-#   - TensorFlow 2.12's numpy <= 1.24.3 and typing-extensions < 4.6 caps are
-#     overridden: pyqtgraph, PyTables' blosc2 and albumentations need newer,
-#     and TensorFlow 2.12.1 ran GPU convolutions and a DeepLabCut model with
-#     numpy 1.26.4 and typing-extensions 4.16.
-tensorflow = [
-    'tensorflow >= 2.12, < 2.13',
-    # Capped below 2.13 deliberately: 2.13 pairs with a keras that moved
-    # legacy_tf_layers, which breaks tf_slim's batch_norm and therefore every
-    # DeepLabCut model load ("No module named 'keras.legacy_tf_layers'").
-
-    'tensorpack >= 0.11, < 1',
-    'tf-slim >= 1.1, < 2',
-    # NB: tensorpack and tf-slim are used/required by deeplabcut, even tough they are not depended on by it,
-    # so we explicitly add them here.
-    'imgaug >= 0.4, < 0.5',
-    # DeepLabCut 3's TensorFlow engine imports imgaug and does not declare it.
-]
-# YOLO-pose (Ultralytics) models. Not installed by reachAQ: ultralytics is
-# AGPL-3.0, and the live model is the keypoint backend. Kept so a site that
-# installs it themselves can still run an existing YOLO model; without it a
-# YOLO model directory is refused at pre-validation with a message saying so.
-yolo = [
-    'ultralytics >= 8.4, < 9',
-]
+# Installed alongside the DeepLabCut plugin's tensorflow extra by
+# tools/install/reachaq-linux-install.sh; the conditions that makes safe are
+# recorded beside that extra in plugins/deeplabcut/pyproject.toml.
 torch = [
     'torch >= 2.7, < 2.8',
     # 2.7 on a CUDA 12.8 build covers compute capability 7.5 through 12.0,

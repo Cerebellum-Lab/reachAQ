@@ -86,14 +86,12 @@ from autotrainer.inference import (
     InferenceStatus,
     PoseResponse,
     calibration_FLIR,
-    DlcPoseModel,
 )
 from autotrainer.inference.backend_selection import (
     available_backends,
     confidence_threshold,
     pre_validate_model,
     selected_backend,
-    trained_model_name,
 )
 from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.config import load_calib_stereo_params
@@ -2287,7 +2285,6 @@ class AppModel(ObservableObject):
             # the pellet never once appeared on the overlay.
             confidence_threshold=confidence_threshold(
                 selected_backend(model_path=model_location),
-                model_name=trained_model_name(model_location),
                 model_path=model_location,
             ),
         )

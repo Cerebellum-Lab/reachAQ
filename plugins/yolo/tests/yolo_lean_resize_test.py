@@ -18,7 +18,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from autotrainer.inference.yolo import YoloPoseModel
+from autotrainer.pose_plugins.yolo import YoloPoseModel
 
 
 class _BrightestPixelGraph:

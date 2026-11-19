@@ -6,6 +6,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SCRIPT = REPO_ROOT / "tools" / "install" / "reachaq-linux-install.sh"
+PLUGIN_LIB = REPO_ROOT / "tools" / "install" / "plugin-install-lib.sh"
 DESKTOP_INSTALL_SCRIPT = REPO_ROOT / "tools" / "install" / "install-reachaq-desktop.sh"
 TOOLS_PROJECT = REPO_ROOT / "tools" / "pyproject.toml"
 DEVICE_PROJECT = REPO_ROOT / "auto-trainer-device" / "pyproject.toml"
@@ -43,7 +44,9 @@ def test_portable_installer_always_attempts_complete_workflow():
 
     assert 'run_step "Install Miniconda" install_miniconda' in source
     assert 'begin_category "Pose engine GPU runtimes"' in source
-    assert 'run_step "Verify TensorFlow GPU preflight"' in source
+    # The TensorFlow steps run only with the DeepLabCut plugin; they live in
+    # the library both installers source.
+    assert 'run_step "Verify TensorFlow GPU preflight"' in PLUGIN_LIB.read_text()
     assert 'run_step "Run focused non-hardware tests"' in source
     assert "[options]" not in source
     assert "--skip-" not in source
@@ -53,6 +56,7 @@ def test_portable_installer_always_attempts_complete_workflow():
 
 def test_portable_installer_builds_python_310_with_both_pose_engines():
     source = INSTALL_SCRIPT.read_text()
+    library = PLUGIN_LIB.read_text()
 
     # Every subproject declares requires-python >= 3.10; a 3.8 default made the
     # editable install fail on a fresh host.
@@ -61,13 +65,15 @@ def test_portable_installer_builds_python_310_with_both_pose_engines():
     # CUDA 12.8 build instead of pip fetching the CUDA 13 one.
     torch_step = source.index('run_step "Install PyTorch pose engine" install_torch_engine')
     assert torch_step < source.index('run_step "Install Python requirements"')
-    assert source.index('run_step "Install TensorFlow pose engine" install_tensorflow_engine') > torch_step
+    # TensorFlow arrives only with a restored DeepLabCut plugin, after torch.
+    assert source.index('run_step "Restore $name pose plugin" install_pose_plugin "$name"') > torch_step
+    assert 'run_step "Install TensorFlow pose engine" install_tensorflow_engine' in library
     assert "download.pytorch.org/whl/cu128" in source
     assert 'run_step "Verify PyTorch GPU preflight" verify_torch_gpu_runtime' in source
-    assert 'run_step "Verify both engines in one process" verify_pose_engines_together' in source
+    assert 'run_step "Verify both engines in one process" verify_pose_engines_together' in library
     # TensorFlow's CUDA 11 libraries must not share site-packages/nvidia with
     # torch's, or the second install overwrites the first.
-    assert '--target "$runtime_dir"' in source
+    assert '--target "$runtime_dir"' in library
     assert 'run_step "Verify Python dependencies" verify_python_dependencies' in source
     assert 'run_step "Install Spinnaker Python binding" install_spinnaker_binding' in source
 

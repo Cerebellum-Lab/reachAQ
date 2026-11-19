@@ -6,12 +6,16 @@
 # configuration (FLIR Spinnaker, NI-DAQ/PXI, PEAK CAN, NVIDIA kernel drivers,
 # and channel mappings). The single no-argument workflow installs every
 # portable component into a Python 3.10 Conda environment: the application,
-# both pose engines DeepLabCut 3 can run (PyTorch and TensorFlow; PyTorch also
-# runs the live keypoint models), TensorFlow's CUDA user-space runtime kept
-# apart from PyTorch's, and all tracked verification.
+# PyTorch for the built-in keypoint backend, and all tracked verification. It
+# installs no pose plugin: tools/install/reachaq-plugin-install.sh adds the
+# DeepLabCut plugin (with its TensorFlow engine and that engine's CUDA
+# user-space runtime, kept apart from PyTorch's) or the YOLO plugin on demand.
 #
 # Rerunning it is the update path. An existing environment on another Python
 # version is kept, renamed <env>-py<version>-<date>, and a fresh one is built.
+# Either way the pose plugins the environment had are reinstalled from this
+# checkout; on the first update after the plugins existed, an environment with
+# deeplabcut or ultralytics installed gets the matching plugin.
 # REACHAQ_INSTALL_SYSTEM=0 skips the steps that need root (apt packages, groups,
 # limits, systemd), for rerunning on a host that already has them.
 #
@@ -44,7 +48,11 @@ PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 REPORT_PRINTED=false
+REPORT_TITLE="reachAQ portable install report"
+REPORT_FOOTER="Hardware-specific kernel drivers/configuration are not installed by this script."
 CONDA_BIN=""
+# Pose plugins the environment had before this run, reinstalled after it.
+PLUGINS_TO_RESTORE=()
 
 if [ "$#" -ne 0 ]; then
     printf '%s\n' \
@@ -53,110 +61,14 @@ if [ "$#" -ne 0 ]; then
     exit 2
 fi
 
-record_result() {
-    local state=$1
-    local name=$2
-    local detail=${3:-}
-    RESULT_STATES+=("$state")
-    RESULT_NAMES+=("$CURRENT_CATEGORY | $name")
-    RESULT_DETAILS+=("$detail")
-    case "$state" in
-        PASS) PASS_COUNT=$((PASS_COUNT + 1)) ;;
-        FAIL) FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
-        SKIP) SKIP_COUNT=$((SKIP_COUNT + 1)) ;;
-    esac
-}
-
-begin_category() {
-    CURRENT_CATEGORY=$1
-    printf '\n============================================================\n'
-    printf '%s\n' "$CURRENT_CATEGORY"
-    printf '============================================================\n'
-}
-
-print_command() {
-    printf 'Command:'
-    printf ' %q' "$@"
-    printf '\n'
-}
-
-run_step() {
-    local name=$1
-    shift
-    printf '\n--- %s\n' "$name"
-    print_command "$@"
-    "$@"
-    local result=$?
-    if [ "$result" -eq 0 ]; then
-        record_result PASS "$name"
-        printf '[PASS] %s\n' "$name"
-    else
-        record_result FAIL "$name" "exit $result"
-        printf '[FAIL] %s (exit %d); continuing\n' "$name" "$result" >&2
-    fi
-    return 0
-}
-
-skip_step() {
-    local name=$1
-    local reason=$2
-    record_result SKIP "$name" "$reason"
-    printf '\n[SKIP] %s: %s\n' "$name" "$reason"
-}
-
-print_report() {
-    if $REPORT_PRINTED; then
-        return
-    fi
-    REPORT_PRINTED=true
-    printf '\n============================================================\n'
-    printf 'reachAQ portable install report\n'
-    printf '============================================================\n'
-    local index
-    for ((index = 0; index < ${#RESULT_NAMES[@]}; index++)); do
-        printf '%-4s  %s' "${RESULT_STATES[$index]}" "${RESULT_NAMES[$index]}"
-        if [ -n "${RESULT_DETAILS[$index]}" ]; then
-            printf ' (%s)' "${RESULT_DETAILS[$index]}"
-        fi
-        printf '\n'
-    done
-    printf '%s\n' '------------------------------------------------------------'
-    printf 'PASS=%d FAIL=%d SKIP=%d\n' \
-        "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
-    printf 'Repository: %s\n' "$INSTALL_REPO"
-    printf 'Conda environment: %s (Python %s)\n' "$INSTALL_ENV" "$INSTALL_PYTHON"
-    printf 'Config directory: %s\n' "$INSTALL_CONFIG_DIR"
-    printf 'Data directory: %s\n' "$INSTALL_DATA_DIR"
-    if [ "$FAIL_COUNT" -gt 0 ]; then
-        printf 'Completed with failures. Review every FAIL entry above.\n'
-    else
-        printf 'Installation and verification completed without reported failures.\n'
-    fi
-    printf '%s\n' 'Hardware-specific kernel drivers/configuration are not installed by this script.'
-}
-
-on_exit() {
-    local result=$?
-    if ! $REPORT_PRINTED; then
-        if [ "$result" -ne 0 ]; then
-            record_result FAIL "Unexpected script termination" "exit $result"
-        fi
-        print_report
-    fi
-}
-
-on_interrupt() {
-    record_result FAIL "Interrupted" "signal received"
-    print_report
-    exit 130
-}
+# shellcheck source=plugin-install-lib.sh
+if ! . "$SCRIPT_DIR/plugin-install-lib.sh"; then
+    printf 'Cannot load %s; the checkout is incomplete.\n' "$SCRIPT_DIR/plugin-install-lib.sh" >&2
+    exit 1
+fi
 
 trap on_exit EXIT
 trap on_interrupt INT TERM
-
-have_command() {
-    command -v "$1" >/dev/null 2>&1
-}
 
 run_as_root() {
     if [ "$(id -u)" -eq 0 ]; then
@@ -274,24 +186,6 @@ ensure_rfid_serial_group() {
         "$INSTALL_OPERATOR was added to dialout. Log out and back in before using the RFID reader."
 }
 
-find_conda() {
-    if have_command conda; then
-        command -v conda
-        return 0
-    fi
-    local candidate
-    for candidate in \
-        "$HOME/anaconda3/bin/conda" \
-        "$HOME/miniconda3/bin/conda" \
-        "$HOME/mambaforge/bin/conda"; do
-        if [ -x "$candidate" ]; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-    return 1
-}
-
 install_miniconda() {
     local machine
     machine=$(uname -m)
@@ -376,10 +270,32 @@ archive_conda_environment() {
     done
     printf 'Run the archived environment with: conda run --no-capture-output -n %s python -m reachAQ.app\n' \
         "$archive_name"
+    # The new environment is built from nothing; it gets the plugins the one
+    # it replaces had. A failed probe must not stop the new environment being
+    # built: it is reported, and the list read before archiving is kept.
+    if ! find_plugins_to_restore "$archive_name"; then
+        record_result FAIL "Find pose plugins to restore from $archive_name" \
+            "probe failed; kept: ${PLUGINS_TO_RESTORE[*]:-none}"
+    fi
 }
 
-conda_run() {
-    "$CONDA_BIN" run --no-capture-output -n "$INSTALL_ENV" "$@"
+# find_plugins_to_restore <env>: sets PLUGINS_TO_RESTORE to the plugins <env>
+# has registered, plus those inferred from engines installed before the
+# plugins existed. An update never strips an engine, so a probe that fails on
+# an existing environment fails this too and leaves PLUGINS_TO_RESTORE as it
+# was; an environment that does not exist yet has none.
+find_plugins_to_restore() {
+    local env=$1
+    local installed legacy found
+    installed=$(installed_pose_plugins "$env") || return
+    legacy=$(legacy_pose_engines "$env") || return
+    found=$(printf '%s\n%s\n' "$installed" "$legacy" | known_plugins_in)
+    PLUGINS_TO_RESTORE=()
+    if [ -n "$found" ]; then
+        mapfile -t PLUGINS_TO_RESTORE <<< "$found"
+    fi
+    printf 'Pose plugins to restore from %s: %s\n' \
+        "$env" "${PLUGINS_TO_RESTORE[*]:-none}"
 }
 
 # requirements.txt holds `-e .`, which pip resolves against the working
@@ -393,58 +309,18 @@ install_editable_package() {
     conda_run python -m pip install -e "$INSTALL_REPO[test]"
 }
 
-# The pins live in the `torch` and `tensorflow` extras of
-# auto-trainer-inference/pyproject.toml; setup.py merges only base
-# dependencies, so they are read from there rather than copied here.
-pose_engine_requirements() {
-    conda_run python - "$INSTALL_REPO/auto-trainer-inference/pyproject.toml" "$1" <<'PY'
-import sys
-
-import tomli
-
-with open(sys.argv[1], "rb") as stream:
-    extras = tomli.load(stream)["project"]["optional-dependencies"]
-print("\n".join(extras[sys.argv[2]]))
-PY
-}
-
-# Both engines DeepLabCut 3 can run, in one environment. The conditions that
-# makes safe are recorded beside the extras in auto-trainer-inference's
-# pyproject.toml; in short: torch from the CUDA 12.8 index, TensorFlow's CUDA
-# runtime kept apart (install_tensorflow_gpu_runtime), and TensorFlow 2.12's
-# stale numpy and typing-extensions caps overridden afterwards.
-install_extra() {
-    local extra=$1
-    shift
-    local requirement packages=()
-    while IFS= read -r requirement; do
-        [ -n "$requirement" ] && packages+=("$requirement")
-    done < <(pose_engine_requirements "$extra")
-    if [ "${#packages[@]}" -eq 0 ]; then
-        printf 'No %s requirements were found in auto-trainer-inference.\n' "$extra" >&2
-        return 1
-    fi
-    conda_run python -m pip install "${packages[@]}" "$@"
-}
-
-# Before the application's own dependencies: DeepLabCut 3 requires torch, and
-# left to resolve it alone pip takes the newest build - CUDA 13, which
-# TensorFlow cannot share a process with - only for this step to replace it,
-# leaving the CUDA 13 libraries behind.
+# The built-in keypoint backend runs on torch, and the DeepLabCut plugin
+# requires it. Installed first, from the `torch` extra of
+# auto-trainer-inference: left to resolve it alone pip takes the newest build -
+# CUDA 13, which TensorFlow cannot share a process with - only for this step to
+# replace it, leaving the CUDA 13 libraries behind.
 install_torch_engine() {
+    local pyproject="$INSTALL_REPO/auto-trainer-inference/pyproject.toml"
     if [ "$(uname -m)" = x86_64 ]; then
-        install_extra torch --index-url https://download.pytorch.org/whl/cu128
+        install_extra "$pyproject" torch --index-url https://download.pytorch.org/whl/cu128
     else
-        install_extra torch
+        install_extra "$pyproject" torch
     fi
-}
-
-install_tensorflow_engine() {
-    install_extra tensorflow || return
-    # Installing TensorFlow 2.12 pulls numpy down to 1.24.3, typing-extensions
-    # to 4.5 and filelock out of DeepLabCut's range. Put all three back.
-    conda_run python -m pip install \
-        'numpy >= 1.26, < 2' 'typing-extensions >= 4.10' 'filelock >= 3.12, < 3.16'
 }
 
 # pip check, with exactly the two TensorFlow caps the installer overrides on
@@ -485,115 +361,6 @@ verify_terminal_commands() {
     "$bin_dir/reachaq-sync" --help >/dev/null
 }
 
-install_tensorflow_gpu_runtime() {
-    if [ "$(uname -m)" != "x86_64" ]; then
-        printf '%s\n' 'The automated TensorFlow CUDA runtime install supports x86_64 only.' >&2
-        return 2
-    fi
-
-    local tensorflow_version
-    tensorflow_version=$(conda_run python -c \
-        'from importlib.metadata import version; print(version("tensorflow"))') || return
-
-    # TensorFlow's tested build table specifies CUDA 11.8 and cuDNN 8.6 for
-    # TensorFlow 2.12 and 2.13. Keep this case explicit: silently installing a
-    # guessed runtime for a newer TensorFlow version is worse than a clear fail.
-    # https://www.tensorflow.org/install/source#gpu
-    case "$tensorflow_version" in
-        2.12.*|2.13.*)
-            ;;
-        *)
-            printf 'TensorFlow %s is not supported by this automated GPU runtime step.\n' \
-                "$tensorflow_version" >&2
-            printf '%s\n' \
-                'Consult https://www.tensorflow.org/install/source#gpu and install matching CUDA/cuDNN versions.' >&2
-            return 3
-            ;;
-    esac
-
-    # TensorFlow 2.12 needs CUDA 11.8 and cuDNN 8.6; PyTorch brings CUDA 12 and
-    # cuDNN 9. Both arrive as nvidia-* wheels that install into the same
-    # site-packages/nvidia directory, so the second install overwrote the
-    # first: on the reference rig libcudnn.so.8 was gone and TensorFlow fell back
-    # to the CPU without a word. The libraries themselves differ by soname
-    # (libcudnn.so.8 and .9, libcublas.so.11 and .12), so TensorFlow's set goes
-    # in a directory of its own, reached only through LD_LIBRARY_PATH, and
-    # neither framework can load the other's.
-    local env_prefix runtime_dir
-    env_prefix=$(conda_run python -c 'import sys; print(sys.prefix)') || return
-    runtime_dir="$env_prefix/lib/reachaq-tensorflow-cuda11"
-    printf 'Installing CUDA 11.8 and cuDNN 8.6 libraries for TensorFlow %s into %s.\n' \
-        "$tensorflow_version" "$runtime_dir"
-    conda_run python -m pip install --upgrade --target "$runtime_dir" \
-        'nvidia-cuda-runtime-cu11==11.8.89' \
-        'nvidia-cuda-cupti-cu11==11.8.87' \
-        'nvidia-cuda-nvrtc-cu11==11.8.89' \
-        'nvidia-cublas-cu11==11.11.3.6' \
-        'nvidia-cufft-cu11==10.9.0.58' \
-        'nvidia-curand-cu11==10.3.0.86' \
-        'nvidia-cusolver-cu11==11.4.1.48' \
-        'nvidia-cusparse-cu11==11.7.5.86' \
-        'nvidia-cudnn-cu11==8.6.0.163' || return
-
-    local nvidia_root="$runtime_dir/nvidia"
-    local site_nvidia_root
-    site_nvidia_root=$(conda_run python -c \
-        'import sysconfig; print(sysconfig.get_paths()["purelib"] + "/nvidia")') || return
-    local tensorflow_library_path
-    tensorflow_library_path="$nvidia_root/cublas/lib:$nvidia_root/cuda_cupti/lib"
-    tensorflow_library_path="$tensorflow_library_path:$nvidia_root/cuda_nvrtc/lib:$nvidia_root/cuda_runtime/lib"
-    tensorflow_library_path="$tensorflow_library_path:$nvidia_root/cudnn/lib:$nvidia_root/cufft/lib"
-    tensorflow_library_path="$tensorflow_library_path:$nvidia_root/curand/lib:$nvidia_root/cusolver/lib:$nvidia_root/cusparse/lib"
-
-    local existing_library_path
-    existing_library_path=$("$CONDA_BIN" env config vars list -n "$INSTALL_ENV" \
-        | sed -n 's/^LD_LIBRARY_PATH = //p')
-    if [ -n "$existing_library_path" ]; then
-        local preserved_library_path=""
-        local library_directory
-        local existing_library_directories=()
-        IFS=: read -r -a existing_library_directories <<< "$existing_library_path"
-        for library_directory in "${existing_library_directories[@]}"; do
-            # Drop this step's own entries, and the site-packages ones an
-            # earlier version of it set - those now hold PyTorch's CUDA 12.
-            case "$library_directory" in
-                "$nvidia_root"/*/lib|"$site_nvidia_root"/*/lib)
-                    ;;
-                *)
-                    if [ -n "$preserved_library_path" ]; then
-                        preserved_library_path="$preserved_library_path:$library_directory"
-                    else
-                        preserved_library_path=$library_directory
-                    fi
-                    ;;
-            esac
-        done
-        if [ -n "$preserved_library_path" ]; then
-            tensorflow_library_path="$tensorflow_library_path:$preserved_library_path"
-        fi
-    fi
-    "$CONDA_BIN" env config vars set -n "$INSTALL_ENV" \
-        "LD_LIBRARY_PATH=$tensorflow_library_path"
-}
-
-verify_tensorflow_gpu_runtime() {
-    conda_run python - <<'PY'
-import tensorflow as tf
-from autotrainer.inference import detect_gpu_runtime
-
-status = detect_gpu_runtime(required_backend="tensorflow")
-print(status)
-if not status.is_available:
-    raise SystemExit(status.error)
-
-with tf.device("/GPU:0"):
-    result = tf.linalg.matmul(tf.ones((128, 128)), tf.ones((128, 128)))
-print("TensorFlow GPU calculation device:", result.device)
-if "GPU:0" not in result.device:
-    raise SystemExit("TensorFlow calculation did not execute on GPU:0")
-PY
-}
-
 # A convolution rather than a matmul, because cuDNN is what the two frameworks
 # fought over, and a matmul never touches it.
 verify_torch_gpu_runtime() {
@@ -611,29 +378,6 @@ result = torch.nn.functional.conv2d(image, torch.ones((4, 3, 3, 3), device="cuda
 torch.cuda.synchronize()
 print("PyTorch GPU convolution device:", result.device,
       "cuDNN", torch.backends.cudnn.version())
-PY
-}
-
-# DeepLabCut 3 imports torch on import, so its TensorFlow engine always runs
-# with both frameworks in one process. That aborted with torch's CUDA 13 build;
-# check it rather than rely on the pins staying right.
-verify_pose_engines_together() {
-    conda_run python - <<'PY'
-import os
-
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-import torch
-import tensorflow as tf
-
-torch_result = torch.nn.functional.conv2d(
-    torch.ones((1, 3, 32, 32), device="cuda"), torch.ones((4, 3, 3, 3), device="cuda"))
-torch.cuda.synchronize()
-with tf.device("/GPU:0"):
-    tf_result = tf.nn.conv2d(tf.ones((1, 32, 32, 3)), tf.ones((3, 3, 3, 4)), 1, "SAME")
-if "GPU:0" not in tf_result.device:
-    raise SystemExit("TensorFlow convolution did not execute on GPU:0")
-print("Both engines in one process: PyTorch on", torch_result.device,
-      "and TensorFlow on", tf_result.device)
 PY
 }
 
@@ -697,8 +441,11 @@ git_lfs_pull() {
     git -C "$INSTALL_REPO" lfs pull
 }
 
+# torch for the built-in keypoint backend, plus the entry-point module of each
+# pose plugin this run restored; those resolve from the checkout too.
 verify_imports() {
-    conda_run python - "$INSTALL_REPO" <<'PY'
+    conda_run python - "$INSTALL_REPO" "${PLUGINS_TO_RESTORE[@]}" <<'PY'
+import importlib
 import sys
 from pathlib import Path
 
@@ -717,8 +464,11 @@ import autotrainer.video
 import reachAQ
 import tools
 
+plugins = [importlib.import_module(f"autotrainer.pose_plugins.{name}.plugin")
+           for name in sys.argv[2:]]
+
 repository = Path(sys.argv[1]).resolve()
-for module in (autotrainer.core, autotrainer.device, autotrainer.video, reachAQ, tools):
+for module in (autotrainer.core, autotrainer.device, autotrainer.video, reachAQ, tools, *plugins):
     module_file = getattr(module, "__file__", None)
     locations = [Path(module_file).resolve()] if module_file else [
         Path(value).resolve() for value in module.__path__ if Path(value).exists()
@@ -818,6 +568,7 @@ run_focused_tests() {
             tests/instance_lock_test.py \
             tests/nidaq_port_configuration_dialog_test.py \
             tests/reachaq_linux_install_test.py \
+            tests/reachaq_plugin_install_test.py \
             tests/rfid_app_model_test.py \
             tests/signal_stream_ui_test.py \
             tests/softmouse_https_source_test.py \
@@ -867,39 +618,41 @@ fi
 if [ -z "$CONDA_BIN" ]; then
     record_result FAIL "Locate conda" "not found after automatic Miniconda installation attempt"
     printf '\n[FAIL] Locate conda: dependent steps will be skipped\n' >&2
+    skip_step "Find pose plugins to restore" "conda unavailable"
     skip_step "Create conda environment" "conda unavailable"
     skip_step "Upgrade Python packaging tools" "conda unavailable"
     skip_step "Install Python requirements" "conda unavailable"
     skip_step "Install PyTorch pose engine" "conda unavailable"
     skip_step "Install reachAQ editable package" "conda unavailable"
-    skip_step "Install TensorFlow pose engine" "conda unavailable"
 else
     record_result PASS "Locate conda" "$CONDA_BIN"
     printf '\n[PASS] Locate conda: %s\n' "$CONDA_BIN"
+    # Before the environment can be rebuilt or archived; archiving reads the
+    # archive again, which is where the plugins then are.
+    run_step "Find pose plugins to restore" find_plugins_to_restore "$INSTALL_ENV"
     run_step "Create conda environment" ensure_conda_environment
-    # tomli explicitly: pose_engine_requirements reads pyproject.toml with it,
+    # tomli explicitly: pyproject_extra reads pyproject.toml with it,
     # Python 3.10 has no tomllib, and relying on build to pull it in would break
     # silently the day build stops needing it.
     run_step "Upgrade Python packaging tools" conda_run python -m pip install --upgrade pip setuptools wheel build tomli
     run_step "Install PyTorch pose engine" install_torch_engine
     run_step "Install Python requirements" install_python_requirements
     run_step "Install reachAQ editable package" install_editable_package
-    run_step "Install TensorFlow pose engine" install_tensorflow_engine
+    # No plugin is installed by default; only those the environment had. The
+    # DeepLabCut plugin brings the TensorFlow engine, its CUDA runtime and the
+    # both-engines check as steps of their own.
+    for name in "${PLUGINS_TO_RESTORE[@]}"; do
+        run_step "Restore $name pose plugin" install_pose_plugin "$name"
+    done
     run_step "Install reachAQ desktop launcher and terminal commands" install_desktop_launcher
     run_step "Verify reachaq and reachaq-sync commands" verify_terminal_commands
 fi
 
 begin_category "Pose engine GPU runtimes"
 if [ -z "$CONDA_BIN" ]; then
-    skip_step "Install compatible CUDA user-space runtime" "conda unavailable"
-    skip_step "Verify TensorFlow GPU preflight" "conda unavailable"
     skip_step "Verify PyTorch GPU preflight" "conda unavailable"
-    skip_step "Verify both engines in one process" "conda unavailable"
 else
-    run_step "Install compatible CUDA user-space runtime" install_tensorflow_gpu_runtime
-    run_step "Verify TensorFlow GPU preflight" verify_tensorflow_gpu_runtime
     run_step "Verify PyTorch GPU preflight" verify_torch_gpu_runtime
-    run_step "Verify both engines in one process" verify_pose_engines_together
 fi
 
 begin_category "Git LFS"

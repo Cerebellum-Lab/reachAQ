@@ -32,6 +32,5 @@ class InferenceMonitorDataMsg(str, Enum):
 from .pose_algorithm import PoseAlgorithm, PoseResponse, PoseLocation, PoseTuple
 from .pose_model import PoseModel
 from .memory import MemoryPoseModel
-from .dlc import DlcPoseModel
 from .gpu_runtime import GpuRuntimeStatus, detect_gpu_runtime
 from .pose_process import PoseProcess, InferenceCommandMessageKind, InferenceStatusMessageKind, InferenceMode

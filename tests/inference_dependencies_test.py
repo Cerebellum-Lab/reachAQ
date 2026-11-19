@@ -3,15 +3,18 @@
 They stay extras rather than hard dependencies because installing both naively
 breaks one: their nvidia-* CUDA wheels share site-packages/nvidia, and on
 christielab10 the later install overwrote the earlier. The installer installs
-both deliberately, with TensorFlow's CUDA runtime kept apart; the conditions are
-recorded beside the extras in auto-trainer-inference/pyproject.toml.
+both deliberately, with TensorFlow's CUDA runtime kept apart.
 
-DeepLabCut 3.x still ships both engines, verified against the installed 3.0.2,
-so raising the floor does not strand the TensorFlow path.
+DeepLabCut and the tensorflow extra moved to the auto-trainer-pose-deeplabcut
+plugin, with the conditions recorded beside the extra; its own tests check
+them (plugins/deeplabcut/tests/test_dependencies.py). Core keeps the torch
+extra, which the built-in keypoint backend needs.
 """
 
 import re
 from pathlib import Path
+
+import pytest
 
 PYPROJECT = Path(__file__).resolve().parents[1] / "auto-trainer-inference" / "pyproject.toml"
 
@@ -46,12 +49,14 @@ def test_neither_framework_is_a_hard_dependency():
         )
 
 
-def test_deeplabcut_is_still_required_at_3_x():
-    block = _dependencies_block(_text())
-    match = re.search(r"deeplabcut\s*>=\s*([0-9.]+)", block)
-    assert match, "deeplabcut is not a hard dependency"
-    major = int(match.group(1).split(".")[0])
-    assert major >= 3, f"deeplabcut floor is {match.group(1)}; the PyTorch engine needs 3.x"
+def test_deeplabcut_is_not_a_hard_dependency():
+    """It ships in the auto-trainer-pose-deeplabcut plugin, installed on request.
+
+    Requirement strings only: the comment saying where it went names it.
+    """
+    requirements = re.findall(r"""^\s*['"]([^'"]+)['"]""", _dependencies_block(_text()), re.M)
+    assert requirements, "no requirements parsed"
+    assert not [r for r in requirements if r.split()[0].lower() == "deeplabcut"]
 
 
 def test_core_pandas_and_numpy_stay_required():
@@ -60,40 +65,31 @@ def test_core_pandas_and_numpy_stay_required():
         assert package in block, f"{package} should remain a hard dependency"
 
 
+def test_core_declares_what_core_imports():
+    """scipy and scikit-learn are imported by core code (every
+    `import autotrainer.inference` reaches scipy; app_model reaches sklearn).
+    They used to arrive only through deeplabcut, so a fresh install without
+    the plugin lacked them."""
+    requirements = re.findall(r"""^\s*['"]([^'"]+)['"]""", _dependencies_block(_text()), re.M)
+    names = {re.split(r"[\s<>=!~;\[]", r, maxsplit=1)[0].lower() for r in requirements}
+    for package in ("scipy", "scikit-learn"):
+        assert package in names, f"{package} is imported by core but not a hard dependency"
+
+
 def test_both_extras_are_declared():
+    """Only torch is left: the tensorflow extra moved to the DeepLabCut plugin."""
     text = _text()
-    assert _extras_block(text, "tensorflow")
     assert _extras_block(text, "torch")
+    with pytest.raises(AssertionError, match="no 'tensorflow' extra"):
+        _extras_block(text, "tensorflow")
 
 
-def test_tensorflow_extra_excludes_2_13():
-    """2.13 pairs with a keras that moved legacy_tf_layers.
-
-    That breaks tf_slim's batch_norm and therefore every DeepLabCut model load.
-    Measured on the rig: ModuleNotFoundError: No module named
-    'keras.legacy_tf_layers'.
-    """
-    extra = _extras_block(_text(), "tensorflow")
-    assert re.search(r"tensorflow\s*[><=!,\s0-9.]*<\s*2\.13", extra), (
-        "the tensorflow extra must cap below 2.13"
-    )
-
-
-def test_tensorflow_extra_carries_its_helper_packages():
-    extra = _extras_block(_text(), "tensorflow")
-    for package in ("tensorpack", "tf-slim"):
-        assert package in extra, f"{package} is required by the DeepLabCut TF engine"
-
-
-def test_yolo_runtime_is_only_an_optional_extra():
-    """ultralytics is AGPL-3.0: it may be offered as an extra, never required."""
-    assert "ultralytics" not in _dependencies_block(_text())
-    assert "ultralytics" in _extras_block(_text(), "yolo")
-
-
-def test_tensorflow_extra_carries_imgaug():
-    """DeepLabCut 3's TensorFlow engine imports imgaug without declaring it."""
-    assert "imgaug" in _extras_block(_text(), "tensorflow")
+def test_core_has_no_yolo_extra():
+    """ultralytics is AGPL-3.0: it lives in the auto-trainer-pose-yolo plugin,
+    not in a core extra."""
+    assert "ultralytics" not in _text()
+    with pytest.raises(AssertionError, match="no 'yolo' extra"):
+        _extras_block(_text(), "yolo")
 
 
 def test_torch_extra_is_capped_at_the_build_shown_to_share_a_process():
@@ -115,3 +111,23 @@ def test_torch_extra_covers_the_whole_gpu_fleet():
         f"torch floor {match.group(1)} predates sm_120 support; the RTX 5060 Ti "
         f"needs >= 2.7 with CUDA 12.8+"
     )
+
+
+WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "run_unit_tests.yaml"
+
+
+def test_ci_never_installs_the_yolo_plugin():
+    """The YOLO plugin is AGPL-3.0; CI neither installs nor tests it."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "plugins/yolo" not in text
+    assert "ultralytics" not in text.lower()
+
+
+def test_ci_tests_the_deeplabcut_plugin_in_its_own_job():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert re.search(r"^  deeplabcut-plugin:", text, re.M), "no deeplabcut-plugin job"
+    job = text[text.index("  deeplabcut-plugin:"):]
+    assert "pip install -e plugins/deeplabcut" in job
+    assert "plugins/deeplabcut[" not in job, "the tensorflow extra is not installed in CI"
+    assert "check_licences --allowlist .github/licence-allowlist.txt" in job
+    assert "pytest plugins/deeplabcut/tests" in job
