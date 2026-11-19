@@ -72,7 +72,8 @@ def test_core_declares_what_core_imports():
     the plugin lacked them."""
     requirements = re.findall(r"""^\s*['"]([^'"]+)['"]""", _dependencies_block(_text()), re.M)
     names = {re.split(r"[\s<>=!~;\[]", r, maxsplit=1)[0].lower() for r in requirements}
-    for package in ("scipy", "scikit-learn"):
+    # tables: pandas to_hdf/read_hdf (pose_result_process, h5_tools) need PyTables.
+    for package in ("scipy", "scikit-learn", "tables"):
         assert package in names, f"{package} is imported by core but not a hard dependency"
 
 
