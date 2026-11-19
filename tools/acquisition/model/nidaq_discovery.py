@@ -10,6 +10,7 @@ import time
 from typing import List, Optional, Tuple
 
 from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization
+from autotrainer.core.simulation import is_simulation
 
 
 logger = get_verbose_logger(__name__)
@@ -69,7 +70,81 @@ class NidaqDevicePorts:
     analog_output_readbacks: Tuple[Tuple[str, str], ...] = tuple()
 
 
+def simulated_nidaq_devices(configuration=None) -> Tuple[NidaqDevicePorts, ...]:
+    """SimDAQ1, the one board a simulation run has: a PCIe-6363-shaped X series.
+
+    Its inventory matches what discovery reports for a real one closely enough
+    that the channel plan, the timing plan and the configuration checks run
+    unchanged. `configuration` is accepted for callers holding one; the board
+    does not depend on it.
+    """
+    # Here rather than at the top: the isolated discovery process imports this
+    # module, and should not load the device package to do it.
+    from autotrainer.device.nidaq_simulated import SIM_NIDAQ_DEVICE
+
+    del configuration
+    name = SIM_NIDAQ_DEVICE
+    timing_terminals = (
+        *(f"PFI{index}" for index in range(16)),
+        *(f"{subsystem}/{signal}"
+          for subsystem in ("ai", "ao", "di", "do")
+          for signal in ("SampleClock", "StartTrigger")),
+        "ai/ReferenceTrigger", "ai/SampleClockTimebase", "ai/ConvertClock",
+        "ao/SampleClockTimebase",
+        *(f"Ctr{index}{signal}"
+          for index in range(4)
+          for signal in ("InternalOutput", "Source", "Gate")),
+        "10MHzRefClock", "20MHzTimebase", "100MHzTimebase", "100kHzTimebase",
+        "ChangeDetectionEvent",
+    )
+    return (
+        NidaqDevicePorts(
+            name=name,
+            product_type="Simulated",
+            product_number=None,
+            serial_number=None,
+            analog_outputs=tuple(f"{name}/ao{index}" for index in range(4)),
+            analog_inputs=tuple(f"{name}/ai{index}" for index in range(16)),
+            digital_outputs=tuple(f"{name}/port0/line{index}" for index in range(32)),
+            digital_inputs=tuple(f"{name}/port0/line{index}" for index in range(32)),
+            counter_outputs=tuple(f"{name}/ctr{index}" for index in range(4)),
+            counter_inputs=tuple(f"{name}/ctr{index}" for index in range(4)),
+            # Not PXI: a single board, so no backplane or chassis checks apply.
+            bus_type="PCI_EXPRESS",
+            product_category="X_SERIES_DAQ",
+            analog_trigger_supported=True,
+            # ai0-ai7 pair with ai8-ai15 for DIFF, as on a real X series.
+            analog_input_terminal_configs=tuple(
+                (f"{name}/ai{index}",
+                 ("RSE", "NRSE", "DIFF") if index < 8 else ("RSE", "NRSE"))
+                for index in range(16)
+            ),
+            trigger_usages=(
+                ("ai", ("START", "REFERENCE", "PAUSE")),
+                ("ao", ("START", "PAUSE")),
+                ("di", ("START", "REFERENCE", "PAUSE")),
+                ("do", ("START", "PAUSE")),
+                ("ci", ("START", "PAUSE", "ARM_START")),
+                ("co", ("START", "PAUSE", "ARM_START")),
+            ),
+            terminals=tuple(f"/{name}/{terminal}" for terminal in timing_terminals),
+            analog_output_sample_clock_supported=True,
+            digital_trigger_supported=True,
+            analog_input_max_single_channel_rate=2_000_000.0,
+            analog_input_max_multi_channel_rate=1_000_000.0,
+            analog_output_max_rate=2_860_000.0,
+            digital_input_max_rate=10_000_000.0,
+            analog_output_readbacks=tuple(
+                (f"{name}/ao{index}", f"{name}/_ao{index}_vs_aognd")
+                for index in range(4)
+            ),
+        ),
+    )
+
+
 def discover_nidaq_devices() -> Tuple[Tuple[NidaqDevicePorts, ...], Optional[str]]:
+    if is_simulation():
+        return simulated_nidaq_devices(), None
     started = time.perf_counter()
     log_hardware_initialization(
         logger,

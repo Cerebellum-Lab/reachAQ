@@ -64,6 +64,7 @@ from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
 from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR
 from autotrainer.core.configuration import SystemConfigurationDumper, DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.multiproc import no_op_timer
+from autotrainer.core.simulation import is_simulation
 from autotrainer.core.logging import (
     get_verbose_logger,
     log_hardware_initialization,
@@ -8194,10 +8195,26 @@ class AppModel(ObservableObject):
         self._set_subsystem_status(
             SubsystemId.LASER,
             SubsystemState.READY,
-            reason="laser controller connected",
+            reason=self._laser_ready_reason(),
             generation=generation,
         )
         return True
+
+    def _laser_ready_reason(self) -> str:
+        """READY's reason; it says so when an NI laser can only hold a DC command.
+
+        With hardwareTimed false the NI controller refuses every pulse train
+        and the calibration ramp (NidaqLaserController.run_synchronized_pulse_train),
+        which a protocol, Test stim and Run Pulse all need.
+        """
+        configuration = self._laser.configuration
+        if configuration.backend == "nidaq" and not configuration.hardware_timed:
+            logger.warning(
+                "The NI laser is configured with hardwareTimed: false, so pulse "
+                "trains, Test stim, Run Pulse and the calibration ramp are refused")
+            return ("laser controller connected; hardwareTimed is false, so pulses "
+                    "and the calibration ramp are refused")
+        return "laser controller connected"
 
     def _laser_analog_terminal_config(self):
         """The stream's analogTerminalConfig, which the laser's own inputs use.
@@ -10145,13 +10162,16 @@ class AppModel(ObservableObject):
             )
 
     def _on_laser_runtime_property_changed(self, name, value, _old_value):
+        if name == self._laser.CONTROLLER_FAULT:
+            self._on_laser_process_fault(str(value))
+            return
         if name != self._laser.IS_CONNECTED:
             return
         if value:
             self._set_subsystem_status(
                 SubsystemId.LASER,
                 SubsystemState.READY,
-                reason="laser controller connected",
+                reason=self._laser_ready_reason(),
             )
         elif self._laser.configuration.backend != "disabled":
             current = self._acquisition.subsystems.get(SubsystemId.LASER)
@@ -10185,6 +10205,19 @@ class AppModel(ObservableObject):
                     return SubsystemState.STOPPED, dict(reason="laser controller disconnected")
 
                 self._set_laser_status_after_close(decide)
+
+    def _on_laser_process_fault(self, reason: str) -> None:
+        """The laser process failed (laser_process): the laser latches FAILED.
+
+        The process drove the laser safe, or the application reset it from a
+        new process; the reason says which, or that it must be made safe by
+        hand. Laser service stays off until the next Run or Refresh Hardware
+        opens a controller again (Ben, 2026-11-18).
+        """
+        error = f"laser process failed: {reason}"
+        self._set_subsystem_status(SubsystemId.LASER, SubsystemState.FAILED, error=error)
+        if self._acquisition.started and not self._acquisition.stopping:
+            self._handle_recording_subsystem_failure(SubsystemId.LASER, error)
 
     def _handle_recording_subsystem_failure(
         self,
@@ -11708,6 +11741,16 @@ class AppModel(ObservableObject):
                 # clock fits it used, and why anything is missing.
                 "latency": dict(self._latency_status),
             }
+            if is_simulation():
+                # Marks the session so simulated data is never taken for a recording.
+                out["simulation"] = {
+                    "enabled": True,
+                    "bus": os.environ.get("REACHAQ_SIM_BUS"),
+                    "backends": {
+                        "camera": "sim", "nidaq": "simulated",
+                        "laser": "simulated", "can": "emulation",
+                    },
+                }
         out = _metadata_without_nonfinite_numbers(out)
         json_path = Path(file_name + ".json")
         yaml_path = Path(file_name + ".yaml")

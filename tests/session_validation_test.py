@@ -170,6 +170,33 @@ def test_validator_checks_merged_frame_ids_and_event_association(tmp_path):
     ).status.value == "pass"
 
 
+def test_ledger_reads_a_mixed_case_camera_by_the_column_the_merge_writes(tmp_path):
+    # The merge lowercases camera names for its columns
+    # (AppModel._camera_timing_field_name): stimCam's is frame_present_stimcam.
+    root = _session(tmp_path)
+    stream_path = root / "streams/stream_manifest.json"
+    stream = json.loads(stream_path.read_text(encoding="utf-8"))
+    stream["enabledSources"] = [{
+        "id": "camera.stimCam",
+        "kind": "camera",
+        "path": "stimCam.mp4",
+        "sampleCount": 2,
+        "persistenceStatus": "written",
+    }]
+    _write(stream_path, json.dumps(stream))
+    _write(
+        root / "session001_frame_timing.csv",
+        "frame_id,utc_when,frame_present_stimcam\n10,1000.0,1\n11,1000.01,1\n",
+    )
+
+    report = validate_session(
+        root, profile=ValidationProfile.FAST, selected_rules=("camera.ledger",))
+
+    result = next(item for item in report.results if item.rule_id == "camera.ledger")
+    assert result.status.value == "pass", result.message
+    assert result.observed["camera_counts"] == {"stimCam": 2}
+
+
 def test_validator_reconciles_trial_and_protocol_operation(tmp_path):
     root = _session(tmp_path)
     recipe = {

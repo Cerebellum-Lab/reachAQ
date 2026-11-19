@@ -27,8 +27,17 @@ def main():
     # before logging, so a refused start leaves no log behind.
     from tools.acquisition.instance_lock import (
         ALREADY_RUNNING_EXIT, AlreadyRunning, acquire_instance_lock)
+    simulation = None
     try:
-        instance_lock = acquire_instance_lock()  # noqa: F841 - held until exit
+        if args.simulate:
+            # Takes the lock in its own home before writing there, and runs
+            # before AppModel starts the forkserver, which keeps the
+            # environment it starts with.
+            from tools.simulation.sim_home import prepare_simulation
+            simulation = prepare_simulation(args)
+            instance_lock = simulation.instance_lock  # noqa: F841 - held until exit
+        else:
+            instance_lock = acquire_instance_lock()  # noqa: F841 - held until exit
     except AlreadyRunning as err:
         print(err, file=sys.stderr)
         return ALREADY_RUNNING_EXIT

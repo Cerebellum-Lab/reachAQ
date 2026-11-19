@@ -138,8 +138,10 @@ laser: !LaserSystemConfiguration
   #   # Ports sets it as "trigger readback input".
   #   triggerMonitorInput: PXI1Slot5/ai9
   backend: disabled
-  hardwareTimed: false
-  sampleRateHz: null
+  # Hardware-timed (sample-clocked) output is what pulse trains, Test stim,
+  # Run Pulse and the calibration ramp need: with false they are refused.
+  hardwareTimed: true
+  sampleRateHz: 100000.0
   pmtShutterOutput: null
   triggerListenerInputs: []
   channels: []

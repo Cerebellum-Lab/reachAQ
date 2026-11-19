@@ -12,6 +12,10 @@ _REPO_ROOT = Path(__file__).resolve().parent
 # but no pytest process may select or reset a host CAN interface implicitly.
 os.environ["AUTOTRAINER_CAN_TRANSPORT"] = "emulation"
 os.environ["REACHAQ_PROHIBIT_PRIVILEGED_CAN_RESET"] = "1"
+# Tests replace NI-DAQmx in the test process, which a laser process would not
+# see, so the NI laser controller opens here; the laser process's own tests
+# open one explicitly (laser_process_test.py).
+os.environ["REACHAQ_LASER_IN_PROCESS"] = "1"
 for _source_dir in reversed((
     _REPO_ROOT,
     _REPO_ROOT / "auto-trainer-behavior" / "src",

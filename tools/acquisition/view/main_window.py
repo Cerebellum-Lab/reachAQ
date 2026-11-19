@@ -122,6 +122,7 @@ class MainWindow(QMainWindow):
         is_dev: bool = False,
         random_cameras: bool = False,
         live_inference: Optional[bool] = None,
+        calib_dir: Optional[Path] = None,
     ):
         super().__init__(None)
 
@@ -160,7 +161,11 @@ class MainWindow(QMainWindow):
 
         self._previous_intersession_analysis_rsp: Optional[Tuple[ProjectInfo, IntersessionResponse]] = None
 
-        app_model = self._app_model = AppModel(prefs)
+        # A simulation's calibration is in its home; a rig run passes none, as before.
+        if calib_dir is None:
+            app_model = self._app_model = AppModel(prefs)
+        else:
+            app_model = self._app_model = AppModel(prefs, calib_dir=calib_dir)
         self._notes_save_timer = QTimer(self)
         self._notes_save_timer.setSingleShot(True)
         self._notes_save_timer.setInterval(500)
