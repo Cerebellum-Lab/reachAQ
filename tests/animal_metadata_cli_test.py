@@ -54,7 +54,8 @@ def test_softmouse_setup_logs_in_lists_colonies_and_keeps_the_password_out_of_pr
     prompt = answers(
         "ben",        # username
         "1",          # colony: the first one listed
-        "", "", "", "", "", "", "", "", "", "",  # accept every suggested column
+        "",           # physical tag column: the suggested Physical Tag
+        "",           # RFID column: the suggested Plate ID
         "",           # keep "skip animals without RFID" (SoftMouse: yes)
         str(tmp_path / "share"),  # publish to
         "",           # no mount check
@@ -84,15 +85,21 @@ def test_spreadsheet_setup_maps_columns_then_refresh_and_status_use_it(
     store = CredentialStore(keyring_backend=False, fallback_path=tmp_path / "s.json")
     prompt = answers(
         str(sheet), "",               # path, no sheet
-        "Mouse", "Mouse", "Chip",     # id, name, rfid
-        "-", "Sex", "", "", "", "", "",  # no state; sex; the rest unguessed
+        "Alt. ID",                    # not a column in the file: asked again
+        "Mouse",                      # physical tag column
+        "Chip",                       # RFID column
         "n",                          # keep animals without RFID
         "",                           # no publication
     )
 
     cli.run_setup(preferences, store, kind_name="spreadsheet", prompt=prompt, secret_prompt=None)
+    assert prompt.remaining == []
     configuration = load_source_configuration(preferences)
+    assert configuration.mapping.external_identity_column == "Mouse"
+    assert configuration.mapping.new_animal_name_column == "Mouse"
     assert configuration.mapping.rfid_column == "Chip"
+    # Filled in by name, not asked.
+    assert configuration.mapping.sex_column == "Sex"
     assert configuration.mapping.state_column is None
     assert not configuration.mapping.require_rfid
 

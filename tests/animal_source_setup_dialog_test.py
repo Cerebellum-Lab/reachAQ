@@ -94,14 +94,16 @@ def test_spreadsheet_setup_maps_the_files_columns(qapp, tmp_path):
     dialog.read_columns()
     assert "1 rows" in dialog.status.text()
     assert dialog._mapping_combos["external_identity_column"].currentText() == "Mouse ID"
-    assert dialog._mapping_combos["state_column"].currentText() == "Status"
-    dialog._mapping_combos["state_column"].setCurrentText("(none)")
+    # Only the tag and RFID columns are chosen; the rest are filled in by name.
+    assert set(dialog._mapping_combos) == {"external_identity_column", "rfid_column"}
+    assert "State = Status" in dialog.other_columns.text()
     dialog.save()
 
     configuration = load_source_configuration(preferences)
     assert configuration.kind == "spreadsheet"
+    assert configuration.mapping.new_animal_name_column == "Mouse ID"
     assert configuration.mapping.rfid_column == "RFID"
-    assert configuration.mapping.state_column is None
+    assert configuration.mapping.state_column == "Status"
     assert not configuration.mapping.require_rfid
 
 

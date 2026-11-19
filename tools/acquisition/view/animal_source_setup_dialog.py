@@ -28,6 +28,9 @@ from tools.acquisition.model.animal_sources.credentials import CredentialStore
 from tools.acquisition.model.animal_sources.mapping import ColumnMapping
 from tools.acquisition.model.animal_sources.publication import PublicationSource
 from tools.acquisition.model.animal_sources.source_setup import (
+    OPERATOR_COLUMNS,
+    build_mapping,
+    describe_other_columns,
     list_choices,
     read_columns,
     save_setup,
@@ -62,6 +65,8 @@ class AnimalSourceSetupDialog(QDialog):
         self._kinds = available_source_kinds() if kinds is None else kinds
         self._existing = load_source_configuration(preferences)
         self._field_widgets: Dict[str, QWidget] = {}
+        # The fields setup fills in itself; only the tag and RFID columns are chosen.
+        self._suggestion: Dict[str, Optional[str]] = {}
         self.saved = None
 
         layout = QVBoxLayout(self)
@@ -87,13 +92,16 @@ class AnimalSourceSetupDialog(QDialog):
         mapping_group = QGroupBox("Columns")
         mapping_form = QFormLayout(mapping_group)
         self._mapping_combos: Dict[str, QComboBox] = {}
-        for name, label, optional in ColumnMapping.COLUMN_FIELDS:
+        for name, label in OPERATOR_COLUMNS:
             combo = QComboBox()
             combo.setEditable(True)
-            if optional:
+            if name == "rfid_column":
                 combo.addItem(_NONE)
             mapping_form.addRow(f"{label}:", combo)
             self._mapping_combos[name] = combo
+        self.other_columns = QLabel("")
+        self.other_columns.setWordWrap(True)
+        mapping_form.addRow("", self.other_columns)
         self.require_rfid = QCheckBox("Skip animals without a valid RFID")
         mapping_form.addRow("", self.require_rfid)
         self.ended_states = QLineEdit("ended")
@@ -196,6 +204,8 @@ class AnimalSourceSetupDialog(QDialog):
             for combo in self._mapping_combos.values():
                 self._select(combo, None if combo.findText(_NONE) >= 0 else "")
             self.require_rfid.setChecked(False)
+            self._suggestion = {}
+            self._show_other_columns()
 
     def _load_existing(self) -> None:
         existing = self._existing
@@ -211,6 +221,26 @@ class AnimalSourceSetupDialog(QDialog):
     def _show_mapping(self, mapping: ColumnMapping) -> None:
         for name, combo in self._mapping_combos.items():
             self._select(combo, getattr(mapping, name))
+        self._suggestion = {
+            name: getattr(mapping, name) for name, _, _ in ColumnMapping.COLUMN_FIELDS
+        }
+        self._show_other_columns()
+
+    def _show_other_columns(self) -> None:
+        if not self._suggestion:
+            self.other_columns.setText("Every column is kept in each animal's metadata.")
+            return
+        preview = build_mapping(
+            self.kind,
+            self._suggestion,
+            self._suggestion.get("external_identity_column") or "?",
+            None,
+            require_rfid=False,
+        )
+        self.other_columns.setText(
+            "Every column is kept in each animal's metadata. Also read by name: "
+            f"{describe_other_columns(preview)}."
+        )
 
     @staticmethod
     def _select(combo: QComboBox, value: Optional[str]) -> None:
@@ -249,16 +279,15 @@ class AnimalSourceSetupDialog(QDialog):
         for name, combo in self._mapping_combos.items():
             text = combo.currentText().strip()
             columns[name] = None if text in {"", _NONE} else text
-        base = self.kind.default_mapping()
-        return ColumnMapping(
-            **columns,
+        return build_mapping(
+            self.kind,
+            self._suggestion,
+            columns["external_identity_column"],
+            columns["rfid_column"],
             require_rfid=self.require_rfid.isChecked(),
             ended_states=tuple(
                 part.strip() for part in self.ended_states.text().split(",") if part.strip()
             ),
-            subject_id_kind=(base.subject_id_kind if base else ColumnMapping.subject_id_kind),
-            profile_id=(base.profile_id if base else "custom"),
-            version=(base.version if base else 1),
         )
 
     def _busy(self, action):
@@ -292,15 +321,16 @@ class AnimalSourceSetupDialog(QDialog):
             return
         headers = [header for header in table.headers if header]
         suggestion = suggest_mapping(self.kind, headers)
-        optional = {name for name, _, is_optional in ColumnMapping.COLUMN_FIELDS if is_optional}
         for name, combo in self._mapping_combos.items():
             current = combo.currentText().strip()
             combo.clear()
-            if name in optional:
+            if name == "rfid_column":
                 combo.addItem(_NONE)
             combo.addItems(headers)
             keep = current if current in headers else None
             self._select(combo, keep or suggestion.get(name))
+        self._suggestion = suggestion
+        self._show_other_columns()
         self.status.setText(
             f"{len(table.rows)} rows; columns: {', '.join(headers)}"
         )
