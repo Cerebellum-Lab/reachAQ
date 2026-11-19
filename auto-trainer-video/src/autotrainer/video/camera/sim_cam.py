@@ -13,7 +13,6 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy
 
-from autotrainer.core.latency.raw_clock import monotonic_raw_time
 # The same grid as autotrainer.device.nidaq_simulated reads: the camera and
 # the NI stream must agree on it.
 from autotrainer.core.simulation import (
@@ -131,13 +130,13 @@ class SimulatedCam(CameraBase):
 
     def latch_clock(self) -> Optional[Tuple[float, int, float, float, float]]:
         # The camera clock is perf_counter itself, so the latch is a perf read
-        # taken inside the bracket.
+        # taken inside the bracket. The RAW bracket is the same perf reads: a
+        # real RAW read would carry the host's perf-vs-RAW slew into the RAW
+        # latch fit, as nidaq_simulated explains for the NI stamps.
         perf_before = time.perf_counter()
-        raw_before = monotonic_raw_time()
         perf_mid = time.perf_counter()
-        raw_after = monotonic_raw_time()
         perf_after = time.perf_counter()
-        return perf_before, int(perf_mid * 1e9), perf_after, raw_before, raw_after
+        return perf_before, int(perf_mid * 1e9), perf_after, perf_before, perf_after
 
     def set_property(self, name: str, value: str) -> bool:
         if name.lower() == "exposure":

@@ -145,12 +145,15 @@ simulated data.
   that output implies. Send a trial with the Send button.
 - **Refresh Hardware's camera scan** looks for Spinnaker cameras and logs a
   failure where PySpin is not installed. The simulated cameras are unaffected.
-- **Host clocks.** In WSL, `perf_counter` (CLOCK_MONOTONIC) was measured
-  running 2.0-2.4% slow against CLOCK_MONOTONIC_RAW. The simulated NI clock is
-  `perf_counter`, so the session's NI-to-RAW fit normally fails and the
-  perf fit is used. Occasionally the RAW fit passes with a residual too coarse
-  for frame pairing, and `alignment.frames` warns `ambiguous_hardware_edge`.
-  A host whose two clocks agree, as a rig's do, is not affected.
+- **Host clocks.** The simulated NI board and cameras run on `perf_counter`,
+  so their RAW stamps (the NI block's `raw_time`, the latch's RAW bracket) are
+  `perf_counter` reads too, not CLOCK_MONOTONIC_RAW. A real board's or
+  camera's oscillator is smooth against RAW. `perf_counter` is not where NTP
+  slews it: in WSL it ran 0.34% fast against RAW, easing to 0.10% over 10 s.
+  Before 2026-11-19 the sim stamped real RAW, so that slew went into the
+  NI-to-RAW and latch fits. They passed or failed by chance, and about 2% of
+  e2e runs warned `ambiguous_hardware_edge` in `alignment.frames`. A
+  simulated session's RAW column is therefore not a host RAW reading.
 
 ## Tests
 
