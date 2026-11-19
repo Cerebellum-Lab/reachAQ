@@ -128,6 +128,33 @@ def test_https_source_selects_the_colony_active_scope_and_writes_csv(tmp_path):
     assert "secret" not in repr(source.credentials)
 
 
+def test_https_source_writes_every_field_softmouse_returns(tmp_path):
+    session = Session()
+    session.list_rows[0].update(mouseearmark="201B", tyxplateid=" T2293857(C1)", scRecords=[])
+    session.list_rows[1].update(gene1="Cre(+)")
+    source = SoftMouseHttpsSource(
+        SoftMouseHttpsConfiguration(colony_name=COLONY),
+        SoftMouseCredentials("ben", "secret"),
+        session=session,
+    )
+
+    path = source.download(tmp_path)
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+    # SoftMouse's Alt. ID column is the mouseearmark field.
+    assert rows[0]["Alt. ID"] == "201B"
+    assert rows[1]["Alt. ID"] == ""
+    # Fields without a known label keep SoftMouse's own name.
+    assert rows[0]["tyxplateid"] == " T2293857(C1)"
+    assert rows[0]["scRecords"] == "[]"
+    assert rows[1]["gene1"] == "Cre(+)" and rows[0]["gene1"] == ""
+    # The labelled columns come first, so the publication's first columns are unchanged.
+    assert reader.fieldnames[:4] == ["SoftMouse ID", "Animal SID", "Physical Tag", "Plate ID"]
+    assert "mouseearmark" not in reader.fieldnames and "plateIdPattern" not in reader.fieldnames
+
+
 def test_https_source_rejects_interactive_authentication_challenge(tmp_path):
     session = Session()
     session.animals_content = b"Enter verification code for two-factor login"
