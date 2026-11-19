@@ -58,6 +58,11 @@ The variables are `REACHAQ_SIMULATION=1`, `REACHAQ_SIM_BUS`, `REACHAQ_SIM_EPOCH`
 flag rather than setting them by hand: by hand, the configuration, preferences,
 data and lock are not moved into a sim home.
 
+The local API listens on its own OS-picked port, so a simulation runs beside
+the rig's instance without taking its API, and its discovery record says
+`"simulated": true`. Connect with `ApiClient(simulated=True)`
+([local-api.md](local-api.md#finding-an-instance)).
+
 ## What each simulated backend produces
 
 All of them share one time grid: simulated exposure k starts at
@@ -138,9 +143,6 @@ simulated data.
 - **No realistic reaches.** `MemoryPoseModel` returns a constant output, so
   trials run and end but are not scored, and automatic sends follow whatever
   that output implies. Send a trial with the Send button.
-- **The external API's ports** (5556, 5557) are fixed. With another reachAQ
-  instance on the host, the second logs "failed to start api service" and runs
-  without the API.
 - **Refresh Hardware's camera scan** looks for Spinnaker cameras and logs a
   failure where PySpin is not installed. The simulated cameras are unaffected.
 - **Host clocks.** In WSL, `perf_counter` (CLOCK_MONOTONIC) was measured

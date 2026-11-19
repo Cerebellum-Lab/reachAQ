@@ -169,10 +169,15 @@ def test_disabled_options_create_no_service():
 
 
 def test_default_options_from_environment():
-    assert create_default_api_options({}) == ApiOptions(True, DEFAULT_API_HOST, DEFAULT_API_PORT)
-    assert create_default_api_options(
-        {"REACHAQ_API_ENABLED": "0", "REACHAQ_API_HOST": "0.0.0.0", "REACHAQ_API_PORT": "5000"}
-    ) == ApiOptions(False, "0.0.0.0", 5000)
+    # Port 0: the OS picks a free port, and the instance publishes it for clients.
+    assert DEFAULT_API_PORT == 0
+    defaults = create_default_api_options({})
+    assert (defaults.enabled, defaults.host, defaults.port, defaults.simulated) == (
+        True, DEFAULT_API_HOST, 0, False)
+    assert defaults.discovery_dir is not None
+    options = create_default_api_options(
+        {"REACHAQ_API_ENABLED": "0", "REACHAQ_API_HOST": "0.0.0.0", "REACHAQ_API_PORT": "5000"})
+    assert (options.enabled, options.host, options.port) == (False, "0.0.0.0", 5000)
     with pytest.raises(ValueError):
         create_default_api_options({"REACHAQ_API_PORT": "70000"})
 

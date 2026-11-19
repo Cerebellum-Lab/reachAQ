@@ -5,9 +5,11 @@ import queue
 import socket
 import threading
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-from .options import DEFAULT_API_HOST, DEFAULT_API_PORT
+from .discovery import find_api_instance
+from .options import DEFAULT_API_HOST
 
 
 class ApiClient:
@@ -16,9 +18,22 @@ class ApiClient:
     ``request()`` returns the first response for its nonce; for a
     ``pending_with_notification`` command call ``wait_response(nonce)`` for the
     final one. Events accumulate in ``events`` (a queue of dicts).
+
+    With no ``port`` the client connects to the running instance's published
+    port (``discovery.find_api_instance``): the only one, or the one whose
+    ``simulated`` flag matches. Several matching instances raise
+    ``ApiInstanceNotFound`` rather than guessing.
     """
 
-    def __init__(self, host: str = DEFAULT_API_HOST, port: int = DEFAULT_API_PORT, timeout: float = 5.0):
+    def __init__(self, host: str = DEFAULT_API_HOST, port: Optional[int] = None, timeout: float = 5.0,
+                 *, simulated: Optional[bool] = None, discovery_dir: Optional[Path] = None):
+        if port is None:
+            instance = find_api_instance(simulated=simulated, directory=discovery_dir)
+            port = instance.port
+            # An instance listening on every address is reached on loopback.
+            if instance.host not in ("", "0.0.0.0", "::"):
+                host = instance.host
+        self.host, self.port = host, port
         self._sock = socket.create_connection((host, port), timeout=timeout)
         self._sock.settimeout(None)
         self._timeout = timeout
