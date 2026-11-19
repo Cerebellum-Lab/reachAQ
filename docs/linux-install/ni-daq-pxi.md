@@ -116,6 +116,59 @@ sudo systemctl restart \
 sudo reboot
 ```
 
+## IOMMU and DMA: boot with `intel_iommu=off`
+
+On Intel hosts the kernel IOMMU can refuse the PXI boards' DMA. NI discovery,
+software-timed reads and digital lines all still work, so the failure shows up
+only when clocked analog input starts: the board fills its onboard FIFO and
+DAQmx raises -200361 (onboard device memory overflow) with nothing in the host
+buffer. It does not depend on rate or channel count: one channel at 1 kHz fails
+the same way as ten at 10 kHz, so do not chase it by lowering the sample rate.
+
+Check the kernel log for DMA remapping faults against the NI boards' bridge:
+
+```bash
+sudo dmesg | grep -i dmar
+journalctl -k -b --no-pager | grep -i 'DMAR'
+```
+
+The failing pattern is a fault on the PCI bridge the NI cards sit behind, for
+example:
+
+```text
+DMAR: [DMA Read NO_PASID] Request device [0b:00.0] ... PTE Read access is not set
+```
+
+`lspci -tv` shows which bridge that is (on the reference rig, both NI boards are
+behind `0b:00.0`). The fix is the kernel boot parameter `intel_iommu=off`:
+
+```bash
+sudo cp /etc/default/grub /etc/default/grub.bak-before-iommu-off
+sudoedit /etc/default/grub
+# add intel_iommu=off to GRUB_CMDLINE_LINUX_DEFAULT, for example:
+# GRUB_CMDLINE_LINUX_DEFAULT="quiet splash intel_iommu=off"
+sudo update-grub
+sudo reboot
+```
+
+After the reboot, confirm that the parameter is active and the faults are gone:
+
+```bash
+grep -o 'intel_iommu=[^ ]*' /proc/cmdline
+sudo dmesg | grep -i dmar   # no DMA Read/Write faults
+```
+
+Then start a clocked stream, for example with the DAQ Monitor below, and check
+that samples arrive.
+
+Re-check `/proc/cmdline` after kernel or BIOS updates: a regenerated GRUB
+configuration or a BIOS reset that turns VT-d back on brings the fault back.
+Turning the IOMMU off removes DMA isolation for every device on the host. That
+is acceptable on a dedicated acquisition computer, but a site that needs it
+should test `intel_iommu=on iommu=pt` (passthrough) first. That combination has
+not been verified with these boards. On AMD hosts the matching parameter is
+`amd_iommu=off`, and it is also unverified here.
+
 ## Configure reachAQ channel roles
 
 Open **Edit → Edit DAQ Ports** while the application is idle. Discovery runs in
@@ -366,6 +419,25 @@ conda run --no-capture-output -n reachaq python tools/hardware/verify_nidaq_wiri
 | `--command-volts V` | Laser command level (default 1.0) |
 | `--report PATH` | Also write the text report to `PATH` |
 | `--config PATH`, `--record PATH` | Configuration read and result file written; default to the files above |
+
+### NI delivery calibration
+
+The camera-latch pairing that rates a session `hardware_edge` needs this rig's
+NI delivery calibration (`nidaqStream.deliveryCalibration`); without one every
+session is anchored by host arrival and rated `ambiguous_hardware_edge`. Measure
+it once the wiring passes, with a BNC loopback from an unused analog output to
+an unused analog input (christielab10: AO 0 to AI 6, AI 6 at SE) and reachAQ
+closed:
+
+```bash
+conda run --no-capture-output -n reachaq python -m tools.hardware.calibrate_ni_delivery \
+    --ao PXI1Slot5/ao0 --ai PXI1Slot5/ai6 --write
+```
+
+It takes about 50 minutes, backs up the configuration before writing, and is
+described in `docs/acquisition/session-recording-and-synchronization.md`, "NI
+delivery calibration". Calibrate again after changing the NI board, the reach
+cameras or the host.
 
 ## Device identity and timing configuration
 

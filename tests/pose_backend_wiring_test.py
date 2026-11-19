@@ -28,6 +28,7 @@ from autotrainer.inference.backend_selection import (
 
 
 INFERENCE_MODEL = "tools/acquisition/model/inference_model.py"
+APP_MODEL = "tools/acquisition/model/app_model.py"
 
 
 def test_the_runtime_probe_is_no_longer_pinned_to_tensorflow():
@@ -67,6 +68,20 @@ def test_the_model_check_asks_the_selector_about_the_same_model():
 
 def test_the_runtime_probe_imports_the_selector():
     assert source_contract.imports(INFERENCE_MODEL, "selected_backend")
+
+
+def test_the_call_sites_no_longer_read_the_backbone_themselves():
+    """The DeepLabCut plugin reads the backbone from model_path.
+
+    A caller still passing a backbone name would be importing a DeepLabCut
+    helper that leaves core with the plugin.
+    """
+    for module in (INFERENCE_MODEL, APP_MODEL):
+        assert not source_contract.imports(module, "trained_model_name"), module
+        assert not source_contract.calls(module, "trained_model_name"), module
+        for call in source_contract.calls(module, "confidence_threshold"):
+            assert source_contract.keyword(call, "model_name") is None, module
+            assert source_contract.keyword(call, "model_path") is not None, module
 
 
 def test_can_start_live_inference_also_validates_the_model():

@@ -68,7 +68,7 @@ from tools.acquisition.model.trial_protocol_schedule import (
     TrialProtocolDocument,
 )
 
-from autotrainer.api import ApiApplicationMode, ApiTrainingMode
+from autotrainer.core.api import ApiApplicationMode, ApiTrainingMode
 
 import top_fixtures
 
@@ -556,11 +556,11 @@ def test_disabling_analysis_changes_scored_counting_to_completed(app_model):
     assert control.trial_count_basis == "completed"
 
 
-def test_softmouse_refresh_is_a_temporary_recording_blocker(app_model):
+def test_animal_metadata_refresh_is_a_temporary_recording_blocker(app_model):
     with app_model._animal_metadata_refresh_lock:
         app_model._animal_metadata_refresh_busy = True
 
-    assert "SoftMouse animal metadata refresh is still running" in (
+    assert "Animal metadata refresh is still running" in (
         app_model.recording_blockers
     )
 
@@ -1022,7 +1022,13 @@ def test_live_intertrial_result_finalizes_attempt_persists_and_syncs_counts(
     assert app_model.behavior.algorithm.pellets_presented == 1
     assert app_model.behavior.algorithm.successful_reaches == 1
     assert app_model.behavior.algorithm.pellets_consumed == 1
-    protocol_outcome.assert_called_once_with("1.1", TrialOutcome.SUCCESS)
+    protocol_outcome.assert_called_once_with(
+        "1.1",
+        TrialOutcome.SUCCESS,
+        reach_count=1,
+        success_count=1,
+        consumption_count=1,
+    )
     update.assert_called_once_with(
         project,
         ledger.to_records(),

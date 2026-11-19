@@ -88,7 +88,7 @@ YAML immediately; enabling runtime hardware queues one combined refresh after
 the submenu closes. The Hardware Status panel remains a compact, read-only view
 of live subsystem health.
 
-The current production schema is system-configuration version 58. Older and
+The current production schema is system-configuration version 59. Older and
 newer versions, unknown fields, retired load-cell/tunnel fields, and obsolete
 NI recording controls are rejected instead of being silently migrated. Start
 from the maintained example at
@@ -256,7 +256,7 @@ and `pulseClockLine`, from every laser `triggerSource` line and PXI_Trig
 `triggerRouteSource`, and from every `triggerListenerInputs` line; Run and the
 stream's own start, Idle's included, refuse a clash, once for each, and the DAQ
 Monitor lists it. The DAQ Monitor window's own stream is configured without the
-laser, so it refuses only one export line against the other. christielab10
+laser, so it refuses only one export line against the other. The reference rig
 keeps every input on the 6221 and sets neither field. This path is tested
 against a DAQmx stand-in only and is not yet verified on hardware.
 
@@ -266,7 +266,7 @@ only picks a saved profile or the builder's unsaved draft and fires it.
 
 Laser Control uses a smaller font (7.5 pt, graph axes 7 pt) so that each
 page fits the docked right-side panel without scrolling; the dialogs it opens
-keep the application font. On christielab10 that panel is 440 x 860 px. Each
+keep the application font. On the reference rig that panel is 440 x 860 px. Each
 channel has **Pulse** and **Calibration** tabs.
 The panel's footer shows its status and, in red, every error or refusal it
 reports: Run Pulse, Test stim, Run Ramp, a profile no longer saved, a Pulse
@@ -410,16 +410,15 @@ model/product number, the configured CAN backend/interface, and the detected
 GPU model, memory, and driver.
 
 The `RFID Reader` category shows its stable serial path, connection state or
-error, and most recent scan result. Configure it under **Preferences → Animal
-metadata**. That panel also separates **Sync from SoftMouse**, which publishes
-to Isilon and refreshes the local cache, from **Refresh local cache**, which
-only consumes the latest completed Isilon publication. Neither action is
-available during recording. See the
-[SoftMouse/RFID guide](../softmouse_sync/README.md) for credentials, reader
-setup, required packages and serial permissions, metadata ownership, safety
-checks, and the single-host nightly timer. The normal portable installer
-installs and verifies these dependencies; credential entry remains a one-time
-per-publisher action.
+error, and most recent scan result. Where animal metadata comes from is set
+under **Preferences → Animal metadata → Set up…**: SoftMouse with the user's
+own login, a spreadsheet, a database, a shared publication, or a lab's own
+source kind. **Refresh now** fetches it into this computer's cache; neither is
+available during recording. See
+[Animal metadata sources](../../docs/acquisition/animal-metadata-sources.md)
+for setup, credentials, refresh, offline behaviour and adding a source, and the
+[SoftMouse/RFID guide](../softmouse_sync/README.md) for the reader, serial
+permissions and metadata ownership.
 
 The Hardware Refresh icon is at the far right of the Hardware Status title bar.
 While idle it repeats discovery and refreshes bindings. While System Mode is

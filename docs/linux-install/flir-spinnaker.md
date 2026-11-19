@@ -21,7 +21,7 @@ are ABI-locked, so a cp38 wheel will not import on 3.10 and renaming it does
 not help. `vendor/spinnaker/manifest.json` lists what is bundled.
 
 The reachAQ environment is Python 3.10, so it uses the cp310 wheel; the cp38
-wheels remain for archived Python 3.8 environments and the Jetson image. The
+wheels remain for archived Python 3.8 environments. The
 bundled 3.2.0.62 wheel runs against the 3.2.0.57 system runtime on
 christielab10 and lists both of its cameras.
 
@@ -89,13 +89,6 @@ Or name the wheel directly. x86_64 Ubuntu, CPython 3.10:
 ```bash
 conda run -n "$REACHAQ_ENV" python -m pip install \
   "$REACHAQ_REPO/vendor/spinnaker/linux/x86_64/spinnaker_python-3.2.0.62-cp310-cp310-linux_x86_64.whl"
-```
-
-Jetson/aarch64 requires the corresponding aarch64 system SDK and wheel:
-
-```bash
-conda run -n "$REACHAQ_ENV" python -m pip install \
-  "$REACHAQ_REPO/vendor/spinnaker/linux/aarch64/spinnaker_python-3.2.0.62-cp310-cp310-linux_aarch64.whl"
 ```
 
 There is no cp310 wheel for Windows here: the 3.2.0.62 Windows bundle is a

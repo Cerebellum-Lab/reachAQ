@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from autotrainer.core import ProjectInfo
+from autotrainer.core.configuration import NidaqDeliveryCalibration
 from autotrainer.core.latency.schema import CAMERA_FRAME_DTYPE
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 from tools.latency import clocks
@@ -22,6 +23,13 @@ from tools.latency.finalize import finalize_session_latency, read_raw_stream
 from frame_alignment_synthetic import (
     ARRIVAL, EXPOSURE, FPS, LATCH_HALF_BRACKET, RATE, SyntheticRig,
 )
+
+# The synthetic camera stamps each frame at the end of its exposure, so a correct latch
+# pairing's residual is the NI timeline's lateness minus the exposure. On true host times that
+# lateness is 0 (EXACT); the spool's reads return 0.2-3.2 ms after their blocks, so its fitted
+# timeline runs 0.22 ms late (CALIBRATION). Each is a rig calibrated there, 20 us between sessions.
+CALIBRATION = NidaqDeliveryCalibration(offset_seconds=0.00022, spread_seconds=20e-6, sessions=27)
+EXACT = NidaqDeliveryCalibration(offset_seconds=0.0, spread_seconds=20e-6, sessions=27)
 
 
 def _project(tmp_path, session=1):
@@ -33,7 +41,7 @@ def _record(tmp_path, *, t0, lag, seconds=20.0, latches=True, stream=True, expos
             polls=(), raw=False, stamps=True, tone_pulses=(), device_rows=(), laser_rows=(),
             trial_records=(), arrival=ARRIVAL, latch_error=0.0, stream_tail_seconds=0.0,
             raw_latches=False, drop_edge_at=None, latch_half_bracket=LATCH_HALF_BRACKET,
-            spool_tail_seconds=0.0, stream_head_seconds=0.0):
+            spool_tail_seconds=0.0, stream_head_seconds=0.0, calibration=CALIBRATION):
     """One finalized session: the spool holds 5 s before the recording and `seconds` of it.
 
     The latency stream starts stream_head_seconds before the recording (more than 5 s
@@ -62,7 +70,7 @@ def _record(tmp_path, *, t0, lag, seconds=20.0, latches=True, stream=True, expos
         project, start_perf, start_wall, end_perf, device_rows, laser_rows, (), spool,
         boundary=boundary, trial_records=trial_records,
         trial_summary={"pending_analysis_attempts": len(trial_records)},
-        camera_exposure_seconds={"left": exposure},
+        camera_exposure_seconds={"left": exposure}, delivery_calibration=calibration,
     )
     return rig, project, n0, result
 
@@ -70,6 +78,20 @@ def _record(tmp_path, *, t0, lag, seconds=20.0, latches=True, stream=True, expos
 def _alignment(project):
     path = Path(project.get_session_path().location) / "streams" / "alignment.json"
     return json.loads(path.read_text())
+
+
+def test_without_a_delivery_calibration_the_arrival_match_anchors_below_hardware_edge(tmp_path):
+    # No rig calibration, so nothing says where the latch residual should sit: the camera-clock
+    # match is refused and named, and arrival anchors the same transition.
+    rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001, calibration=None)
+
+    camera = result["cameraNidaqAlignment"]
+    assert camera["matchedSampleIndex"] == rig.edge_sample(n0)
+    assert camera["anchorMethod"] == "host_arrival"
+    assert camera["confidence"] == "ambiguous_hardware_edge"
+    assert "no NI delivery calibration" in camera["latch"]["reason"]
+    assert camera["deliveryCalibration"] is None
+    assert _alignment(project)["cameraNidaqAlignment"]["deliveryCalibration"] is None
 
 
 def test_the_anchor_is_the_first_frames_own_edge_where_the_epoch_method_took_the_next(tmp_path):
@@ -345,14 +367,18 @@ def test_the_latency_stream_is_read_only_when_the_fitted_anchor_can_use_it(tmp_p
 
 
 @pytest.mark.parametrize("exposure", (None, 0.0055, 6.0, -0.005))
-def test_the_exposure_is_recorded_and_never_moves_the_anchor(tmp_path, exposure):
-    # Unknown, as long as the exposure of a long frame, a units mix-up or a sign slip: none of
-    # it matters to the camera-clock and arrival matches, which take no exposure.
+def test_an_unknown_or_wrong_exposure_never_moves_the_anchor(tmp_path, exposure):
+    # Unknown, as long as the exposure of a long frame, a units mix-up or a sign slip, while
+    # the camera really exposes for 175 us. The exposure centres the latch residual band, so
+    # each puts it where the residual is not, and the camera-clock match is refused rather
+    # than vouched for. The arrival match takes no exposure and anchors the same edge.
     rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001, exposure=exposure)
 
     camera = result["cameraNidaqAlignment"]
     assert camera["matchedSampleIndex"] == rig.edge_sample(n0)
-    assert camera["confidence"] == "hardware_edge"
+    assert camera["anchorMethod"] == "host_arrival"
+    assert camera["latch"]["status"] == "ambiguous"
+    assert camera["confidence"] == "ambiguous_hardware_edge"
     assert camera["exposureSeconds"] == (None if exposure is None else pytest.approx(exposure))
     assert not any(note in camera["reason"]
                    for note in ("assumed 0", "is negative", "not shorter than the frame period"))
@@ -460,8 +486,12 @@ def test_with_raw_latches_a_perf_slew_does_not_cost_the_anchor(tmp_path):
     # the half-bracket (plus the clock's resolution) of the map, and none is left out.
     assert latch["uncertaintySeconds"] == pytest.approx(1e-4, abs=1e-6)
     assert latch["dropped"] == []
-    # The residual tolerance is a quarter of the measured period (under the 2 ms cap here).
-    assert latch["limitSeconds"] == pytest.approx(camera["framePeriodSeconds"] / 4)
+    # The residual band: centred on the calibration less the exposure, the calibration's
+    # spread (prediction_factor() of them, for its session count) and the map's uncertainty wide.
+    assert latch["expectedResidualSeconds"] == pytest.approx(CALIBRATION.offset_seconds - EXPOSURE)
+    assert latch["limitSeconds"] == pytest.approx(
+        clocks.prediction_factor(CALIBRATION.sessions) * CALIBRATION.spread_seconds
+        + latch["uncertaintySeconds"])
 
 
 @pytest.mark.parametrize("raw, raw_latches", [(False, False), (True, False), (False, True)],
@@ -530,7 +560,8 @@ def test_a_latch_left_out_of_the_map_is_listed_in_the_anchor_evidence(tmp_path):
 
     evidence, number = SessionDataRecorder._latch_anchor(
         SimpleNamespace(primary_frame_id=rig.frame_id(n0)), stream, "", transitions, 1 / FPS,
-        ni_residual_rms=4e-5, transition_raw=None)
+        ni_residual_rms=4e-5, transition_raw=None, exposure_seconds=EXPOSURE,
+        delivery_calibration=EXACT)
 
     assert evidence["status"] == "paired" and number == 10
     assert evidence["dropped"] == [4]
@@ -539,7 +570,8 @@ def test_a_latch_left_out_of_the_map_is_listed_in_the_anchor_evidence(tmp_path):
     # A first frame whose transition is outside the spool still says which latch was left out.
     evidence, number = SessionDataRecorder._latch_anchor(
         SimpleNamespace(primary_frame_id=rig.frame_id(n0) - 20), stream, "", transitions, 1 / FPS,
-        ni_residual_rms=4e-5, transition_raw=None)
+        ni_residual_rms=4e-5, transition_raw=None, exposure_seconds=EXPOSURE,
+        delivery_calibration=EXACT)
     assert evidence["status"] == "outside" and number is None
     assert "(-10) is outside the spool" in evidence["reason"]
     assert "latch 4 left out" in evidence["reason"]
@@ -551,7 +583,8 @@ def test_a_3_ms_slew_needs_the_raw_map_to_pair(tmp_path):
     # the perf latch line cannot follow it, and RAW, which no slew touches, is not in it. The
     # `clock` label alone cannot tell the two apart; this outcome rests on the numbers. By
     # hand: half the frames sit under 3 ms x sin(pi/4) = 2.12 ms of bump, and less the 0.175 ms
-    # exposure the perf residual's median is about 1.95 ms, over the 1.67 ms quarter period.
+    # exposure the perf residual's median is about 1.95 ms, 2.12 ms from where the calibration
+    # expects it (-0.175 ms on these true host times).
     rig = SyntheticRig()
     n0 = rig.first_edge_at_or_after(5.0)
     stream = read_raw_stream(rig.write_latency_stream(_project(tmp_path), "left", n0, 3000, 0.001,
@@ -563,13 +596,14 @@ def test_a_3_ms_slew_needs_the_raw_map_to_pair(tmp_path):
     def anchor(transition_raw):
         return SessionDataRecorder._latch_anchor(
             boundary, stream, "", perf, 1 / FPS, ni_residual_rms=4e-5,
-            transition_raw=transition_raw)
+            transition_raw=transition_raw, exposure_seconds=EXPOSURE,
+            delivery_calibration=EXACT)
 
     on_perf, perf_number = anchor(None)
     on_raw, raw_number = anchor(rig.raw(t))
 
     assert on_perf["status"] == "ambiguous" and perf_number is None
-    assert on_perf["clock"] == "perf" and "over the latch tolerance" in on_perf["reason"]
+    assert on_perf["clock"] == "perf" and "from the expected" in on_perf["reason"]
     assert on_perf["medianResidualSeconds"] == pytest.approx(0.00195, abs=5e-5)
     assert on_raw["status"] == "paired" and raw_number == 10
     assert on_raw["clock"] == "raw" and on_raw["slip"] is None
@@ -591,7 +625,7 @@ def test_raw_on_one_latch_burst_only_anchors_on_perf(tmp_path):
     def anchored():
         return SessionDataRecorder._match_camera_nidaq_edge(
             boundary, start_perf, spool, ni_fit=fit, exposure_seconds=EXPOSURE,
-            read_latency_stream=lambda: (stream, ""))
+            delivery_calibration=CALIBRATION, read_latency_stream=lambda: (stream, ""))
 
     assert anchored()["latch"]["clock"] == "raw"
     stream["clock_latches"]["raw_before"][3:] = np.nan
@@ -616,7 +650,8 @@ def test_alignment_schema_four_keeps_the_old_fields_and_records_both_matches(tmp
                 "confidence", "reason"):
         assert key in camera, key
     for key in ("anchorMethod", "niToHost", "exposureSeconds", "impliedLagSeconds",
-                "framePeriodSeconds", "latch", "anchorsAgree", "arrival", "arrivalSampleIndex"):
+                "framePeriodSeconds", "latch", "anchorsAgree", "arrival", "arrivalSampleIndex",
+                "deliveryCalibration"):
         assert key in camera, key
     for key in ("expectedLagSeconds", "lagGateSeconds", "expectedLagSampleIndex"):
         assert key not in camera, key
@@ -629,8 +664,14 @@ def test_alignment_schema_four_keeps_the_old_fields_and_records_both_matches(tmp
     assert camera["latch"]["status"] == "paired" and camera["latch"]["usableLatches"] == 6
     assert camera["arrival"]["status"] == "paired" and camera["arrival"]["agreement"] == 1.0
     # The measured limits, additive inside the evidence (still schemaVersion 4).
-    for key in ("clock", "uncertaintySeconds", "limitSeconds", "slip", "dropped"):
+    for key in ("clock", "uncertaintySeconds", "limitSeconds", "expectedResidualSeconds", "slip",
+                "dropped"):
         assert key in camera["latch"], key
+    # The calibration the band was centred on, as the rebuild reads it back.
+    calibration = camera["deliveryCalibration"]
+    assert calibration["offsetSeconds"] == pytest.approx(CALIBRATION.offset_seconds)
+    assert calibration["spreadSeconds"] == pytest.approx(CALIBRATION.spread_seconds)
+    assert calibration["sessions"] == CALIBRATION.sessions
     for key in ("limitSeconds", "slip"):
         assert key in camera["arrival"], key
     lag, period = camera["arrival"]["medianLagSeconds"], camera["framePeriodSeconds"]
@@ -925,6 +966,7 @@ def _tone_inputs(tmp_path):
     rig.write_latency_stream(project, "left", n0, 2000, 0.001)
     camera = SessionDataRecorder._match_camera_nidaq_edge(
         boundary, start_perf, spool, ni_fit=fit, exposure_seconds=EXPOSURE,
+        delivery_calibration=CALIBRATION,
         read_latency_stream=lambda: SessionDataRecorder._read_primary_latency_stream(
             project, boundary))
     assert camera["status"] == "matched", camera["reason"]
@@ -1037,3 +1079,15 @@ def test_a_tone_fallback_beside_a_ready_frame_timeline_keeps_its_frame_at_a_lowe
     assert frame["method"].endswith("nidaq_camera_exposure_timeline_verified_by_writer")
     assert camera["confidence"] == "hardware_edge"
     assert frame["confidence"] == "ambiguous_hardware_edge"
+
+
+def test_nidaq_h5_keeps_which_read_each_copys_stamps_are(tmp_path):
+    rig, project, n0, result = _record(tmp_path, t0=5.0, lag=0.001)
+
+    streams = Path(project.get_session_path().location) / "streams"
+    with h5py.File(streams / "nidaq.h5", "r") as store:
+        newest = store["block_newest_read_start_index"][()]
+        index = store["sample_index"][()]
+    # The synthetic rig copies one read at a time, so each sample's newest read is its own.
+    assert newest.shape == index.shape
+    assert np.all(newest <= index) and np.all(index - newest < 167)

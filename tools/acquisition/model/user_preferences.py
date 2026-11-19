@@ -9,9 +9,6 @@ from PySide6.QtCore import QByteArray, QCoreApplication, QRect, QSettings
 from autotrainer.core import ObservableObject
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.configuration import SystemConfiguration
-from tools.acquisition.model.animal_metadata_sync import (
-    DEFAULT_SOFTMOUSE_MANIFEST_PATH,
-)
 
 
 logger = get_verbose_logger(__name__)
@@ -46,7 +43,9 @@ class UserPreferences(ObservableObject):
     ANIMAL_LOCATION = "animal_location"
     PELLET_PORT = "pellet_port"
     MEASUREMENT_GRAPH = "measurement_graph"
+    ANIMAL_METADATA_SOURCE = "animal_metadata_source"
     SOFTMOUSE_MANIFEST_PATH = "softmouse_manifest_path"
+    SOFTMOUSE_PUBLICATION_MOUNT = "softmouse_publication_mount"
     SOFTMOUSE_NAME_COLUMN = "softmouse_name_column"
     SOFTMOUSE_NIGHTLY_REFRESH = "softmouse_nightly_refresh"
     WINDOW_NORMAL_GEOMETRY = "window_normal_geometry"
@@ -98,14 +97,20 @@ class UserPreferences(ObservableObject):
         self._live_feed_refresh_rate: int = settings.value("display/refresh_rate", 15, int)  # noqa
         self._measurement_graph: str = settings.value("ui/measurement_graph", "")  # noqa
 
-        self._softmouse_manifest_path: str = (
-            settings.value(
-                "softmouse/manifest_path",
-                DEFAULT_SOFTMOUSE_MANIFEST_PATH.as_posix(),
-                str,
-            ).strip()
-            or DEFAULT_SOFTMOUSE_MANIFEST_PATH.as_posix()
-        )
+        # The animal metadata source this user set up, as JSON (see
+        # animal_sources.config); its secrets are kept outside this file.
+        self._animal_metadata_source: str = settings.value(
+            "animal_metadata/source", "", str
+        ).strip()
+        # Before sources existed: a shared publication to read, and the
+        # options that went with it. Read when no source is set up.
+        self._softmouse_manifest_path: str = settings.value(
+            "softmouse/manifest_path", "", str
+        ).strip()
+        # The mount the publication must be on; empty checks none.
+        self._softmouse_publication_mount: str = settings.value(
+            "softmouse/publication_mount", "", str
+        ).strip()
         self._softmouse_name_column: str = settings.value(
             "softmouse/new_animal_name_column", "Physical Tag", str
         )
@@ -310,15 +315,37 @@ class UserPreferences(ObservableObject):
         self._on_property_changed(self.MEASUREMENT_GRAPH, value, prev)
 
     @property
+    def animal_metadata_source(self) -> str:
+        return self._animal_metadata_source
+
+    @animal_metadata_source.setter
+    def animal_metadata_source(self, value: str) -> None:
+        value = value.strip()
+        prev, self._animal_metadata_source = self._animal_metadata_source, value
+        self._settings.setValue("animal_metadata/source", value)
+        self._on_property_changed(self.ANIMAL_METADATA_SOURCE, value, prev)
+
+    @property
     def softmouse_manifest_path(self) -> str:
         return self._softmouse_manifest_path
 
     @softmouse_manifest_path.setter
     def softmouse_manifest_path(self, value: str) -> None:
-        value = value.strip() or DEFAULT_SOFTMOUSE_MANIFEST_PATH.as_posix()
+        value = value.strip()
         prev, self._softmouse_manifest_path = self._softmouse_manifest_path, value
         self._settings.setValue("softmouse/manifest_path", self._softmouse_manifest_path)
         self._on_property_changed(self.SOFTMOUSE_MANIFEST_PATH, self._softmouse_manifest_path, prev)
+
+    @property
+    def softmouse_publication_mount(self) -> str:
+        return self._softmouse_publication_mount
+
+    @softmouse_publication_mount.setter
+    def softmouse_publication_mount(self, value: str) -> None:
+        value = value.strip()
+        prev, self._softmouse_publication_mount = self._softmouse_publication_mount, value
+        self._settings.setValue("softmouse/publication_mount", value)
+        self._on_property_changed(self.SOFTMOUSE_PUBLICATION_MOUNT, value, prev)
 
     @property
     def softmouse_name_column(self) -> str:

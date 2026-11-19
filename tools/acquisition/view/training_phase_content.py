@@ -9,7 +9,7 @@ from autotrainer.core.logging import get_verbose_logger
 from autotrainer.pyside import CardWidget
 from autotrainer.pyside.StackedContent import StackedWidget
 
-from autotrainer.training import TrainingPlan, TrainingPhase
+from autotrainer.behavior.training import TrainingPlan, TrainingPhase
 
 from autotrainer.pyside.content_widget import invoke_method
 

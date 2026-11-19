@@ -20,7 +20,6 @@ omit =
     shibokensupport/*
     signature_bootstrap.py
     */tests/*
-    */auto-trainer-api/*
 
 # allow coverage in python sub-processes (subprocess):
 # patch = subprocess  # only valid from coverage 7.10+ but one for py3.8 is stuck lower.
@@ -54,4 +53,3 @@ omit =
     shibokensupport/*
     signature_bootstrap.py
     */tests/*
-    */auto-trainer-api/*

@@ -32,7 +32,11 @@ class SoftMouseCredentials:
 
 @dataclass(frozen=True)
 class SoftMouseHttpsConfiguration:
-    """Application-owned description of the Christie SoftMouse export flow."""
+    """How the SoftMouse Animals export is reached; the colony is the lab's.
+
+    ``colony_name`` is chosen at setup from the colonies the user's account
+    can open. Nothing here names a lab.
+    """
 
     base_url: str = "https://www.softmouse.net/"
     login_path: str = ""
@@ -40,7 +44,7 @@ class SoftMouseHttpsConfiguration:
     login_username_field: str = "username"
     login_password_field: str = "password"
     csrf_field: str = "csrftoken"
-    colony_name: str = "Jason Christie"
+    colony_name: str = ""
     colony_owner_parameter: str = "ownerCode"
     animal_list_path: str = "smdb/mouse/list.do"
     animal_list_marker: str = "exportMouseMenuButton"
@@ -125,7 +129,7 @@ class _SoftMousePageParser(HTMLParser):
 
 
 class SoftMouseHttpsSource:
-    """Browserless replay of the fixed Christie SoftMouse Animals export flow."""
+    """Browserless replay of the SoftMouse Animals export for one colony."""
 
     _EXPORT_COLUMNS = (
         ("SoftMouse ID", "id"),
@@ -164,6 +168,8 @@ class SoftMouseHttpsSource:
         self._sleep = sleep
 
     def download(self, destination_directory: Path) -> Path:
+        if not self.configuration.colony_name.strip():
+            raise ValueError("A SoftMouse colony must be chosen at setup")
         logger.info(
             "SoftMouse HTTPS export started: colony=%s origin=%s",
             self.configuration.colony_name,
@@ -207,13 +213,22 @@ class SoftMouseHttpsSource:
         parser.feed(text)
         return parser
 
-    def _login_and_select_colony(self) -> str:
+    def list_colonies(self) -> list[str]:
+        """The colonies this account can open, as named on the SoftMouse home page."""
+        parser = self._login()
+        names = []
+        for link in parser.links:
+            query = parse_qs(urlparse(link["href"]).query)
+            name = " ".join(" ".join(link["text"]).split())
+            if query.get(self.configuration.colony_owner_parameter) and name:
+                names.append(name)
+        names = list(dict.fromkeys(names))
+        logger.info("SoftMouse colonies listed: count=%d", len(names))
+        return names
+
+    def _login(self) -> _SoftMousePageParser:
         cfg = self.configuration
-        logger.info(
-            "SoftMouse authentication started: origin=%s colony=%s",
-            cfg.base_url,
-            cfg.colony_name,
-        )
+        logger.info("SoftMouse authentication started: origin=%s", cfg.base_url)
         response = self._transient_request("GET", self._url(cfg.login_path))
         response.raise_for_status()
         parser = self._parse_page(response.text)
@@ -247,12 +262,16 @@ class SoftMouseHttpsSource:
             raise RuntimeError("SoftMouse rejected the stored username or password")
         self._reject_interactive_challenge(login_response.text)
         logger.info("SoftMouse authentication accepted")
+        return login_parser
 
+    def _login_and_select_colony(self) -> str:
+        cfg = self.configuration
+        login_parser = self._login()
         target_name = cfg.colony_name.casefold()
         matching_links = [
             link
             for link in login_parser.links
-            if " ".join(link["text"]).strip().casefold() == target_name
+            if " ".join(" ".join(link["text"]).split()).casefold() == " ".join(target_name.split())
         ]
         if len(matching_links) != 1:
             raise RuntimeError(
@@ -265,7 +284,9 @@ class SoftMouseHttpsSource:
             cfg.colony_owner_parameter, []
         )
         if len(owner_values) != 1 or not owner_values[0]:
-            raise RuntimeError("SoftMouse Christie colony link has no owner identifier")
+            raise RuntimeError(
+                f"SoftMouse colony link {cfg.colony_name!r} has no owner identifier"
+            )
         owner_code = owner_values[0]
 
         selected = self._transient_request("GET", colony_url)
@@ -355,10 +376,13 @@ class SoftMouseHttpsSource:
 
         record_count = expected_records or 0
         if record_count < 1:
-            raise RuntimeError("SoftMouse Christie active-animal export is empty")
+            raise RuntimeError(
+                f"SoftMouse active-animal export for {cfg.colony_name!r} is empty"
+            )
         if record_count > cfg.maximum_export_rows:
             raise RuntimeError(
-                f"SoftMouse reports {record_count} active Christie animals; its "
+                f"SoftMouse reports {record_count} active animals in "
+                f"{cfg.colony_name!r}; its "
                 f"configured publication safety limit is {cfg.maximum_export_rows}"
             )
         if not rows:
@@ -374,9 +398,13 @@ class SoftMouseHttpsSource:
             if not isinstance(row, dict):
                 raise RuntimeError("SoftMouse returned an invalid Animals row")
             if str(row.get("ownerId", "")) != owner_code:
-                raise RuntimeError("SoftMouse export scope includes a non-Christie owner")
+                raise RuntimeError(
+                    "SoftMouse export scope includes an animal of another colony owner"
+                )
             if str(row.get("owner", "")).strip().casefold() != cfg.colony_name.casefold():
-                raise RuntimeError("SoftMouse export scope owner name is not Christie")
+                raise RuntimeError(
+                    f"SoftMouse export scope owner name is not {cfg.colony_name!r}"
+                )
             if str(row.get("mousestate", "")).strip().casefold() not in allowed_states:
                 raise RuntimeError("SoftMouse export scope includes an inactive animal")
             identifier = row.get("id")

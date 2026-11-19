@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import ClassVar, Iterable, Optional, Tuple
 
 from autotrainer.core import make_camelize_representer, make_decamelize_constructor
@@ -39,6 +40,67 @@ class NidaqSignalChannelConfiguration:
 
 
 @dataclasses.dataclass(frozen=True)
+class NidaqDeliveryCalibration:
+    """Where a correct camera-latch pairing's residual sits on this rig, measured by loopback.
+
+    The pairing's median residual is the NI-to-host fit's delivery floor, plus the
+    camera's own stamp offset, minus the exposure (the camera stamps a frame at the
+    end of its exposure, the NI edge marks its start). offset_seconds is the mean of
+    residual + exposure over loopback-verified sessions and spread_seconds its
+    standard deviation between them: the residual gate is centred on offset minus
+    the session's exposure. tools/hardware/calibrate_ni_delivery.py measures both
+    and records what the sessions covered; the gate reads only the two numbers.
+    """
+
+    offset_seconds: float
+    spread_seconds: float
+    sessions: int
+    measured: str = ""
+    """When the calibration ran (ISO 8601)."""
+    read_chunk_samples: Tuple[int, ...] = tuple()
+    frame_rates_hz: Tuple[float, ...] = tuple()
+    exposures_seconds: Tuple[float, ...] = tuple()
+    camera_serials: Tuple[str, ...] = tuple()
+    delivery_floor_min_seconds: Optional[float] = None
+    delivery_floor_max_seconds: Optional[float] = None
+
+    def __post_init__(self):
+        # Every number is checked here: alignment.json, which records the calibration,
+        # is written without NaN, and a hand-edited value (YAML reads 35e-6 as text) must
+        # fail when the configuration loads, not when a session is finalized.
+        def number(name, value):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"NI delivery calibration {name} must be a number, "
+                                 f"not {value!r}") from None
+            if not math.isfinite(value):
+                raise ValueError(f"NI delivery calibration {name} must be finite")
+            return value
+
+        object.__setattr__(self, "offset_seconds", number("offset_seconds", self.offset_seconds))
+        object.__setattr__(self, "spread_seconds", number("spread_seconds", self.spread_seconds))
+        if not self.spread_seconds > 0:
+            raise ValueError("NI delivery calibration spread_seconds must be positive")
+        if isinstance(self.sessions, bool) or int(self.sessions) != self.sessions:
+            raise ValueError("NI delivery calibration sessions must be a whole number")
+        object.__setattr__(self, "sessions", int(self.sessions))
+        if self.sessions < 2:
+            raise ValueError("NI delivery calibration needs at least two sessions")
+        object.__setattr__(self, "measured", str(self.measured))
+        object.__setattr__(self, "read_chunk_samples",
+                           tuple(int(value) for value in self.read_chunk_samples))
+        for name in ("frame_rates_hz", "exposures_seconds"):
+            object.__setattr__(self, name, tuple(number(name, value)
+                                                 for value in getattr(self, name)))
+        object.__setattr__(self, "camera_serials", tuple(str(value) for value in self.camera_serials))
+        for name in ("delivery_floor_min_seconds", "delivery_floor_max_seconds"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, number(name, value))
+
+
+@dataclasses.dataclass(frozen=True)
 class NidaqSignalStreamConfiguration:
     """Continuous NI-DAQ acquisition stream and independent display selection."""
 
@@ -60,6 +122,9 @@ class NidaqSignalStreamConfiguration:
     #: unrelated inputs. "rse" matches a BNC breakout's shared ground and is
     #: the default; "diff" and "nrse" are available for other wiring.
     analog_terminal_config: str = "rse"
+    #: This rig's NI delivery calibration, or None. Without one the camera-latch
+    #: pairing is refused, so no session is rated hardware_edge by camera clock.
+    delivery_calibration: Optional[NidaqDeliveryCalibration] = None
 
     def __post_init__(self):
         channels = tuple(self.channels)
@@ -121,6 +186,7 @@ class NidaqSignalStreamConfiguration:
 
 for _tag, _cls in (
     ("NidaqSignalChannelConfiguration", NidaqSignalChannelConfiguration),
+    ("NidaqDeliveryCalibration", NidaqDeliveryCalibration),
     ("NidaqSignalStreamConfiguration", NidaqSignalStreamConfiguration),
 ):
     SystemConfigurationDumper.add_representer(_cls, make_camelize_representer(f"!{_tag}"))

@@ -49,5 +49,5 @@ class QueueFit:
             return frame
         # INTER_AREA at an integer ratio is a plain block mean, and it is ~170x
         # faster than the numpy equivalent (0.014 ms vs 2.4 ms at 512x512 on
-        # christielab10). It releases the GIL while it runs.
+        # the reference rig). It releases the GIL while it runs.
         return cv2.resize(frame, (self.shape[1], self.shape[0]), interpolation=cv2.INTER_AREA)

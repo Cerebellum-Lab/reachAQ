@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import math
 import numbers
 import threading
 import time
-from typing import Dict, Mapping, Optional, Protocol, Tuple, Union
+from typing import Dict, Mapping, Optional, Protocol, Tuple, Union, runtime_checkable
 
 from autotrainer.core import (
     LaserChannelConfiguration,
@@ -13,6 +14,9 @@ from autotrainer.core import (
     LaserSystemConfiguration,
     normalize_laser_channel_id,
 )
+from autotrainer.core.simulation import is_simulation, publish_signal
+
+logger = logging.getLogger(__name__)
 
 
 def _check_timeout_seconds(timeout_seconds: Optional[float]) -> None:
@@ -146,7 +150,7 @@ class LaserSynchronizedPulseTrain:
 
 
 #: How long the start of each calibration step is left out of its point, by
-#: default: a time, whatever the step's length. Confirmed on christielab10
+#: default: a time, whatever the step's length. Confirmed on the reference rig
 #: with 5 ms steps at 100 kHz (H2b, 56f58866): laser 2's diode came within 2%
 #: in 270-610 us, laser 1's in 420-430 us, the command copies at once, and
 #: every point lands within 0.5% of its step. Laser 2 needs 55-61 samples
@@ -262,6 +266,7 @@ class LaserDiodePowerCurve:
         return self.points[-1].command_volts
 
 
+@runtime_checkable
 class LaserControllerProtocol(Protocol):
     """Application-facing contract for laser control implementations."""
 
@@ -329,6 +334,13 @@ class LaserPulseCancelled(RuntimeError):
 
 class NullLaserController:
     """In-memory laser controller for UI development and tests."""
+
+    #: The timing status an emulated asynchronous operation reports.
+    _emulated_timing_status = {
+        "status": "emulated_software_start",
+        "reason": "Null laser backend; no physical AO timing is claimed",
+        "emulated": True,
+    }
 
     def __init__(self, configuration: LaserSystemConfiguration):
         self._configuration = configuration
@@ -458,11 +470,7 @@ class NullLaserController:
                 context=pulse_train.operation_context,
                 terminal_callback=self._release_emulated_operation,
             )
-            operation._set_timing_status({
-                "status": "emulated_software_start",
-                "reason": "Null laser backend; no physical AO timing is claimed",
-                "emulated": True,
-            })
+            operation._set_timing_status(self._emulated_timing_status)
             self._live_operations[operation.operation_id] = operation
 
         def execute():
@@ -472,6 +480,7 @@ class NullLaserController:
             # whatever close_shutter says (Ben, 2026-10-02). There is no
             # before_abort here, so a cancel does not close them itself.
             shutters_opened = delivered = False
+            started_perf = None
             try:
                 operation._mark_armed()
                 timeout = (
@@ -486,6 +495,8 @@ class NullLaserController:
                 operation._require_not_cancelled()
                 operation._mark_triggered("emulated software start accepted")
                 shutters_opened = True
+                started_perf = time.perf_counter()
+                self._emulated_train_started(pulse_train, started_perf)
                 for train in pulse_train.pulse_trains:
                     channel = self._configuration.get_channel(train.channel_id)
                     if train.open_shutter:
@@ -503,6 +514,8 @@ class NullLaserController:
             except Exception as error:
                 terminal_error = error
             finally:
+                if started_perf is not None and not delivered:
+                    self._emulated_train_cut_short(pulse_train, started_perf)
                 for train in pulse_train.pulse_trains:
                     channel = self._configuration.get_channel(train.channel_id)
                     self.set_command_voltage(
@@ -546,6 +559,12 @@ class NullLaserController:
                 duration += (train.pulse_count - 1) / train.frequency_hz
             durations.append(duration)
         return max(durations, default=0.0)
+
+    def _emulated_train_started(self, pulse_train, started_perf: float) -> None:
+        """An emulated train's output began at `started_perf`; nothing to do here."""
+
+    def _emulated_train_cut_short(self, pulse_train, started_perf: float) -> None:
+        """An emulated train that began at `started_perf` ended early; nothing to do here."""
 
     def _release_emulated_operation(self, operation):
         with self._operation_lock:
@@ -617,3 +636,162 @@ class NullLaserController:
                 f"laser channel {channel.channel_id.value} has no auxiliary_output configured"
             )
         return self._aux_enabled[channel.channel_id]
+
+
+
+def simulated_pulse_windows(train: LaserPulseTrain, started_perf: float) -> Tuple[Tuple[float, float], ...]:
+    """Each pulse's (start, end) perf time, for a train whose output began at `started_perf`.
+
+    Laid out as the NI waveform lays them (_pulse_train_samples): the
+    baseline, then the pulses one period apart.
+    """
+    first = started_perf + train.baseline_ms / 1000.0
+    period = 1.0 / train.frequency_hz if train.pulse_count > 1 else 0.0
+    duration = train.duration_ms / 1000.0
+    return tuple(
+        (first + index * period, first + index * period + duration)
+        for index in range(train.pulse_count)
+    )
+
+
+#: A simulated train's published windows start this long after the train
+#: does, so none begins before it is on the bus: the stream truncates an
+#: event published after it has sampled the event's window.
+SIM_WINDOW_LEAD_S = 0.001
+
+
+class SimulatedLaserController(NullLaserController):
+    """The NI laser in a simulation run: the null controller, seen on the NI inputs.
+
+    Each pulse window is published on the simulation bus as the laser's
+    command copy and diode would read it, raw: the commanded volts on both,
+    which the stream then scales by the channel's command_copy_scale and
+    feedback_scale, as NullLaserController's readings are scaled. A train's
+    windows are all published when it starts: the stream truncates an event
+    published after it has sampled the event's window.
+    """
+
+    _emulated_timing_status = {
+        "status": "emulated_software_start",
+        "reason": "Simulated NI laser; pulse windows are published on the simulation bus",
+        "emulated": True,
+        "simulated": True,
+    }
+
+    def __init__(self, configuration: LaserSystemConfiguration, **_nidaq_kwargs):
+        # feedback_reader, timing_plan and analog_terminal_config are the NI
+        # controller's; there is no NI task here for them to configure.
+        super().__init__(configuration)
+        self._warned_bus_error = False
+
+    @property
+    def timing_status(self) -> dict:
+        return {
+            "status": "simulated",
+            "reason": "Simulated NI laser; no physical AO timing is claimed",
+            "emulated": True,
+        }
+
+    def run_synchronized_pulse_train(self, pulse_train: LaserSynchronizedPulseTrain):
+        result = super().run_synchronized_pulse_train(pulse_train)
+        if pulse_train.wait:
+            # The null train returns at once; its windows start now.
+            self._publish_guarded(self._publish_windows, pulse_train, time.perf_counter())
+        return result
+
+    def _publish_guarded(self, publish, *args) -> None:
+        # The train has run (or is running), so a bus that cannot be written
+        # is no failure of it. Once-only warning, as on every path.
+        try:
+            publish(*args)
+        except OSError as err:
+            if not self._warned_bus_error:
+                self._warned_bus_error = True
+                logger.warning("simulated laser windows not published on the bus: %s", err)
+
+    def _emulated_train_started(self, pulse_train, started_perf: float) -> None:
+        self._publish_guarded(self._publish_windows, pulse_train, started_perf)
+
+    def _emulated_train_cut_short(self, pulse_train, started_perf: float) -> None:
+        self._publish_guarded(self._clear_windows, pulse_train, started_perf)
+
+    def _clear_windows(self, pulse_train, started_perf: float) -> None:
+        # The windows were published ahead; a later event overrides an
+        # earlier one on the stream, so 0 V from now to the train's end
+        # clears the pulses that will not now fire.
+        now = time.perf_counter()
+        end = started_perf + SIM_WINDOW_LEAD_S + self._emulated_pulse_duration_seconds(pulse_train)
+        if end <= now:
+            return
+        for train in pulse_train.pulse_trains:
+            for line in self._bus_lines(train.channel_id):
+                publish_signal(line, now, end, 0.0)
+
+    def _publish_windows(self, pulse_train: LaserSynchronizedPulseTrain, started_perf: float) -> None:
+        for train in pulse_train.pulse_trains:
+            lines = self._bus_lines(train.channel_id)
+            for start, end in simulated_pulse_windows(train, started_perf + SIM_WINDOW_LEAD_S):
+                for line in lines:
+                    publish_signal(line, start, end, float(train.amplitude_volts))
+
+    def _bus_lines(self, channel_id) -> Tuple[str, ...]:
+        """The NI channel names nidaq_channel_plan gives this laser's inputs."""
+        channel = self._configuration.get_channel(channel_id)
+        number = int(channel.channel_id)
+        lines = []
+        if channel.command_copy_input:
+            lines.append(f"laser{number}_command_copy")
+        if channel.diode_input:
+            lines.append(f"laser{number}_diode")
+        return tuple(lines)
+
+
+def make_laser_controller(
+    configuration: LaserSystemConfiguration,
+    *,
+    feedback_reader=None,
+    timing_plan=None,
+    analog_terminal_config: Optional[str] = None,
+    hardware_class=None,
+    isolate: Optional[bool] = None,
+    on_fault=None,
+) -> LaserControllerProtocol:
+    """The controller `configuration`'s backend names; the simulated one for NI in a simulation run.
+
+    An NI laser, real or simulated, is opened in a laser process of its own
+    (laser_process.LaserProcessController), which drives it safe when this
+    process dies or hangs; `on_fault` is told why that process failed.
+    `isolate` False opens it here instead, as the laser process itself does;
+    None follows laser_process.isolation_enabled().
+
+    `hardware_class` lets a call site pass the NI class it imported, so tests
+    that patch that module attribute keep patching what is constructed. It
+    applies to a controller opened here only.
+    """
+    backend = configuration.backend
+    if backend == "null":
+        return NullLaserController(configuration)
+    if backend == "nidaq":
+        from . import laser_process
+        if isolate is None:
+            isolate = laser_process.isolation_enabled()
+        if isolate:
+            return laser_process.LaserProcessController(
+                configuration,
+                feedback_reader=feedback_reader,
+                timing_plan=timing_plan,
+                analog_terminal_config=analog_terminal_config,
+                on_fault=on_fault,
+            )
+        if is_simulation():
+            return SimulatedLaserController(configuration)
+        if hardware_class is None:
+            # Imported here: nidaq_laser imports this module.
+            from .nidaq_laser import NidaqLaserController as hardware_class
+        return hardware_class(
+            configuration,
+            feedback_reader=feedback_reader,
+            timing_plan=timing_plan,
+            analog_terminal_config=analog_terminal_config,
+        )
+    raise RuntimeError(f"Laser backend {backend!r} has no controller to open")

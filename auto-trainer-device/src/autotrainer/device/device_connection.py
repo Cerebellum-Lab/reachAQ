@@ -9,7 +9,7 @@ from threading import Event, Lock, Thread
 from typing import Callable, Union, Optional, Any, Set
 
 
-from autotrainer.api import ApiEventKind
+from autotrainer.core.api import ApiEventKind
 
 from autotrainer.core import (
     MotorConfigurations,

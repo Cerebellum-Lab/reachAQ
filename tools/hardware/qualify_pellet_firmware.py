@@ -75,8 +75,8 @@ from tools.hardware.verify_nidaq_wiring import (  # noqa: E402
     matches,
 )
 
-DEFAULT_CONFIG = Path.home() / "Autotrainer" / "system_configuration.yaml"
-DEFAULT_RECORD_DIR = Path.home() / "Autotrainer" / "pellet_firmware_qualification"
+DEFAULT_CONFIG = SystemConfiguration.DEFAULT_PATH.expanduser()
+DEFAULT_RECORD_DIR = SystemConfiguration.DEFAULT_CONFIG_DIR.expanduser() / "pellet_firmware_qualification"
 
 EPERM = 1
 #: jerrycan_gpio_pulse_phase_t in reachAQ-hardware's jerrycan_types.h.
@@ -345,7 +345,7 @@ def map_stim_terminals(evidence, nidaqmx, interface, configuration):
     The watched terminal is the one PFI the output raises: the pulse check
     times it and the drop check counts edges on it. A port line that rises
     with it is a digital readback of the same output, recorded but not
-    watched; christielab10 gained them after 2.3.0 was qualified (port0/line5
+    watched; the reference rig gained them after 2.3.0 was qualified (port0/line5
     for STIM2, line6 for STIM3). No PFI, or more than one, fails.
     """
     observed = {}
@@ -476,7 +476,7 @@ def check_drops(evidence, nidaqmx, interface, terminal, count):
             f"{device}/ctr0", edge=Edge.RISING, initial_count=0,
             count_direction=CountDirection.COUNT_UP)
         channel.ci_count_edges_term = terminal
-        # Unfiltered, christielab10's PFI0 counts about ten rising edges per
+        # Unfiltered, the reference rig's PFI0 counts about ten rising edges per
         # pulse, at any width, and none with nothing driven: glitches under
         # 125 ns at the transitions (measured 2026-09-23). The smallest filter
         # the 6221 offers rejects them and cannot swallow a 1 ms pulse. The

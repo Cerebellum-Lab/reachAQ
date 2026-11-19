@@ -130,12 +130,16 @@ class SyntheticRig:
         return float(self.host(self.edge_time(n))) + lag
 
     def write_spool(self, path, *, t_from, t_to, tone_pulses=(), raw=False, stamps=True,
-                    drop_edge_at=None):
+                    drop_edge_at=None, reads_per_copy=1, newest_read_column=True):
         """The recorder's spool for NI seconds [t_from, t_to): the layout
         _open_nidaq_spool_locked creates, and the snapshot _write_session takes.
 
         drop_edge_at (NI seconds) omits the toggle of the first exposure edge at
-        or after it, so cam_frames has one transition fewer from there on."""
+        or after it, so cam_frames has one transition fewer from there on.
+        reads_per_copy groups that many reads into each recorder copy, stamped
+        with its newest read's stamps, as reads shorter than the copy interval
+        are; newest_read_column=False leaves out block_newest_read_start_index,
+        as spools from before it do."""
         first = int(round(t_from * RATE))
         last = int(round(t_to * RATE))
         index = np.arange(first, last, dtype=np.int64)
@@ -149,8 +153,12 @@ class SyntheticRig:
         if not stamps:
             stamp = np.full(reads.size, np.nan)
         per_sample = read_number - reads[0]
-        block_perf = stamp[per_sample]
-        block_raw = raw_stamp[per_sample]
+        # The newest read of the copy each sample is in, relative to the first read.
+        newest = np.minimum((per_sample // reads_per_copy + 1) * reads_per_copy - 1,
+                            per_sample[-1])
+        block_perf = stamp[newest]
+        block_raw = raw_stamp[newest]
+        newest_start = np.maximum((reads[0] + newest) * READ, first)
         edges = np.array([self.edge_sample(n) for n in range(int((t_to + 1.0 - EDGE0) / PERIOD) + 1)])
         if drop_edge_at is not None:
             edges = np.delete(edges, self.first_edge_at_or_after(drop_edge_at))
@@ -175,6 +183,8 @@ class SyntheticRig:
             store.create_dataset("block_observation_perf_time", data=block_perf)
             store.create_dataset("block_observation_wall_time", data=block_perf + 1e9)
             store.create_dataset("block_observation_raw_time", data=block_raw)
+            if newest_read_column:
+                store.create_dataset("block_newest_read_start_index", data=newest_start)
             store.create_dataset("values", data=np.vstack(rows))
             store.attrs["channel_names"] = tuple(channels)
             store.attrs["sample_rate_hz"] = RATE

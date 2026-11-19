@@ -1,3 +1,4 @@
+import contextlib
 import csv
 import ctypes
 import dataclasses
@@ -28,7 +29,7 @@ from typing import Optional, List, Dict, Callable, Any, Union, ClassVar, Protoco
 import numpy as np
 import yaml
 
-from autotrainer.api import ApiDetectorKind, ApiTrainingMode, \
+from autotrainer.core.api import ApiDetectorKind, ApiTrainingMode, \
     ApiSystemConfiguration, ApiApplicationMode, ApiCommand, ApiCommandRequestErrorKind
 
 from autotrainer.core import (
@@ -60,8 +61,10 @@ from autotrainer.core import (
 from autotrainer.core.configuration.json_compat import SystemConfigurationJSONEncoder
 from autotrainer.core.interfaces import RecordingEndingReason, CaptureAnalysisResult
 from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
+from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR
 from autotrainer.core.configuration import SystemConfigurationDumper, DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.multiproc import no_op_timer
+from autotrainer.core.simulation import is_simulation
 from autotrainer.core.logging import (
     get_verbose_logger,
     log_hardware_initialization,
@@ -83,14 +86,12 @@ from autotrainer.inference import (
     InferenceStatus,
     PoseResponse,
     calibration_FLIR,
-    DlcPoseModel,
 )
 from autotrainer.inference.backend_selection import (
     available_backends,
     confidence_threshold,
     pre_validate_model,
     selected_backend,
-    trained_model_name,
 )
 from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.config import load_calib_stereo_params
@@ -113,9 +114,9 @@ from autotrainer.behavior import (
     TrialOutcome,
 )
 
-from autotrainer.training import TrainingPlan, TrainingPhase, PlanRepository, PlanInfo, LoadProgressResult
+from autotrainer.behavior.training import TrainingPlan, TrainingPhase, PlanRepository, PlanInfo, LoadProgressResult
 
-from autotrainer.api import (
+from autotrainer.core.api import (
     RpcService,
     ApiCommandRequest,
     ApiCommandRequestResponse,
@@ -156,6 +157,8 @@ from tools.acquisition.model.send_block_reasons import SendBlockReasons
 # The name intertrial analysis holds the pellet send under. Inter-trial timing
 # holds under its own name, so neither releases the other.
 INTERTRIAL_ANALYSIS_BLOCK_NAME = "intertrial_analysis"
+# The name a training plan's between-trials pause holds the pellet send under.
+TRAINING_PAUSE_BLOCK_NAME = "training_plan_pause"
 from tools.acquisition.model.coordinate_model import CoordinateModel
 from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.helpers import first_line, get_config_location
@@ -182,6 +185,11 @@ from tools.acquisition.model.nidaq_wiring_verification import (
 )
 from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
 from tools.acquisition.model.nidaq_stream_autostart import NidaqStreamAutoStart
+from tools.acquisition.model.pose_training_model import (
+    PoseTrainingModel,
+    last_deploy,
+    record_deploy,
+)
 from tools.acquisition.model.nidaq_timing import (
     remap_nidaq_physical_channel,
     resolve_nidaq_device_aliases,
@@ -197,9 +205,10 @@ from tools.acquisition.model.animal_reconciliation import (
 )
 from tools.acquisition.model.animal_registry import AnimalRegistry
 from tools.acquisition.model.rfid_metadata_controller import RfidMetadataController
-from tools.acquisition.model.softmouse_spreadsheet_source import (
-    SoftMouseMappingProfile,
-    SoftMouseSpreadsheetSource,
+from tools.acquisition.model.animal_sources.config import (
+    build_source,
+    load_source_configuration,
+    publish_target,
 )
 from tools.acquisition.model.session_data_recorder import SessionDataRecorder
 from tools.acquisition.model.session_telemetry import (
@@ -327,7 +336,7 @@ _DAQ_PORTS_UPDATE = "DAQ ports update"
 _LASER_CALIBRATION = "laser calibration"
 _LASER_CALIBRATION_REASON = "a laser calibration ramp is running"
 #: How long Record waits for a protocol check another thread is running. A
-#: check of 5000 rows took 0.45 s on christielab10's E-cores; the default
+#: check of 5000 rows took 0.45 s on the reference rig's E-cores; the default
 #: protocol has 15.
 _PROTOCOL_CHECK_RECORD_WAIT_S = 2.0
 #: How much longer than the ramp's own timeout closing waits for it.
@@ -444,6 +453,11 @@ class _BoundedClose:
             return "failed to close ({})".format(
                 first_line(self.error) or self.error.__class__.__name__)
         return ""
+
+
+# A Preferences edit arrives per keystroke or spin-box step; its save waits
+# this long after the last one, so a run of edits writes the file once.
+_PREFERENCES_SAVE_DELAY_SECONDS = 0.5
 
 
 def _serialized_session_configuration(method):
@@ -810,11 +824,17 @@ class AppModel(ObservableObject):
 
         self.set_log_location()
 
-        self._plan_repo = PlanRepository()
+        self._plan_repo = PlanRepository(
+            Path(preferences.configuration_location).expanduser() / "training_plans"
+        )
+        self._training_pause_timer: Optional[threading.Timer] = None
+        self._training_pause_lock = threading.RLock()
+        self._training_offset_warned = False
         self._training_plan: Optional[TrainingPlan] = None
         self._training_plan_animal: Optional[AnimalSubject] = None
         self._recording_session = RecordingSessionController()
         self._session_lifecycle_command_lock = threading.RLock()
+        self._pending_configuration_save: Optional[threading.Timer] = None
         self._session_stop_policy: Optional[SessionStopPolicy] = None
         self._session_stop_evaluation: Optional[SessionStopEvaluation] = None
         self._recording_ending_reason = RecordingEndingReason.NA
@@ -1051,6 +1071,7 @@ class AppModel(ObservableObject):
         self._attached_animal: Optional[AnimalSubject] = None
         self._protocol_runner = TrialProtocolRunner(
             on_protocol_complete=self._on_trial_protocol_complete,
+            on_trial_recorded=self._on_training_trial_recorded,
         )
         self._pellet_cycles = PelletCycleController(
             self._session_api,
@@ -1165,6 +1186,7 @@ class AppModel(ObservableObject):
             readiness=self._pellet_send_readiness,
             guard=self._guard_protocol_send,
         )
+        pellet_m.set_motion_readiness_callback(self._pellet_motion_readiness)
 
         analysis.watchdog_monitor.property_changed += self._on_watchdog_property_changed
 
@@ -2222,7 +2244,7 @@ class AppModel(ObservableObject):
 
     def reload_calib(self, calib_dir: Optional[Path]):
         calib_src_dir = (
-            Path(f"~/Autotrainer/{DEFAULT_3D_CALIB_DIR_NAME}") if calib_dir is None
+            DEFAULT_CONFIG_DIR / DEFAULT_3D_CALIB_DIR_NAME if calib_dir is None
             else calib_dir
         ).expanduser()
         logger.info("loading calib from %s", calib_src_dir)
@@ -2268,7 +2290,6 @@ class AppModel(ObservableObject):
             # the pellet never once appeared on the overlay.
             confidence_threshold=confidence_threshold(
                 selected_backend(model_path=model_location),
-                model_name=trained_model_name(model_location),
                 model_path=model_location,
             ),
         )
@@ -3067,8 +3088,14 @@ class AppModel(ObservableObject):
                 f"Pellet axis {', '.join(axes)} needs homing after a refused command: "
                 "home the pellet axes"
             )
+        faults = self._pellet_axes_with_driver_fault()
+        if pellet_source_required and faults:
+            blockers.append(
+                f"Pellet stepper driver fault on axis {', '.join(faults)}: "
+                "home the pellet axes to clear it"
+            )
         if self.animal_metadata_refresh_busy:
-            blockers.append("SoftMouse animal metadata refresh is still running")
+            blockers.append("Animal metadata refresh is still running")
         if self._recording_session.status is not SessionRecordingStatus.READY:
             blockers.append(
                 f"recording state: {self._recording_session.status.value}"
@@ -3631,7 +3658,12 @@ class AppModel(ObservableObject):
         self._animal_registry = None
         self._animal_metadata_sync = None
         self._rfid_metadata_controller = None
-        manifest_value = getattr(self._preferences, "softmouse_manifest_path", "")
+        try:
+            source_configuration = load_source_configuration(self._preferences)
+            source_error = None
+        except Exception as exc:
+            logger.exception("Animal metadata source configuration is unreadable")
+            source_configuration, source_error = None, exc
         hardware_configuration = (
             None if self._loaded_configuration is None
             else self._loaded_configuration.hardware
@@ -3641,9 +3673,9 @@ class AppModel(ObservableObject):
             and hardware_configuration.rfid_reader_enabled
         )
         logger.info(
-            "Configuring SoftMouse/RFID services: manifest_configured=%s "
+            "Configuring animal metadata/RFID services: source=%s "
             "rfid_enabled=%s rfid_device=%s",
-            bool(manifest_value),
+            "none" if source_configuration is None else source_configuration.kind,
             reader_enabled,
             (
                 "not configured"
@@ -3651,12 +3683,12 @@ class AppModel(ObservableObject):
                 else hardware_configuration.rfid_device
             ),
         )
-        if not manifest_value and not reader_enabled:
+        if source_configuration is None and source_error is None and not reader_enabled:
             self._set_animal_metadata_status("Not configured")
             self._set_subsystem_status(
                 SubsystemId.ANIMAL_REGISTRY,
                 SubsystemState.DISABLED,
-                reason="SoftMouse/RFID not configured",
+                reason="animal metadata source/RFID not configured",
                 required_for_recording=False,
             )
             self._set_subsystem_status(
@@ -3666,13 +3698,14 @@ class AppModel(ObservableObject):
                 required_for_recording=False,
             )
             return
+        # The directory keeps its first name so existing caches carry over.
         cache_directory = Path(self._preferences.configuration_location) / "softmouse"
         try:
             registry = self._animal_registry = AnimalRegistry(
                 cache_directory / "animal-registry.sqlite3"
             )
         except Exception as exc:
-            logger.exception("SoftMouse animal registry initialization failed")
+            logger.exception("Animal registry initialization failed")
             self._set_animal_metadata_status(f"Registry unavailable: {exc}")
             self._set_subsystem_status(
                 SubsystemId.ANIMAL_REGISTRY,
@@ -3694,7 +3727,7 @@ class AppModel(ObservableObject):
                 f"{registry.recovered_corrupt_path.name}"
             )
             logger.warning(
-                "Recovered corrupt SoftMouse registry: backup=%s",
+                "Recovered corrupt animal registry: backup=%s",
                 registry.recovered_corrupt_path,
             )
         self._set_subsystem_status(
@@ -3703,21 +3736,29 @@ class AppModel(ObservableObject):
             reason=registry_reason,
             required_for_recording=False,
         )
-        if manifest_value:
-            profile = SoftMouseMappingProfile(
-                new_animal_name_column=getattr(
-                    self._preferences, "softmouse_name_column", "Physical Tag"
+        source_status = None
+        if source_error is not None:
+            source_status = f"Source setup unreadable: {source_error}"
+        elif source_configuration is not None:
+            try:
+                configured = build_source(source_configuration)
+            except Exception as exc:
+                logger.exception(
+                    "Animal metadata source unavailable: kind=%s", source_configuration.kind
                 )
-            )
-            self._animal_metadata_sync = AnimalMetadataSyncService(
-                manifest_path=Path(manifest_value),
-                local_staging_directory=cache_directory / "source",
-                source=SoftMouseSpreadsheetSource(profile),
-                registry=registry,
-                can_refresh=lambda: (
-                    self.session_recording_status is SessionRecordingStatus.READY
-                ),
-            )
+                source_status = f"Source unavailable: {exc}"
+            else:
+                publish_directory, publish_mount = publish_target(source_configuration)
+                self._animal_metadata_sync = AnimalMetadataSyncService(
+                    configured=configured,
+                    local_staging_directory=cache_directory / "source",
+                    registry=registry,
+                    can_refresh=lambda: (
+                        self.session_recording_status is SessionRecordingStatus.READY
+                    ),
+                    publish_directory=publish_directory,
+                    publish_mount=publish_mount,
+                )
         if reader_enabled:
             self._rfid_metadata_controller = RfidMetadataController(
                 app_model=self,
@@ -3742,11 +3783,19 @@ class AppModel(ObservableObject):
                 required_for_recording=False,
             )
         previous = registry.last_complete_import()
-        if previous is None:
-            self._set_animal_metadata_status("Ready; no export imported yet")
+        if source_status is not None:
+            self._set_animal_metadata_status(source_status)
+            self._set_subsystem_status(
+                SubsystemId.ANIMAL_REGISTRY,
+                SubsystemState.FAILED,
+                error=source_status,
+                required_for_recording=False,
+            )
+        elif previous is None:
+            self._set_animal_metadata_status("Ready; nothing imported yet")
         else:
             self._set_animal_metadata_status(
-                f"Cache has {previous['accepted_rows']} tagged animals; "
+                f"Cache has {previous['accepted_rows']} animals; "
                 f"last refresh {previous['imported_utc']}; "
                 f"source {previous['source_file_sha256'][:12]}"
             )
@@ -3763,7 +3812,7 @@ class AppModel(ObservableObject):
     ) -> bool:
         service = self._animal_metadata_sync
         if service is None:
-            raise RuntimeError("Configure a SoftMouse publication manifest first")
+            raise RuntimeError("Set up an animal metadata source first")
         if self.session_recording_status is not SessionRecordingStatus.READY:
             with self._animal_metadata_refresh_lock:
                 self._animal_metadata_refresh_deferred = True
@@ -3774,7 +3823,7 @@ class AppModel(ObservableObject):
             if self._animal_metadata_refresh_busy:
                 self._animal_metadata_refresh_deferred = True
                 self._animal_metadata_refresh_reason = str(reason)
-                logger.info("SoftMouse refresh coalesced while another refresh is active")
+                logger.info("Animal metadata refresh coalesced while another refresh is active")
                 return False
             self._animal_metadata_refresh_busy = True
             self._animal_metadata_refresh_deferred = False
@@ -3783,21 +3832,21 @@ class AppModel(ObservableObject):
             self.Props.ANIMAL_METADATA_REFRESH_BUSY, True, False,
         )
         logger.info(
-            "SoftMouse local-cache refresh requested: manifest=%s reason=%s",
-            service.manifest_path,
+            "Animal metadata refresh requested: source=%s reason=%s",
+            service.describe(),
             reason,
         )
         self._set_animal_metadata_status("Refreshing…")
         self._set_subsystem_status(
             SubsystemId.ANIMAL_REGISTRY,
             SubsystemState.STARTING,
-            reason="refreshing SoftMouse cache",
+            reason="refreshing animal metadata cache",
             required_for_recording=False,
         )
         thread = threading.Thread(
             target=self._run_animal_metadata_refresh,
             args=(service, bool(only_if_due)),
-            name="softmouse-cache-refresh",
+            name="animal-metadata-refresh",
             daemon=True,
         )
         self._animal_metadata_refresh_thread = thread
@@ -3820,7 +3869,7 @@ class AppModel(ObservableObject):
     ) -> None:
         if error is not None:
             logger.error(
-                "SoftMouse local-cache refresh failed: %s",
+                "Animal metadata refresh failed: %s",
                 error,
                 exc_info=(type(error), error, error.__traceback__),
             )
@@ -3858,8 +3907,9 @@ class AppModel(ObservableObject):
 
     def _publish_animal_metadata_refresh_result(self, result) -> None:
         batch = result.preview.batch
+        with_rfid = sum(record.physical_rfid is not None for record in batch.records)
         status = (
-            f"Imported {batch.accepted_rows} tagged animals; "
+            f"Imported {batch.accepted_rows} animals ({with_rfid} with RFID); "
             f"ignored {batch.ignored_missing_rfid_rows} without RFID and "
             f"{batch.ignored_ended_rows} ended"
         )
@@ -3869,6 +3919,9 @@ class AppModel(ObservableObject):
             f"; source {batch.source_file_sha256[:12]}; "
             f"refreshed {batch.imported_utc}"
         )
+        publication = getattr(result, "publication", None)
+        if publication is not None:
+            status += f"; published {publication.manifest_path}"
         self._set_animal_metadata_status(status)
         previous_preview, self._animal_metadata_preview = (
             self._animal_metadata_preview,
@@ -3886,7 +3939,7 @@ class AppModel(ObservableObject):
             required_for_recording=False,
         )
         logger.info(
-            "SoftMouse local-cache refresh complete: import_id=%s total_rows=%d "
+            "Animal metadata refresh complete: import_id=%s total_rows=%d "
             "tagged_rows=%d ignored_missing_rfid=%d ignored_ended=%d unchanged=%s "
             "source_sha256=%s",
             batch.import_id,
@@ -3904,14 +3957,14 @@ class AppModel(ObservableObject):
                 "scheduled catch-up", only_if_due=True,
             )
         except Exception as exc:
-            logger.warning("Scheduled SoftMouse catch-up refresh failed: %s", exc)
+            logger.warning("Scheduled animal metadata catch-up refresh failed: %s", exc)
 
     def _request_animal_metadata_catchup(self) -> None:
         self._run_animal_metadata_catchup()
 
     def apply_animal_metadata_preferences(self) -> None:
         if self.animal_metadata_refresh_busy:
-            raise RuntimeError("SoftMouse settings cannot change during a cache refresh")
+            raise RuntimeError("Animal metadata settings cannot change during a refresh")
         self._configure_animal_metadata_services()
         if self._rfid_metadata_controller is not None:
             self._rfid_metadata_controller.start()
@@ -4516,6 +4569,7 @@ class AppModel(ObservableObject):
         session_control = self._behavior.algorithm.active_config.session_control
         session_control.automatic_protocol_advance_enabled = enabled
         self._protocol_runner.automatic_advance = enabled
+        self._save_configuration_soon()
         if self._attached_plan is not None:
             self._attached_plan.is_automatic = enabled
             self._on_property_changed(
@@ -4592,6 +4646,7 @@ class AppModel(ObservableObject):
         """Apply a Preferences mutation through the session-state boundary."""
         self._require_session_ready_for_configuration(action)
         update(self._behavior.algorithm)
+        self._save_configuration_soon()
 
     @_serialized_session_configuration
     def set_live_inference_enabled(self, enabled: bool) -> None:
@@ -4599,6 +4654,10 @@ class AppModel(ObservableObject):
             "Changing live inference"
         )
         self._inference.is_enabled = bool(enabled)
+        # The operator's choice replaces a --live-inference override, which
+        # would otherwise keep the file at its loaded value.
+        self._runtime_live_inference_override = None
+        self._save_configuration_soon()
 
     @_serialized_session_configuration
     def set_inference_model_location(self, value: str) -> None:
@@ -4606,6 +4665,51 @@ class AppModel(ObservableObject):
             "Changing the inference model"
         )
         self._inference.model_location = str(value)
+        self._save_configuration_soon()
+
+    @property
+    def pose_training(self) -> PoseTrainingModel:
+        """The in-app pose training run, created on first use.
+
+        It may only train while the session is READY, and it is paused when a
+        recording arms: every route into a recording passes through ARMING,
+        and the transition is published synchronously on the thread that
+        starts the recording, so the cameras do not start until the training
+        process has checkpointed and exited.
+        """
+        # Not getattr: Events answers any unknown attribute with an event.
+        training = self.__dict__.get("_pose_training")
+        if training is None:
+            training = self._pose_training = PoseTrainingModel(
+                is_ready=lambda: (
+                    self._recording_session.status is SessionRecordingStatus.READY
+                ),
+            )
+            self.property_changed += self._pause_pose_training_for_recording
+        return training
+
+    def _pause_pose_training_for_recording(self, name, value, _previous) -> None:
+        if (
+            name == self.Props.SESSION_RECORDING_STATUS
+            and value is SessionRecordingStatus.ARMING
+            and not self._pose_training.pause()
+        ):
+            logger.error("pose training did not stop before the recording started")
+
+    def deploy_pose_model(self, path: str) -> None:
+        """Make a trained model the live one, remembering the model it replaces."""
+        self._require_session_ready_for_configuration("Changing the inference model")
+        previous = self._inference.model_location
+        self.set_inference_model_location(path)
+        record_deploy(self.pose_training.models_root, previous, str(path))
+
+    def revert_pose_model(self) -> str:
+        """Go back to the model the last deploy replaced; returns its location."""
+        entry = last_deploy(self.pose_training.models_root)
+        if entry is None:
+            raise RuntimeError("no pose model has been deployed from pose training")
+        self.deploy_pose_model(entry["previous"])
+        return entry["previous"]
 
     @_serialized_session_configuration
     def update_user_preference(self, name: str, value) -> None:
@@ -4630,6 +4734,9 @@ class AppModel(ObservableObject):
         logger.success("Set new project to %s", dataclasses.asdict(new_prj))
         log_path = new_prj.get_log_file_path(auto_new=False)
         self.set_log_location(log_path)
+        # A load sets it from the file it is reading; only an edit saves.
+        if not self._configuration_load_incomplete:
+            self._save_configuration_soon()
 
     @property
     def animal_name(self) -> str:
@@ -5689,7 +5796,7 @@ class AppModel(ObservableObject):
             # algorithm's thread without waiting, and the relay returns
             # nothing. Wait for this one, so the state below says whether
             # the SEND was taken: unwaited, every protocol Send was failed
-            # here before that thread ran it (christielab10, 2026-10-02).
+            # here before that thread ran it (reference rig, 2026-10-02).
             with BehaviorAlgorithm.set_put_func_call_mode(True):
                 self._behavior.system_machine.pellet.send_pellet(force=force)
             if operation.state is PreparedState.PREPARED:
@@ -5747,6 +5854,9 @@ class AppModel(ObservableObject):
             automatic = controller.latest
             if automatic is not None and automatic.apply_automatically:
                 controller.accept(automatic.generation)
+        directive = self._protocol_runner.next_trial_directive(
+            self._training_draw_key(trial_id, attempt_id)
+        )
         context = TrialCompileContext(
             session_id=token.session_id,
             session_generation=token.generation,
@@ -5776,6 +5886,10 @@ class AppModel(ObservableObject):
             automatic_recommendation=(
                 None if automatic is None else automatic.to_record()
             ),
+            training_offset_dcs=(
+                (0.0, 0.0, 0.0) if directive is None else directive.target_offset_dcs
+            ),
+            training_directive=None if directive is None else directive.to_record(),
         )
         if (
             row.position_lane.value != "center"
@@ -5848,7 +5962,7 @@ class AppModel(ObservableObject):
                 raise RuntimeError(
                     "Pre-reveal stimulation requires the pellet cover policy Reveal"
                 )
-            # The laser's own board line: laser 2 on christielab10 is wired
+            # The laser's own board line: laser 2 on the reference rig is wired
             # to STIM2, and a board pulse on STIM3 never triggered it.
             self._behavior.system_machine.pellet.prepare_pre_reveal_stimulus(
                 row["pre_reveal_ms"],
@@ -6202,6 +6316,22 @@ class AppModel(ObservableObject):
         axes = getattr(self._hardware, "pellet_axes_needing_home", ())
         return axes if isinstance(axes, tuple) else ()
 
+    def _pellet_axes_with_driver_fault(self) -> Tuple[str, ...]:
+        axes = getattr(self._hardware, "pellet_axes_with_driver_fault", ())
+        return axes if isinstance(axes, tuple) else ()
+
+    def _pellet_motion_readiness(self) -> bool:
+        """Whether the board will accept automatic pellet motion: no axis needs a home.
+
+        While a refusal says an axis needs a home, the board would refuse
+        automatic motion as well, so automation waits for an acknowledged
+        home. It is asked on every automatic load; a forced (manual) load is
+        not held.
+        While a refused automatic cover or release holds, it is also asked on
+        every automatic cover and release check, to end that hold.
+        """
+        return not self._pellet_axes_needing_home()
+
     def _pellet_send_readiness(self) -> bool:
         """Whether an automatic send may go: asked for every send that is not forced.
 
@@ -6234,20 +6364,95 @@ class AppModel(ObservableObject):
         self.request_pellet_send(force=False, automatic=True)
         return False
 
-    def _guard_protocol_send(self) -> None:
+    def _training_draw_key(self, trial_id, attempt_id) -> str:
+        """Seeds a training plan's random trial actions: one draw per attempt."""
+        return f"{self._protocol_session_seed}:{trial_id}:{attempt_id}"
+
+    def _apply_training_send_actions(self) -> None:
+        """The attached plan's tone, played right before every SEND.
+
+        Pellet-target offsets are applied only through an ordered protocol's
+        compiled trial, whose positioning waits for each axis; a SEND without
+        one is left where the operator put the pellet.
+        """
+        directive = self._protocol_runner.next_trial_directive(
+            self._training_draw_key(self._pellet_cycles.planned_trial_id, "send")
+        )
+        if directive is None:
+            return
+        if directive.tone is not None:
+            # A cue that fails must not stop the SEND it accompanies.
+            try:
+                token = self._hardware.play_tone(
+                    directive.tone.frequency_hz,
+                    directive.tone.duration_ms / 1000.0,
+                )
+            except Exception:
+                logger.exception("Training plan tone failed for phase %s", directive.phase_id)
+            else:
+                if token is None:
+                    logger.warning("Training plan tone was not queued for phase %s", directive.phase_id)
         if (
             self._selected_ordered_protocol is None
-            or not self._behavior.algorithm.is_in_session
+            and any(directive.target_offset_dcs)
+            and not self._training_offset_warned
         ):
-            return
-        token = self._recording_session.token()
-        operation = self._trial_action_executor.operation
-        if token is None or operation is None:
-            raise RuntimeError("Ordered protocol SEND has not been prepared")
-        self._trial_action_executor.require_send_permission(
-            operation.recipe.operation_id,
-            token.generation,
+            self._training_offset_warned = True
+            logger.warning(
+                "Training plan %s phase %s moves the pellet target, which needs an "
+                "ordered protocol; this SEND uses the current pellet position",
+                directive.plan_id, directive.phase_id,
+            )
+
+    def _on_training_trial_recorded(self, attempt_label: str) -> None:
+        """Hold automatic SENDs for the current phase's between-trials pause."""
+        directive = self._protocol_runner.next_trial_directive(
+            f"{self._protocol_session_seed}:after:{attempt_label}"
         )
+
+        def release():
+            # A timer cancelled too late must not release a newer pause.
+            with self._training_pause_lock:
+                if self._training_pause_timer is timer:
+                    self._clear_training_pause()
+
+        with self._training_pause_lock:
+            self._clear_training_pause()
+            if directive is None or directive.pause_seconds <= 0.0:
+                return
+            self._send_block_reasons.set(
+                TRAINING_PAUSE_BLOCK_NAME,
+                f"training plan pause {directive.pause_seconds:.1f} s",
+            )
+            timer = threading.Timer(directive.pause_seconds, release)
+            timer.daemon = True
+            self._training_pause_timer = timer
+            timer.start()
+        logger.info("Training plan %s phase %s: pausing %.3f s before the next automatic SEND",
+                    directive.plan_id, directive.phase_id, directive.pause_seconds)
+
+    def _clear_training_pause(self) -> None:
+        with self._training_pause_lock:
+            timer, self._training_pause_timer = self._training_pause_timer, None
+            if timer is not None:
+                timer.cancel()
+            self._send_block_reasons.clear(TRAINING_PAUSE_BLOCK_NAME)
+
+    def _guard_protocol_send(self) -> None:
+        if (
+            self._selected_ordered_protocol is not None
+            and self._behavior.algorithm.is_in_session
+        ):
+            token = self._recording_session.token()
+            operation = self._trial_action_executor.operation
+            if token is None or operation is None:
+                raise RuntimeError("Ordered protocol SEND has not been prepared")
+            self._trial_action_executor.require_send_permission(
+                operation.recipe.operation_id,
+                token.generation,
+            )
+        # Only once the SEND is allowed: no cue without a pellet.
+        self._apply_training_send_actions()
 
     def _cancel_protocol_operation(
         self,
@@ -6298,6 +6503,7 @@ class AppModel(ObservableObject):
             )
             if control.trial_count_basis == TrialCountBasis.SCORED.value:
                 control.trial_count_basis = TrialCountBasis.COMPLETED.value
+        self._save_configuration_soon()
         self._notify_trial_protocol_state()
         return True
 
@@ -6312,6 +6518,7 @@ class AppModel(ObservableObject):
             raise ValueError(f"Unknown session-control option: {field}")
         candidate = dataclasses.replace(control, **{str(field): value})
         setattr(control, str(field), getattr(candidate, str(field)))
+        self._save_configuration_soon()
         self._notify_trial_protocol_state()
         return True
 
@@ -6584,6 +6791,7 @@ class AppModel(ObservableObject):
         plan = self._attached_plan
         if plan is None:
             return
+        self._clear_training_pause()
         self._detach_training_phase()
         plan.property_changed -= self._on_training_plan_property_changed
         plan.progress_updated -= self._on_training_plan_progress_updated
@@ -8033,10 +8241,26 @@ class AppModel(ObservableObject):
         self._set_subsystem_status(
             SubsystemId.LASER,
             SubsystemState.READY,
-            reason="laser controller connected",
+            reason=self._laser_ready_reason(),
             generation=generation,
         )
         return True
+
+    def _laser_ready_reason(self) -> str:
+        """READY's reason; it says so when an NI laser can only hold a DC command.
+
+        With hardwareTimed false the NI controller refuses every pulse train
+        and the calibration ramp (NidaqLaserController.run_synchronized_pulse_train),
+        which a protocol, Test stim and Run Pulse all need.
+        """
+        configuration = self._laser.configuration
+        if configuration.backend == "nidaq" and not configuration.hardware_timed:
+            logger.warning(
+                "The NI laser is configured with hardwareTimed: false, so pulse "
+                "trains, Test stim, Run Pulse and the calibration ramp are refused")
+            return ("laser controller connected; hardwareTimed is false, so pulses "
+                    "and the calibration ramp are refused")
+        return "laser controller connected"
 
     def _laser_analog_terminal_config(self):
         """The stream's analogTerminalConfig, which the laser's own inputs use.
@@ -8996,8 +9220,10 @@ class AppModel(ObservableObject):
         # several steps can raise. A load that stops part-way leaves the cameras
         # on the new configuration and the rest on the old, and save_configuration
         # builds what it writes from those live objects. On 2026-09-17 exactly
-        # that wrote a demo run's playback cameras over christielab10's real
+        # that wrote a demo run's playback cameras over the reference rig's real
         # ones. So nothing may be saved until this load reaches its last line.
+        # An edit still waiting belongs to the file it was made on.
+        self.flush_configuration_save()
         self._configuration_load_incomplete = True
         if location is None:
             location = self.get_config_location()
@@ -9212,7 +9438,12 @@ class AppModel(ObservableObject):
         self.output_location = configuration.persistence.output_location
         self._configure_subsystem_intent(configuration)
 
-        self.reload_training_plans(reraise_on_error=True)
+        # A loaded configuration brings its own plans, as it brings its own
+        # protocols. Plan files are operator-written: a bad one is reported
+        # and leaves the library empty rather than failing the load.
+        self._plan_repo.root = self._loaded_config_dir_path / "training_plans"
+        self._training_plans = []
+        self.reload_training_plans()
 
         # and:
         self._load_animals()
@@ -9247,6 +9478,32 @@ class AppModel(ObservableObject):
             return
         self._training_plans = plan_infos
 
+    def _save_configuration_soon(self) -> None:
+        """Save once the edits stop; exit and a load write a pending save first."""
+        with self._session_lifecycle_command_lock:
+            if self._pending_configuration_save is not None:
+                self._pending_configuration_save.cancel()
+            timer = threading.Timer(
+                _PREFERENCES_SAVE_DELAY_SECONDS, self._flush_configuration_save_from_timer)
+            timer.daemon = True
+            self._pending_configuration_save = timer
+            timer.start()
+
+    def _flush_configuration_save_from_timer(self) -> None:
+        try:
+            self.flush_configuration_save()
+        except Exception:
+            logger.exception("Could not save the configuration after a Preferences edit")
+
+    def flush_configuration_save(self) -> None:
+        """Write a Preferences save still waiting; nothing when none is."""
+        with self._session_lifecycle_command_lock:
+            timer, self._pending_configuration_save = self._pending_configuration_save, None
+            if timer is None:
+                return
+            timer.cancel()
+            self.save_configuration()
+
     def save_configuration(self):
         if self._loaded_configuration is None:
             # do not save if loaded_config is still None, which signify the load configuration failed,
@@ -9264,11 +9521,14 @@ class AppModel(ObservableObject):
         # Back to the file it was loaded from. The preferences location is only
         # where the application looks when no file is named; saving there meant
         # a run started with -c on a copy overwrote the real configuration on
-        # exit, which on christielab10 wrote a test run's settings into
+        # exit, which on the reference rig wrote a test run's settings into
         # ~/Autotrainer on 2026-09-16.
         loc = self._loaded_configuration_path
         logger.info("Saving configuration to %s", loc)
-        conf = self._create_configuration()
+        # A training phase's device settings are not the operator's configuration.
+        plan = self._attached_plan
+        with contextlib.nullcontext() if plan is None else plan.device_settings_restored():
+            conf = self._create_configuration()
         conf.save_file(loc, as_yaml=True)
 
     @_serialized_session_configuration
@@ -9587,7 +9847,12 @@ class AppModel(ObservableObject):
         # mp_mgr.join()
 
         self._preferences.save()
-        self.save_configuration()
+        # Only a Preferences edit still waiting for its save is written here.
+        # Each operator edit of a stored setting saves itself; what changed
+        # while running (a stim session's camera mode, a CLI override, the
+        # protocol's progress) is the session's, and its metadata records it.
+        # Saving on exit wrote that runtime state over the file every run.
+        self.flush_configuration_save()
         unregister_fatal_exception_callback(self._on_fatal_exception)
 
     def _on_fatal_exception(self, source: str, exception: BaseException) -> None:
@@ -9943,13 +10208,16 @@ class AppModel(ObservableObject):
             )
 
     def _on_laser_runtime_property_changed(self, name, value, _old_value):
+        if name == self._laser.CONTROLLER_FAULT:
+            self._on_laser_process_fault(str(value))
+            return
         if name != self._laser.IS_CONNECTED:
             return
         if value:
             self._set_subsystem_status(
                 SubsystemId.LASER,
                 SubsystemState.READY,
-                reason="laser controller connected",
+                reason=self._laser_ready_reason(),
             )
         elif self._laser.configuration.backend != "disabled":
             current = self._acquisition.subsystems.get(SubsystemId.LASER)
@@ -9983,6 +10251,19 @@ class AppModel(ObservableObject):
                     return SubsystemState.STOPPED, dict(reason="laser controller disconnected")
 
                 self._set_laser_status_after_close(decide)
+
+    def _on_laser_process_fault(self, reason: str) -> None:
+        """The laser process failed (laser_process): the laser latches FAILED.
+
+        The process drove the laser safe, or the application reset it from a
+        new process; the reason says which, or that it must be made safe by
+        hand. Laser service stays off until the next Run or Refresh Hardware
+        opens a controller again (Ben, 2026-11-18).
+        """
+        error = f"laser process failed: {reason}"
+        self._set_subsystem_status(SubsystemId.LASER, SubsystemState.FAILED, error=error)
+        if self._acquisition.started and not self._acquisition.stopping:
+            self._handle_recording_subsystem_failure(SubsystemId.LASER, error)
 
     def _handle_recording_subsystem_failure(
         self,
@@ -10659,7 +10940,11 @@ class AppModel(ObservableObject):
         hard = self._hardware
         if name == hard.CAN_CONNECTION_STATE_PROPERTY:
             self._on_can_connection_state_changed(value)
-        elif name in {hard.FIRMWARE_COMPATIBILITY_PROPERTY, hard.PELLET_NEEDS_HOME_PROPERTY}:
+        elif name in {
+            hard.FIRMWARE_COMPATIBILITY_PROPERTY,
+            hard.PELLET_NEEDS_HOME_PROPERTY,
+            hard.PELLET_DRIVER_FAULT_PROPERTY,
+        }:
             self.property_changed(
                 self.Props.RECORDING_BLOCKERS,
                 self.recording_blockers,
@@ -11502,6 +11787,16 @@ class AppModel(ObservableObject):
                 # clock fits it used, and why anything is missing.
                 "latency": dict(self._latency_status),
             }
+            if is_simulation():
+                # Marks the session so simulated data is never taken for a recording.
+                out["simulation"] = {
+                    "enabled": True,
+                    "bus": os.environ.get("REACHAQ_SIM_BUS"),
+                    "backends": {
+                        "camera": "sim", "nidaq": "simulated",
+                        "laser": "simulated", "can": "emulation",
+                    },
+                }
         out = _metadata_without_nonfinite_numbers(out)
         json_path = Path(file_name + ".json")
         yaml_path = Path(file_name + ".yaml")

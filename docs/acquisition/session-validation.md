@@ -35,11 +35,29 @@ Current stable rule IDs:
 
 | Area | Rules |
 |---|---|
-| Publication | `session.layout`, `session.schema`, `session.generation`, `session.manifest`, `metadata.mirror` |
+| Publication | `session.layout`, `session.schema`, `session.generation`, `session.manifest`, `metadata.mirror`, `session.provenance` |
 | Sources/media | `sources.contract`, `camera.frames`, `camera.ledger` |
 | NI | `nidaq.continuity`, `nidaq.timing_graph`, `alignment.frames` |
 | Events | `events.alignment`, `events.frames`, `events.tones`, `events.laser`, `events.board_time`, `stim.evidence` |
 | Trials | `trials.lifecycle`, `trials.protocol` |
+
+`session.provenance` warns "simulated session: no hardware was recorded" when the
+session metadata carries a `simulation` block with `enabled` true, and passes
+("recorded on hardware backends") when it has none. Only a simulation run
+(`REACHAQ_SIMULATION=1`) writes the block, so a warning here means the data is not
+from hardware.
+
+`camera.ledger` reads each camera's `frame_present_` column by the name the merge
+writes it under: lowercased, with other characters as `_` (`frame_present_stimcam`
+for `stimCam`). Validator versions before 2026-11-18 looked the name up as
+given and failed every session that recorded a mixed-case camera.
+
+Each camera's present count is checked against `presentFrames` in
+`streams/camera_alignment.json`, the frames the camera delivered. A dropped frame
+is written to the video as a blank, so `sampleCount` counts it but the ledger
+marks it absent; the rule warns with the number of blanks instead of failing.
+Sessions without `presentFrames` are checked against `sampleCount`. Validator
+versions before 2026-11-19 failed every session with a real dropped frame.
 
 `sources.contract` checks each file a source lists. Pose is recorded as one
 `raw2D_live.h5` per camera, and each missing one is named. Validator versions

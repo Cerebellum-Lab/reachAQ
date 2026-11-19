@@ -17,6 +17,7 @@ from typing import Dict, List, Mapping
 
 import numpy
 
+from autotrainer.core.hdf5_inheritance import mark_close_on_exec
 from autotrainer.core.latency import latency_recording_enabled
 from autotrainer.core.latency.schema import EVENT_TABLES, LATENCY_SCHEMA_VERSION
 
@@ -251,6 +252,7 @@ class LatencyEventLog:
         staged = path.with_name(path.name + ".partial")
         try:
             with h5py.File(staged, "w") as store:
+                mark_close_on_exec(store)
                 store.attrs["schema_version"] = LATENCY_SCHEMA_VERSION
                 for name, dtype in EVENT_TABLES.items():
                     rows = tables.get(name)

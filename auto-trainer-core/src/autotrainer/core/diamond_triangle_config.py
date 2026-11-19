@@ -9,6 +9,7 @@ import yaml
 from typing_extensions import Self
 
 from autotrainer.core import Offset3DTuple
+from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR
 from autotrainer.core.logging import get_verbose_logger
 
 
@@ -16,7 +17,7 @@ logger = get_verbose_logger(__name__)
 
 
 DEFAULT_DIAMOND_TRIANGLE_CONFIG_PATH = Path(
-    os.getenv("AUTOTRAINER_DIAMOND_TRIANGLE_CONFIG", "~/Autotrainer/diamond_triangle_offset.yaml")
+    os.getenv("AUTOTRAINER_DIAMOND_TRIANGLE_CONFIG", DEFAULT_CONFIG_DIR / "diamond_triangle_offset.yaml")
 ).expanduser()
 
 _offset_nans = Offset3DTuple(math.nan, math.nan, math.nan)

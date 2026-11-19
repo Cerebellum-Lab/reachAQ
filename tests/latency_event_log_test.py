@@ -1,11 +1,13 @@
 import logging
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import h5py
 import pytest
 
 from autotrainer.core.latency.schema import EVENT_TABLES
+from tools.acquisition.model import latency_event_log
 from tools.acquisition.model.latency_event_log import LatencyEventLog, _BlockTable
 
 _LOG_NAME = "tools.acquisition.model.latency_event_log"
@@ -101,6 +103,22 @@ def test_write_creates_every_table_even_when_empty(tmp_path):
         assert len(store["stim3_pulses"]) == 1
         assert len(store["live_poses"]) == 0
     assert sorted(item.name for item in tmp_path.iterdir()) == ["events.h5"]
+
+
+def test_the_events_file_is_marked_close_on_exec_while_it_is_written(monkeypatch, tmp_path):
+    # It is written in the app's process at Stop, where NI-DAQmx's CEIP client starts
+    # processes that would otherwise inherit it and hold its HDF5 lock (christielab10, 2026-11-13).
+    real_mark = latency_event_log.mark_close_on_exec
+    marked = []
+
+    def mark(store):
+        marked.append((Path(store.filename).name, real_mark(store)))
+        return marked[-1][1]
+
+    monkeypatch.setattr(latency_event_log, "mark_close_on_exec", mark)
+    LatencyEventLog.write(tmp_path / "events.h5", {})
+
+    assert marked == [("events.h5.partial", True)]
 
 
 def test_a_write_that_fails_part_way_leaves_no_events_file(monkeypatch, tmp_path):

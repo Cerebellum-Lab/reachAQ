@@ -4,8 +4,6 @@ from typing import Dict, Any
 
 from autotrainer.core.logging import get_verbose_logger
 
-from autotrainer.training import TrainingPlan
-
 
 logger = get_verbose_logger(__name__)
 

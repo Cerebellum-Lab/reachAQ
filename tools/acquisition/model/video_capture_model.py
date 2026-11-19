@@ -452,7 +452,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         """The recorder's encoder: "x264" at a capture-binning preset, else "mp4v".
 
         OpenCV's mp4v writer cannot keep up with 1024x1024 at 150 fps on a lit
-        scene (136 fps per camera on christielab10); x264 through ffmpeg can.
+        scene (136 fps per camera on the reference rig); x264 through ffmpeg can.
         The base capture keeps mp4v, so standard sessions keep today's files.
         """
         try:

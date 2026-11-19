@@ -23,6 +23,7 @@ import h5py
 import numpy as np
 
 from autotrainer.core import ProjectInfo
+from autotrainer.core.hdf5_inheritance import mark_close_on_exec
 from tools.acquisition.model import board_clock_chain
 from tools.acquisition.model.session_boundary import SessionBoundary
 from tools.acquisition.model.latency_event_log import LatencyEventLog
@@ -71,7 +72,7 @@ _PRESSURE_FIELDS = (
 )
 
 # Threads that deflate nidaq.h5's chunks. Deflated one chunk at a time inside
-# h5py, a 45-minute session's 27M samples took 17 s of Stop on christielab10;
+# h5py, a 45-minute session's 27M samples took 17 s of Stop on the reference rig;
 # on eight threads it took under 3 s.
 _NIDAQ_DEFLATE_THREADS = 8
 
@@ -203,6 +204,38 @@ _MINIMUM_VALID_TONE_PULSE_SECONDS = 0.002
 # the latency finalizer does with its own 5 s retry; it has a fallback, so it
 # waits less for a stream the capture process is still closing.
 _ANCHOR_STREAM_RETRY_SECONDS = 1.0
+
+
+def _delivery_calibration_record(calibration) -> Optional[dict]:
+    """alignment.json's deliveryCalibration: the NI delivery calibration the latch
+    residual band was centred on, with what it covered, or None without one. The
+    latency rebuild reads offsetSeconds and spreadSeconds back from it."""
+    if calibration is None:
+        return None
+    try:
+        return _delivery_calibration_fields(calibration)
+    except Exception:
+        # The configuration validates every field; whatever slipped past costs the
+        # record of it, never the session's finalization.
+        logging.getLogger(__name__).exception("NI delivery calibration could not be recorded")
+        return None
+
+
+def _delivery_calibration_fields(calibration) -> dict:
+    floor_min = calibration.delivery_floor_min_seconds
+    floor_max = calibration.delivery_floor_max_seconds
+    return {
+        "offsetSeconds": float(calibration.offset_seconds),
+        "spreadSeconds": float(calibration.spread_seconds),
+        "sessions": int(calibration.sessions),
+        "measured": str(calibration.measured),
+        "readChunkSamples": [int(value) for value in calibration.read_chunk_samples],
+        "frameRatesHz": [float(value) for value in calibration.frame_rates_hz],
+        "exposuresSeconds": [float(value) for value in calibration.exposures_seconds],
+        "cameraSerials": [str(value) for value in calibration.camera_serials],
+        "deliveryFloorMinSeconds": None if floor_min is None else float(floor_min),
+        "deliveryFloorMaxSeconds": None if floor_max is None else float(floor_max),
+    }
 
 
 def _persistence_reason(source) -> str:
@@ -528,6 +561,8 @@ class SessionDataRecorder:
             log_rows = tuple(self._log_rows)
             nidaq_chunks = self._snapshot_nidaq_locked()
             timing_plan = self._nidaq_monitor.timing_plan
+            delivery_calibration = getattr(
+                getattr(self._nidaq_monitor, "configuration", None), "delivery_calibration", None)
             source_manifest = self._source_manifest
             source_results = dict(self._source_results)
             if self._laser_model.configuration.backend != "disabled":
@@ -571,6 +606,7 @@ class SessionDataRecorder:
                 "latency_events": latency_events,
                 "latency_events_failure": latency_events_failure,
                 "camera_exposure_seconds": dict(self._camera_exposure_seconds),
+                "delivery_calibration": delivery_calibration,
             }
             self._armed = False
             self._pending_stop_end_perf = None
@@ -658,12 +694,24 @@ class SessionDataRecorder:
                 pending_source = pending.get("nidaq_chunks")
                 if isinstance(pending_source, _NidaqSpoolSnapshot):
                     spool_path = pending_source.path
+            # A stopped session whose finalization is retained for retry keeps
+            # its spool, as it keeps its other staged files; v3.0.1 deleted it
+            # as the app closed and the session's NI data was lost for good.
+            # Only an unfinished recording's spool is removed.
+            retained = pending is not None or self._pending_stop_end_perf is not None
+            project = (None if pending is None else pending.get("project")) or self._project
             self._pending_finalization = None
             self._pending_stop_end_perf = None
             self._end_latency_events(
                 failures, "the recorder is cleared without it")
             self._clear_locked()
-        if spool_path is not None:
+        if spool_path is None:
+            return
+        if retained:
+            logging.getLogger(__name__).warning(
+                "Session %s was not finalized; its NI-DAQ spool is kept at %s",
+                "(unknown)" if project is None else project.short_id, spool_path)
+        else:
             spool_path.unlink(missing_ok=True)
 
     def request_abort(self) -> None:
@@ -1658,6 +1706,9 @@ class SessionDataRecorder:
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         output = h5py.File(path, "w")
+        # Open for the whole recording, in the process where NI-DAQmx's CEIP
+        # client starts processes (hdf5_inheritance says why).
+        mark_close_on_exec(output)
         channel_count = len(ring.channel_names)
         for name, dtype in (
             ("sample_index", np.int64),
@@ -1667,6 +1718,7 @@ class SessionDataRecorder:
             ("block_observation_perf_time", np.float64),
             ("block_observation_wall_time", np.float64),
             ("block_observation_raw_time", np.float64),
+            ("block_newest_read_start_index", np.int64),
         ):
             output.create_dataset(name, shape=(0,), maxshape=(None,), dtype=dtype,
                                   chunks=True)
@@ -1704,6 +1756,11 @@ class SessionDataRecorder:
             ),
             "block_observation_raw_time": np.full(
                 count, getattr(read, "source_raw_time", math.nan), dtype=np.float64,
+            ),
+            # Which read the stamps are: a copy can hold several, and the stamps
+            # bound the sample before the newest (clocks.block_stamps_from_runs).
+            "block_newest_read_start_index": np.full(
+                count, int(getattr(read, "source_start_sample_index", -1)), dtype=np.int64,
             ),
         }
         dataset_names = (*observations, "values")
@@ -1785,6 +1842,7 @@ class SessionDataRecorder:
         latency_events=None,
         latency_events_failure: str = "",
         camera_exposure_seconds=None,
+        delivery_calibration=None,
     ):
         session_dir = Path(project.get_session_path().location)
         streams_dir = session_dir / "streams"
@@ -1859,6 +1917,7 @@ class SessionDataRecorder:
                 SessionDataRecorder._read_primary_latency_stream(project, boundary)
             ),
             exposure_seconds=primary_exposure,
+            delivery_calibration=delivery_calibration,
         )
         recorded_frame_timeline = (
             SessionDataRecorder._load_recorded_frame_timeline(
@@ -2266,6 +2325,13 @@ class SessionDataRecorder:
                 session_id=project.short_id,
                 unwritten=(
                     {"events": latency_events_failure} if latency_events_failure else None),
+                exposure_seconds=primary_exposure,
+                delivery_offset_seconds=(
+                    None if delivery_calibration is None else delivery_calibration.offset_seconds),
+                delivery_spread_seconds=(
+                    None if delivery_calibration is None else delivery_calibration.spread_seconds),
+                delivery_sessions=(
+                    None if delivery_calibration is None else delivery_calibration.sessions),
             )
         except Exception as error:
             logging.getLogger(__name__).exception("Latency finalization failed")
@@ -2574,7 +2640,7 @@ class SessionDataRecorder:
         diagnostics["endCoverageMissingSeconds"] = last_missing
         # The saved samples are the ones inside the boundary, so the first can
         # fall up to one sample period after it, and the last one period
-        # before, with none lost: 88 us at 10 kHz on christielab10 on
+        # before, with none lost: 88 us at 10 kHz on the reference rig on
         # 2026-09-24 was reported as missing coverage. perf_time advances by
         # exactly one period per sample, so a gap of a period or more is a
         # sample that is not there.
@@ -2870,18 +2936,37 @@ class SessionDataRecorder:
                     else:
                         raw_problem = (f"{raw_column.size} values against {perf_column.size} "
                                        "block_observation_perf_time stamps")
-            return (clocks.block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends),
+                newest_at_ends = SessionDataRecorder._newest_read_at_ends(
+                    source, perf_column.shape, ends)
+            return (clocks.block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends,
+                                                  newest_at_ends),
                     raw_problem)
-        index, perf, raw = [], [], []
+        index, perf, raw, newest = [], [], [], []
         for chunk in chunks:
             count = len(chunk[0])
             index.append(np.asarray(chunk[0], dtype=np.int64))
             perf.append(np.full(count, float(chunk[9]) if len(chunk) > 9 else math.nan))
             raw.append(np.full(count, float(chunk[11]) if len(chunk) > 11 else math.nan))
+            newest.append(np.full(count, int(chunk[12]) if len(chunk) > 12 else -1,
+                                  dtype=np.int64))
         if not index:
             return clocks.block_stamps_from_runs(np.empty(0, dtype=np.int64), np.empty(0)), ""
         return clocks.ni_block_stamps(np.concatenate(index), np.concatenate(perf),
-                                      np.concatenate(raw)), ""
+                                      np.concatenate(raw), np.concatenate(newest)), ""
+
+    @staticmethod
+    def _newest_read_at_ends(source, shape, ends):
+        """block_newest_read_start_index at the run ends, or None: a spool from before the
+        column has none, and one of another length cannot be paired with the run ends."""
+        if "block_newest_read_start_index" not in source:
+            return None
+        column = source["block_newest_read_start_index"]
+        if column.shape != shape:
+            logging.getLogger(__name__).warning(
+                "block_newest_read_start_index has %d values against %d stamps; pairing the "
+                "stamps with the previous copy's end", column.size, int(np.prod(shape)))
+            return None
+        return column[()][ends]
 
     @staticmethod
     def _nidaq_perf_values(chunks, start_perf, end_perf):
@@ -3144,7 +3229,8 @@ class SessionDataRecorder:
 
     @staticmethod
     def _latch_anchor(boundary, stream, stream_reason, transition_host, period, *,
-                      ni_residual_rms, transition_raw):
+                      ni_residual_rms, transition_raw, exposure_seconds=None,
+                      delivery_calibration=None):
         """(evidence, the first recorded frame's transition number or None), by camera clock.
 
         The latency finalizer's pairing: each frame's camera timestamp, placed
@@ -3157,7 +3243,10 @@ class SessionDataRecorder:
         CLOCK_MONOTONIC_RAW, where no slew is, so one latch line holds all
         session; or None for perf_counter (transition_host), where that line
         ignores the slews. The evidence names the clock, the map's uncertainty,
-        the latches it left out, the residual tolerance and any slip.
+        the latches it left out, the residual band (its centre, the rig's NI
+        delivery calibration minus exposure_seconds, and its half-width) and any
+        slip. Without a calibration or an exposure the band cannot be judged and
+        the pairing is ambiguous.
         """
         if stream is None:
             return {"status": "unavailable", "reason": stream_reason}, None
@@ -3183,9 +3272,17 @@ class SessionDataRecorder:
                 frames["frame_id"][kept], frames["camera_ts_ns"][kept], latches, transitions,
                 math.nan if period is None else float(period), ni_residual_rms=ni_residual_rms,
                 clock=clock,
+                exposure=math.nan if exposure_seconds is None else float(exposure_seconds),
+                delivery_offset=(math.nan if delivery_calibration is None
+                                 else float(delivery_calibration.offset_seconds)),
+                delivery_spread=(math.nan if delivery_calibration is None
+                                 else float(delivery_calibration.spread_seconds)),
+                delivery_sessions=(None if delivery_calibration is None
+                                   else int(delivery_calibration.sessions)),
             )
             residual = float(pairing.median_residual)
             uncertainty, limit = float(fit.uncertainty), float(pairing.limit)
+            expected = float(pairing.expected_residual)
             # The pairing refits the same latches; the fit's own reason is what names the
             # latches it left out, and nothing else carries it.
             dropped_reason = fit.reason if fit.dropped else ""
@@ -3202,6 +3299,7 @@ class SessionDataRecorder:
                 "clock": pairing.clock,
                 "uncertaintySeconds": uncertainty if math.isfinite(uncertainty) else None,
                 "limitSeconds": limit if math.isfinite(limit) else None,
+                "expectedResidualSeconds": expected if math.isfinite(expected) else None,
                 "slip": pairing.slip,
                 "dropped": [int(row) for row in fit.dropped],
             }
@@ -3291,7 +3389,8 @@ class SessionDataRecorder:
     @staticmethod
     def _match_camera_nidaq_edge(boundary, start_perf, chunks, *, ni_fit=None,
                                  read_latency_stream=None,
-                                 exposure_seconds=None) -> dict:
+                                 exposure_seconds=None,
+                                 delivery_calibration=None) -> dict:
         """The cam_frames transition of the first recorded frame.
 
         On the drift-corrected NI-to-host fit, two measured matches over the
@@ -3303,6 +3402,10 @@ class SessionDataRecorder:
         before the first frame's own host stamp; both at lower confidence.
         The arrival pairing assumes only that a frame arrives within one frame
         period of its exposure edge, and a longer lag shows as a disagreement.
+        The latch pairing is judged against a band centred on the rig's NI
+        delivery calibration minus the exposure (clocks.latch_residual_band);
+        with either missing it is refused, so the arrival pairing anchors, below
+        hardware_edge. Both are recorded.
         read_latency_stream, a callable returning (stream, why not), is called
         only where the matches are about to be used: a locked stream costs its
         whole retry budget, which the epoch method has no use for.
@@ -3342,10 +3445,11 @@ class SessionDataRecorder:
             "ambiguitySeconds": None,
             "edgePolarity": None,
             # schemaVersion 4: how the anchor was chosen, and the two matches behind it.
-            # The exposure is recorded and moves nothing.
+            # The exposure and the delivery calibration centre the latch residual band.
             "anchorMethod": None,
             "niToHost": None if ni_fit is None else ni_fit.as_record(include_knots=True),
             "exposureSeconds": exposure_seconds,
+            "deliveryCalibration": _delivery_calibration_record(delivery_calibration),
             "impliedLagSeconds": None,
             "framePeriodSeconds": None,
             "latch": None,
@@ -3397,6 +3501,7 @@ class SessionDataRecorder:
             return SessionDataRecorder._match_camera_nidaq_edge_on_fit(
                 base, boundary, start_perf, indices, rate, channel_values, edge_positions,
                 ni_fit, read_latency_stream,
+                exposure_seconds=exposure_seconds, delivery_calibration=delivery_calibration,
             )
         except Exception as error:
             logging.getLogger(__name__).exception(
@@ -3412,7 +3517,8 @@ class SessionDataRecorder:
     @staticmethod
     def _match_camera_nidaq_edge_on_fit(base, boundary, start_perf, indices, rate,
                                         channel_values, edge_positions, ni_fit,
-                                        read_latency_stream) -> dict:
+                                        read_latency_stream, *, exposure_seconds=None,
+                                        delivery_calibration=None) -> dict:
         ni_seconds = indices[edge_positions] / float(rate)
         transition_host = ni_fit.map(ni_seconds)
         # The median interval, as the epoch method and the latency finalizer
@@ -3436,6 +3542,7 @@ class SessionDataRecorder:
         latch, latched = SessionDataRecorder._latch_anchor(
             boundary, latency_stream, stream_reason, transition_host, period,
             ni_residual_rms=ni_fit.residual_rms, transition_raw=transition_raw,
+            exposure_seconds=exposure_seconds, delivery_calibration=delivery_calibration,
         )
         arrival, arrived = SessionDataRecorder._arrival_anchor(
             boundary, latency_stream, stream_reason, transition_host, period,
@@ -4705,6 +4812,7 @@ class SessionDataRecorder:
             observation_raw = (
                 float(observation[2]) if len(observation) > 2 else math.nan
             )
+            newest_read = int(observation[3]) if len(observation) > 3 else -1
             mask = (perf >= start_perf) & (perf <= end_perf)
             if np.any(mask):
                 selected.append((
@@ -4732,8 +4840,10 @@ class SessionDataRecorder:
                         observation_raw,
                         dtype=np.float64,
                     ),
+                    np.full(np.count_nonzero(mask), newest_read, dtype=np.int64),
                 ))
         with h5py.File(path, "w") as output:
+            mark_close_on_exec(output)
             output.attrs["recording_start_perf"] = start_perf
             output.attrs["recording_start_wall"] = start_wall
             output.attrs["recording_end_perf"] = end_perf
@@ -4762,6 +4872,10 @@ class SessionDataRecorder:
                     data=np.empty(0, dtype=np.float64),
                 )
                 output.create_dataset(
+                    "block_newest_read_start_index",
+                    data=np.empty(0, dtype=np.int64),
+                )
+                output.create_dataset(
                     "values",
                     data=np.empty((len(channel_names), 0), dtype=np.float32),
                 )
@@ -4773,6 +4887,7 @@ class SessionDataRecorder:
             observation_perf = np.concatenate([item[9] for item in selected])
             observation_wall = np.concatenate([item[10] for item in selected])
             observation_raw = np.concatenate([item[11] for item in selected])
+            newest_read = np.concatenate([item[12] for item in selected])
             if indices.size > 1 and not np.all(np.diff(indices) == 1):
                 raise RuntimeError(
                     "NI-DAQ session sample indices are not strictly consecutive"
@@ -4801,6 +4916,11 @@ class SessionDataRecorder:
                 compression="gzip",
             )
             output.create_dataset(
+                "block_newest_read_start_index",
+                data=newest_read,
+                compression="gzip",
+            )
+            output.create_dataset(
                 "wall_time",
                 data=start_wall + (perf - start_perf),
                 compression="gzip",
@@ -4826,6 +4946,7 @@ class SessionDataRecorder:
     ) -> None:
         with h5py.File(snapshot.path, "r") as source, h5py.File(path, "w") as output, \
                 ThreadPoolExecutor(_NIDAQ_DEFLATE_THREADS, thread_name_prefix="NidaqDeflate") as pool:
+            mark_close_on_exec(output)
             perf_source = source["perf_time"]
             count = int(perf_source.shape[0])
             if count:
@@ -4869,23 +4990,26 @@ class SessionDataRecorder:
                 "block_observation_perf_time",
                 "block_observation_wall_time",
                 "block_observation_raw_time",
+                "block_newest_read_start_index",
             )
+            # A spool from before the RAW stamp or the newest-read index has no such
+            # column; the published file still gets it, unknown throughout (NaN, -1).
+            # No other column may be missing: that is a damaged spool, and it fails
+            # here rather than publishing an unknown for it.
+            optional = {"block_observation_raw_time": (np.float64, np.nan),
+                        "block_newest_read_start_index": (np.int64, -1)}
             for name in one_dimensional:
-                # A spool from before the RAW stamp has no such column; the
-                # published file still gets it, unknown throughout. No other
-                # column may be missing: that is a damaged spool, and it fails
-                # here rather than publishing NaN for it.
-                source_dataset = (source.get(name) if name == "block_observation_raw_time"
-                                  else source[name])
+                source_dataset = source.get(name) if name in optional else source[name]
                 output_dataset = output.create_dataset(
                     name,
                     shape=(selected_count,),
-                    dtype=np.float64 if source_dataset is None else source_dataset.dtype,
+                    dtype=(optional[name][0] if source_dataset is None
+                           else source_dataset.dtype),
                     compression="gzip" if selected_count else None,
                 )
                 if source_dataset is None:
                     if selected_count:
-                        output_dataset[...] = np.nan
+                        output_dataset[...] = optional[name][1]
                     continue
                 if selected_count:
                     SessionDataRecorder._write_deflated(

@@ -23,7 +23,7 @@ from autotrainer.pyside import Separator, CardWidget
 from autotrainer.pyside.StackedContent import StackedWidget, StackedLayout
 from autotrainer.pyside.content_widget import ContentWidget, invoke_method
 
-from autotrainer.training import TrainingPlan, TrainingPhase
+from autotrainer.behavior.training import TrainingPlan, TrainingPhase
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.hardware_model import HardwareModel

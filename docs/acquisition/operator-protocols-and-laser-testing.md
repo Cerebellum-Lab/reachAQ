@@ -555,6 +555,17 @@ shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
   shutter at the rig - only when that CRITICAL appears and says the output
   may still hold up to the ramp's highest command.
 
+## If reachAQ or the laser process dies
+
+The NI laser runs in a laser process of its own. If reachAQ crashes, is
+killed or freezes for a second, that process closes the shutters, aborts any
+pulse and puts the command at its minimum, by itself. If the laser process
+dies, reachAQ resets the outputs from a new process. Either way the laser
+shows **FAILED** with the reason until the next Run or Refresh Hardware. A
+reason that ends *"make the laser safe by hand"* means neither could confirm
+it: turn the laser off at its key first. Details, timings and limits are in
+[laser-process-safety.md](laser-process-safety.md).
+
 ## What failure looks like
 
 Every refusal names its reason, in red on the Laser Control status line and in

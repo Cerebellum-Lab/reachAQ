@@ -2,9 +2,9 @@ import abc
 from typing import Callable, Optional, List, Union, Protocol, Any
 
 
-from autotrainer.api import ApiEventKind
+from autotrainer.core.api import ApiEventKind
 
-from autotrainer.api import ApiPelletShiftSource
+from autotrainer.core.api import ApiPelletShiftSource
 
 from autotrainer.core import Offset3DTuple, calculate_std_dev_manual, ObservableObject, get_verbose_logger, ProjectInfo, \
     mean_method

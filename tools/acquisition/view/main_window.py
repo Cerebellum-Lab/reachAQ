@@ -42,7 +42,7 @@ from autotrainer.behavior.pellet import PelletState
 
 from autotrainer.pyside.content_widget import InvokeMethod, invoke_method
 
-from autotrainer.training import TrainingPlan, PlanInfo, LoadProgressResult, TrainingPhase
+from autotrainer.behavior.training import TrainingPlan, PlanInfo, LoadProgressResult, TrainingPhase
 
 from autotrainer.pyside.xyz_label import XYZQLabel
 
@@ -122,6 +122,7 @@ class MainWindow(QMainWindow):
         is_dev: bool = False,
         random_cameras: bool = False,
         live_inference: Optional[bool] = None,
+        calib_dir: Optional[Path] = None,
     ):
         super().__init__(None)
 
@@ -160,7 +161,11 @@ class MainWindow(QMainWindow):
 
         self._previous_intersession_analysis_rsp: Optional[Tuple[ProjectInfo, IntersessionResponse]] = None
 
-        app_model = self._app_model = AppModel(prefs)
+        # A simulation's calibration is in its home; a rig run passes none, as before.
+        if calib_dir is None:
+            app_model = self._app_model = AppModel(prefs)
+        else:
+            app_model = self._app_model = AppModel(prefs, calib_dir=calib_dir)
         self._notes_save_timer = QTimer(self)
         self._notes_save_timer.setSingleShot(True)
         self._notes_save_timer.setInterval(500)
@@ -1095,6 +1100,31 @@ class MainWindow(QMainWindow):
         window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         window.show()
 
+    def _open_pose_training(self):
+        """Open the pose training window, or raise the one already open.
+
+        Closing it only hides the view: a training run belongs to the app
+        model and keeps going.
+        """
+        existing = getattr(self, "_pose_training_window", None)
+        if existing is not None:
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
+        # Imported here: the window pulls in the keypoint dataset code, which
+        # the rest of the acquisition UI does not need at start-up.
+        from tools.acquisition.view.pose_training_window import PoseTrainingWindow
+        try:
+            window = PoseTrainingWindow(self._app_model, self)
+        except Exception as exc:
+            logger.exception("Pose training could not be opened: %s", exc)
+            self.statusBar().showMessage(
+                f"Pose training could not be opened: {exc}", 8000)
+            return
+        self._pose_training_window = window
+        window.show()
+
     def _show_preferences(self):
         if (
             self._app_model.session_recording_status
@@ -1118,7 +1148,7 @@ class MainWindow(QMainWindow):
         action = self.animal_metadata_action = QAction(
             _toolbar_icon("fa5s.id-card"), "RFID links…", self
         )
-        action.setToolTip("Manually link or reconcile reachAQ and SoftMouse animals")
+        action.setToolTip("Manually link or reconcile reachAQ animals and source records")
         action.triggered.connect(self._show_animal_metadata)
 
         action = self.edit_camera_settings_action = QAction(_toolbar_icon("fa5s.edit"), "Edit Camera Settings", self)
@@ -1217,6 +1247,13 @@ class MainWindow(QMainWindow):
             "NI-DAQ input stream pauses while it is open.")
         action.triggered.connect(self._open_daq_monitor)
 
+        action = self.pose_training_action = QAction("Pose Training…", self)
+        action.setToolTip(
+            "Label frames from recorded sessions, train a live pose model, "
+            "compare it with the current one and make it live. Training "
+            "pauses whenever a recording starts.")
+        action.triggered.connect(self._open_pose_training)
+
         action = self.view_diagnostics_action = QAction("Logging", self)
         action.setToolTip("Show or hide the application logging panel")
         action.setCheckable(True)
@@ -1276,6 +1313,7 @@ class MainWindow(QMainWindow):
 
         tools_menu = menu_bar.addMenu("Tools")
         tools_menu.addAction(self.daq_monitor_action)
+        tools_menu.addAction(self.pose_training_action)
         tools_menu.addSeparator()
         tools_menu.addAction(self.calib_diamond_triangle_action)
         tools_menu.addAction(self.make_3d_calib_action)
@@ -2136,7 +2174,7 @@ class MainWindow(QMainWindow):
             self._rfid_status_label.setText("RFID: unlinked")
             self._rfid_status_label.setStyleSheet("color: #b36b00;")
             self._rfid_status_label.setToolTip(
-                f"Subject: {animal.name}\nNo SoftMouse/RFID link"
+                f"Subject: {animal.name}\nNo RFID linked"
             )
 
     @invoke_method

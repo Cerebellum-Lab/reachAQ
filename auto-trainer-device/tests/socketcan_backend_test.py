@@ -521,3 +521,28 @@ def test_can_interface_does_not_query_configuration_without_board_address(monkey
     assert interface.open() is False
     assert interface._jc.close_called is True
     assert query_called == []
+
+
+def test_stepper_status_frame_decodes_the_status_byte():
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.STEPPER_STATUS, 0)  # 0x2C0
+    payload = struct.pack("<BBBBff", 1, 0x03, 0, 1, 2.5, 3.0)
+
+    message = socketcan_jerrycan.decode_frame(can_id, payload)
+
+    assert message.stepper_status.motor_id == 1
+    assert message.stepper_status.status == 0x03
+    assert message.stepper_status.limit_switch == 1
+    assert message.stepper_status.position == 2.5
+
+
+@pytest.mark.parametrize("payload, error", [
+    (b"\xff\xff\xff\xff", -1),
+    (b"\x8c\xff\xff\xff", -116),
+    (b"\xf5\xff\xff\xff", -11),
+    (b"\x00\x00\x00\x00", 0),
+])
+def test_ack_error_decodes_as_a_signed_int32(payload, error):
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.ACKNOWLEDGE, 0)
+    message = socketcan_jerrycan.decode_frame(can_id, payload + bytes([42]))
+    assert message.ack.error == error
+    assert message.uuid == 42

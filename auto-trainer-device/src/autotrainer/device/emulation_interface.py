@@ -6,12 +6,13 @@ from typing import Union, Tuple
 
 from autotrainer.core import Offset3DTuple
 from autotrainer.core.logging import get_verbose_logger
+from autotrainer.core.simulation import is_simulation, publish_signal
 
 from .device_interface import (DeviceInterface, ServoConfig, StepperConfig,
                                StepperStatus, ServoStatus, Target, DigitalOutputs,
                                Motor, AnalogOutputs, Version,
                                PelletDigitalInputs, Acknowledge, ColorLed,
-                               BOARD_STIM_LINE_OUTPUTS
+                               BOARD_STIM_LINE_OUTPUTS, TONE_CONFIRMATION_FREQUENCIES_HZ
                                )
 from .can_interface import motor_to_str
 
@@ -20,6 +21,15 @@ logger = get_verbose_logger(__name__)
 
 # Slower than the real hardware to be more forgiving in emulation.
 _STATUS_MESSAGE_INTERVAL = 2.0
+
+# Simulated board outputs on the signal bus (a no-op without REACHAQ_SIM_BUS).
+# Tones raise the confirmation line the board's devicetree maps them to; STIM
+# pulses are named by board STIM number, and the simulation profile aliases
+# them to whichever NI readback channels the config wires them to.
+_TONE_BUS_LINES = dict(TONE_CONFIRMATION_FREQUENCIES_HZ)
+_STIM_BUS_LINES = {gpio: f"board_stim{number}" for number, gpio in BOARD_STIM_LINE_OUTPUTS.items()}
+# The board acts a moment after the command leaves the host.
+_SIGNAL_LEAD_S = 0.001
 
 
 class _SharedList:
@@ -136,9 +146,20 @@ class EmulationInterface(DeviceInterface):
                 ServoStatus(Target.PELLET_DEVICE, Motor.PELLET_LOAD_SERVO,
                             self._positions[Motor.PELLET_LOAD_SERVO]))
 
+            # A simulation reports idle inputs: the host decodes stimulus_1 as
+            # the tone1 GPIO, and a constant high there is a tone the NI never saw.
+            active = not is_simulation()
             messages.append(PelletDigitalInputs(
-                target=Target.PELLET_DEVICE, stimulus_1=True, stimulus_2=False, stimulus_3=True, stimulus_4=False))
+                target=Target.PELLET_DEVICE, stimulus_1=active, stimulus_2=False, stimulus_3=active, stimulus_4=False))
             messages.append(self._color_led)
+
+        if is_simulation():
+            # Stamped on receipt, as CanInterface stamps a frame it reads: a
+            # session times acks and board reports by these, and 0 would put
+            # an ack before the SEND it answers.
+            wall_ns, perf_ns = time.time_ns(), time.perf_counter_ns()
+            for message in messages:
+                message.timestamp_ns, message.index = wall_ns, perf_ns
 
         return messages
 
@@ -281,6 +302,11 @@ class EmulationInterface(DeviceInterface):
     def emit_tone(self, frequency, duration_ms) -> bool:
         if self._is_open:
             logger.info(f"play tone f={frequency} d={duration_ms}")
+            # Exact match, as the board's tone driver: 5000.0 finds tone1, None finds nothing.
+            line = _TONE_BUS_LINES.get(frequency)
+            if line is not None:
+                start = time.perf_counter() + _SIGNAL_LEAD_S
+                publish_signal(line, start, start + float(duration_ms) / 1000.0)
             self._messages.append(Acknowledge(uuid=EmulationInterface.next_uuid()))
         return self._is_open
 
@@ -332,6 +358,8 @@ class EmulationInterface(DeviceInterface):
             raise ValueError("Stimulus pulse duration must be within 100 us..5 s")
         if self._is_open:
             logger.info("Pulse digital output %s for %s us", int(gpio.value), duration_us)
+            start = time.perf_counter() + _SIGNAL_LEAD_S
+            publish_signal(_STIM_BUS_LINES[gpio], start, start + duration_us / 1e6)
             self._messages.append(Acknowledge(uuid=EmulationInterface.next_uuid()))
         return self._is_open
 

@@ -78,7 +78,7 @@ evidence contracts are defined in
 [Recording sessions, pellet trials, protocols, and schema migration](session-trials-protocols.md).
 
 The load-cell acquisition, tare, configuration, UI, and automatic recording
-triggers have been removed. System configuration v58 rejects obsolete schemas
+triggers have been removed. System configuration v59 rejects obsolete schemas
 and fields rather than creating a compatibility runtime. Alarm, emergency,
 tunnel, head-fix, magnet, and webcam/top-camera behavior is removed. Pellet
 presence, pellet misplacement, watchdog liveness, structured errors, and safe
@@ -131,7 +131,11 @@ closes the failed socket, reopens the transport,
 rediscovers the pellet board, requests firmware, reloads motor/move
 configuration, and restarts status streaming before publishing Ready. An
 in-flight motor operation is finalized as unknown and is never replayed across
-the reconnect boundary.
+the reconnect boundary. Recovery stops when the board refuses its home (the
+log says `CAN recovery stopped`) or when every attempt fails (`CAN recovery
+exhausted`). It then closes the transport it opened and leaves CAN Failed.
+Refresh Hardware, which retries failed hardware while System Mode runs, then
+makes a full connection, home included.
 
 Explicit System Mode stop still attempts to stop every domain even when one cleanup
 operation fails.
@@ -187,7 +191,17 @@ project identity until publication succeeds. A later Record attempt first retrie
 that exact generation and republishes its authoritative metadata; it cannot start a
 new session while the previous one remains incomplete. Successful generations remove
 only now-empty staging directories. Failed staged files are never recursively cleaned
-and remain available for diagnosis and retry.
+and remain available for diagnosis and retry. Closing the application while a
+finalization is still retained keeps its NI-DAQ spool,
+`.staging/<generation>/streams/nidaq_capture.h5`, and logs its path; only the spool
+of a recording that never stopped is removed.
+
+The HDF5 files the application's own process writes (the NI-DAQ spool, `nidaq.h5`,
+`events.h5` and `latency.h5`) are marked close-on-exec as they are opened. HDF5 opens
+files without it, and NI-DAQmx's CEIP client starts ni-wine helpers from the process
+that uses it, at its first task create and its first task close. Those helpers live
+about 4 s and inherited every such descriptor. In v3.0.1 they held the open spool's
+HDF5 lock while Stop read it, so the session got no `nidaq.h5` or `alignment.json`.
 
 ### Camera frame and closed-video validation
 
@@ -251,7 +265,8 @@ resolution is 0.1 ms.
 
 The primary datasets are `sample_index`, `perf_time`, `offset_seconds`,
 `wall_time`, `epoch`, `values`, `block_observation_perf_time`,
-`block_observation_wall_time` and `block_observation_raw_time`. `values` is
+`block_observation_wall_time`, `block_observation_raw_time` and
+`block_newest_read_start_index`. `values` is
 channel-by-sample and follows the `channel_names` attribute. File attributes
 include the recording boundaries, sample rate, epoch, gap/overrun counts,
 source clock, and serialized timing plan. `perf_time` is derived from the
@@ -259,10 +274,18 @@ sample-index epoch and carries the epoch's offset and the NI clock's drift.
 The block-observation times are the stamps taken before each NI read:
 `block_observation_perf_time` on `time.perf_counter` and
 `block_observation_raw_time` on `CLOCK_MONOTONIC_RAW` (NaN where the host has
-no such clock, or the file predates it). The NI-to-host fit (NI sample time to
-host `perf_counter`) is built from these two columns, not from `perf_time`; it
-is what `alignment.json` stores as `cameraNidaqAlignment.niToHost`, and the
-host times that file derives from NI samples go through it.
+no such clock, or the file predates it). The recorder copies the NI sample ring
+every 10 ms, and each copy carries the stamps of its newest read;
+`block_newest_read_start_index` is that read's first sample index (-1 where
+unknown, or the file predates it). A copy holds two reads or more whenever the
+reads are under half the copy interval (display refresh of 200 Hz or more), and
+the stamps then bound the sample before the newest read, not the previous copy's
+last one: the fit pairs them so, and without the column it maps NI times a whole
+read late (4.4-5.2 ms on christielab10 at 200-240 Hz, against 0.19-0.20 ms with
+it). The NI-to-host fit (NI sample time to host `perf_counter`) is built from
+these columns, not from `perf_time`; it is what `alignment.json` stores as
+`cameraNidaqAlignment.niToHost`, and the host times that file derives from NI
+samples go through it.
 
 The NI-DAQ epoch is anchored once. Later block delivery time does not reconstruct
 each block independently, so host scheduling jitter cannot create backward
@@ -467,12 +490,14 @@ the primary camera's latency stream:
   Each records `status` (`unavailable`, `paired`, `ambiguous`, `outside` when
   the first frame's transition lies outside the spool, or `failed`), `shift`,
   `agreement`, `ambiguous`, `reason`, `frames`, `limitSeconds` and `slip`;
-  `latch` adds `medianResidualSeconds`, `latches`, `usableLatches`, `clock`,
-  `uncertaintySeconds` and `dropped`, and `arrival` adds `medianLagSeconds`,
+  `latch` adds `medianResidualSeconds`, `expectedResidualSeconds`, `latches`,
+  `usableLatches`, `clock`, `uncertaintySeconds` and `dropped`, and `arrival`
+  adds `medianLagSeconds`,
   the median time from the paired transition to the frame's arrival; evidence
   of a match that could not run is `unavailable` or `failed` and carries little
   more than `status` and `reason`. `limitSeconds`, `slip`, `clock`,
-  `uncertaintySeconds` and `dropped` were added within schemaVersion 4, so
+  `uncertaintySeconds`, `dropped`, `latch.expectedResidualSeconds` and the
+  top-level `deliveryCalibration` were added within schemaVersion 4, so
   earlier schema-4 files lack them; read them with a default.
   `arrivalSampleIndex` is the NI sample the arrival match names for the first
   recorded frame (null without one). `latch.frames` and `arrival.frames` count
@@ -499,15 +524,34 @@ the primary camera's latency stream:
 - The limits are measured, with one constant: `FALSE_ALARM_PROBABILITY`
   (1e-6, per check and per session, in `tools/latency/clocks.py`), which gives
   k = 4.89 standard errors (the two-sided Gaussian quantile; on a robust
-  spread, 1.4826 × MAD, an approximation). σ_NI is `niToHost.residual_rms`
-  and P is `framePeriodSeconds`.
+  spread, 1.4826 × MAD, an approximation). σ_NI is `niToHost.residual_rms`,
+  P is `framePeriodSeconds`, and D̄ and σ_D are the rig's NI delivery
+  calibration (below).
   - The latch match is trusted only while `uncertaintySeconds + k·σ_NI` is
     under P/4. Otherwise it is `ambiguous`, its shift still recorded, and
     `reason` reads *latch mapping uncertainty X ms plus 4.89 NI residuals (Y ms)
     exceeds a quarter frame period (Z ms)*.
-  - `latch.limitSeconds` is the residual tolerance, min(P/4, 2 ms): a
-    `medianResidualSeconds` beyond it is `ambiguous`. The 2 ms cap stays until
-    the NI delivery delay is measured.
+  - The latch residual is judged against a band. A Blackfly S stamps a frame
+    at the end of its exposure and the NI edge marks its start, so a correct
+    pairing's `medianResidualSeconds` sits at D̄ − `exposureSeconds`, where D̄
+    is the NI-to-host fit's delivery floor plus the camera's own stamp offset.
+    `latch.expectedResidualSeconds` is that centre and `latch.limitSeconds`
+    the half-width, min(t·σ_D + `uncertaintySeconds`, P/4), where t is
+    Student's t at `FALSE_ALARM_PROBABILITY` for the calibration's session
+    count, widened by √(1 + 1/n) (10.1 at 12 sessions); a residual outside
+    it is `ambiguous`, *median residual X ms is Y ms from the expected Z ms,
+    over the band's W ms*. A mapping a whole NI read or frame off moves the
+    residual by milliseconds, which a quarter-period test alone can miss
+    (on christielab10 at 200 Hz display refresh and 150 fps, −1.58 ms).
+  - Without a delivery calibration, or without an exposure, the band cannot be
+    judged: the latch match is `ambiguous` with *no NI delivery calibration
+    for this rig* or *the exposure is unknown*, and the arrival match anchors,
+    so the session is at most `ambiguous_hardware_edge`. The latency
+    finalizer pairs such a session by host arrival (`mixed`).
+  - An offset-only latch map (latches within 10 s) carries the camera's drift
+    within its 30 s window outside `uncertaintySeconds`; 20 ppm moves the
+    residual about 0.3 ms, so such a match can read `ambiguous` and the
+    arrival match anchors.
   - `arrival.limitSeconds` is the margin k·√(σ_NI² + (1.2533·MAD_lag/√n)²),
     MAD_lag the robust spread of the per-frame lags and n the frames counted:
     a `medianLagSeconds` within it of 0 or of P is `ambiguous`.
@@ -535,8 +579,17 @@ the primary camera's latency stream:
     flagging. A backlog that grows past one period (votes s, s−1, s−2, s−1, s)
     is not flanked by the majority, so it is flagged, which errs on the side
     of flagging too. `agreement` stays as a diagnostic.
-  - These replace the fixed 0.95 agreement, 0.1 ms arrival margin and 2 ms
-    latch bracket cap.
+  - These replace the fixed 0.95 agreement, 0.1 ms arrival margin, 2 ms
+    latch bracket cap and 2 ms latch residual cap.
+- `deliveryCalibration` is the rig's `nidaqStream.deliveryCalibration` the band
+  was centred on, or null without one: `offsetSeconds` (D̄) and
+  `spreadSeconds` (σ_D), and what the calibration covered, for provenance
+  (`sessions`, `measured`, `readChunkSamples`, `frameRatesHz`,
+  `exposuresSeconds`, `cameraSerials`, `deliveryFloorMinSeconds`,
+  `deliveryFloorMaxSeconds`). `python -m tools.latency.rebuild` judges the
+  latch pairing by this and `exposureSeconds`, as the session did.
+  `tools/hardware/calibrate_ni_delivery.py` measures it with an AO-to-AI
+  loopback (see "NI delivery calibration" below).
 - `anchorMethod` is the first that yields a transition: `camera_latch` when the
   latch match is `paired`, else `host_arrival` when the arrival match is, else
   `first_frame_stamp`, the latest transition at or before the first recorded
@@ -558,7 +611,9 @@ the primary camera's latency stream:
   less the anchor transition) and `arrival.medianLagSeconds` are measurements,
   never compared with an expected value.
 - `exposureSeconds` is the exposure the app was given (null when unknown or
-  not a finite number). It is recorded and moves no anchor.
+  not a finite number). It moves no anchor directly; it centres the latch
+  residual band, so an exposure the camera did not use refuses the latch
+  match and leaves the anchor to arrival.
 - schemaVersion 3 files differ here. They carry `expectedLagSeconds`,
   `lagGateSeconds` and `expectedLagSampleIndex`, which schema 4 drops; their
   `anchorMethod` is `camera_latch` or `expected_lag`, the transition nearest
@@ -613,8 +668,8 @@ embedded under `configuration` so each recording is independently reproducible.
 values are normalized to JSON/YAML null; finalized metadata is never written
 with non-standard `NaN` tokens.
 
-The pinned `auto-trainer-api` 0.11.0 lifecycle supports explicit session and
-pellet-attempt events. ReachAQ's status schema contains no alarm, emergency,
+The [local API](local-api.md) publishes explicit session and pellet-attempt
+events. ReachAQ's status schema contains no alarm, emergency,
 tunnel, head-fix, or magnet placeholders. Session events identify the continuous
 recording boundary; trial events identify pellet attempts, never recordings.
 Session metadata, analysis outputs, and the pellet-trial ledger remain the
@@ -1062,6 +1117,58 @@ counted over the whole session, not an addition to the per-row ones. A loss show
 on the first frame the recorder saw of a boot is not counted, because it may have
 come before the session; and a loss on the last frames before the recorder stops
 may be missed.
+
+### NI delivery calibration (`nidaqStream.deliveryCalibration`)
+
+The camera-latch pairing is rated against where its residual should sit on this
+rig: the NI-to-host fit's delivery floor (how late the fit maps the sample
+clock, which nothing in a session measures) plus the camera's own stamp offset,
+minus the exposure. `nidaqStream.deliveryCalibration` holds that offset
+(`offsetSeconds`) and its spread between sessions (`spreadSeconds`), with what
+the calibration covered. Without it the latch match is refused on every session
+and the anchor falls to the arrival match (`ambiguous_hardware_edge`; the
+latency record pairs by host arrival, `mixed`). See `alignment.json` above.
+
+`tools/hardware/calibrate_ni_delivery.py` measures it with a loopback:
+
+1. With reachAQ and SpinView closed, connect a BNC cable from an unused analog
+   output to an unused analog input of the NI stream's board (christielab10:
+   the 6221's AO 0 to AI 6 on the BNC-2090A, with the AI 6 / AI 14 switch at SE).
+   Nothing else may be connected to either.
+2. Run, as the operator, from the repository root:
+
+   ```bash
+   conda run --no-capture-output -n reachaq python -m tools.hardware.calibrate_ni_delivery \
+       --ao PXI1Slot5/ao0 --ai PXI1Slot5/ai6
+   ```
+
+   It refuses to start while reachAQ or SpinView is running, or when the input does
+   not follow the output (a missing cable, or the input's switch at DIFF). It
+   then records 18 isolated sessions of 120 s, about 50 minutes: display
+   refresh 60, 120, 144, 165, 200 and 240 Hz (the NI read size) at 50, 100 and
+   150 fps, at the live exposure. Each runs from a scratch copy of the configuration with
+   CAN, the pellet controller and the laser off, under `--out`, while the output
+   steps at random times. `--refresh`, `--fps`, `--exposure-us`, `--passes` and
+   `--seconds` change the plan.
+3. It prints a table per session: the fit's delivery floor L, the residual, and
+   residual + exposure (D). A session whose fit is half an NI read late or more,
+   whose latch pairing is not where the NI edges are, slips or rests on a latch
+   map too uncertain to choose transitions by, is left out and named, and so is
+   one the other sessions' prediction band cannot hold. The mean and standard
+   deviation of D over the rest, with the number of sessions, are the
+   calibration (at least two sessions); the gate scales the spread by Student's
+   t for that number.
+4. Add `--write` to put it into `~/Autotrainer/system_configuration.yaml`. The file
+   is copied to `system_configuration_before_delivery_calibration_<time>.yaml`
+   first and only changed after every session has finished; without `--write`
+   nothing outside `--out` is changed. Then remove the cable.
+
+Calibrate again after changing the NI board, the reach cameras, their USB
+attachment or the host, since any of them moves the floor or the stamp offset.
+christielab10, 2026-11-13: L 0.19-0.28 ms at NI reads of 42-167 samples (display
+refresh 60-240 Hz), D 0.277 ms with 0.029 ms between 18 sessions. A `nidaq.h5`
+from before `block_newest_read_start_index` fits a whole NI read late at display
+refresh of 200 Hz or more, and its latch pairing is then refused by the band.
 
 ## Storage, discovery, and safe hardware boundaries
 

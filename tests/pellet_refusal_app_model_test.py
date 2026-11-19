@@ -8,13 +8,18 @@ window. While a refusal says an axis needs a home, Record is blocked.
 
 from types import SimpleNamespace
 
+import pytest
+
+from autotrainer.behavior.pellet import PelletState
 from autotrainer.behavior.pellet_trial import HardwareErrorKind, TrialOutcome
-from autotrainer.core import Motor, SystemCommandKind
+from autotrainer.core import MessageHandler, Motor, SystemCommandKind
 from autotrainer.device import (
     CanFailure,
     CanFailureKind,
     CommandRefusal,
     RefusedCommandClass,
+    StepperStatus,
+    Target,
 )
 from tools.acquisition.model.subsystem_status import SubsystemId, SubsystemState
 from tools.acquisition.model.trial_action import PreparedState, PreparedTrialOperation
@@ -220,3 +225,134 @@ def test_a_manual_send_is_not_held_by_a_needs_home_axis(app_model):
     app_model.hardware._set_axes_needing_home(("X", "Y", "Z"))
 
     assert pellet.can_send_pellet(force=True) is True
+
+
+def test_recording_is_blocked_while_a_pellet_driver_fault_is_reported(app_model):
+    app_model._acquisition.started = True
+    app_model._set_subsystem_status(
+        SubsystemId.CAN_PELLET, SubsystemState.READY, required_for_recording=True,
+    )
+    published = []
+    app_model.property_changed += (
+        lambda name, value, old:
+        published.append(value) if name == app_model.Props.RECORDING_BLOCKERS else None)
+
+    def report(status):
+        app_model.hardware._message_handler_property_changed(
+            MessageHandler.STEPPER_Y_PROPERTY,
+            StepperStatus(Target.PELLET_DEVICE, Motor.PELLET_Y_MOTOR, 1.0, 2.0, False, status=status),
+            None)
+
+    def fault_blockers():
+        return [b for b in app_model.recording_blockers if "driver fault" in b]
+
+    assert fault_blockers() == [], "nothing blocks before the board has reported"
+
+    report(0x02)  # enable off alone, before any fault has latched, blocks nothing
+    assert fault_blockers() == []
+
+    report(0x03)
+    (blocker,) = fault_blockers()
+    assert "Y" in blocker and "home the pellet axes" in blocker
+    assert any(any("driver fault" in b for b in blockers) for blockers in published)
+
+    report(0x02)  # the fault clears while the enable is still off
+    assert fault_blockers() == []
+    assert not any("driver fault" in b for b in published[-1]), "clearing the fault republishes the blockers"
+
+
+def _start_session_and_drain(app_model, mock_system, reason):
+    assert app_model.behavior.algorithm.start_session(reason=reason)
+    mock_system.mock_pellet_ack(until_none=True)  # whatever session start sent
+    mock_system.pellet_dev.reset_mock()  # count only what the test itself causes
+
+
+def test_a_refused_load_is_not_reissued_while_a_pellet_axis_needs_homing(app_model, mock_system):
+    """A refused LOAD leaves the machine in `loading` with its token cleared.
+
+    The scene has not changed, so each pose response sent the load again and
+    the board refused it again: an ERROR, a device event and an on_error per
+    inference frame until someone homed.
+    """
+    pellet, device = mock_system.pellet, mock_system.pellet_dev
+    _start_session_and_drain(app_model, mock_system, "refused-load-test")
+    device.load_pellet.side_effect = lambda: f"load-{device.load_pellet.call_count}"
+    pellet.state = PelletState.loading
+
+    mock_system.mock_pellet_missing()
+    assert device.load_pellet.call_count == 1
+
+    mock_system.msg_handler.command_refused("load-1", perf_c=None, refusal=_refusal(
+        "load-1", -16, SystemCommandKind.LOAD_PELLET, RefusedCommandClass.STEPPER_MOVE,
+        (Motor.PELLET_X_MOTOR,)))
+    assert app_model.hardware.pellet_axes_needing_home == ("X",)
+
+    mock_system.mock_pose_response(pellet_seen=False)
+    assert device.load_pellet.call_count == 1, "the refused load was sent again"
+
+    for _ in range(3):
+        mock_system.mock_pellet_ack(until_none=True)  # a cover the held machine sent instead
+        mock_system.mock_pose_response(pellet_seen=False)
+    assert device.load_pellet.call_count == 1
+    assert pellet.state == PelletState.loading
+
+    app_model.hardware._set_axes_needing_home(())  # what an acknowledged home does
+    mock_system.mock_pose_response(pellet_seen=False)
+    assert device.load_pellet.call_count == 2, "the first scene update after the home loads"
+
+
+def test_a_held_machine_in_monitoring_sends_no_load_while_the_pellet_is_gone(app_model, mock_system):
+    """After a refused SEND the machine goes sending -> monitoring and would load next."""
+    pellet, device = mock_system.pellet, mock_system.pellet_dev
+    _start_session_and_drain(app_model, mock_system, "held-monitoring-test")
+    app_model.hardware._set_axes_needing_home(("X", "Y", "Z"))
+    pellet.state = PelletState.monitoring
+    pellet._covered_state = True
+
+    mock_system.mock_pellet_missing()
+    device.load_pellet.assert_not_called()  # before the drain, which would hide a loop
+
+    mock_system.mock_pellet_ack(until_none=True)
+    mock_system.mock_pose_response(pellet_seen=False)
+
+    device.load_pellet.assert_not_called()
+    device.send_pellet.assert_not_called()
+
+    app_model.hardware._set_axes_needing_home(())  # what an acknowledged home does
+    mock_system.mock_pose_response(pellet_seen=False)
+    assert device.load_pellet.call_count == 1, "the first scene update after the home loads"
+
+
+@pytest.mark.parametrize("cover_enabled, command, kind", [
+    (True, "cover_pellet", SystemCommandKind.COVER_PELLET),
+    (False, "release_pellet", SystemCommandKind.RELEASE_PELLET),
+])
+def test_a_refused_automatic_servo_command_is_not_reissued_until_an_acknowledged_home(
+    app_model, mock_system, cover_enabled, command, kind,
+):
+    """Under E-stop the board refuses servo moves too (-1) and marks every axis.
+
+    With loads held the machine covers or releases instead, and the refusal
+    reset covered_state to unknown, so the same command went out every frame.
+    """
+    pellet, device = mock_system.pellet, mock_system.pellet_dev
+    mock_system.algo.pellet_cover_enabled = cover_enabled
+    _start_session_and_drain(app_model, mock_system, f"refused-{command}-test")
+    servo = getattr(device, command)
+    servo.side_effect = lambda: f"{command}-{servo.call_count}"
+    app_model.hardware._set_axes_needing_home(("X", "Y", "Z"))  # automatic loads are held while an axis needs a home
+    pellet.state = PelletState.loading
+    pellet._covered_state = None
+
+    mock_system.mock_pose_response(pellet_seen=False)
+    assert servo.call_count == 1
+
+    mock_system.msg_handler.command_refused(f"{command}-1", perf_c=None, refusal=_refusal(
+        f"{command}-1", -1, kind, RefusedCommandClass.SERVO_MOVE, (Motor.PELLET_COVER_SERVO,)))
+    for _ in range(3):
+        mock_system.mock_pose_response(pellet_seen=False)
+    assert servo.call_count == 1, "the refused servo command was sent again"
+    (device.release_pellet if cover_enabled else device.cover_pellet).assert_not_called()
+
+    app_model.hardware._set_axes_needing_home(())  # what an acknowledged home does
+    assert getattr(pellet, f"can_{command}")() is True, "the hold ends with the home"

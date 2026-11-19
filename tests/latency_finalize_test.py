@@ -27,7 +27,6 @@ from tools.acquisition.model.latency_event_log import LatencyEventLog
 from tools.autotrainer_version import __version__ as app_version
 from tools.latency import finalize
 from tools.latency import rebuild
-from tools.latency.finalize import finalize_session_latency
 
 RATE = 10_000.0
 PERIOD = 1 / 150
@@ -40,6 +39,20 @@ DIODE_DELAY = 0.0001
 START_ENTRY_NI = 1.0
 RAW_OFFSET = 3.0       # CLOCK_MONOTONIC_RAW = the unslewed host clock + 3 s
 SLEW_HALF_WIDTH = 0.2  # seconds either side of mid-session
+# The synthetic reads return 0.2-3.2 ms after their blocks and the camera stamps the exposure
+# itself, so a correct latch pairing's residual is the envelope's floor: 0.51 ms in the default
+# session, 0.22 ms in a 30 s one (more reads per envelope bin). A rig calibrated across both.
+CALIBRATION = {"exposure_seconds": 0.0, "delivery_offset_seconds": 0.00036,
+               "delivery_spread_seconds": 60e-6, "delivery_sessions": 27}
+
+
+def finalize_session_latency(session_dir, **kwargs):
+    """The finalizer as a calibrated rig runs it, unless a test passes its own inputs."""
+    return finalize.finalize_session_latency(session_dir, **{**CALIBRATION, **kwargs})
+
+
+def _band(pairing: dict) -> "finalize.clocks.ResidualBand":
+    return finalize.clocks.ResidualBand(pairing["expected_residual"], pairing["limit"])
 
 
 def _slew(host, slew):
@@ -318,8 +331,8 @@ def test_a_latch_left_out_of_the_map_is_named_in_the_camera_to_ni_record(tmp_pat
     assert json.loads(attrs["latchDropped"]) == [1]
 
 
-@pytest.mark.parametrize("disagreement, gated", [(0.0025, True), (0.0005, False)],
-                         ids=["over_tolerance", "within_tolerance"])
+@pytest.mark.parametrize("disagreement, gated", [(0.0005, True), (0.00003, False)],
+                         ids=["over_the_band", "within_the_band"])
 def test_a_latch_pairing_the_ni_path_disagrees_with_is_ambiguous(tmp_path, monkeypatch,
                                                                   disagreement, gated):
     real = finalize._latch_direct_lag_p50
@@ -333,11 +346,12 @@ def test_a_latch_pairing_the_ni_path_disagrees_with_is_ambiguous(tmp_path, monke
     assert camera["pairing"]["ambiguous"] is gated
     assert camera["valid"] is not gated
     if gated:
-        # Both numbers, in ms, and the tolerance: a quarter of a 150 fps period.
+        # Both numbers, in ms, and the band's half-width, well under a quarter period.
         reason = camera["pairing"]["reason"]
         assert f"{camera['niDerivedLagP50'] * 1e3:.3f} ms" in reason
         assert f"{camera['latchDirectLagP50'] * 1e3:.3f} ms" in reason
-        assert "1.667 ms" in reason
+        assert f"{camera['pairing']['limit'] * 1e3:.3f} ms" in reason
+        assert camera["pairing"]["limit"] < PERIOD / 4
         assert camera["reason"] == reason
         # The mixed figures fall back as for any ambiguous pairing.
         assert status["loops"]["pose"]["status"] == "partial"
@@ -434,19 +448,19 @@ def test_a_sustained_perf_step_does_not_invalidate_a_raw_pairing(tmp_path):
     status = finalize_session_latency(session, primary_camera="left")
 
     camera = status["clocks"]["cameraToNi"]
-    tolerance = finalize.clocks.latch_tolerance(PERIOD)
+    band = _band(camera["pairing"])
     assert status["clocks"]["niToHost"]["method"] == "raw_bridged"
     # The perf figures read the chord's error as a disagreement, or this test has no teeth.
-    assert abs(camera["latchDirectLagP50"] - camera["niDerivedLagP50"]) > tolerance
+    assert not band.holds(camera["latchDirectLagP50"] - camera["niDerivedLagP50"])
     assert camera["valid"] is True, camera
     assert camera["pairing"]["clock"] == "raw"
     assert camera["pairing"]["slip"] is None and camera["pairing"]["ambiguous"] is False
-    assert abs(camera["latchVersusNiRawSeconds"]) < tolerance
+    assert band.holds(camera["latchVersusNiRawSeconds"])
     assert camera["arrivalPairing"]["shift"] == 0 and camera["arrivalPairing"]["ambiguous"] is False
 
 
-@pytest.mark.parametrize("off, gated", [(0.0025, True), (0.0005, False)],
-                         ids=["over_tolerance", "within_tolerance"])
+@pytest.mark.parametrize("off, gated", [(0.0005, True), (0.00003, False)],
+                         ids=["over_the_band", "within_the_band"])
 def test_a_raw_pairing_is_checked_by_its_two_exposure_paths_on_raw(tmp_path, monkeypatch, off, gated):
     # A camera-to-NI line off by `off` moves the NI path's exposure and not the latches'.
     real = finalize.clocks.fit_camera_to_ni
@@ -468,9 +482,10 @@ def test_a_raw_pairing_is_checked_by_its_two_exposure_paths_on_raw(tmp_path, mon
     assert camera["valid"] is not gated
     if gated:
         reason = camera["pairing"]["reason"]
-        assert "NI-derived exposure" in reason and "latch-derived exposure" in reason
-        # The difference, in ms, and the tolerance: a quarter of a 150 fps period.
-        assert f"{difference * 1e3:.3f} ms" in reason and "1.667 ms" in reason
+        assert "NI-derived minus latch-derived exposure on RAW" in reason
+        # The difference, in ms, and the band's half-width.
+        assert f"{difference * 1e3:.3f} ms" in reason
+        assert f"{camera['pairing']['limit'] * 1e3:.3f} ms" in reason
         assert camera["reason"] == reason
 
 
@@ -599,8 +614,7 @@ def test_an_unreadable_stream_fails_without_raising(tmp_path, monkeypatch):
 
 def test_rebuild_writes_beside_the_original_and_leaves_it_alone(tmp_path, capsys):
     session = _session(tmp_path)
-    (session / "streams" / "alignment.json").write_text(
-        json.dumps({"canonicalBoundary": {"primaryCamera": "left"}}))
+    (session / "streams" / "alignment.json").write_text(json.dumps(_alignment()))
     assert finalize_session_latency(session, primary_camera="left")["status"] == "complete"
     original = session / "streams" / "latency.h5"
     before = hashlib.sha256(original.read_bytes()).hexdigest()
@@ -612,6 +626,29 @@ def test_rebuild_writes_beside_the_original_and_leaves_it_alone(tmp_path, capsys
     assert hashlib.sha256(original.read_bytes()).hexdigest() == before
     # The top-level status, not a substring a per-loop status would also match.
     assert json.loads(capsys.readouterr().out)["status"] == "complete"
+
+
+def _alignment(calibration=True) -> dict:
+    """alignment.json as the recorder writes it, for what a rebuild reads back."""
+    return {"canonicalBoundary": {"primaryCamera": "left"},
+            "cameraNidaqAlignment": {
+                "exposureSeconds": CALIBRATION["exposure_seconds"],
+                "deliveryCalibration": None if not calibration else {
+                    "offsetSeconds": CALIBRATION["delivery_offset_seconds"],
+                    "spreadSeconds": CALIBRATION["delivery_spread_seconds"], "sessions": 27}}}
+
+
+def test_a_rebuild_without_a_recorded_calibration_refuses_the_latch_pairing(tmp_path, capsys):
+    session = _session(tmp_path)
+    (session / "streams" / "alignment.json").write_text(json.dumps(_alignment(calibration=False)))
+
+    assert rebuild.main([str(session)]) == 0
+
+    status = json.loads(capsys.readouterr().out)
+    pairing = status["clocks"]["cameraToNi"]["pairing"]
+    # As at recording: no calibration, so host arrival pairs and the latch shift is not vouched for.
+    assert pairing["method"] == "host_arrival"
+    assert status["status"] == "partial"
 
 
 def test_two_rebuilds_in_one_second_do_not_overwrite_each_other(tmp_path, capsys):
@@ -670,7 +707,7 @@ def test_the_file_records_its_clock_fits_session_and_app_version(tmp_path):
     assert set(ni) >= {"offset", "drift", "x_min", "x_max", "reason", "segmentDriftPpmMin",
                        "segmentDriftPpmMax", "knotSeconds"}
     assert "minimum delivery delay" in ni["note"]
-    assert "unmeasured" in ni["envelope_bias_floor"]
+    assert "not subtracted" in ni["envelope_bias_floor"]
     assert "unmeasured" in ni["secondary_trigger_delay"]
     assert camera["valid"] and camera["points"] == FRAMES
     assert camera["pairing_shift"] == 0 and not camera["pairing_ambiguous"]
@@ -949,36 +986,63 @@ def test_a_consecutive_sample_index_is_derived_and_a_gap_uses_the_stored_one(tmp
         assert "values" not in ni and "channels" not in ni  # no samples are retained
 
 
-def test_the_raw_column_is_not_kept_alive_through_the_channel_scans(tmp_path, monkeypatch):
-    # The stamps keep only the run ends, so the whole RAW column (8 bytes a sample, 288 MB
-    # an hour at 10 kHz) must be gone before the channels are scanned.
+def test_no_stamp_column_is_kept_alive_through_the_channel_scans(tmp_path, monkeypatch):
+    # The stamps keep only the run ends, so each whole stamp column (8 bytes a sample, 288 MB
+    # an hour at 10 kHz) must be gone before the channels are scanned, and none may be
+    # held while the next is read.
     path = tmp_path / "nidaq.h5"
     seen = np.arange(10, dtype=np.float64)
+    columns = ("block_observation_perf_time", "block_observation_raw_time",
+               "block_newest_read_start_index")
     _write(path, {"sample_index": (1000 + np.arange(10)).astype(np.int64),
                   "block_observation_perf_time": seen,
                   "block_observation_raw_time": seen + 3.0,
+                  "block_newest_read_start_index": (1000 + np.arange(10)).astype(np.int64),
                   "values": np.array([[0, 0, 1, 1, 0, 0, 1, 1, 0, 0]], dtype=np.float32)},
            {"channel_names": np.array([b"cam_frames"]), "sample_rate_hz": 1000.0})
-    raw_arrays, alive_during_scan = [], []
-    real_stamps, real_transitions = finalize.clocks.ni_block_stamps, finalize.clocks.transitions
+    read, alive_when_read, alive_during_scan = [], [], []
+    real_read, real_transitions = finalize._read_inflated, finalize.clocks.transitions
 
-    def stamps(index, observed, raw=None):
-        raw_arrays.append(weakref.ref(raw))
-        return real_stamps(index, observed, raw)
+    def inflated(dataset, row=None):
+        gc.collect()
+        alive_when_read.append(sum(ref() is not None for ref in read))
+        data = real_read(dataset, row)
+        if dataset.name.lstrip("/") in columns:
+            read.append(weakref.ref(data))
+        return data
 
     def transitions(channel):
         gc.collect()
-        alive_during_scan.append(raw_arrays[0]() is not None)
+        alive_during_scan.append(sum(ref() is not None for ref in read))
         return real_transitions(channel)
 
-    monkeypatch.setattr(finalize.clocks, "ni_block_stamps", stamps)
+    monkeypatch.setattr(finalize, "_read_inflated", inflated)
     monkeypatch.setattr(finalize.clocks, "transitions", transitions)
 
     ni = finalize._read_nidaq(path)
 
     assert ni["transitions"].tolist() == [1002, 1004, 1006, 1008]
     assert np.isfinite(ni["block_stamps"].raw).all()  # the RAW stamps were read and kept
-    assert alive_during_scan == [False]
+    assert len(read) == 3
+    assert alive_when_read[:3] == [0, 0, 0] and alive_during_scan == [0]
+
+
+def test_latency_h5_is_marked_close_on_exec_while_it_is_written(monkeypatch, tmp_path):
+    # It is written in the app's process at Stop, where NI-DAQmx's CEIP client starts
+    # processes that would otherwise inherit it and hold its HDF5 lock (christielab10, 2026-11-13).
+    real_mark = finalize.mark_close_on_exec
+    marked = []
+
+    def mark(store):
+        marked.append((Path(store.filename).name, real_mark(store)))
+        return marked[-1][1]
+
+    monkeypatch.setattr(finalize, "mark_close_on_exec", mark)
+    finalize._write_output(tmp_path / "latency.h5", {}, {"clocks": {}}, session_id="s",
+                           app_version="v")
+
+    assert marked == [("latency.h5.partial", True)]
+    assert (tmp_path / "latency.h5").is_file()
 
 
 @pytest.mark.parametrize(("shape", "options", "row"), (
@@ -1096,3 +1160,24 @@ def test_unreadable_streams_share_one_open_retry_budget(tmp_path, monkeypatch):
     assert elapsed < 0.6, f"{elapsed:.2f} s for three unreadable streams"
     # The first file is retried until the deadline, so the budget is spent, not skipped.
     assert elapsed >= 0.3, f"{elapsed:.2f} s: the open retries did not use the budget"
+
+
+def test_a_rebuild_can_take_the_calibration_from_a_configuration(tmp_path, capsys):
+    from autotrainer.core import SystemConfiguration
+    from autotrainer.core.configuration import (NidaqDeliveryCalibration,
+                                                NidaqSignalStreamConfiguration)
+    session = _session(tmp_path / "session")
+    (session / "streams" / "alignment.json").write_text(json.dumps(_alignment(calibration=False)))
+    calibration = NidaqDeliveryCalibration(
+        offset_seconds=CALIBRATION["delivery_offset_seconds"],
+        spread_seconds=CALIBRATION["delivery_spread_seconds"],
+        sessions=CALIBRATION["delivery_sessions"])
+    configuration = tmp_path / "system_configuration.yaml"
+    SystemConfiguration(nidaq_stream=NidaqSignalStreamConfiguration(
+        delivery_calibration=calibration)).save_file(configuration.with_suffix(""), as_yaml=True)
+
+    assert rebuild.main([str(session), "--delivery-calibration-from", str(configuration)]) == 0
+
+    status = json.loads(capsys.readouterr().out)
+    assert status["clocks"]["cameraToNi"]["pairing"]["method"] == "camera_latch"
+    assert status["status"] == "complete"

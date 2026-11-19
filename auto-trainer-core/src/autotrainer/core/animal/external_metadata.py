@@ -35,10 +35,7 @@ def normalize_rfid(value: Any) -> str:
     if text is None:
         raise ValueError("RFID cannot be empty")
     if _RFID_RE.fullmatch(text) is None:
-        raise ValueError(
-            "RFID must be the 15-digit ISO 11784 identifier stored in "
-            "SoftMouse Plate ID"
-        )
+        raise ValueError("RFID must be the 15-digit ISO 11784 identifier")
     return text
 
 
@@ -195,7 +192,9 @@ class ExternalMetadataSnapshot:
 @dataclass(frozen=True)
 class ExternalAnimalRecord:
     identity: ExternalIdentity
-    physical_rfid: str
+    #: None when the source has no RFID for this animal; such a record can
+    #: only be linked by hand, never by a scan.
+    physical_rfid: Optional[str]
     new_animal_name_candidate: Optional[str]
     state: str
     source_payload: Mapping[str, Any]
@@ -208,7 +207,11 @@ class ExternalAnimalRecord:
     protocol: Optional[str] = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "physical_rfid", normalize_rfid(self.physical_rfid))
+        object.__setattr__(
+            self,
+            "physical_rfid",
+            None if self.physical_rfid is None else normalize_rfid(self.physical_rfid),
+        )
         object.__setattr__(
             self,
             "new_animal_name_candidate",
@@ -266,7 +269,11 @@ class NormalizedAnimalBatch:
         object.__setattr__(self, "records", tuple(self.records))
         object.__setattr__(self, "warnings", tuple(self.warnings))
         identities = [record.identity.key for record in self.records]
-        rfids = [record.physical_rfid for record in self.records]
+        rfids = [
+            record.physical_rfid
+            for record in self.records
+            if record.physical_rfid is not None
+        ]
         if len(identities) != len(set(identities)):
             raise ValueError("Batch contains duplicate external subject identities")
         if len(rfids) != len(set(rfids)):

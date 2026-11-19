@@ -256,7 +256,7 @@ def slave_input_timing(
     (sampleClockExportTerminal, startTriggerExportTerminal), named on
     `device`: the master's own terminals, named on another board, are a route
     DAQmx makes only by reserving a backplane line, and it reserves none on an
-    unidentified chassis such as christielab10's (-89125), as the laser found
+    unidentified chassis such as the reference rig's (-89125), as the laser found
     (NidaqLaserController._shared_clock_for). None for one whose field names
     no PXI_Trig line. A master with no analog input clocks its slaves from a
     counter and exports no start trigger, so its slaves keep the plan's.

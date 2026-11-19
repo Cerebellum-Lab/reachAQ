@@ -16,7 +16,7 @@ from autotrainer.behavior import BehaviorAlgorithm
 
 logger = get_verbose_logger(__name__)
 
-missing_file = "The configuration file %s does not exist; a default configuration will be loaded"
+missing_file = "The configuration file %s does not exist; name an existing file with -c"
 
 CardHeader.DEFAULT_BACKGROUND_COLOR = "#cfb87c"
 CardHeader.DEFAULT_TITLE_COLOR = "black"
@@ -42,6 +42,8 @@ def _terminate_owned_children(*, force: bool = False) -> tuple[int, ...]:
 def verify_configuration(configuration: Optional[Path]):
     if configuration is not None and not configuration.exists():
         logger.error(missing_file, configuration)
+        # Not created with defaults: a mistyped -c would write a new file.
+        return False
 
     return True
 
@@ -95,6 +97,7 @@ def run_acquisition(
             is_dev=args.dev,
             random_cameras=args.random_cameras,
             live_inference=args.live_inference,
+            calib_dir=getattr(args, "sim_calib_dir", None),
         )
     except:
         event_manager.close()

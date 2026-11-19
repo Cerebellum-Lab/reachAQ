@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import math
 from unittest import mock
@@ -596,3 +597,125 @@ def test_a_refusal_is_logged_below_error_so_the_footer_keeps_the_operator_notice
     refused = [r for r in caplog.records if "refused" in r.getMessage()]
     assert refused, "the refusal is still logged"
     assert all(r.levelno < logging.ERROR for r in refused)
+
+
+def test_an_automatic_load_asks_the_motion_readiness_and_a_forced_one_does_not(machine, monkeypatch):
+    pellet_m = machine.pellet
+    monkeypatch.setattr(machine.algorithm, "can_load_pellet", lambda **kwargs: True)
+    ready, asked = [False], []
+    pellet_m.set_motion_readiness_callback(lambda: asked.append(1) or ready[0])
+
+    assert pellet_m.can_load_pellet() is False
+    assert pellet_m.can_load_pellet(force=True) is True
+    ready[0] = True
+    assert pellet_m.can_load_pellet() is True
+    assert len(asked) == 2, "asked for each automatic load, never for a forced one"
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_only_a_refused_automatic_cover_holds_automatic_covers_until_motion_readiness(machine, forced):
+    pellet_m = machine.pellet
+    ready = [False]
+    pellet_m.set_motion_readiness_callback(lambda: ready[0])
+    pellet_m._covered_state = None
+    pellet_m.cover_pellet(force=forced)
+    token = pellet_m._token_cover_pellet
+    assert token is not None
+
+    pellet_m._pellet_device_command_refused(token, refusal=_refusal(token, -1))
+
+    assert pellet_m.can_cover_pellet() is forced, "only an automatic command's refusal holds"
+    assert pellet_m.can_cover_pellet(force=True) is True, "a forced command is never held"
+    ready[0] = True  # an acknowledged home
+    assert pellet_m.can_cover_pellet() is True
+    ready[0] = False
+    assert pellet_m.can_cover_pellet() is True, "the hold ended with the home"
+
+
+def test_a_forced_command_sent_after_an_automatic_cover_does_not_relabel_the_covers_refusal(machine):
+    """A refusal is judged by its own command: the cover was automatic, the release after it was not."""
+    pellet_m = machine.pellet
+    pellet_m._pellet_device.cover_pellet.return_value = "cover-1"
+    pellet_m._pellet_device.release_pellet.return_value = "release-1"
+    ready = [False]
+    pellet_m.set_motion_readiness_callback(lambda: ready[0])
+    pellet_m._covered_state = None
+    pellet_m.cover_pellet()
+    assert pellet_m._token_cover_pellet == "cover-1"
+    pellet_m.release_pellet(force=True)  # a manual release, sent while the cover is pending
+    assert pellet_m._token_release_pellet == "release-1"
+
+    pellet_m._pellet_device_command_refused("cover-1", refusal=_refusal("cover-1", -1))
+    pellet_m._api_status_token = None  # the release's ack would free the machine; it is not under test
+
+    assert pellet_m.can_cover_pellet() is False, "the automatic cover's refusal holds, whatever went after it"
+    assert pellet_m.can_cover_pellet(force=True) is True
+    ready[0] = True  # an acknowledged home
+    assert pellet_m.can_cover_pellet() is True
+
+
+def test_a_refused_automatic_load_holds_neither_covers_nor_releases(machine, monkeypatch):
+    """Only a refused cover or release holds, not any refused automatic command."""
+    pellet_m = machine.pellet
+    monkeypatch.setattr(machine.algorithm, "can_load_pellet", lambda **kwargs: True)
+    monkeypatch.setattr(machine.algorithm, "can_release_pellet", lambda **kwargs: True)
+    pellet_m._pellet_device.load_pellet.return_value = "load-1"
+    ready = [True]
+    pellet_m.set_motion_readiness_callback(lambda: ready[0])
+    pellet_m.load_pellet()
+    token = pellet_m._token_pellet_load
+    assert token == "load-1"
+    ready[0] = False  # the refusal says an axis needs a home
+
+    pellet_m._pellet_device_command_refused(token, refusal=_refusal(token, -1))
+
+    assert pellet_m.can_cover_pellet() is True
+    assert pellet_m.can_release_pellet() is True
+
+
+def test_a_refused_automatic_release_holds_automatic_covers_as_well(machine, monkeypatch):
+    pellet_m = machine.pellet
+    monkeypatch.setattr(machine.algorithm, "can_cover_pellet", lambda: True)
+    monkeypatch.setattr(machine.algorithm, "can_release_pellet", lambda **kwargs: True)
+    pellet_m._pellet_device.release_pellet.return_value = "release-1"
+    ready = [False]
+    pellet_m.set_motion_readiness_callback(lambda: ready[0])
+    pellet_m._covered_state = None
+    pellet_m.release_pellet()
+    token = pellet_m._token_release_pellet
+    assert token == "release-1"
+
+    pellet_m._pellet_device_command_refused(token, refusal=_refusal(token, -1))
+
+    assert pellet_m.can_cover_pellet() is False, "the hold covers both kinds"
+    assert pellet_m.can_release_pellet() is False
+    ready[0] = True  # an acknowledged home
+    assert pellet_m.can_cover_pellet() is True
+    assert pellet_m.can_release_pellet() is True
+
+
+@pytest.mark.parametrize("policy, command", [("cover", "cover_pellet"), ("reveal", "release_pellet")])
+def test_a_protocol_cover_policy_is_sent_while_a_refused_cover_holds(machine, monkeypatch, policy, command):
+    """The protocol's cover or release is forced, so no standing hold may stop it."""
+    pellet_m = machine.pellet
+    device = pellet_m._pellet_device
+    # Let the algorithm permit an automatic release, so only the hold can stop one.
+    monkeypatch.setattr(machine.algorithm, "can_release_pellet", lambda **kwargs: True)
+    device.cover_pellet.return_value = "cover-1"
+    device.release_pellet.return_value = "release-1"
+    pellet_m.set_motion_readiness_callback(lambda: False)  # an axis needs a home
+    pellet_m._covered_state = None
+    pellet_m.cover_pellet()
+    pellet_m._pellet_device_command_refused("cover-1", refusal=_refusal("cover-1", -1))
+    assert pellet_m.can_cover_pellet() is False, "an automatic cover is held"
+    assert pellet_m.can_release_pellet() is False, "and so is an automatic release"
+    device.cover_pellet.reset_mock()
+    device.release_pellet.reset_mock()
+
+    # What happens after the command goes out is not under test: the relayed
+    # trigger returns None today, so the call ends in "Could not queue"; once
+    # that is fixed it waits for an ack that never comes (TimeoutError).
+    with contextlib.suppress(PelletDeviceCommandFailed, TimeoutError):
+        pellet_m.prepare_cover_policy(policy, timeout=0.05)
+
+    getattr(device, command).assert_called_once()

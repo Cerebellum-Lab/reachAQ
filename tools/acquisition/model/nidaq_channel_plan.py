@@ -301,7 +301,7 @@ def build_nidaq_acquisition_configuration(
     # Claimed here, so a channel already acquired on that input is taken over
     # rather than kept as a custom one; added last, below. It has no scale in
     # the laser configuration. It keeps the settings of a custom channel it
-    # takes over, such as christielab10's laser1_trigger_readback, and its
+    # takes over, such as the reference rig's laser1_trigger_readback, and its
     # own from an earlier load; another role's entry left on its input, an
     # old command copy's scale for one, is not its to keep.
     triggers = []
@@ -362,7 +362,7 @@ def build_nidaq_acquisition_configuration(
     # Last, so the readbacks follow every other input in the multiplexed
     # scan and the fast STIM edge is not converted just before a diode. A
     # channel already acquired keeps its place when nothing is taken over,
-    # or when what is taken over came last, as christielab10's two
+    # or when what is taken over came last, as the reference rig's two
     # *_trigger_readback channels did; one taken over from the middle moves
     # the channels after it up by one.
     for trigger in triggers:

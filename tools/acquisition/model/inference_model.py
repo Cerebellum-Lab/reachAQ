@@ -18,12 +18,13 @@ from autotrainer.core.project import ProjectDependentProtocol
 from autotrainer.core.multiproc import get_mp_ctx, pool_init
 from autotrainer.core.logging import get_verbose_logger, log_hardware_initialization, make_log_dict_config
 from autotrainer.core.pose_elements import SceneElement, AllHandsParts
+from autotrainer.core.simulation import is_simulation
 
 from autotrainer.inference import GpuRuntimeStatus, PoseProcess, InferenceCommandMessageKind, \
     InferenceStatusMessageKind, PoseAlgorithm, InferenceMode, InferenceStatus, \
     InferenceMonitorDataMsg, detect_gpu_runtime
 from autotrainer.inference.backend_selection import (
-    build_pose_model, confidence_threshold, selected_backend, trained_model_name,
+    build_pose_model, confidence_threshold, selected_backend,
 )
 from autotrainer.inference.pose_result_process import InferenceMonitorDataProc
 from autotrainer.inference.analysis import intersession_process, IntersessionResponse
@@ -385,6 +386,10 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         return True
 
     def check_live_inference_runtime(self, *, force_refresh: bool = False) -> GpuRuntimeStatus:
+        if is_simulation() and not self._model_location:
+            # A simulation's empty location is MemoryPoseModel, which runs on
+            # the CPU; a hardware-free host has no GPU runtime to probe.
+            return GpuRuntimeStatus(True, backend="cpu", devices=("simulation: in-memory pose model",))
         if force_refresh or self._gpu_runtime_status is None:
             # Probe the backend live inference will actually run on. The two
             # are not interchangeable: on the reachAQ rig TensorFlow sees the
@@ -719,7 +724,6 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
                     # already handled downstream.
                     pose_algo.set_confidence_threshold(confidence_threshold(
                         selected_backend(model_path=self._model_location),
-                        model_name=trained_model_name(self._model_location),
                         model_path=self._model_location,
                     ))
                     pose_algo.initialize(context)

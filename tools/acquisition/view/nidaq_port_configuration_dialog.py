@@ -696,7 +696,7 @@ class NidaqPortConfigurationDialog(QDialog):
             return tuple(dict.fromkeys(device.analog_inputs + self._streamable_lines(device)))
         if kind == "trigger":
             # DAQmx spells the backplane lines PXI_Trig0-7. Looking for
-            # "pxitrig" alone never matched one, so the lines christielab10's
+            # "pxitrig" alone never matched one, so the lines the reference rig's
             # trigger inputs use were never offered, only kept when stored.
             return tuple(
                 terminal

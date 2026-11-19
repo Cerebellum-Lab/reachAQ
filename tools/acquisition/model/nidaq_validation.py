@@ -321,7 +321,7 @@ _CORRUPTED = ("two signals driven onto one backplane line corrupt each other, "
               "and DAQmx does not see it across these boards")
 
 #: The order a free line is suggested in. PXI_Trig0 to PXI_Trig3 come last:
-#: christielab10's triggers take PXI_Trig0 and PXI_Trig2, and the laser's
+#: The reference rig's triggers take PXI_Trig0 and PXI_Trig2, and the laser's
 #: clock lines default to PXI_Trig1 and PXI_Trig3, which a caller given no
 #: laser configuration cannot see.
 _SUGGESTED_LINES = tuple(f"PXI_Trig{number}" for number in (4, 5, 6, 7, 0, 1, 2, 3))

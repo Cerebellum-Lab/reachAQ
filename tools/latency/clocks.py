@@ -34,7 +34,7 @@ FALSE_ALARM_PROBABILITY = 1e-6
 # NI-to-host is fitted window by window, joined at the knots, because the
 # host clock is slewed by NTP: timesyncd polls every 2048 s and the kernel
 # steps the rate by up to about 6.5 ppm, decaying over 512 s. Simulated on
-# christielab10's settings (ntp/pll_sim.py, 2026-10-07): one line per session
+# The reference rig's settings (ntp/pll_sim.py, 2026-10-07): one line per session
 # leaves p95 errors of 1.9-4.3 ms at 1 h; 120 s windows leave under 0.4 ms.
 # A window with fewer envelope points than MIN_WINDOW_POINTS (a short tail, a
 # gap) merges into its neighbour rather than fitting noise.
@@ -59,7 +59,7 @@ PIECEWISE_LINE = "piecewise_line"
 BRIDGE_WINDOW_SECONDS = 1.0
 BRIDGE_TAIL_SECONDS = 5.0
 BRIDGE_MIN_RAW_COVERAGE = 0.9
-# A camera clock latch is one USB round trip: christielab10's BFS-U3-16S2M
+# A camera clock latch is one USB round trip: the reference rig's BFS-U3-16S2M
 # brackets it in 0.14-0.58 ms inside the running app (60 latches, median
 # 0.27 ms) and in about 0.20 ms with the app closed; the widest in the
 # 2026-11-03 sweep was 1.78 ms. No width is refused: fit_latches fits through
@@ -70,16 +70,21 @@ BRIDGE_MIN_RAW_COVERAGE = 0.9
 # frames within LATCH_WINDOW_SECONDS (20 ppm over 30 s is 0.6 ms).
 LATCH_DRIFT_SPAN_SECONDS = 10.0
 LATCH_WINDOW_SECONDS = 30.0
-# What may separate the NI edge from the latched camera time it is paired with:
-# a quarter period, never more than this. This residual gate is the safeguard
+# What may separate the NI edge from the latched camera time it is paired with
+# is set by the rig's NI delivery calibration (latch_residual_band). A correct
+# pairing's residual sits at the NI-to-host fit's delivery floor plus the
+# camera's own stamp offset, minus the exposure, and a bias of whole periods or
+# whole NI reads moves it by milliseconds. That residual gate is the safeguard
 # against whole-period mispairing, because a bias of whole periods plus a
-# little passes a quarter-period test at low frame rates: christielab10's NI
-# stamps, paired with their own blocks, put the edges 16.6 ms early, and
-# 50 fps paired a frame off with a 3.39 ms residual. With the bias gone the
-# residual is about 0.1 ms. The finalizer's NI-versus-latch lag check uses the
-# same tolerance but sees this same residual again, through the fitted
-# camera-to-NI line; it is no reason to relax this gate.
-LATCH_MAX_RESIDUAL_SECONDS = 0.002
+# little passes a quarter-period test: the reference rig's NI stamps, paired with
+# their own blocks, put the edges 16.6 ms early and 50 fps paired a frame off
+# with a 3.39 ms residual; at 200 Hz display refresh (50-sample NI reads) the
+# fit ran a read late before block_newest_read_start_index and 150 fps paired
+# a frame off at -1.58 ms, inside a quarter period. The loopback calibration
+# (2026-11-13, 18 sessions, NI reads of 42-167 samples) put residual + exposure
+# at 0.277 ms, 0.029 ms between sessions. The finalizer's NI-versus-latch lag
+# check sees this same residual again, through the fitted camera-to-NI line,
+# and is judged against the same band.
 HOST_ARRIVAL = "host_arrival"
 CAMERA_LATCH = "camera_latch"
 
@@ -179,7 +184,7 @@ def rising_edges(values, *, min_swing: float) -> EdgeResult:
 
     Laser pulses are sparse, so the baseline is the median and the peak the
     maximum. A channel whose swing is not well clear of its own noise - a
-    floating input such as christielab10's laser-1 diode - is reported
+    floating input such as the reference rig's laser-1 diode - is reported
     unusable rather than producing edges from noise.
     """
     values = numpy.asarray(values, dtype=numpy.float64)
@@ -227,8 +232,9 @@ def run_ends(observation_perf) -> numpy.ndarray:
     return numpy.append(ends, observation_perf.size - 1).astype(numpy.int64)
 
 
-def block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends=None) -> BlockStamps:
-    """Pair each run's stamps with the last sample of the run before it.
+def block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends=None,
+                           newest_read_at_ends=None) -> BlockStamps:
+    """Pair each run's stamps with the last sample delivered before its newest read.
 
     In nidaq.h5 a run of equal block_observation_perf_time values is not one NI
     read. It is one copy the session recorder makes from the NI sample ring
@@ -239,8 +245,19 @@ def block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends=None) -> Blo
     is an upper bound on when the previous run's last sample was taken, though
     (that sample came from an earlier read, which had returned), and that is
     what the lower envelope in fit_ni_to_host needs. The first run's stamp
-    bounds nothing and is dropped. How loose the bound is depends on the read
-    size; see fit_ni_to_host.
+    bounds nothing and is dropped.
+
+    When a copy holds more than one read, the sample the stamp bounds tightly
+    is the last one before the copy's newest read, a read after the previous
+    run's end. Paired with that end instead, every stamp is a read loose, and
+    with reads under half the copy interval (display refresh of 200 Hz or more)
+    every copy holds two: the fit then maps NI times a whole read late
+    (reference rig loopback, 2026-11-12: 4.4-5.2 ms against 0.19-0.20 ms).
+    newest_read_at_ends, each run's newest read's first sample index
+    (block_newest_read_start_index), pairs each stamp with the sample before
+    it, or with the previous run's end where that is later. Without it, or
+    where it is negative (unknown), the previous run's end is used, as for
+    nidaq.h5 files that predate the column.
     """
     index_at_ends = numpy.asarray(index_at_ends, dtype=numpy.int64)
     perf_at_ends = numpy.asarray(perf_at_ends, dtype=numpy.float64)
@@ -249,18 +266,25 @@ def block_stamps_from_runs(index_at_ends, perf_at_ends, raw_at_ends=None) -> Blo
     if perf_at_ends.size < 2:
         return BlockStamps(numpy.empty(0, dtype=numpy.int64), numpy.empty(0), numpy.empty(0))
     previous_end, stamp, raw = index_at_ends[:-1], perf_at_ends[1:], raw_at_ends[1:]
+    if newest_read_at_ends is not None:
+        newest = numpy.asarray(newest_read_at_ends, dtype=numpy.int64)[1:]
+        previous_end = numpy.where(newest >= 0, numpy.maximum(previous_end, newest - 1),
+                                   previous_end)
     keep = numpy.isfinite(stamp)
     return BlockStamps(previous_end[keep], stamp[keep], raw[keep])
 
 
-def ni_block_stamps(sample_index, observation_perf, observation_raw=None) -> BlockStamps:
+def ni_block_stamps(sample_index, observation_perf, observation_raw=None,
+                    newest_read_start=None) -> BlockStamps:
     """block_stamps_from_runs over per-sample arrays, as nidaq.h5 stores them."""
     sample_index = numpy.asarray(sample_index, dtype=numpy.int64)
     observation_perf = numpy.asarray(observation_perf, dtype=numpy.float64)
     ends = run_ends(observation_perf)
     raw = (None if observation_raw is None
            else numpy.asarray(observation_raw, dtype=numpy.float64)[ends])
-    return block_stamps_from_runs(sample_index[ends], observation_perf[ends], raw)
+    newest = (None if newest_read_start is None
+              else numpy.asarray(newest_read_start, dtype=numpy.int64)[ends])
+    return block_stamps_from_runs(sample_index[ends], observation_perf[ends], raw, newest)
 
 
 def ni_block_ends(sample_index, observation_perf) -> Tuple[numpy.ndarray, numpy.ndarray]:
@@ -302,20 +326,19 @@ def fit_ni_to_host(end_index, seen_perf, sample_rate: float) -> ClockFit:
     """NI sample time (index / rate) -> host perf_counter, from the lower envelope.
 
     Each point pairs a sample with a host time no earlier than when it was
-    taken (ni_block_ends: a recorder copy's stamp, taken before the blocking
-    read, bounds the previous copy's last sample). So each (seen - sample
-    time) is at least the delivery delay. The smallest across the session
-    trace the clock relation with only their minimum left in it, which makes
-    every mapped time late by about that much. A sync pulse (sub-project 2) is
-    what would bound it.
+    taken (block_stamps_from_runs: a recorder copy's stamp, taken before its
+    newest read blocked, bounds the sample before that read). So each (seen -
+    sample time) is at least the delivery delay. The smallest across the
+    session trace the clock relation with only their minimum left in it, which
+    makes every mapped time late by about that much: the delivery floor, which
+    a rig's NI delivery calibration measures by loopback (0.19-0.28 ms on
+    the reference rig at NI reads of 42-167 samples, 2026-11-13).
 
-    That minimum depends on the display refresh rate, which sets the NI read
-    size (sample rate / refresh). While reads are long against the 10 ms copy
-    period, some copies end on the read just before the stamped one and the
-    minimum is the delivery floor. When every copy spans two or more reads,
-    the previous copy ends a whole read or more before the stamp. Simulated
-    (Task 16 review): 60-165 Hz maps about 0.25 ms late, 200 Hz fails the
-    fit, and 240 Hz maps 4.45 ms late. christielab10 runs at 60 Hz.
+    A copy spans two reads or more when reads are under the 10 ms copy period
+    (display refresh, which sets the NI read size, of 100 Hz or more). Paired
+    with the previous copy's end, as nidaq.h5 files without
+    block_newest_read_start_index are, its stamp is a read loose; at 200 Hz
+    and above every copy is, and the fit maps a whole read late (4.4-5.2 ms).
     """
     t, seen, problem = _read_pairs(end_index, seen_perf, sample_rate)
     if problem:
@@ -861,9 +884,13 @@ class Pairing:
     and no reason to refuse it; the camera-clock pairing refuses any slip,
     whose votes delivery cannot move."""
     limit: float = math.nan
-    """What the verdict was judged against, in seconds: the arrival margin or the latch tolerance."""
+    """What the verdict was judged against, in seconds: the arrival margin, or the latch
+    residual band's half-width."""
     clock: str = "perf"
     """The host clock the frames and transitions were compared on: "perf" or "raw"."""
+    expected_residual: float = math.nan
+    """Camera-clock method: the residual band's centre, the rig's delivery offset minus
+    the exposure (latch_residual_band)."""
 
 
 def coverage_factor() -> float:
@@ -871,6 +898,75 @@ def coverage_factor() -> float:
     FALSE_ALARM_PROBABILITY: 4.89 at 1e-6. A Gaussian quantile on a robust
     spread is an approximation, not a guarantee."""
     return statistics.NormalDist().inv_cdf(1 - FALSE_ALARM_PROBABILITY / 2)
+
+
+def prediction_factor(sessions) -> float:
+    """How many of a calibration's spreads a new session may lie from its mean,
+    two-sided at FALSE_ALARM_PROBABILITY.
+
+    The mean and the standard deviation both come from `sessions` sessions, so
+    a new one is Student's t on sessions - 1 degrees of freedom, widened by
+    sqrt(1 + 1/sessions) for the mean's own error: 10.1 at 12 sessions, 6.5 at
+    27, coverage_factor() in the limit. inf below two sessions, where there is
+    no spread to scale."""
+    try:
+        sessions = int(sessions)
+    except (TypeError, ValueError):
+        return math.inf
+    if sessions < 2:
+        return math.inf
+    return (_student_t_quantile(1 - FALSE_ALARM_PROBABILITY / 2, sessions - 1)
+            * math.sqrt(1 + 1 / sessions))
+
+
+def _student_t_quantile(probability: float, dof: int) -> float:
+    """The t below which Student's t on dof degrees of freedom falls with probability."""
+    tail = 1 - probability
+
+    def upper(t):  # P(T > t), t >= 0
+        return 0.5 * _regularized_beta(dof / 2, 0.5, dof / (dof + t * t))
+
+    low, high = 0.0, 1.0
+    while upper(high) > tail:
+        low, high = high, high * 2
+    for _ in range(200):
+        middle = (low + high) / 2
+        if upper(middle) > tail:
+            low = middle
+        else:
+            high = middle
+    return (low + high) / 2
+
+
+def _regularized_beta(a: float, b: float, x: float) -> float:
+    """I_x(a, b), by its continued fraction (Lentz), on whichever side converges."""
+    if x <= 0:
+        return 0.0
+    if x >= 1:
+        return 1.0
+    front = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+                     + a * math.log(x) + b * math.log1p(-x))
+    if x < (a + 1) / (a + b + 2):
+        return front * _beta_fraction(a, b, x) / a
+    return 1 - front * _beta_fraction(b, a, 1 - x) / b
+
+
+def _beta_fraction(a: float, b: float, x: float) -> float:
+    tiny = 1e-300
+    c, d = 1.0, 1 - (a + b) * x / (a + 1)
+    d = 1 / (d if abs(d) > tiny else tiny)
+    result = d
+    for m in range(1, 500):
+        for numerator in (m * (b - m) * x / ((a + 2 * m - 1) * (a + 2 * m)),
+                          -(a + m) * (a + b + m) * x / ((a + 2 * m) * (a + 2 * m + 1))):
+            d = 1 + numerator * d
+            d = 1 / (d if abs(d) > tiny else tiny)
+            c = 1 + numerator / c
+            c = c if abs(c) > tiny else tiny
+            result *= c * d
+        if abs(c * d - 1) < 1e-15:
+            break
+    return result
 
 
 def robust_spread(values) -> float:
@@ -1254,8 +1350,8 @@ def _dropped_reason(dropped: tuple, kept: int, model: str) -> str:
 def latch_gate_ok(fit: ClockFit, ni_residual_rms: float, frame_period: float) -> bool:
     """Whether a latch map is trusted to choose the transitions: its uncertainty
     plus coverage_factor() NI-to-host residuals (ni_residual_rms) is under a
-    quarter frame period, the bound latch_tolerance() also puts on the residual
-    (below its cap). At 150 fps the quarter is 1.67 ms; the worst session of
+    quarter frame period, the bound latch_residual_band() also puts on its
+    half-width. At 150 fps the quarter is 1.67 ms; the worst session of
     the 2026-11-03 sweep needs 0.89 + 4.89 x 0.039 = 1.08 ms. False when the
     fit's uncertainty, the residual or the period is not finite, which covers
     an invalid fit.
@@ -1287,11 +1383,55 @@ def latch_gate_reason(fit: ClockFit, ni_residual_rms: float, frame_period: float
             f"exceeds a quarter frame period ({period / 4 * 1e3:.3f} ms)")
 
 
-def latch_tolerance(frame_period: float) -> float:
-    """How far the NI path may sit from the latch path: P/4, at most LATCH_MAX_RESIDUAL_SECONDS."""
-    if not math.isfinite(frame_period):
-        return math.nan
-    return min(frame_period / 4, LATCH_MAX_RESIDUAL_SECONDS)
+@dataclasses.dataclass(frozen=True)
+class ResidualBand:
+    """Where a correct camera-latch pairing's residual lies, in seconds."""
+    centre: float
+    half_width: float
+    reason: str = ""
+    """Why the residual cannot be judged, or "" when it can."""
+
+    def holds(self, residual: float) -> bool:
+        """Whether residual lies in the band; False whenever it cannot be judged."""
+        return not self.reason and abs(float(residual) - self.centre) <= self.half_width
+
+
+def latch_residual_band(frame_period: float, *, exposure: float, delivery_offset: float,
+                        delivery_spread: float, delivery_sessions, uncertainty: float
+                        ) -> ResidualBand:
+    """How far the NI path may sit from the latch path.
+
+    The camera stamps a frame at the end of its exposure and the NI edge marks
+    its start, so a correct pairing's residual (transition minus latched time)
+    sits at the rig's delivery offset minus the exposure. delivery_offset and
+    delivery_spread are the NI stream's delivery calibration: the mean of
+    residual + exposure over delivery_sessions loopback-verified sessions and
+    its standard deviation between them. The band is centred there,
+    prediction_factor(delivery_sessions) spreads plus the latch map's own
+    uncertainty wide, and never wider than a quarter period. Unjudgeable (a
+    reason, and holds() is False) without a calibration of two sessions or
+    more, an exposure, a finite period or a finite map uncertainty: no fixed
+    tolerance stands in for any of them.
+    """
+    values = [_float_or_nan(value) for value in (frame_period, exposure, delivery_offset,
+                                                 delivery_spread, uncertainty)]
+    period, exposure, offset, spread, uncertainty = values
+    factor = prediction_factor(delivery_sessions)
+    if not (math.isfinite(offset) and math.isfinite(spread) and math.isfinite(factor)):
+        reason = ("no NI delivery calibration for this rig (nidaqStream.deliveryCalibration; "
+                  "tools/hardware/calibrate_ni_delivery.py measures it)")
+    elif not math.isfinite(exposure):
+        reason = "the exposure is unknown, so the expected residual is too"
+    elif not math.isfinite(period):
+        reason = "the frame period is unknown, so the residual cannot be judged"
+    elif not math.isfinite(uncertainty):
+        reason = "the latch map's uncertainty is unknown, so the residual cannot be judged"
+    else:
+        reason = ""
+    if reason:
+        return ResidualBand(math.nan, math.nan, reason)
+    half_width = min(factor * spread + uncertainty, period / 4)
+    return ResidualBand(offset - exposure, half_width)
 
 
 def latch_window(fit: ClockFit, camera_seconds) -> numpy.ndarray:
@@ -1325,7 +1465,8 @@ def latch_clock(latches, ni_fit) -> str:
 
 def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_times,
                                    frame_period: float, *, ni_residual_rms: float,
-                                   clock: str) -> Pairing:
+                                   clock: str, exposure: float, delivery_offset: float,
+                                   delivery_spread: float, delivery_sessions) -> Pairing:
     """Which exposure transition belongs to which frame, decided by the camera's clock.
 
     The latches place camera time on the host clock named by clock ("perf" or
@@ -1337,23 +1478,25 @@ def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_
 
     The median residual (transition minus expected time, over the chosen shift)
     is where the camera stamps a frame relative to the NI edge, plus the NI-to-
-    host bias, plus the latch map's error. All of it must stay well under half a
-    period for the nearest transition to be the right one, and a bias near a
-    whole period would pair a frame off with a small residual, so a residual
-    over latch_tolerance() (a quarter period, at most 2 ms), or a shift that
-    changes partway through (find_slip), marks the pairing ambiguous. Any slip
-    does, one that looks like a backlog (reverts) too: delivery cannot move a
-    hardware timestamp, so no backlog explains it. So does a
-    latch map too uncertain to choose a transition by (latch_gate_ok: the map's
-    uncertainty plus coverage_factor() times ni_residual_rms, the NI-to-host
-    fit's residual, against a quarter period); the shift it found is still
-    reported. The lag is not measured here: median_lag is NaN. The residual
-    tolerance is in Pairing.limit.
+    host bias, plus the latch map's error. A Blackfly S stamps a frame at the end
+    of its exposure and the NI edge marks its start, so on a correct pairing it
+    sits at the rig's delivery calibration (delivery_offset, delivery_spread,
+    delivery_sessions) minus the exposure, and a bias near a whole period or a whole NI read moves
+    it by milliseconds. So a residual outside latch_residual_band(), or a shift
+    that changes partway through (find_slip), marks the pairing ambiguous, and
+    so does a band that cannot be judged: no calibration, no exposure (NaN for
+    either), no period. Any slip does, one that looks like a backlog (reverts)
+    too: delivery cannot move a hardware timestamp, so no backlog explains it.
+    So does a latch map too uncertain to choose a transition by (latch_gate_ok:
+    the map's uncertainty plus coverage_factor() times ni_residual_rms, the
+    NI-to-host fit's residual, against a quarter period); the shift it found is
+    still reported. The lag is not measured here: median_lag is NaN. The band's
+    half-width is in Pairing.limit and its centre in Pairing.expected_residual.
 
-    The limit that sets: a Blackfly S stamps a frame at the end of its exposure
-    and the NI edge marks its start, so the residual approaches minus the
-    exposure time. An exposure longer than about 1.8 ms therefore reads
-    ambiguous, visibly, rather than being paired on a guess.
+    The nearest transition is the right one only while the expected residual is
+    under half a period. A longer exposure pairs every frame a period off; its
+    residual then lies a period from the band, and it reads ambiguous, visibly,
+    rather than being paired on a guess.
     """
     fit = fit_latches(latches, clock=clock)
     if not fit.valid:
@@ -1381,27 +1524,36 @@ def choose_pairing_by_camera_clock(frame_ids, camera_ts_ns, latches, transition_
     inside = (numbers >= 0) & (numbers < transition_times.size)
     residual = transition_times[numbers[inside]] - expected[inside]
     median_residual = float(numpy.median(residual)) if residual.size else math.nan
-    tolerance = latch_tolerance(frame_period)
-    residual_ambiguous = not abs(median_residual) <= tolerance
+    band = latch_residual_band(frame_period, exposure=exposure, delivery_offset=delivery_offset,
+                               delivery_spread=delivery_spread,
+                               delivery_sessions=delivery_sessions, uncertainty=fit.uncertainty)
+    residual_ambiguous = not band.holds(median_residual)
     gate_ok = latch_gate_ok(fit, ni_residual_rms, frame_period)
     slip = find_slip(voters, votes, shift)
     problems = []
     if slip is not None:
         problems.append(_slip_reason(slip, shift))
-    if not math.isfinite(tolerance):
-        problems.append("the frame period is unknown, so the residual cannot be judged")
+    if band.reason:
+        problems.append(band.reason)
     elif not math.isfinite(median_residual):
         problems.append("no frame of the chosen shift has a transition")
     elif residual_ambiguous:
-        problems.append(f"median residual {median_residual * 1e3:.3f} ms is over the latch "
-                        f"tolerance ({tolerance * 1e3:.3f} ms)")
-    # An unknown frame period fails the gate too, and is already the reason.
-    if not gate_ok and math.isfinite(tolerance):
+        problems.append(latch_band_reason("median residual", median_residual, band))
+    # An unknown frame period fails the gate too; the band's reason already says so.
+    if not gate_ok and math.isfinite(_float_or_nan(frame_period)):
         problems.append(latch_gate_reason(fit, ni_residual_rms, frame_period))
     return Pairing(shift, math.nan, agreement,
                    bool(residual_ambiguous or slip is not None or not gate_ok),
                    "; ".join(problems), method=CAMERA_LATCH, median_residual=median_residual,
-                   slip=slip, limit=tolerance, clock=clock)
+                   slip=slip, limit=band.half_width, clock=clock,
+                   expected_residual=band.centre)
+
+
+def latch_band_reason(what: str, value: float, band: ResidualBand) -> str:
+    """Why value lies outside band, for a pairing's reason."""
+    return (f"{what} {value * 1e3:.3f} ms is {abs(value - band.centre) * 1e3:.3f} ms from the "
+            f"expected {band.centre * 1e3:.3f} ms, over the band's "
+            f"{band.half_width * 1e3:.3f} ms")
 
 
 def fit_camera_to_ni(frame_ids, camera_ts_ns, transition_index, sample_rate: float,

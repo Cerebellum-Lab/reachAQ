@@ -2050,6 +2050,7 @@ class CanInterface(DeviceInterface):
             send_position=round_val(motor_send_pos),
             limit_switch=message.stepper_status.limit_switch == 1,
             position_error=self._motors_drift_error[motor_axis_idx],
+            status=int(getattr(message.stepper_status, "status", 0) or 0),
         )
 
     def servo_attach(self, motor: Motor):

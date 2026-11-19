@@ -20,7 +20,7 @@ logger = get_verbose_logger(__name__)
 class AnimalTraining:
     """Animal Training configuration"""
 
-    # NB: protocol == plan ; todo: could/should better be moved to auto-trainer-training repo
+    # NB: protocol == training plan (autotrainer.behavior.training); `protocols` holds each plan's progress
 
     current_protocol: Optional[str] = None
     ordered_protocol_id: Optional[str] = None

@@ -12,6 +12,15 @@ _REPO_ROOT = Path(__file__).resolve().parent
 # but no pytest process may select or reset a host CAN interface implicitly.
 os.environ["AUTOTRAINER_CAN_TRANSPORT"] = "emulation"
 os.environ["REACHAQ_PROHIBIT_PRIVILEGED_CAN_RESET"] = "1"
+# Tests replace NI-DAQmx in the test process, which a laser process would not
+# see, so the NI laser controller opens here; the laser process's own tests
+# open one explicitly (laser_process_test.py).
+os.environ["REACHAQ_LASER_IN_PROCESS"] = "1"
+# An app a test starts publishes its local API record here, not where a client
+# on the rig would find it beside the real application's.
+if "REACHAQ_API_DISCOVERY_DIR" not in os.environ:
+    import tempfile
+    os.environ["REACHAQ_API_DISCOVERY_DIR"] = tempfile.mkdtemp(prefix="reachaq-api-test-")
 for _source_dir in reversed((
     _REPO_ROOT,
     _REPO_ROOT / "auto-trainer-behavior" / "src",

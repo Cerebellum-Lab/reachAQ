@@ -465,6 +465,10 @@ LATCH_DTYPE = np.dtype([("perf_before", "<f8"), ("camera_ns", "<i8"), ("perf_aft
                         ("raw_before", "<f8"), ("raw_after", "<f8")])
 PERIOD_150 = 1 / 150
 CAMERA_BEHIND_HOST = 40.0  # camera clock = host perf_counter - 40 s
+# These camera stamps fall on the exposure itself and its NI edge has no delay, so a correct
+# pairing's residual is 0: a rig whose delivery calibration is 0 with 20 us between sessions.
+CALIBRATED = {"exposure": 0.0, "delivery_offset": 0.0, "delivery_spread": 20e-6,
+              "delivery_sessions": 27}
 
 
 def _camera_clock(host):
@@ -505,7 +509,7 @@ def test_host_arrival_pairing_aliases_a_lag_over_one_period_and_the_camera_clock
                                        ni_residual_rms=0.00002)
     by_clock = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
                                                      PERIOD_150, ni_residual_rms=0.00002,
-                                                     clock="perf")
+                                                     clock="perf", **CALIBRATED)
 
     # The latest transition before each arrival is two frames on, and nothing says so.
     assert by_arrival.method == "host_arrival"
@@ -525,7 +529,7 @@ def test_a_latch_off_by_more_than_half_a_period_is_ambiguous():
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
                                                     PERIOD_150, ni_residual_rms=0.00002,
-                                                    clock="perf")
+                                                    clock="perf", **CALIBRATED)
 
     assert pairing.ambiguous
     assert "residual" in pairing.reason
@@ -544,16 +548,19 @@ def test_an_hour_of_camera_drift_is_fitted_through_two_latches_or_windowed_aroun
 
     both = clocks.choose_pairing_by_camera_clock(
         ids, camera_ts_ns, _latches([start, end], camera_of=drifting), transition_perf, PERIOD_150,
-        ni_residual_rms=0.00002, clock="perf")
+        ni_residual_rms=0.00002, clock="perf", **CALIBRATED)
     start_only = clocks.choose_pairing_by_camera_clock(
         ids, camera_ts_ns, _latches([start], camera_of=drifting), transition_perf, PERIOD_150,
-        ni_residual_rms=0.00002, clock="perf")
+        ni_residual_rms=0.00002, clock="perf", **CALIBRATED)
 
     # 20 ppm over an hour is 72 ms, ten frame periods: one offset cannot pair the whole session.
     for pairing in (both, start_only):
-        assert pairing.shift == 995 and not pairing.ambiguous, pairing.reason
+        assert pairing.shift == 995, pairing.reason
         assert abs(pairing.median_residual) < PERIOD_150 / 4
-    assert abs(both.median_residual) < 1e-5
+    assert abs(both.median_residual) < 1e-5 and not both.ambiguous, both.reason
+    # The offset map's drift inside its window (0.3 ms median here) is not in its uncertainty,
+    # so the calibrated band will not vouch for the windowed pairing; host arrival must.
+    assert start_only.ambiguous and "from the expected" in start_only.reason
 
 
 @pytest.mark.parametrize("latches, why", [
@@ -569,7 +576,7 @@ def test_unusable_latches_give_an_ambiguous_pairing_with_a_reason(latches, why):
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
                                                     PERIOD_150, ni_residual_rms=0.00002,
-                                                    clock="perf")
+                                                    clock="perf", **CALIBRATED)
 
     assert pairing.ambiguous
     assert pairing.method == "camera_latch"
@@ -579,7 +586,8 @@ def test_unusable_latches_give_an_ambiguous_pairing_with_a_reason(latches, why):
 def test_a_pairing_one_frame_off_at_50_fps_is_ambiguous():
     # christielab10 with NI blocks paired to their own stamps: the mapped edges
     # sat 16.6 ms before the camera stamps, so at 50 fps the nearest edge was
-    # the next frame's, 3.39 ms on: under P/4, and wrong.
+    # the next frame's, 3.39 ms on: under P/4, and wrong. The calibrated band
+    # is a fraction of a millisecond wide.
     period = 1 / 50
     ids = np.arange(1000, 4000)
     exposure = 50.0 + (ids - 1000 + 5) * period
@@ -588,7 +596,7 @@ def test_a_pairing_one_frame_off_at_50_fps_is_ambiguous():
     latches = _latches([exposure[0] + 0.001, exposure[-1] + 0.001])
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
-                                                    period, ni_residual_rms=0.00002, clock="perf")
+                                                    period, ni_residual_rms=0.00002, clock="perf", **CALIBRATED)
 
     assert pairing.shift == 994  # frame 1000 is transition 5
     assert pairing.median_residual == pytest.approx(0.00339, abs=1e-5)
@@ -601,12 +609,17 @@ def test_a_correct_pairing_with_a_small_residual_is_accepted():
     camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
     latches = _latches([exposure[0] + 0.001, exposure[-1] + 0.001])
 
+    # Transitions 0.3 ms late and a 0.2 ms exposure the stamps do not show: the residual
+    # sits at offset - exposure, where the band is centred.
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches,
                                                     transition_perf + 0.0001, PERIOD_150,
-                                                    ni_residual_rms=0.00002, clock="perf")
+                                                    ni_residual_rms=0.00002, clock="perf",
+                                                    exposure=0.0002, delivery_offset=0.0003,
+                                                    delivery_spread=20e-6, delivery_sessions=27)
 
     assert pairing.shift == 995 and not pairing.ambiguous, pairing.reason
     assert pairing.median_residual == pytest.approx(0.0001, abs=1e-6)
+    assert pairing.expected_residual == pytest.approx(0.0001)
 
 
 @pytest.mark.parametrize("drop", [60, 140])
@@ -617,7 +630,7 @@ def test_a_lost_transition_is_a_slip_for_the_camera_clock_too(drop):
 
     pairing = clocks.choose_pairing_by_camera_clock(
         ids, camera_ts_ns, latches, np.delete(transition_perf, 5 + drop), PERIOD_150,
-        ni_residual_rms=0.00002, clock="perf")
+        ni_residual_rms=0.00002, clock="perf", **CALIBRATED)
 
     assert pairing.ambiguous
     # The lost edge's own frame sits midway between its neighbours; either may take it.
@@ -637,7 +650,7 @@ def test_the_camera_clock_flags_a_run_that_reverts():
 
     pairing = clocks.choose_pairing_by_camera_clock(
         ids, camera_ts_ns, latches, transition_perf, PERIOD_150, ni_residual_rms=0.00002,
-        clock="perf")
+        clock="perf", **CALIBRATED)
 
     assert pairing.ambiguous
     assert pairing.slip["reverts"] is True
@@ -645,11 +658,74 @@ def test_the_camera_clock_flags_a_run_that_reverts():
     assert "slip at frame" in pairing.reason
 
 
-@pytest.mark.parametrize("frame_period, tolerance", [
-    (1 / 150, 1 / 600), (1 / 50, 0.002), (1 / 25, 0.002), (float("nan"), float("nan")),
-], ids=["150fps", "50fps", "25fps", "unknown"])
-def test_the_latch_tolerance_is_a_quarter_period_capped_at_2_ms(frame_period, tolerance):
-    assert clocks.latch_tolerance(frame_period) == pytest.approx(tolerance, nan_ok=True)
+# christielab10's loopback calibration (2026-11-12) and its 175 us exposure.
+RIG = {"delivery_offset": 0.000303, "delivery_spread": 0.000035, "delivery_sessions": 27}
+
+
+def test_the_residual_band_is_centred_on_the_calibration_minus_the_exposure():
+    band = clocks.latch_residual_band(PERIOD_150, exposure=0.000175, uncertainty=0.00012, **RIG)
+
+    assert band.reason == ""
+    assert band.centre == pytest.approx(0.000303 - 0.000175)
+    assert band.half_width == pytest.approx(clocks.prediction_factor(27) * 0.000035 + 0.00012)
+
+
+def test_the_residual_band_is_never_wider_than_a_quarter_period():
+    band = clocks.latch_residual_band(PERIOD_150, exposure=0.0, uncertainty=0.0,
+                                      delivery_offset=0.0, delivery_spread=0.01,
+                                      delivery_sessions=27)
+
+    assert band.half_width == pytest.approx(PERIOD_150 / 4)
+
+
+@pytest.mark.parametrize("residual, exposure, holds", [
+    (-0.00158, 0.000175, False),  # 200 Hz display refresh, 150 fps: a read late, a frame off
+    (0.00428, 0.000175, False),   # 240 Hz at 50 fps: under P/4 (5 ms), refused by the band
+    (-0.002647, 0.003, True),     # a 3 ms exposure, correctly paired
+    (0.000149, 0.000175, True),   # the dry run at 60 Hz, 150 fps
+], ids=["200Hz_150fps", "240Hz_50fps", "3ms_exposure", "60Hz_150fps"])
+def test_the_measured_sessions_fall_where_the_loopback_put_them(residual, exposure, holds):
+    period = 1 / 50 if residual > 0.004 else PERIOD_150
+    band = clocks.latch_residual_band(period, exposure=exposure, uncertainty=0.00012, **RIG)
+
+    assert band.holds(residual) is holds
+
+
+@pytest.mark.parametrize("inputs, why", [
+    ({"delivery_offset": float("nan"), "delivery_spread": float("nan")}, "no NI delivery calibration"),
+    ({"exposure": float("nan")}, "exposure is unknown"),
+    ({"frame_period": float("nan")}, "frame period is unknown"),
+    ({"uncertainty": float("nan")}, "uncertainty is unknown"),
+    ({"delivery_sessions": 1}, "no NI delivery calibration"),
+    ({"delivery_sessions": None}, "no NI delivery calibration"),
+], ids=["no_calibration", "no_exposure", "no_period", "no_uncertainty", "one_session",
+        "no_session_count"])
+def test_a_residual_band_that_cannot_be_judged_holds_nothing(inputs, why):
+    values = {"frame_period": PERIOD_150, "exposure": 0.000175, "uncertainty": 0.00012, **RIG,
+              **inputs}
+
+    band = clocks.latch_residual_band(values.pop("frame_period"), **values)
+
+    assert why in band.reason
+    assert not band.holds(band.centre)
+    assert not band.holds(0.0)
+
+
+def test_without_a_delivery_calibration_the_camera_clock_pairing_is_refused():
+    ids, exposure, transition_perf = _exposures(3000)
+    camera_ts_ns = np.round(_camera_clock(exposure) * 1e9).astype(np.int64)
+    latches = _latches([exposure[0] + 0.001, exposure[-1] + 0.001])
+
+    pairing = clocks.choose_pairing_by_camera_clock(
+        ids, camera_ts_ns, latches, transition_perf, PERIOD_150, ni_residual_rms=0.00002,
+        clock="perf", exposure=0.0, delivery_offset=float("nan"),
+        delivery_spread=float("nan"), delivery_sessions=None)
+
+    # The shift is still found and reported; nothing may vouch for it.
+    assert pairing.shift == 995 and abs(pairing.median_residual) < 1e-5
+    assert pairing.ambiguous
+    assert "no NI delivery calibration" in pairing.reason
+    assert "nan" not in pairing.reason
 
 
 def test_an_unknown_frame_period_is_ambiguous_without_printing_nan():
@@ -658,7 +734,7 @@ def test_an_unknown_frame_period_is_ambiguous_without_printing_nan():
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, _latches([exposure[0]]),
                                                     transition_perf, float("nan"),
-                                                    ni_residual_rms=0.00002, clock="perf")
+                                                    ni_residual_rms=0.00002, clock="perf", **CALIBRATED)
 
     assert pairing.ambiguous
     assert "frame period is unknown" in pairing.reason
@@ -807,7 +883,7 @@ def test_wide_latch_brackets_fail_the_geometric_gate_at_150_fps():
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
                                                     PERIOD_150, ni_residual_rms=0.00002,
-                                                    clock="perf")
+                                                    clock="perf", **CALIBRATED)
 
     # Every bracket is centred on the truth, so the pairing is right; what fails
     # is how far the map could be wrong, 2 ms, over a quarter period (1.67 ms).
@@ -827,7 +903,7 @@ def test_brackets_of_1_78_ms_still_pair_at_150_fps():
 
     pairing = clocks.choose_pairing_by_camera_clock(ids, camera_ts_ns, latches, transition_perf,
                                                     PERIOD_150, ni_residual_rms=0.000039,
-                                                    clock="perf")
+                                                    clock="perf", **CALIBRATED)
 
     assert pairing.shift == 995
     assert not pairing.ambiguous, pairing.reason
@@ -1659,3 +1735,34 @@ def test_every_result_of_the_piecewise_line_fitter_carries_its_own_method():
         assert fit.method == clocks.PIECEWISE_LINE and not fit.valid
     # the NI-to-host helper keeps its own label
     assert clocks.invalid_piecewise_fit("x").method == clocks.PIECEWISE_ENVELOPE
+
+
+def test_a_copys_stamp_pairs_with_the_sample_before_its_newest_read():
+    # Three copies ending at samples 99, 199 and 299; the last two hold two reads of 50, so
+    # their stamps were taken after the reads ending at 149 and 249 had returned.
+    ends = np.array([99, 199, 299])
+    stamps = np.array([1.0, 1.01, 1.02])
+
+    paired = clocks.block_stamps_from_runs(ends, stamps, newest_read_at_ends=[50, 150, 250])
+    older = clocks.block_stamps_from_runs(ends, stamps)
+    unknown = clocks.block_stamps_from_runs(ends, stamps, newest_read_at_ends=[-1, -1, -1])
+
+    assert paired.end_index.tolist() == [149, 249]
+    assert older.end_index.tolist() == unknown.end_index.tolist() == [99, 199]
+    # A newest read that began before the previous copy ended pairs with that end.
+    assert clocks.block_stamps_from_runs(ends, stamps, newest_read_at_ends=[0, 60, 250]
+                                         ).end_index.tolist() == [99, 249]
+
+
+def test_the_prediction_factor_is_students_t_widened_for_the_calibrations_own_mean():
+    # Two sessions: t on one degree of freedom is Cauchy, tan(pi/2 - pi*p/2) in closed form.
+    tail = clocks.FALSE_ALARM_PROBABILITY / 2
+    assert clocks.prediction_factor(2) == pytest.approx(
+        math.tan(math.pi / 2 - math.pi * tail) * math.sqrt(1.5), rel=1e-9)
+    # Eleven degrees of freedom: the two-sided 1e-6 point of t is 9.7014.
+    assert clocks.prediction_factor(12) == pytest.approx(9.7014 * math.sqrt(1 + 1 / 12), rel=1e-4)
+    # Many sessions: the Gaussian factor the per-session limits use.
+    assert clocks.prediction_factor(10 ** 7) == pytest.approx(clocks.coverage_factor(), rel=1e-5)
+    factors = [clocks.prediction_factor(n) for n in (2, 3, 5, 12, 27, 100)]
+    assert factors == sorted(factors, reverse=True)
+    assert math.isinf(clocks.prediction_factor(1)) and math.isinf(clocks.prediction_factor(None))

@@ -1,7 +1,7 @@
 """Small widgets for a docked panel that must fit without scrolling.
 
 Laser Control sits in the right-hand panel, about 440 px wide on
-christielab10's 1920x1080 screen, and every control, both laser graphs and
+The reference rig's 1920x1080 screen, and every control, both laser graphs and
 the builder preview had to fit there at once. These pieces make that
 possible without hiding anything: a section that folds away, a one-line
 label that elides instead of wrapping or widening its panel, and graph axes
@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 #: The panel font. The rest of reachAQ keeps the platform font: Ubuntu 11 pt
-#: on christielab10's desktop (DejaVu Sans 9 pt under offscreen Qt).
+#: on the reference rig's desktop (DejaVu Sans 9 pt under offscreen Qt).
 COMPACT_FONT_POINT_SIZE = 7.5
 #: Graph tick and axis-label font; pyqtgraph draws these itself.
 COMPACT_AXIS_POINT_SIZE = 7.0

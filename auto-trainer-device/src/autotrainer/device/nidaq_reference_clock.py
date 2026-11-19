@@ -3,7 +3,7 @@
 The timing plan carries one terminal name for the whole chassis, but neither
 the boards nor the task types are alike, and getting this wrong does not
 degrade timing - it fails the task outright and takes whatever it belonged to
-with it. Two ways it goes wrong, both seen on christielab10:
+with it. Two ways it goes wrong, both seen on the reference rig:
 
   * the plan's default is written PXI_CLK10 while NI calls the terminal
     PXI_Clk10, and a PXI-6713 exposes no Clk10 at all, so naming it fails

@@ -35,7 +35,7 @@ def _bootstrap_repo_sources():
 _bootstrap_repo_sources()
 
 
-def _exec_main(args):
+def _exec_main(args, calib_dir=None):
 
     from autotrainer.core.logging import get_verbose_logger, get_console_handler
     from autotrainer.core.event import try_register_api_event_plugin
@@ -57,7 +57,11 @@ def _exec_main(args):
 
     get_console_handler().setLevel(preferences.log_level)
 
-    app_model = AppModel(preferences)
+    # A simulation's calibration is in its home; a rig run passes none, as before.
+    if calib_dir is None:
+        app_model = AppModel(preferences)
+    else:
+        app_model = AppModel(preferences, calib_dir=calib_dir)
 
     plugin = try_register_api_event_plugin()
     app_model.rpc_service = plugin.service
@@ -140,8 +144,17 @@ def main():
     # before logging, so a refused start leaves no log behind.
     from tools.acquisition.instance_lock import (
         ALREADY_RUNNING_EXIT, AlreadyRunning, acquire_instance_lock)
+    simulation = None
     try:
-        instance_lock = acquire_instance_lock()  # noqa: F841 - held until exit
+        if args.simulate:
+            # Takes the lock in its own home before writing there, and runs
+            # before AppModel starts the forkserver, which keeps the
+            # environment it starts with.
+            from tools.simulation.sim_home import prepare_simulation
+            simulation = prepare_simulation(args)
+            instance_lock = simulation.instance_lock  # noqa: F841 - held until exit
+        else:
+            instance_lock = acquire_instance_lock()  # noqa: F841 - held until exit
     except AlreadyRunning as err:
         print(err, file=sys.stderr)
         return ALREADY_RUNNING_EXIT
@@ -156,7 +169,7 @@ def main():
     log_can_frame_logging(logger, can_frame_logging)
 
     try:
-        return _exec_main(args)
+        return _exec_main(args, calib_dir=simulation.calib_dir if simulation else None)
     except KeyboardInterrupt:
         logger.notice("KeyboardInterrupt")
         exit_code = 0

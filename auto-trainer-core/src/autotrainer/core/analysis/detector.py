@@ -4,7 +4,7 @@ import threading
 import time
 from typing import Dict, Tuple, Optional, Union, ClassVar, TypeVar, Type, Generic
 
-from autotrainer.api import ApiEventKind, ApiDetectorKind
+from autotrainer.core.api import ApiEventKind, ApiDetectorKind
 from autotrainer.core import ObservableObject, get_perf_now
 from autotrainer.core.configuration.detector import DetectorConfig
 from autotrainer.core.event import post_api_detector_event_content

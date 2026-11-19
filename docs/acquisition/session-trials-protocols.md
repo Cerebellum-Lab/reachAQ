@@ -286,13 +286,11 @@ decoded event stream.
 
 ## Protocol progress
 
-ReachAQ owns the trial-boundary adapter in
-`tools/acquisition/model/trial_protocol_runner.py`. The installed training
-package still supplies protocol parsing, reusable pellet actions/predicates,
-progress serialization, and phase navigation, but its recording-boundary
-callbacks are detached. A qualifying pellet trial is evaluated exactly once at
-the pellet-trial boundary, so one recording session can advance through many
-trials without stopping camera writers.
+Training plans are reachAQ's own ([training plans](training-plans.md),
+`autotrainer.behavior.training`), run by the trial-boundary adapter in
+`tools/acquisition/model/trial_protocol_runner.py`. A qualifying pellet trial
+is evaluated exactly once at the pellet-trial boundary, so one recording
+session can advance through many trials without stopping camera writers.
 
 Hardware-error, aborted, and incomplete attempts do not advance protocol
 progress. Automatic advance/fallback occurs only when enabled. Reaching the
@@ -371,7 +369,7 @@ available.
 
 ## System configuration policy
 
-The production system configuration schema is version 58. ReachAQ loads only
+The production system configuration schema is version 59. ReachAQ loads only
 that version and rejects older/newer versions, unknown keys, retired
 load-cell/tunnel/head-fix fields, obsolete NI recording controls, and historic
 pellet-shift coordinate keys. There is no hidden compatibility runtime.
@@ -415,7 +413,8 @@ ID, and unknown future versions are rejected clearly.
 
 ## Public API lifecycle
 
-ReachAQ pins `auto-trainer-api` 0.11.0 and publishes its own status schema with
+ReachAQ publishes its events on its own [local API](local-api.md)
+(`autotrainer.core.api`) with its own status schema:
 acquisition state, recording-session state, reach synchronization readiness,
 independent subsystem states, animal identity/pellet coordinates, protocol
 state, pellet-device state, and the four session counts. Retired alarm,

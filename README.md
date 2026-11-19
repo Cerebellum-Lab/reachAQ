@@ -35,7 +35,7 @@ and local acquisition data should be configured under
 Install, start and update in three commands - see [INSTALL.md](INSTALL.md):
 
 ```bash
-./tools/install/reachaq-linux-install.sh   # install, or repair; Python 3.10, both pose engines
+./tools/install/reachaq-linux-install.sh   # install, or repair; Python 3.10, PyTorch
 reachaq                                    # start
 reachaq-sync                               # update the checkout
 ```
@@ -46,10 +46,11 @@ Vendor drivers and rig-specific hardware configuration remain in separate
 guides selected from the Linux installation map. The portable installer also
 installs the terminal-visible mouse-icon desktop launcher, verifies the
 SoftMouse HTTPS/spreadsheet/keyring dependencies and RFID serial dependency and
-permissions, and installs the tracked publisher systemd units. Credential
-entry and enabling the one designated nightly timer remain explicit
+permissions, and installs the tracked publisher systemd units. Setting up each
+user's animal metadata source (SoftMouse, a spreadsheet, a database or a shared
+publication) and enabling an optional nightly publisher remain explicit
 post-install steps in the
-[SoftMouse/RFID checklist](tools/softmouse_sync/CONFIGURATION_GUIDE.md).
+[animal metadata and RFID checklist](tools/softmouse_sync/CONFIGURATION_GUIDE.md).
 
 ## Applications
 
@@ -72,9 +73,12 @@ from the core logic of the applications for two reasons:
     * [Detailed Instructions](tools/acquisition/README.md)
     * [Session recording, synchronization, persistence, and hardware isolation](docs/acquisition/session-recording-and-synchronization.md)
     * [Recording sessions, pellet trials, protocols, and schema migration](docs/acquisition/session-trials-protocols.md)
+    * [Training plans](docs/acquisition/training-plans.md)
+    * [Local API: events and commands over TCP](docs/acquisition/local-api.md)
     * [Session validation command and rule coverage](docs/acquisition/session-validation.md)
     * [Pellet firmware compatibility and rollout](docs/acquisition/pellet-firmware-compatibility.md)
     * Use `--random-cameras` to start with software-generated frames when no physical cameras are configured.
+    * Use `--simulate` to run with no hardware at all: [simulation mode](docs/acquisition/simulation-mode.md) and its [backend interfaces](docs/acquisition/backend-interfaces.md).
   * Headless implementation for command line only
     * `auto-trainer-headless -c ~/Autotrainer/system_configuration.yaml`
     * Headless mode continues to start acquisition by default because it has no UI start control.
@@ -96,10 +100,10 @@ utilities. Run them from the repository root in the configured environment.
   hardware.
 * `scripts/can_measure_counts.py` - decoded message-rate diagnostic using the
   same environment-selected CAN transport as reachAQ.
-* `scripts/load_dlc_model.py` - load a DeepLabCut model and print its body-part
-  metadata.
-* `scripts/run_dlc_model.py` - run a DeepLabCut model against paired recorded
-  videos.
+* `plugins/deeplabcut/scripts/load_dlc_model.py` - load a DeepLabCut model and
+  print its body-part metadata. Needs the DeepLabCut plugin installed.
+* `plugins/deeplabcut/scripts/run_dlc_model.py` - run a DeepLabCut model against
+  paired recorded videos. Needs the DeepLabCut plugin installed.
 
 ## Additional Tools
 
@@ -107,6 +111,10 @@ Current hardware bring-up tools live under `tools/hardware`:
 
 * `tools/hardware/validate_can_hardware.py` - discover the pellet CAN board,
   request status/configuration, or perform explicitly enabled motion tests.
+  It exits 1, naming the code, when the board refuses a command (any ACK
+  error other than 0 and -11). Exit 0 means only that no refusal arrived
+  within the listen window (`--listen-seconds`, default 2.0 s); a slow
+  command such as a home can outlast it.
 * `tools/hardware/validate_laser_hardware.py` - validate configured NI-DAQ laser
   channels one controlled operation at a time.
 * `tools/hardware/verify_nidaq_wiring.py` - drive each board output and laser
@@ -127,9 +135,12 @@ Current hardware bring-up tools live under `tools/hardware`:
   application close only closes its own socket. The helper serializes and
   debounces service restart, refuses to reset a channel owned by another
   reachAQ process, and is not a physical emergency stop or board power cycle.
-* [`tools/softmouse_sync/README.md`](tools/softmouse_sync/README.md) - configure
-  SoftMouse publication, per-computer metadata caches, USB RFID readers, the
-  manual UI sync, and the single-host midnight timer.
+* [`docs/acquisition/animal-metadata-sources.md`](docs/acquisition/animal-metadata-sources.md) -
+  set up where animal metadata comes from (SoftMouse, spreadsheet, database,
+  shared publication, or a lab's own source), credentials, refresh, offline
+  behaviour and the optional nightly publisher.
+* [`tools/softmouse_sync/README.md`](tools/softmouse_sync/README.md) - the
+  SoftMouse source, USB RFID readers and metadata ownership.
 
 See [linux-install-instructions.md](linux-install-instructions.md) for the
 installation map and [the PEAK SocketCAN guide](docs/linux-install/peak-socketcan.md)
@@ -262,7 +273,6 @@ guidelines are in place for future additions and changes to help with and improv
 * `pip` and `pyproject.toml` are currently used.
   * `pyproject.toml` in modules should be kept up to date if possible.
 * Versions in `pyproject.toml` generally need team-wide notification to update.
-  * There are several dependencies whose version traces back to the specific environment that is currently required on the Jetson.
 * Docstrings should be in the "Google" style.
   * A lot of existing docstrings are in "reStructuredText" (Sphinx) style, which may be confusing.
   * Documentation generation can be assumed to be using `mkdocs`.

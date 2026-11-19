@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import math
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,6 +65,7 @@ def validate_session(
         _generation_rule,
         _manifest_rule,
         _metadata_mirror_rule,
+        _provenance_rule,
         _source_contract_rule,
         _camera_rule,
         _camera_ledger_rule,
@@ -342,6 +344,20 @@ _metadata_mirror_rule.RULE_ID = "metadata.mirror"
 _metadata_mirror_rule.MINIMUM = ValidationProfile.FAST
 
 
+def _provenance_rule(context):
+    manifest = context.json("manifest.json")
+    metadata = context.json(manifest["authoritativeMetadata"])
+    simulation = metadata.get("simulation")
+    if isinstance(simulation, dict) and simulation.get("enabled") is True:
+        return _result(
+            "session.provenance", "warning",
+            "simulated session: no hardware was recorded",
+            observed=simulation,
+        )
+    return _result("session.provenance", "pass", "recorded on hardware backends")
+_provenance_rule.RULE_ID = "session.provenance"
+
+
 def _source_contract_rule(context):
     path = context.path("streams/stream_manifest.json")
     if not path.is_file():
@@ -430,6 +446,15 @@ def _frame_ledger_path(context):
     return candidates[0], candidates
 
 
+def _ledger_field_name(camera_name):
+    """The ledger's column suffix for a camera, as AppModel._camera_timing_field_name writes it.
+
+    The merge has two fallbacks this does not copy: `camera_{index}` when the
+    normalised name is empty, and a `_2` suffix when two names collide.
+    """
+    return re.sub(r"[^0-9A-Za-z]+", "_", camera_name).strip("_").lower()
+
+
 def _camera_ledger_rule(context):
     stream_manifest = context.json("streams/stream_manifest.json")
     cameras = {
@@ -474,18 +499,33 @@ def _camera_ledger_rule(context):
                     errors.append(f"row {line_number}: non-increasing wall time")
                 previous_id, previous_wall = frame_id, wall
                 for name in cameras:
-                    value = row.get(f"frame_present_{name}")
+                    value = row.get(f"frame_present_{_ledger_field_name(name)}")
                     if value is None:
                         errors.append(f"row {line_number}: camera {name} has no presence column")
                     elif int(value):
                         present_counts[name] += 1
             except (KeyError, TypeError, ValueError) as error:
                 errors.append(f"row {line_number}: {error}")
+    # sampleCount counts the blank the capture writes for each dropped frame
+    # (video_capture.py), which the merge marks absent. camera_alignment.json's
+    # presentFrames is the frames the camera delivered; a session written before
+    # it existed falls back to sampleCount.
+    try:
+        aligned = context.json("streams/camera_alignment.json").get("cameras", {})
+    except (OSError, ValueError):
+        aligned = {}
     for name, source in cameras.items():
-        expected = int(source.get("sampleCount", -1))
+        sample_count = int(source.get("sampleCount", -1))
+        present = (aligned.get(name) or {}).get("presentFrames")
+        expected = sample_count if present is None else int(present)
         if present_counts[name] != expected:
             errors.append(
                 f"camera {name}: ledger={present_counts[name]} expected={expected}"
+            )
+        elif sample_count > expected:
+            warnings.append(
+                f"camera {name}: {sample_count - expected} dropped frame(s) "
+                "recorded as blanks"
             )
     if cameras and row_count != max(present_counts.values(), default=0):
         warnings.append(

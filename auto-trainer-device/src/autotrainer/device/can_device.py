@@ -1310,7 +1310,7 @@ class CanDevice(Device):
         steps = self._send_pellet.steps
         if isinstance(data, dict) and data.get("pre_reveal_stimulus") is not None:
             # (delay_ms, pulse_us, board STIM line). The line is the trial
-            # laser's own: on christielab10 laser 2 is wired to STIM2, and a
+            # laser's own: on the reference rig laser 2 is wired to STIM2, and a
             # pulse fixed on STIM3 never triggered it. Data from before the
             # line was carried has two elements and meant STIM3, so it still
             # does.
@@ -1569,7 +1569,8 @@ class CanDevice(Device):
         if api is not None and kind is not None:
             prev_data, prev_perf_c = self._previous_stepper_status_pos_perf_c.get(kind, (None, -math.inf))
             perf_now = get_perf_now()
-            data = (message.position, message.send_position, message.is_at_limit, message.position_error)
+            data = (message.position, message.send_position, message.is_at_limit, message.position_error,
+                    message.status)
             if data != prev_data or perf_now - prev_perf_c > self.same_data_refresh_delay:
                 self._previous_stepper_status_pos_perf_c[kind] = (data, perf_now)
                 api.send_message(kind, message)
@@ -1679,7 +1680,7 @@ class CanDevice(Device):
 
         The callback runs the hardware model and the session recorder (a lock
         and JSON), which takes milliseconds. Run before the send, it delayed the
-        frame by that much: on christielab10 the PULSE row to the NI rise took
+        frame by that much: on the reference rig the PULSE row to the NI rise took
         3.5-15.7 ms, and this callback was part of it (latency-report.md 3.1).
         The stamp the row carries is still taken before the
         send. A send that is refused or raises is recorded too, once.
@@ -1716,7 +1717,7 @@ class CanDevice(Device):
         A host-only step sends nothing: the predefined cover, release, retrieve
         and scoop, load_arm and barrier_arm only inject the servo steps, and
         _no_op does nothing. Returning to the command loop after one cost the
-        loop's 50 ms wait before the next step went out (christielab10
+        loop's 50 ms wait before the next step went out (reference rig
         session004: the pre-reveal release went out 69-111 ms after its
         1500 ms target, 50 ms of it this wait). So the pass carries on after a
         host-only step and ends at the first step that sent a frame. That

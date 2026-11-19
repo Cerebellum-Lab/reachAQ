@@ -94,12 +94,12 @@ class AnimalMetadataDialog(QDialog):
                 record.new_animal_name_candidate or record.identity.subject_id
             )
             self.external_record.addItem(
-                f"{linked_name} · RFID {record.physical_rfid}",
+                f"{linked_name} · RFID {record.physical_rfid or 'none'}",
                 record.identity.key,
             )
         form.addRow("Scanned RFID name:", self.external_record)
         note = QLabel(
-            "This attaches the selected SoftMouse/RFID identity to the existing "
+            "This attaches the selected source/RFID identity to the existing "
             "animal JSON, selects it, and then opens its editable details."
         )
         note.setWordWrap(True)
@@ -137,7 +137,7 @@ class AnimalMetadataDialog(QDialog):
         form.addRow("Merge linked RFID animal:", self.linked_duplicate)
         note = QLabel(
             "The kept JSON retains its name, notes, training, reach position, and "
-            "limits. The RFID/SoftMouse link is transferred; the duplicate JSON "
+            "limits. The RFID/source link is transferred; the duplicate JSON "
             "is archived with a redirect. The kept animal opens for editing next."
         )
         note.setWordWrap(True)

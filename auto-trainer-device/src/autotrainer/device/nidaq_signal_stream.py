@@ -39,7 +39,7 @@ def resolve_analog_terminal_config(nidaqmx, name):
     differential - pairing each with ai8-ai15 - and ai8 upwards
     single-ended, so a channel list spanning both halves reads some
     channels against pins it also reads directly. Measured on
-    christielab10: one laser's command copy appeared on three inputs it is
+    the reference rig: one laser's command copy appeared on three inputs it is
     not wired to, and holding the scan rate down to 10 Hz did not shift
     it, which is how it was told apart from a settling artefact.
     """
@@ -628,7 +628,7 @@ class NidaqSignalStreamController:
         count could never rise, and the stream never started.
 
         It was not removed to save time, and it does not. Measured on
-        christielab10 at 10 kHz, 160 chunks over eight seconds, three
+        the reference rig at 10 kHz, 160 chunks over eight seconds, three
         runs each alternating: with the barrier 11.2/11.7/12.1% of a
         core, without it 13.2/13.5/14.0%. The DAQmx blocking read does
         not sleep through the wait - it costs slightly more than the
@@ -890,7 +890,7 @@ class NidaqSignalStreamController:
 
         The plan refuses this before a start (build_nidaq_timing_plan). Named
         on the master's own terminal instead, the task would fail inside
-        DAQmx at -89125 on an unidentified chassis such as christielab10's,
+        DAQmx at -89125 on an unidentified chassis such as the reference rig's,
         naming neither the slave nor the field.
         """
         return (

@@ -246,6 +246,109 @@ def test_a_run_on_another_file_saves_back_to_that_file(app_model, config_file_pa
     assert SystemConfiguration.load_yaml_file(copy).get_camera(CameraId.Camera3).is_enabled
 
 
+
+def test_a_start_record_stop_exit_cycle_leaves_the_configuration_byte_identical(
+    app_model, system_config, trainer_config_dir, config_file_path,
+):
+    # Exit saved everything the run had changed: on christielab10 a run on a
+    # demo copy left its playback cameras in ~/Autotrainer. Nothing a run does
+    # writes the file now, only an operator edit of a stored setting.
+    for camera in system_config.cameras:
+        if camera.id in (CameraId.Left, CameraId.Right):
+            camera.is_enabled = True
+            camera.is_record_enabled = True
+    system_config.save_default(trainer_config_dir)
+    on_disk = config_file_path.read_bytes()
+
+    assert app_model.load_configuration() is True
+    app_model.set_runtime_live_inference_override(
+        not system_config.inference.is_enabled)
+    assert app_model.capture_start() is True
+    assert app_model.add_animal("config-hygiene", select=True) is not None
+    assert app_model.start_recording() is True
+    _wait_until(lambda: app_model.session_recording_status
+                is SessionRecordingStatus.RECORDING, timeout=30)
+    assert app_model.stop_recording() is True
+    _wait_until(lambda: app_model.session_recording_status
+                is SessionRecordingStatus.READY, timeout=60)
+    app_model.capture_stop()
+    app_model.on_close()
+
+    assert config_file_path.read_bytes() == on_disk
+
+
+def test_exit_no_longer_saves_what_changed_while_running(app_model, config_file_path):
+    assert app_model.load_configuration() is True
+    on_disk = config_file_path.read_bytes()
+    # Changed, but not through an operator edit that saves.
+    app_model.stim_camera.is_enabled = True
+    app_model.on_close()
+
+    assert config_file_path.read_bytes() == on_disk
+
+
+def test_a_preferences_edit_saves_when_it_is_made(app_model, config_file_path, tmp_path):
+    assert app_model.load_configuration() is True
+    data = tmp_path.joinpath("OtherData").as_posix()
+
+    app_model.output_location = data
+    app_model.set_inference_model_location("/models/other")
+    app_model.update_session_control_option("trial_limit", 7)
+    app_model.flush_configuration_save()
+
+    saved = SystemConfiguration.load_yaml_file(config_file_path)
+    assert saved.persistence.output_location == data
+    assert saved.inference.pose_model_location == "/models/other"
+    assert saved.behavior.session_control.trial_limit == 7
+
+
+
+def test_a_run_of_preferences_edits_writes_the_file_once(
+    app_model, config_file_path, monkeypatch,
+):
+    assert app_model.load_configuration() is True
+    writes = []
+    save_file = SystemConfiguration.save_file
+    def counted(self, path, *args, **kwargs):
+        writes.append(path)
+        return save_file(self, path, *args, **kwargs)
+    monkeypatch.setattr(SystemConfiguration, "save_file", counted)
+
+    # A spin box stepping from 1 to 9 is nine edits.
+    for limit in range(1, 10):
+        app_model.update_session_control_option("trial_limit", limit)
+    _wait_until(lambda: writes)
+    time.sleep(0.7)  # past another save delay: nothing more is written
+
+    assert len(writes) == 1
+    saved = SystemConfiguration.load_yaml_file(config_file_path)
+    assert saved.behavior.session_control.trial_limit == 9
+
+
+def test_exit_writes_a_preferences_edit_still_waiting(app_model, config_file_path):
+    assert app_model.load_configuration() is True
+    app_model.update_session_control_option("trial_limit", 11)
+    app_model.on_close()
+
+    saved = SystemConfiguration.load_yaml_file(config_file_path)
+    assert saved.behavior.session_control.trial_limit == 11
+
+def test_a_live_inference_edit_replaces_the_cli_override(app_model, config_file_path):
+    assert app_model.load_configuration() is True
+    loaded = SystemConfiguration.load_yaml_file(config_file_path).inference.is_enabled
+    app_model.set_runtime_live_inference_override(not loaded)
+    app_model.on_close()
+    assert SystemConfiguration.load_yaml_file(config_file_path).inference.is_enabled is loaded
+
+
+def test_a_missing_configuration_file_is_refused_not_created(tmp_path):
+    from tools.acquisition.run_acquisition import verify_configuration
+
+    missing = tmp_path / "no_such_configuration.yaml"
+    assert verify_configuration(missing) is False
+    assert not missing.exists()
+    assert verify_configuration(None) is True
+
 def test_load_config_extra_reach_camera_slot(app_model, trainer_config_dir, system_config):
     camera3 = CameraConfiguration(
         id=CameraId.Camera3,
@@ -1994,6 +2097,7 @@ def test_launch_cli(system_config, config_file_path, user_pref, calib_dir, diamo
         cam.is_record_enabled = True
         cam.record_mode = record_mode.value
     system_config.save_file(config_file_path, as_yaml=True)
+    config_bytes = config_file_path.read_bytes()
     env = app_launch_env  # its own HOME, so its default data folder is under tmp too
     env['AUTOTRAINER_DIAMOND_TRIANGLE_CONFIG'] = diamond_config_path.as_posix()  # same for this !
     env['AUTOTRAINER_FORCE_CAN_EMULATION_IFACE'] = "1"
@@ -2065,7 +2169,9 @@ def test_launch_cli(system_config, config_file_path, user_pref, calib_dir, diamo
     assert_is_present(f"Loading diamond-triangle file {diamond_config_path.as_posix()!r}")
     assert_is_present(f"Using setting ini file: {settings_ini_path.as_posix()!r}")
     assert_is_present("Pellet-board hardware or transport support not found. Using emulation interface.")
-    assert_is_present(f"Writing to {config_file_path.as_posix()!r}")
+    # Start, run and SIGINT exit wrote nothing over the file it was given.
+    assert config_file_path.read_bytes() == config_bytes
+    assert not any(f"Writing to {config_file_path.as_posix()!r}" in line for line in out_lines), output
     # It opened its startup log under that HOME, not the operator's, and read
     # the motor and move files app_launch_env put there.
     home = Path(env["HOME"])

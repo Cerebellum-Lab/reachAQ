@@ -29,10 +29,10 @@ class ClosedVideoValidation:
 
 # Decoding threads for the full-decode frame count. One thread counted a
 # 6-minute 1024x1024 H.264 recording in 45 s; eight did it in 7.7 s
-# (christielab10, 2026-10-06).
+# (reference rig, 2026-10-06).
 _FFPROBE_DECODE_THREADS = 8
 # The rig's own 256x256 mp4v decodes faster on one thread: 35,149 frames in
-# 0.92 s against 1.37 s on eight (christielab10, 2026-11-09). Frame threads
+# 0.92 s against 1.37 s on eight (reference rig, 2026-11-09). Frame threads
 # cost more than such small frames take to decode.
 _SMALL_MPEG4_PIXELS = 256 * 256
 
@@ -124,7 +124,7 @@ def _ffprobe_frame_count(video_path: Path, timeout_seconds: float) -> int:
 def _ffprobe_packet_count(video_path: Path, timeout_seconds: float) -> int:
     """The video's packets, one per frame written, counted without decoding.
 
-    Decoding both cameras' 45-minute videos took 17 s of Stop on christielab10
+    Decoding both cameras' 45-minute videos took 17 s of Stop on the reference rig
     at 256 px mp4v, and would take about 112 s at 1024 px H.264; counting their
     packets took 0.26 s. --full session validation still decodes every frame.
     """

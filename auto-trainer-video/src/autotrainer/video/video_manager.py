@@ -9,6 +9,7 @@ from autotrainer.core.logging import get_verbose_logger
 from .camera.camera_base import CameraBase
 from .camera.random_cam import RandomCam
 from .camera.playback_cam import PlaybackCam
+from .camera.sim_cam import SimulatedCam
 
 logger = get_verbose_logger(__name__)
 
@@ -37,6 +38,7 @@ class CameraKind(str, Enum):
     Random = "random"
     Playback = "playback"
     Spinnaker = "spinnaker"
+    Simulated = "sim"
 
 
 class VideoManager:
@@ -58,6 +60,7 @@ class VideoManager:
         cam_cls = {
             CameraKind.Random: RandomCam,
             CameraKind.Playback: PlaybackCam,
+            CameraKind.Simulated: SimulatedCam,
         }.get(cam_kind, None)
         if cam_cls is None:
             raise ValueError(f"Unhandled camera kind: {cam_kind!r}")
@@ -85,6 +88,8 @@ class VideoManager:
             camera = cls.get_spin_camera(parsed.hostname, name)
         elif parsed.scheme == CameraKind.Playback:
             camera = PlaybackCam(parsed.path, name)
+        elif parsed.scheme == CameraKind.Simulated:
+            camera = SimulatedCam(name)
         else:
             logger.warning("No such cam scheme: %s", parsed.scheme)
             return None

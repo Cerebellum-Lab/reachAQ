@@ -1,41 +1,59 @@
-"""Adapt retained training protocols to pellet-delivery trial boundaries."""
+"""Run a training plan on pellet-delivery trial boundaries."""
 
 from __future__ import annotations
 
 from typing import Callable, Optional
 
-from autotrainer.core.interfaces import CaptureAnalysisResult
-from autotrainer.training import TrainingProgressState
-from autotrainer.training.training_phase import SessionResult
+from autotrainer.behavior.training import (
+    SessionResult,
+    TrainingProgressState,
+    TrialDirective,
+    TrialKind,
+    TrialResult,
+)
 
 from autotrainer.behavior.pellet_trial import TrialOutcome
 
 
+# Outcomes that never count as a plan trial: the subject had no fair trial.
+_NOT_COUNTED = {
+    TrialOutcome.HARDWARE_ERROR,
+    TrialOutcome.ABORTED,
+    TrialOutcome.INCOMPLETE,
+}
+
+_KIND = {
+    TrialOutcome.SUCCESS: TrialKind.SUCCESS,
+    TrialOutcome.FAILURE: TrialKind.FAILURE,
+    TrialOutcome.NO_REACH: TrialKind.NO_REACH,
+    TrialOutcome.PELLET_MISSING: TrialKind.PELLET_MISSING,
+    TrialOutcome.PELLET_PRECHECK_FAILED: TrialKind.PELLET_MISSING,
+    TrialOutcome.PELLET_PRECHECK_AUTHORIZATION_TIMEOUT: TrialKind.PELLET_MISSING,
+}
+
+
 class TrialProtocolRunner:
-    """Run a selected protocol without treating recordings as protocol trials.
+    """Evaluate the selected training plan exactly once per completed pellet trial.
 
-    The installed training package still provides protocol parsing, actions,
-    predicates, progress serialization, and manual phase navigation. This
-    adapter deliberately disconnects its recording lifecycle callbacks and
-    evaluates those same phase rules exactly once per completed pellet trial.
+    Recordings are not plan trials. The pellet-cycle controller reports each
+    presented pellet (``begin_trial``) and each finalized logical trial
+    (``record_trial_outcome``); the plan's predicates are evaluated then, and
+    with automatic advance the phase change is applied here.
     """
-
-    _RECORDING_CALLBACKS = (
-        ("session_starting", "_on_session_starting"),
-        ("session_capture_ending", "_on_session_capture_ending"),
-        ("session_ending", "_on_session_ending"),
-    )
 
     def __init__(
         self,
         *,
         automatic_advance: bool = False,
         on_protocol_complete: Optional[Callable[[], None]] = None,
+        on_trial_recorded: Optional[Callable[[str], None]] = None,
     ):
         self.automatic_advance = bool(automatic_advance)
         self._on_protocol_complete = on_protocol_complete
+        # Called with the attempt label after each counted trial, once any
+        # phase change is applied, so the next trial's directive is current.
+        self._on_trial_recorded = on_trial_recorded
         self._plan = None
-        self._algorithm = None
         self._active_attempt_label: Optional[str] = None
         self._protocol_complete = False
 
@@ -55,20 +73,20 @@ class TrialProtocolRunner:
         self.detach()
         plan.attach(algorithm, pellet_device, None)
         self._plan = plan
-        self._algorithm = algorithm
-        self._set_recording_callbacks_enabled(False)
 
     def detach(self) -> None:
         plan = self._plan
         if plan is None:
             return
         self.cancel_active_trial()
-        # TrainingPlan.detach expects to remove its original callbacks.
-        self._set_recording_callbacks_enabled(True)
         plan.detach()
         self._plan = None
-        self._algorithm = None
         self._protocol_complete = False
+
+    def next_trial_directive(self, draw_key: str) -> Optional[TrialDirective]:
+        """What the current phase's trial actions ask of the next SEND."""
+        plan = self._plan
+        return None if plan is None else plan.next_trial_directive(draw_key)
 
     def begin_trial(self, attempt_label: str) -> bool:
         plan = self._plan
@@ -97,42 +115,45 @@ class TrialProtocolRunner:
         self,
         attempt_label: str,
         outcome: TrialOutcome,
+        **counts,
     ) -> bool:
         """Count and evaluate one non-hardware pellet trial exactly once."""
         if self._active_attempt_label != str(attempt_label):
             return False
         self._active_attempt_label = None
-        return self.record_trial_outcome(attempt_label, outcome)
+        return self.record_trial_outcome(attempt_label, outcome, **counts)
 
     def record_trial_outcome(
         self,
         attempt_label: str,
         outcome: TrialOutcome,
+        *,
+        reach_count: int = 0,
+        success_count: int = 0,
+        consumption_count: int = 0,
     ) -> bool:
         """Apply one finalized pellet-trial result after session analysis."""
         plan = self._plan
         phase = None if plan is None else plan.current_phase
         if phase is None:
             return False
+        if self._active_attempt_label == str(attempt_label):
+            self._active_attempt_label = None
 
         outcome = TrialOutcome(outcome)
-        if outcome in {
-            TrialOutcome.HARDWARE_ERROR,
-            TrialOutcome.ABORTED,
-            TrialOutcome.INCOMPLETE,
-        }:
+        if outcome in _NOT_COUNTED:
             phase.progress.progress_paused()
             plan._on_progress_updated()
             return False
 
-        phase.capture_ended()
-        phase.progress.session_count += 1
-        context = plan._system_context
-        context.capture_analysis_result = CaptureAnalysisResult.CAPTURE_ONLY
-        try:
-            result = phase.session_ended(context)
-        finally:
-            context.capture_analysis_result = None
+        kind = _KIND.get(outcome, TrialKind.OTHER)
+        result = plan.record_trial(TrialResult(
+            kind=kind,
+            reaches=int(reach_count),
+            successful_reaches=int(success_count),
+            pellets_consumed=int(consumption_count),
+            pellet_presented=kind is not TrialKind.PELLET_MISSING,
+        ))
 
         if self.automatic_advance:
             if result is SessionResult.FALLBACK and plan.can_fallback:
@@ -143,6 +164,8 @@ class TrialProtocolRunner:
                 else:
                     self._mark_protocol_complete()
         plan._on_progress_updated()
+        if self._on_trial_recorded is not None:
+            self._on_trial_recorded(str(attempt_label))
         return True
 
     def _mark_protocol_complete(self) -> None:
@@ -152,14 +175,3 @@ class TrialProtocolRunner:
         self._plan.progress_state = TrainingProgressState.Complete
         if self._on_protocol_complete is not None:
             self._on_protocol_complete()
-
-    def _set_recording_callbacks_enabled(self, enabled: bool) -> None:
-        if self._plan is None or self._algorithm is None:
-            return
-        for event_name, callback_name in self._RECORDING_CALLBACKS:
-            event = getattr(self._algorithm, event_name)
-            callback = getattr(self._plan, callback_name)
-            if enabled:
-                event += callback
-            else:
-                event -= callback

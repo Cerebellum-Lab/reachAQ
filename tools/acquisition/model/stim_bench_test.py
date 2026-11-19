@@ -94,7 +94,7 @@ def bench_wait_seconds(profile, firing) -> float:
 
     This was max(3 s, trigger pulse + 2 s), which ignored the waveform, so a
     5 s burst was reported as never finishing while it was still running
-    (christielab10, 2026-09-24).
+    (reference rig, 2026-09-24).
     """
     return max(
         _MINIMUM_WAIT_SECONDS,

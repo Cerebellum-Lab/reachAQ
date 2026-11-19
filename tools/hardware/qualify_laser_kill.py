@@ -133,7 +133,7 @@ READER_MAX_RESTARTS = 5
 #: tell a held output from a safe one (its tolerance is LEVEL_TOLERANCE_V).
 MIN_LEVEL_SPAN_V = 0.5
 TRACKING_LEVELS = (0.0, 1.0, 2.0, 4.0)
-DEFAULT_RECORD_DIR = Path.home() / "Autotrainer" / "laser-kill"
+DEFAULT_RECORD_DIR = SystemConfiguration.DEFAULT_CONFIG_DIR.expanduser() / "laser-kill"
 #: Pushed on the victim's line queue when its output ends.
 STREAM_CLOSED = "STREAM CLOSED"
 VICTIM_PATH = Path(__file__).with_name("laser_kill_victim.py")
@@ -180,7 +180,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         description="Kill a process that holds the laser command output and read the output.",
         allow_abbrev=False)
     parser.add_argument(
-        "--config", default=os.path.expanduser("~/Autotrainer/system_configuration.yaml"))
+        "--config", default=str(SystemConfiguration.DEFAULT_PATH.expanduser()))
     parser.add_argument("--laser", type=int, default=1)
     parser.add_argument("--level", type=float, default=2.0, help="command volts")
     parser.add_argument("--hold-seconds", type=float, default=5.0)

@@ -12,7 +12,7 @@ from queue import Queue
 from uuid import UUID, uuid4
 from typing import Optional, Tuple, Dict, Union, List
 
-from autotrainer.api import ApiEventKind, ApiDetectorKind
+from autotrainer.core.api import ApiEventKind, ApiDetectorKind
 from autotrainer.core import (ObservableObject, SystemCommandKind, MessageHandler, AnimalSubject, Offset3DTuple,
                               get_verbose_logger, Motor, EventManager, HardwareConfiguration,
                               get_perf_now, SystemStatusMessageKind)
@@ -49,6 +49,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     PENDING_COMMAND_PROPERTY = "pending_command"
     CAN_CONNECTION_STATE_PROPERTY = "can_connection_state"
     PELLET_NEEDS_HOME_PROPERTY = "pellet_needs_home"
+    PELLET_DRIVER_FAULT_PROPERTY = "pellet_driver_fault"
     LAST_COMMAND_REFUSAL_PROPERTY = "last_command_refusal"
 
     DEVICE_ACK_TIMEOUT_ENGAGED = "device_ack_timeout_engaged"
@@ -107,6 +108,9 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         # Stepper axes the board will refuse to move until each is homed, as
         # its refusals said; cleared by an acknowledged home.
         self._axes_needing_home: Tuple[str, ...] = ()
+        # Stepper axes whose driver reports a latched fault (status bit 0), as
+        # the board last said; the board clears it when a home re-proves them.
+        self._axes_with_driver_fault: Tuple[str, ...] = ()
         self._last_command_refusal = ""
 
         message_handler.property_changed += self._message_handler_property_changed
@@ -197,6 +201,11 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     def pellet_axes_needing_home(self) -> Tuple[str, ...]:
         """Pellet stepper axes ("X", "Y", "Z") a refusal said need a home."""
         return self._axes_needing_home
+
+    @property
+    def pellet_axes_with_driver_fault(self) -> Tuple[str, ...]:
+        """Pellet stepper axes ("X", "Y", "Z") whose driver reports a latched fault."""
+        return self._axes_with_driver_fault
 
     @property
     def last_command_refusal(self) -> str:
@@ -958,6 +967,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             new = prev.replace(x=value.position)
             self._last_motor_coordinates = new
             self.send_x = value.send_position
+            self._note_driver_fault("X", value)
             self._on_property_changed(self.POS_XYZ, new, prev)
 
         elif name == props.STEPPER_Y_PROPERTY:
@@ -965,6 +975,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             new = prev.replace(y=value.position)
             self._last_motor_coordinates = new
             self.send_y = value.send_position
+            self._note_driver_fault("Y", value)
             self._on_property_changed(self.POS_XYZ, new, prev)
 
         elif name == props.STEPPER_Z_PROPERTY:
@@ -972,6 +983,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             new = prev.replace(z=value.position)
             self._last_motor_coordinates = new
             self.send_z = value.send_position
+            self._note_driver_fault("Z", value)
             self._on_property_changed(self.POS_XYZ, new, prev)
 
         elif name == props.COVER_ARM_ANGLE_PROPERTY:
@@ -1258,6 +1270,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                         "state", "recovery_refused",
                         data={"error": error, "generation": generation},
                     )
+                    self._close_stopped_recovery(generation)
                     self._set_can_connection_state("failed", error=error, generation=generation)
                     return
                 except Exception as exc:
@@ -1297,6 +1310,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 "state", "recovery_exhausted",
                 data={"error": error, "generation": generation},
             )
+            self._close_stopped_recovery(generation)
             self._set_can_connection_state(
                 "failed", error=error, generation=generation,
             )
@@ -1304,6 +1318,21 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             with self._can_recovery_lock:
                 if generation == self._can_recovery_generation:
                     self._can_recovery_thread = None
+
+    def _close_stopped_recovery(self, generation: int) -> None:
+        """Close the transport a stopped recovery's last attempt left open.
+
+        That attempt can fail after the transport is up (a refused home, no
+        version reply). Left open, connected stays True, so Refresh Hardware
+        and the subsystem retry skip the connect that would home the axes.
+        """
+        with self._can_lifecycle_lock:
+            if not self._can_recovery_is_current(generation):
+                return  # a newer connect owns the transport
+            try:
+                self._disconnect_transport(command_outcome="unknown")
+            except Exception:
+                logger.exception("Failed to close the CAN transport after recovery stopped")
 
     def _can_recovery_is_current(self, generation: int) -> bool:
         with self._can_recovery_lock:
@@ -1521,6 +1550,34 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         prev, self._axes_needing_home = self._axes_needing_home, tuple(axes)
         if prev != self._axes_needing_home:
             self.property_changed(self.PELLET_NEEDS_HOME_PROPERTY, self._axes_needing_home, prev)
+
+    def _note_driver_fault(self, axis: str, status) -> None:
+        """Keep the axis in, or out of, the faulted set as its status byte says.
+
+        Only DRIVER_FAULT (bit 0) is read. ENABLE_OFF (bit 1) is informational:
+        it sets no fault, no blocker and no log.
+        """
+        faulted = set(self._axes_with_driver_fault)
+        if bool(getattr(status, "driver_fault", False)):
+            faulted.add(axis)
+        else:
+            faulted.discard(axis)
+        self._set_axes_with_driver_fault(tuple(sorted(faulted)))
+
+    def _set_axes_with_driver_fault(self, axes: Tuple[str, ...]) -> None:
+        prev, self._axes_with_driver_fault = self._axes_with_driver_fault, tuple(axes)
+        if prev == self._axes_with_driver_fault:
+            return
+        # Below ERROR: every ERROR record lands in the footer, and the status
+        # panel and the Record blocker already report the fault.
+        if not prev:
+            logger.warning(
+                "Pellet stepper driver fault on axis %s: home the pellet axes to clear it",
+                ", ".join(self._axes_with_driver_fault))
+        elif not self._axes_with_driver_fault:
+            logger.info("Pellet stepper driver fault no longer reported")
+        self.property_changed(
+            self.PELLET_DRIVER_FAULT_PROPERTY, self._axes_with_driver_fault, prev)
 
     def wait_pending_command_acked(
         self,
