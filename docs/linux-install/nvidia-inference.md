@@ -54,7 +54,9 @@ environment with:
 | PyTorch | 2.7, CUDA 12.8 build | 12.8 / 9 | Keypoint models (the live default), DeepLabCut PyTorch models |
 | TensorFlow | 2.12 | 11.8 / 8.6 | DeepLabCut TensorFlow models |
 
-No engine is installed by default. A keypoint model always runs on PyTorch,
+PyTorch comes with the base install, and the built-in keypoint backend runs on
+it. No optional pose plugin is installed by default, and TensorFlow arrives
+only with the DeepLabCut plugin. A keypoint model always runs on PyTorch,
 and so does a YOLO model. A DeepLabCut model runs on the engine
 `REACHAQ_POSE_BACKEND` selects, or, unset, on TensorFlow where it is installed
 and PyTorch otherwise; the variable applies to DeepLabCut models only. See the

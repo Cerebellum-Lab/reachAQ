@@ -91,7 +91,10 @@ the kernel driver or install a system-wide CUDA toolkit.
 - The pose plugins the environment had are reinstalled from the checkout, into
   a rebuilt environment too. An environment from before the plugins existed
   gets the DeepLabCut plugin if it has `deeplabcut` installed and the YOLO
-  plugin if it has `ultralytics`.
+  plugin if it has `ultralytics`. To drop a plugin for good, uninstall both its
+  distribution and its engine package (for example
+  `pip uninstall auto-trainer-pose-yolo ultralytics`) before rerunning the
+  installer, otherwise it restores the plugin.
 - `REACHAQ_INSTALL_SYSTEM=0` skips the steps that need root (apt packages,
   groups, limits, systemd) and reports them as `SKIP`. Use it to rerun on a rig
   that already has them, for example after `reachaq-sync`.

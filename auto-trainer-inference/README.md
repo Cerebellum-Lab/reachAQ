@@ -15,12 +15,14 @@ Live pose inference requires GPU acceleration on a CUDA-capable NVIDIA GPU. It
 intentionally refuses CPU fallback because the live acquisition rate cannot be
 supported reliably by CPU inference.
 
-The installed environment carries both engines: PyTorch runs the keypoint and
-DeepLabCut PyTorch models (and YOLO ones, with the optional plugin), TensorFlow
-runs DeepLabCut TensorFlow models, and
+The base install carries PyTorch, which runs the built-in keypoint backend. No
+optional pose plugin is installed by default. The DeepLabCut plugin brings
+TensorFlow, and then PyTorch runs DeepLabCut PyTorch models (and YOLO ones,
+with the YOLO plugin) while TensorFlow runs DeepLabCut TensorFlow models;
 `REACHAQ_POSE_BACKEND` picks the engine for a DeepLabCut model
-(`backend_selection.py`). Why the two can share an environment, and what that
-needs, is recorded beside the extras in `pyproject.toml`.
+(`backend_selection.py`). Why the two engines can share an environment, and
+what that needs, is recorded beside the extras in
+`plugins/deeplabcut/pyproject.toml`.
 
 Before acquisition hardware starts, reachAQ checks the active NVIDIA kernel
 driver with `nvidia-smi` and then validates that the engine the configured model

@@ -2,8 +2,9 @@
 
 A pose engine ships as its own distribution under `plugins/<name>` and
 registers itself in the `autotrainer.pose_backends` entry-point group. reachAQ
-core installs no engine: it finds the installed plugins, asks each whether it
-owns a model directory, and runs the model through the one that does. Core
+core installs PyTorch for the built-in keypoint backend and no optional pose
+plugin, so TensorFlow arrives only with the DeepLabCut plugin. It finds the
+installed plugins, asks each whether it owns a model directory, and runs the model through the one that does. Core
 never imports an engine to decide that.
 
 | Plugin | Distribution | Claims a model directory with | Runs on |
@@ -157,7 +158,9 @@ KnownLayout("MyEngine", "myengine", "auto-trainer-pose-myengine",
 ```
 
 `matches(model_path)` is a filesystem-only test of the marker the plugin claims
-on. `hint`, optional, is appended to the install instruction for a layout with
+on. It can be stricter than `claims()`: the DeepLabCut plugin claims any
+`config.yaml`, but the not-installed hint needs `config.yaml` plus a
+`dlc-models*` directory. `hint`, optional, is appended to the install instruction for a layout with
 a supported alternative; the YOLO entry offers retraining as a keypoint model.
 
 ## Licence rule
