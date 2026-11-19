@@ -136,6 +136,10 @@ def spin_cam(monkeypatch):
         monkeypatch.setitem(sys.modules, "PySpin", _fake_pyspin())
         faked = True
     spinnaker_cam = importlib.import_module("autotrainer.video.camera.spinnaker_cam")
+    if not faked:
+        # The real SDK rejects the fake nodes (CCommandPtr(<SimpleNamespace>) raises),
+        # so SpinCam reads its PySpin from the fake even where Spinnaker is installed.
+        monkeypatch.setattr(spinnaker_cam, "PySpin", _fake_pyspin())
     cam = spinnaker_cam.SpinCam.__new__(spinnaker_cam.SpinCam)
     CameraBase.__init__(cam, "right")
     cam._serial_number = "fake"
