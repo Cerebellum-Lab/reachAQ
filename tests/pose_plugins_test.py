@@ -256,3 +256,36 @@ def test_an_unrecognised_directory_lists_the_installed_plugins(tmp_path, entry_p
     message = str(raised.value)
     for name in ("keypoint",):
         assert name in message
+
+
+def test_a_keypoint_model_without_torch_names_the_missing_engine(tmp_path, entry_points,
+                                                                 monkeypatch):
+    (tmp_path / "keypoint_pose.yaml").write_text("x: 1\n")
+    monkeypatch.setattr(pose_plugins, "_installed", lambda module: module != "torch")
+    with pytest.raises(PoseBackendNotInstalled) as raised:
+        resolve(str(tmp_path))
+    assert raised.value.missing == ("torch",)
+    assert raised.value.distribution == "auto-trainer"
+    assert raised.value.engine == "keypoint"
+    assert "torch" in str(raised.value)
+    assert "reachaq-plugin-install.sh keypoint" not in str(raised.value)
+
+
+def test_a_keypoint_model_with_torch_still_resolves(tmp_path, entry_points, monkeypatch):
+    (tmp_path / "keypoint_pose.yaml").write_text("x: 1\n")
+    monkeypatch.setattr(pose_plugins, "_installed", lambda module: True)
+    assert resolve(str(tmp_path)) is KEYPOINT_PLUGIN
+
+
+def test_the_unrecognised_model_message_explains_a_broken_plugin(tmp_path, entry_points):
+    entry_points.append(_FakeEntryPoint("half", error=ImportError("gone")))
+    with pytest.raises(PoseBackendNotInstalled) as raised:
+        resolve(str(tmp_path))
+    assert "half: ImportError: gone" in str(raised.value)
+
+
+def test_the_unrecognised_model_message_has_no_broken_note_when_all_load(tmp_path,
+                                                                        entry_points):
+    with pytest.raises(PoseBackendNotInstalled) as raised:
+        resolve(str(tmp_path))
+    assert "failed to load" not in str(raised.value)

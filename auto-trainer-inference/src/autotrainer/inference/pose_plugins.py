@@ -114,7 +114,8 @@ class _KeypointPlugin(PoseBackendPlugin):
     """
 
     name = "keypoint"
-    distribution = "auto-trainer-inference"
+    # The distribution a rig has installed; auto-trainer-inference ships inside it.
+    distribution = "auto-trainer"
     requires = ("torch",)
 
     SIDECAR = "keypoint_pose.yaml"
@@ -240,7 +241,8 @@ class PoseBackendNotInstalled(ImportError):
                  missing: typing.Sequence[str] = (), *,
                  plugin_name: typing.Optional[str] = None,
                  installed: typing.Sequence[str] = (),
-                 hint: str = ""):
+                 hint: str = "",
+                 broken: typing.Sequence[typing.Tuple[str, str]] = ()):
         self.model_path = model_path
         self.engine = engine
         self.distribution = distribution
@@ -248,14 +250,25 @@ class PoseBackendNotInstalled(ImportError):
         self.plugin_name = plugin_name
         self.installed = tuple(installed)
         self.hint = hint
+        self.broken = tuple(broken)
         super().__init__(self._message())
 
     def _message(self) -> str:
         if self.engine is None:
-            return (f"no installed pose backend recognises {self.model_path!r} "
-                    f"(installed: {', '.join(self.installed) or 'none'}). If it is "
-                    f"a model for another engine, install that engine's plugin "
-                    f"with {INSTALL_COMMAND} <name>.")
+            message = (f"no installed pose backend recognises {self.model_path!r} "
+                       f"(installed: {', '.join(self.installed) or 'none'}). If it is "
+                       f"a model for another engine, install that engine's plugin "
+                       f"with {INSTALL_COMMAND} <name>.")
+            if self.broken:
+                message += (" Plugins that failed to load: "
+                            + "; ".join(f"{name}: {reason}"
+                                        for name, reason in self.broken) + ".")
+            return message
+        if self.plugin_name == KEYPOINT_PLUGIN.name:
+            return (f"{self.model_path!r} is a keypoint model, and the keypoint "
+                    f"pose backend cannot run here: {', '.join(self.missing)} not "
+                    f"installed. Rerun tools/install/reachaq-linux-install.sh to "
+                    f"restore it (distribution {self.distribution}).")
         install = (f"Install it with {INSTALL_COMMAND} {self.plugin_name} "
                    f"(distribution {self.distribution}).")
         if self.hint:
@@ -352,6 +365,11 @@ def resolve(model_path: typing.Optional[str]) -> PoseBackendPlugin:
     PoseBackendNotInstalled when none can run it.
     """
     if KEYPOINT_PLUGIN.claims(model_path or ""):
+        missing = KEYPOINT_PLUGIN.missing_requirements()
+        if missing:
+            raise PoseBackendNotInstalled(model_path, "keypoint",
+                                          KEYPOINT_PLUGIN.distribution, missing,
+                                          plugin_name=KEYPOINT_PLUGIN.name)
         return KEYPOINT_PLUGIN
     plugins = discover_plugins()
     claiming = ([plugin for plugin in plugins
@@ -376,4 +394,5 @@ def resolve(model_path: typing.Optional[str]) -> PoseBackendPlugin:
                                               plugin_name=layout.plugin,
                                               hint=layout.hint)
     raise PoseBackendNotInstalled(model_path, None,
-                                  installed=[plugin.name for plugin in plugins])
+                                  installed=[plugin.name for plugin in plugins],
+                                  broken=broken_plugins())
