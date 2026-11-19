@@ -27,9 +27,12 @@ Set it up as the operator who runs reachAQ on that computer, not with `sudo`.
    username and password, then click **List** to log in and choose the colony.
 2. Click **Read columns**. reachAQ fetches the source once and lists its
    columns.
-3. Map the columns. Only **Permanent external ID** and **New-animal name** are
-   required; choose **(none)** for a field the source lacks. SoftMouse's
-   columns are filled in for you.
+3. Choose the two columns that identify an animal: **Physical tag** (its
+   permanent ID, also the name a new animal gets) and **RFID** (**(none)** if
+   the source has no RFID column). For SoftMouse they default to Physical Tag
+   and Plate ID. Every column of the source is kept in each animal's metadata;
+   state, sex, date of birth, strain, genotype, cage and protocol are also read
+   by name when a column matches, and the dialog lists which ones it found.
 4. Decide **Skip animals without a valid RFID** (see "RFID" below).
 5. Optionally, **Publish to** a shared directory (see "Sharing one source").
 6. **Save**. The app reconnects to the new source; click **Refresh now** to

@@ -22,9 +22,15 @@ from typing import Callable, Optional
 from .base import available_source_kinds
 from .config import build_source, load_source_configuration, publish_target
 from .credentials import CredentialStore
-from .mapping import ColumnMapping
 from .publication import AnimalTablePublisher, PublicationSource, ensure_publication_directory
-from .source_setup import list_choices, read_columns, save_setup, suggest_mapping
+from .source_setup import (
+    build_mapping,
+    describe_other_columns,
+    list_choices,
+    read_columns,
+    save_setup,
+    suggest_mapping,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -98,33 +104,33 @@ def run_setup(
     print("Reading the source's columns…")
     table = read_columns(kind, values, credentials)
     print(f"{len(table.rows)} rows; columns: {', '.join(h for h in table.headers if h)}")
-    suggestion = suggest_mapping(kind, table.headers)
+    headers = [header for header in table.headers if header]
+    suggestion = suggest_mapping(kind, headers)
+    chosen = dict(suggestion)
     if existing is not None and existing.kind == kind_name and existing.mapping is not None:
-        suggestion = {
-            name: getattr(existing.mapping, name) for name, _, _ in ColumnMapping.COLUMN_FIELDS
-        }
-    columns = {}
-    for name, label, optional in ColumnMapping.COLUMN_FIELDS:
-        default = suggestion.get(name) or ""
-        hint = f" [{default}]" if default else (" (optional; - for none)" if optional else "")
-        answer = prompt(f"{label} column{hint}: ").strip()
-        columns[name] = None if answer == "-" else (answer or default or None)
+        chosen.update(
+            external_identity_column=existing.mapping.external_identity_column,
+            rfid_column=existing.mapping.rfid_column,
+        )
+    print("Every column is kept in each animal's metadata. Choose the two that identify it.")
+    tag_default = chosen.get("external_identity_column") or ""
+    physical_tag = _choose(prompt, "Physical tag column", headers, tag_default)
+    rfid_default = chosen.get("rfid_column") or "-"
+    rfid_answer = _choose(prompt, "RFID column (- for none)", headers + ["-"], rfid_default)
+    rfid_column = None if rfid_answer == "-" else rfid_answer
     base = kind.default_mapping()
     require_default = (
         "y" if (existing.mapping.require_rfid if existing and existing.mapping else
                 base is not None and base.require_rfid) else "n"
     )
-    require_rfid = (
+    require_rfid = rfid_column is not None and (
         prompt(f"Skip animals without a valid RFID? (y/n) [{require_default}]: ").strip().lower()
         or require_default
     ).startswith("y")
-    mapping = ColumnMapping(
-        **columns,
-        require_rfid=require_rfid,
-        subject_id_kind=(base.subject_id_kind if base else ColumnMapping.subject_id_kind),
-        profile_id=(base.profile_id if base else "custom"),
-        version=(base.version if base else 1),
+    mapping = build_mapping(
+        kind, suggestion, physical_tag, rfid_column, require_rfid=require_rfid
     )
+    print(f"Also read by name: {describe_other_columns(mapping)}")
     publish_directory = publish_mount = ""
     if kind_name != PublicationSource.kind:
         publish_default = "" if existing is None else existing.publish_directory

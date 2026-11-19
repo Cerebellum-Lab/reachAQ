@@ -116,6 +116,56 @@ def suggest_mapping(
     return suggestion
 
 
+#: The two columns the operator chooses at setup. Every other field is filled
+#: from the source's own mapping or its column names, and every column is kept
+#: in each animal's metadata (its source payload) whatever is mapped here.
+OPERATOR_COLUMNS = (
+    ("external_identity_column", "Physical tag"),
+    ("rfid_column", "RFID"),
+)
+
+
+def build_mapping(
+    kind: Type[AnimalMetadataSource],
+    suggestion: Mapping[str, Optional[str]],
+    physical_tag_column: str,
+    rfid_column: Optional[str],
+    *,
+    require_rfid: bool,
+    ended_states: Sequence[str] = ("ended",),
+) -> ColumnMapping:
+    """The operator's tag and RFID columns, with the other fields from ``suggestion``.
+
+    The physical tag is also the name a new animal gets.
+    """
+    columns = {name: suggestion.get(name) for name, _, _ in ColumnMapping.COLUMN_FIELDS}
+    columns.update(
+        external_identity_column=physical_tag_column,
+        new_animal_name_column=physical_tag_column,
+        rfid_column=rfid_column,
+    )
+    base = kind.default_mapping()
+    return ColumnMapping(
+        **columns,
+        require_rfid=require_rfid,
+        ended_states=tuple(ended_states),
+        subject_id_kind=(base.subject_id_kind if base else ColumnMapping.subject_id_kind),
+        profile_id=(base.profile_id if base else "custom"),
+        version=(base.version if base else 1),
+    )
+
+
+def describe_other_columns(mapping: ColumnMapping) -> str:
+    """The fields setup filled in itself, for the operator to see."""
+    chosen = {name for name, _ in OPERATOR_COLUMNS} | {"new_animal_name_column"}
+    mapped = [
+        f"{label} = {getattr(mapping, name)}"
+        for name, label, _ in ColumnMapping.COLUMN_FIELDS
+        if name not in chosen and getattr(mapping, name)
+    ]
+    return ", ".join(mapped) if mapped else "none"
+
+
 @dataclass(frozen=True)
 class SavedSetup:
     configuration: SourceConfiguration
