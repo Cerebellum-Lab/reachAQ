@@ -20,6 +20,7 @@ from autotrainer.inference.backend_selection import (
     POSE_BACKENDS,
     TENSORFLOW_BACKEND,
     TORCH_BACKEND,
+    parse_runtime,
 )
 from autotrainer.inference.pose_model import PoseModel
 
@@ -107,17 +108,6 @@ TORCH_MODEL_CONFIDENCE_THRESHOLDS = {
     "cspnext_m": 0.2,
     "rtmpose_s": 0.3,
 }
-
-# Spellings an operator is likely to type, mapped to the canonical name.
-_BACKEND_ALIASES = {
-    "tensorflow": TENSORFLOW_BACKEND,
-    "tf": TENSORFLOW_BACKEND,
-    "tf1": TENSORFLOW_BACKEND,
-    "torch": TORCH_BACKEND,
-    "pytorch": TORCH_BACKEND,
-    "pt": TORCH_BACKEND,
-}
-
 
 def _available_runtimes() -> typing.Tuple[str, ...]:
     """The engines DeepLabCut could run on here, in preference order."""
@@ -213,16 +203,9 @@ class DeepLabCutPlugin(pose_plugins.PoseBackendPlugin):
         TensorFlow still wins when both are installed. Deployed rigs run trained
         TensorFlow snapshots, and an unset variable must not change what they do.
         """
-        raw = environ.get(POSE_BACKEND_ENV_VAR)
-        if raw is not None and raw.strip():
-            backend = _BACKEND_ALIASES.get(raw.strip().lower())
-            if backend is None:
-                logger.warning("%s=%r is not one of %s; falling back to detection",
-                               POSE_BACKEND_ENV_VAR, raw, POSE_BACKENDS)
-            else:
-                logger.info("%s=%r selects the %s pose backend",
-                            POSE_BACKEND_ENV_VAR, raw, backend)
-                return backend
+        explicit = parse_runtime(environ)
+        if explicit is not None:
+            return explicit
 
         available = _available_runtimes()
         if not available:

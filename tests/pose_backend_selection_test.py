@@ -208,8 +208,8 @@ def test_a_typo_falls_through_to_detection_rather_than_a_blind_default(monkeypat
     assert backend_selection.selected_backend(model_path=project) == TORCH_BACKEND
 
 
-def test_with_nothing_resolvable_the_answer_is_torch(monkeypatch, tmp_path):
-    """No model, or one no installed plugin can run: the keypoint runtime.
+def test_with_nothing_resolvable_or_installed_the_answer_is_torch(monkeypatch, tmp_path):
+    """No model, or one no installed plugin can run, and no TensorFlow.
 
     Never raises - pre-validation is where the operator is told what to
     install - so the GPU probe still has a name to ask about.
@@ -223,11 +223,75 @@ def test_with_nothing_resolvable_the_answer_is_torch(monkeypatch, tmp_path):
     assert backend_selection.available_backends() == ()
 
 
-def test_an_ambiguous_model_selects_torch_but_fails_pre_validation(monkeypatch, tmp_path):
+# --- no model, or one that does not resolve -----------------------------------
+#
+# An empty model location is rig checkout, and its GPU probe still runs. On the
+# reachAQ rig every torch convolution aborts in cuDNN, so answering torch there
+# fails a preflight that passes on TensorFlow - and the variable has to be able
+# to steer it.
+
+
+def test_no_model_follows_an_explicit_tensorflow(monkeypatch):
+    _only(monkeypatch, "torch")
+    assert selected_backend({POSE_BACKEND_ENV_VAR: "tensorflow"}) == TENSORFLOW_BACKEND
+    assert selected_backend({POSE_BACKEND_ENV_VAR: "tf"}, model_path="") == TENSORFLOW_BACKEND
+
+
+def test_no_model_unset_prefers_an_installed_tensorflow(monkeypatch):
+    _only(monkeypatch, "tensorflow", "torch")
+    assert selected_backend({}) == TENSORFLOW_BACKEND
+    assert selected_backend({}, model_path="") == TENSORFLOW_BACKEND
+
+
+def test_no_model_unset_without_tensorflow_is_torch(monkeypatch):
+    _only(monkeypatch, "torch")
+    assert selected_backend({}) == TORCH_BACKEND
+
+
+def test_an_unresolvable_model_follows_an_explicit_torch(monkeypatch, tmp_path):
+    _only(monkeypatch, "tensorflow", "torch")
+    assert selected_backend({POSE_BACKEND_ENV_VAR: "torch"},
+                            model_path=str(tmp_path)) == TORCH_BACKEND
+
+
+@pytest.mark.parametrize("value", ["torch", "pytorch", "pt", "PyTorch", "  TORCH  "])
+def test_torch_spellings_are_accepted_without_a_model(value, monkeypatch):
+    _only(monkeypatch, "tensorflow", "torch")
+    assert selected_backend({POSE_BACKEND_ENV_VAR: value}) == TORCH_BACKEND
+
+
+@pytest.mark.parametrize("value", ["tensorflow", "tf", "tf1", "TensorFlow"])
+def test_tensorflow_spellings_are_accepted_without_a_model(value, monkeypatch):
+    _only(monkeypatch, "torch")
+    assert selected_backend({POSE_BACKEND_ENV_VAR: value}) == TENSORFLOW_BACKEND
+
+
+@pytest.mark.parametrize("value", ["", "   ", "onnx", "tensorrt", "true"])
+def test_an_unusable_value_without_a_model_falls_back(value, monkeypatch):
+    _only(monkeypatch, "tensorflow", "torch")
+    assert selected_backend({POSE_BACKEND_ENV_VAR: value}) == DEFAULT_POSE_BACKEND
+
+
+def test_without_a_model_the_process_environment_is_the_default_source(monkeypatch):
+    _only(monkeypatch, "tensorflow", "torch")
+    monkeypatch.setenv(POSE_BACKEND_ENV_VAR, "pytorch")
+    assert selected_backend() == TORCH_BACKEND
+    monkeypatch.delenv(POSE_BACKEND_ENV_VAR)
+    assert selected_backend() == TENSORFLOW_BACKEND
+
+
+def test_a_typo_without_a_model_falls_through_to_detection(monkeypatch):
+    monkeypatch.setenv(POSE_BACKEND_ENV_VAR, "tensorflwo")
+    _only(monkeypatch, "torch")
+    assert selected_backend() == TORCH_BACKEND
+
+
+def test_an_ambiguous_model_selects_a_runtime_but_fails_pre_validation(monkeypatch, tmp_path):
     _only(monkeypatch, "deeplabcut", "ultralytics", "tensorflow", "torch")
     (tmp_path / "config.yaml").write_text("bodyparts: [a]")
     (tmp_path / "yolo_pose.yaml").write_text("bodyparts: [a]")
-    assert backend_selection.selected_backend(model_path=str(tmp_path)) == TORCH_BACKEND
+    assert backend_selection.selected_backend(
+        {}, model_path=str(tmp_path)) == TENSORFLOW_BACKEND
     with pytest.raises(AmbiguousPoseModel, match="deeplabcut"):
         pre_validate_model(str(tmp_path))
     with pytest.raises(AmbiguousPoseModel, match="yolo"):

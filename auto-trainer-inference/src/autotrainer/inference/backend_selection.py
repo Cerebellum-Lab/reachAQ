@@ -70,6 +70,51 @@ _MAX_CONFIDENCE_THRESHOLD = 1.0
 
 POSE_BACKENDS = (TENSORFLOW_BACKEND, TORCH_BACKEND)
 
+# Spellings an operator is likely to type, mapped to the canonical name.
+_BACKEND_ALIASES = {
+    "tensorflow": TENSORFLOW_BACKEND,
+    "tf": TENSORFLOW_BACKEND,
+    "tf1": TENSORFLOW_BACKEND,
+    "torch": TORCH_BACKEND,
+    "pytorch": TORCH_BACKEND,
+    "pt": TORCH_BACKEND,
+}
+
+
+def parse_runtime(environ: typing.Mapping[str, str]) -> typing.Optional[str]:
+    """The runtime REACHAQ_POSE_BACKEND names explicitly, or None.
+
+    An unusable value is None with a warning rather than an error: refusing to
+    start live inference over a typo is worse than detecting the runtime.
+    """
+    raw = environ.get(POSE_BACKEND_ENV_VAR)
+    if raw is None or not raw.strip():
+        return None
+    backend = _BACKEND_ALIASES.get(raw.strip().lower())
+    if backend is None:
+        logger.warning("%s=%r is not one of %s; falling back to detection",
+                       POSE_BACKEND_ENV_VAR, raw, POSE_BACKENDS)
+        return None
+    logger.info("%s=%r selects the %s pose backend",
+                POSE_BACKEND_ENV_VAR, raw, backend)
+    return backend
+
+
+def _unresolved_runtime(environ: typing.Mapping[str, str]) -> str:
+    """The runtime for no model, or one no installed plugin can run.
+
+    The explicit variable, else TensorFlow where it is installed, else torch.
+    An empty model location is rig checkout, and on the reachAQ rig every
+    torch convolution aborts in cuDNN: answering torch there would fail a
+    preflight that passes on TensorFlow, with no variable to steer it back.
+    """
+    explicit = parse_runtime(environ)
+    if explicit is not None:
+        return explicit
+    if pose_plugins._installed("tensorflow"):
+        return TENSORFLOW_BACKEND
+    return TORCH_BACKEND
+
 
 def is_yolo_model(model_path: typing.Optional[str]) -> bool:
     """Whether this location is a YOLO model directory, by its sidecar."""
@@ -101,19 +146,28 @@ def selected_backend(environ: typing.Optional[typing.Mapping[str, str]] = None,
     runtime can only be chosen through the environment. A DeepLabCut model
     follows REACHAQ_POSE_BACKEND, and unset, what is installed.
 
-    Never raises and never returns an unknown name. A model no installed plugin
-    can run, or no model at all, answers torch, the built-in keypoint
-    backend's runtime: refusing here would stop the GPU probe from running, and
-    pre_validate_model is where the operator is told what to install.
+    Never raises and never returns an unknown name. No model at all, or one no
+    installed plugin can run, answers REACHAQ_POSE_BACKEND when it is set,
+    else TensorFlow where it is installed, else torch: refusing here would stop
+    the GPU probe from running, and pre_validate_model is where the operator
+    is told what to install.
     """
     source = os.environ if environ is None else environ
+    return _resolve_runtime(model_path, source)[1]
+
+
+def _resolve_runtime(model_path: typing.Optional[str],
+                     environ: typing.Mapping[str, str],
+                     ) -> typing.Tuple[typing.Optional[pose_plugins.PoseBackendPlugin], str]:
+    """The resolved plugin, or None, and the runtime; resolves exactly once."""
     try:
         plugin = resolve(model_path)
     except (PoseBackendNotInstalled, AmbiguousPoseModel) as err:
+        runtime = _unresolved_runtime(environ)
         if model_path:
-            logger.warning("using the %s runtime for now: %s", TORCH_BACKEND, err)
-        return TORCH_BACKEND
-    return plugin.runtime(model_path, source)
+            logger.warning("using the %s runtime for now: %s", runtime, err)
+        return None, runtime
+    return plugin, plugin.runtime(model_path, environ)
 
 
 def confidence_threshold(
@@ -137,23 +191,18 @@ def confidence_threshold(
     warning: refusing to start over a malformed number would be worse, and
     silently gating on a nonsense threshold would be worse still.
     """
-    backend = (selected_backend(environ, model_path=model_path)
-               if backend is None else backend)
-    try:
-        plugin = resolve(model_path)
-    except (PoseBackendNotInstalled, AmbiguousPoseModel) as err:
+    source = os.environ if environ is None else environ
+    plugin, runtime = _resolve_runtime(model_path, source)
+    backend = runtime if backend is None else backend
+    if plugin is None:
         default = _FALLBACK_CONFIDENCE_THRESHOLDS.get(
             backend, _FALLBACK_CONFIDENCE_THRESHOLDS[DEFAULT_POSE_BACKEND]
         )
-        if model_path:
-            logger.warning("gating at the %s default of %.2f for now: %s",
-                           backend, default, err)
     else:
         default = plugin.confidence_threshold(model_path, backend)
         logger.info("%s pose backend gates %r at %.2f on the %s runtime",
                     plugin.name, model_path, default, backend)
 
-    source = os.environ if environ is None else environ
     raw = source.get(POSE_CONFIDENCE_THRESHOLD_ENV_VAR)
     if raw is None or not raw.strip():
         return default

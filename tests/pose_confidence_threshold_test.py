@@ -91,6 +91,25 @@ def test_a_project_without_its_engine_falls_back_rather_than_raising(monkeypatch
     project = _project(tmp_path, "cspnext_s")
     assert confidence_threshold(TORCH_BACKEND, {}, model_path=project) == 0.6
     assert confidence_threshold(TENSORFLOW_BACKEND, {}, model_path=project) == 0.9
+    # Unset, the runtime falls back the way selected_backend does.
+    assert confidence_threshold(None, {}, model_path=project) == 0.9
+    assert confidence_threshold(
+        None, {POSE_BACKEND_ENV_VAR: "torch"}, model_path=project) == 0.6
+
+
+def test_an_unresolvable_model_is_resolved_once(monkeypatch, tmp_path):
+    """One warning per gate decision, not one from each of two lookups."""
+    calls = []
+    real = pose_plugins.resolve
+
+    def counting(model_path):
+        calls.append(model_path)
+        return real(model_path)
+
+    from autotrainer.inference import backend_selection
+    monkeypatch.setattr(backend_selection, "resolve", counting)
+    confidence_threshold(None, {}, model_path=str(tmp_path))
+    assert calls == [str(tmp_path)]
 
 
 def test_an_explicit_override_wins():
