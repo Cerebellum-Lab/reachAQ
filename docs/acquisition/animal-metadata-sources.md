@@ -60,7 +60,12 @@ sets up their own.
 
 - **SoftMouse:** username, password, colony. The export is the colony's active
   animals (Mating, Stock, Weanling, Ordered); the download stops on a
-  CAPTCHA or two-factor prompt rather than guess.
+  CAPTCHA or two-factor prompt rather than guess. It carries every field
+  SoftMouse returns for an animal, whatever columns are shown on the website.
+  The first columns use the website's names (Physical Tag, Plate ID, Alt. ID,
+  State, Sex, Date of Birth, Strain, Genotype, Cage Tag, Protocol and a few
+  more); the rest keep SoftMouse's field names, such as `gene1` or `tyxplateid`.
+  Microchip numbers are in **Plate ID**; **Alt. ID** is the ear-mark field.
 - **Spreadsheet:** the file, and for `.xlsx` the worksheet (empty means the
   first). Keep RFIDs as text cells: a numeric RFID cell is refused, because a
   spreadsheet can silently round a 15-digit number.

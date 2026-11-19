@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -129,13 +130,21 @@ class _SoftMousePageParser(HTMLParser):
 
 
 class SoftMouseHttpsSource:
-    """Browserless replay of the SoftMouse Animals export for one colony."""
+    """Browserless replay of the SoftMouse Animals export for one colony.
+
+    Every field the Animals list returns is written. The fields below come
+    first, under the labels the publication has always used; the rest keep
+    SoftMouse's own field names.
+    """
 
     _EXPORT_COLUMNS = (
         ("SoftMouse ID", "id"),
         ("Animal SID", "sid"),
         ("Physical Tag", "physicaltag"),
         ("Plate ID", "plateIdPattern"),
+        # The Animals page's "Alt. ID" column; matched against it on
+        # christielab10 on 2026-11-19.
+        ("Alt. ID", "mouseearmark"),
         ("State", "mousestate"),
         ("Sex", "sex"),
         ("Date of Birth", "dateofbirth"),
@@ -180,18 +189,16 @@ class SoftMouseHttpsSource:
         destination = Path(destination_directory) / (
             "SoftMouse-AnimalList-download" + self.configuration.export_suffix
         )
+        labelled = {source for _, source in self._EXPORT_COLUMNS}
+        columns = list(self._EXPORT_COLUMNS) + [
+            (name, name) for name in sorted({key for row in rows for key in row} - labelled)
+        ]
         with destination.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(
-                handle,
-                fieldnames=[header for header, _ in self._EXPORT_COLUMNS],
-            )
+            writer = csv.DictWriter(handle, fieldnames=[header for header, _ in columns])
             writer.writeheader()
             for row in rows:
                 writer.writerow(
-                    {
-                        header: "" if row.get(source) is None else row.get(source)
-                        for header, source in self._EXPORT_COLUMNS
-                    }
+                    {header: self._cell(row.get(source)) for header, source in columns}
                 )
         logger.info(
             "SoftMouse HTTPS export written: colony=%s rows=%d destination=%s",
@@ -200,6 +207,14 @@ class SoftMouseHttpsSource:
             destination,
         )
         return destination
+
+    @staticmethod
+    def _cell(value):
+        if value is None:
+            return ""
+        if isinstance(value, (list, dict)):
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return value
 
     def _url(self, path: str) -> str:
         url = urljoin(self.configuration.base_url.rstrip("/") + "/", path)
