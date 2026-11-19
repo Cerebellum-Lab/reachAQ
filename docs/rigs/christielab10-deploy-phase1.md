@@ -286,9 +286,13 @@ conda activate reachaq
 reachaq-animal-metadata setup --kind softmouse
 ```
 
-Choose the lab's colony, **Publish to** `/mnt/isilon/Data/ReachingData/SoftMouse`
-and **Only if mounted** `/mnt/isilon`. The password stored by the old publisher is
-found, so the password prompt can be left empty. Until this step is done, the
+The username is the short SoftMouse login, `benjamin.g.reynolds`, not the email:
+that is the account the old publisher stored the password under, so the password
+prompt can then be left empty. Choose the lab's colony. For the two columns, accept
+**Physical tag** = `Physical Tag` and **RFID** = `Plate ID` unless the export uses
+other names; every other column is kept in the metadata without being asked.
+**Publish to** `/mnt/isilon/Data/ReachingData/SoftMouse` and **Only if mounted**
+`/mnt/isilon` are paths, not yes/no answers. Until this step is done, the
 nightly run stops with "This computer reads a shared publication, so it has nothing
 to publish". The app itself keeps reading the existing publication.
 
