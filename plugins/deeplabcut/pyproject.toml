@@ -33,7 +33,7 @@ deeplabcut = "autotrainer.pose_plugins.deeplabcut.plugin:DLC_PLUGIN"
 # This extra and the torch extra of auto-trainer-inference are installed
 # together by tools/install/reachaq-linux-install.sh, which is the supported
 # way to build an environment. Three conditions make that work, each found on
-# christielab10 on 2026-09-24:
+# the reference rig on 2026-09-24:
 #   - TensorFlow's CUDA 11.8 / cuDNN 8.6 go in a directory of their own, not
 #     site-packages/nvidia. The two frameworks' nvidia-* wheels install into
 #     the same directory and the later one overwrote the earlier: TensorFlow
@@ -47,14 +47,10 @@ deeplabcut = "autotrainer.pose_plugins.deeplabcut.plugin:DLC_PLUGIN"
 #     and TensorFlow 2.12.1 ran GPU convolutions and a DeepLabCut model with
 #     numpy 1.26.4 and typing-extensions 4.16.
 tensorflow = [
-    'tensorflow >= 2.12, < 2.13 ; platform_machine != "aarch64"',
+    'tensorflow >= 2.12, < 2.13',
     # Capped below 2.13 deliberately: 2.13 pairs with a keras that moved
     # legacy_tf_layers, which breaks tf_slim's batch_norm and therefore every
     # DeepLabCut model load ("No module named 'keras.legacy_tf_layers'").
-    'tensorflow == 2.12.0+nv23.06 ; platform_machine == "aarch64"',
-    # aarch64 (Jetson) needs NVIDIA's index: a pip.conf extra-index-url or
-    # PIP_EXTRA_INDEX_URL. Retained rather than removed; dropping Jetson
-    # support is a separate scope decision.
 
     'tensorpack >= 0.11, < 1',
     'tf-slim >= 1.1, < 2',
