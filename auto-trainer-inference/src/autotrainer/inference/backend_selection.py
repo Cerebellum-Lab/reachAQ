@@ -116,12 +116,6 @@ def _unresolved_runtime(environ: typing.Mapping[str, str]) -> str:
     return TORCH_BACKEND
 
 
-def is_yolo_model(model_path: typing.Optional[str]) -> bool:
-    """Whether this location is a YOLO model directory, by its sidecar."""
-    from .yolo.plugin import YOLO_PLUGIN
-    return YOLO_PLUGIN.claims(model_path or "")
-
-
 def is_keypoint_model(model_path: typing.Optional[str]) -> bool:
     """Whether this location is a keypoint model directory, by its sidecar."""
     return pose_plugins.KEYPOINT_PLUGIN.claims(model_path or "")

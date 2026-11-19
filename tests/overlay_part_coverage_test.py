@@ -20,13 +20,14 @@ from autotrainer.core.pose_elements import SceneElement
 from autotrainer.inference import pose_plugins
 from autotrainer.inference.backend_selection import (
     TENSORFLOW_BACKEND,
-    TORCH_BACKEND,
     confidence_threshold,
-    selected_backend,
 )
-from autotrainer.inference.yolo.plugin import YOLO_CONFIDENCE_THRESHOLD
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+# A gate below the TensorFlow default; the YOLO plugin's own measured value is
+# checked in plugins/yolo/tests.
+LIVE_MODEL_GATE = 0.1
 
 # What the live model emits, from its sidecar.
 MODEL_PARTS = (
@@ -153,38 +154,6 @@ def engines(monkeypatch):
     monkeypatch.setattr(pose_plugins, "_installed", lambda module: True)
 
 
-def test_a_yolo_model_is_gated_on_its_own_measured_scale(tmp_path, engines):
-    """Measured at 0.10: 99.1% coverage, 2.04 px median on 33 held-out frames.
-
-    The backend default of 0.6 costs 15 points of coverage and takes both
-    tongue points to zero; TensorFlow's 0.9 takes Pellet to 8%.
-    """
-    model = tmp_path / "N_full_p36"
-    model.mkdir()
-    (model / "yolo_pose.yaml").write_text("bodyparts: [Pellet]\n")
-
-    assert selected_backend(model_path=str(model)) == TORCH_BACKEND
-    assert confidence_threshold(
-        selected_backend(model_path=str(model)),
-        model_path=str(model),
-    ) == pytest.approx(YOLO_CONFIDENCE_THRESHOLD)
-
-
-def test_a_yolo_model_is_not_gated_on_the_tensorflow_scale(tmp_path, engines):
-    """The live bug: the backend was picked without looking at the model."""
-    model = tmp_path / "N_full_p36"
-    model.mkdir()
-    (model / "yolo_pose.yaml").write_text("bodyparts: [Pellet]\n")
-
-    gate = confidence_threshold(
-        selected_backend(model_path=str(model)),
-        model_path=str(model),
-    )
-    # Pellet's highest confidence over 600 demo frames was 0.862, so anything
-    # at or above that gate hides it on every single frame.
-    assert gate < 0.862
-
-
 def test_a_deeplabcut_project_keeps_its_own_threshold(tmp_path, engines):
     """The YOLO rule must not capture DeepLabCut projects."""
     project = tmp_path / "dlc"
@@ -210,10 +179,10 @@ def test_the_gate_can_be_reapplied_once_the_model_is_known():
     algorithm = PoseAlgorithm()
     assert algorithm._plot_threshold == pytest.approx(0.9)
 
-    algorithm.set_confidence_threshold(YOLO_CONFIDENCE_THRESHOLD)
+    algorithm.set_confidence_threshold(LIVE_MODEL_GATE)
 
-    assert algorithm._plot_threshold == pytest.approx(YOLO_CONFIDENCE_THRESHOLD)
-    assert algorithm._present_threshold == pytest.approx(YOLO_CONFIDENCE_THRESHOLD)
+    assert algorithm._plot_threshold == pytest.approx(LIVE_MODEL_GATE)
+    assert algorithm._present_threshold == pytest.approx(LIVE_MODEL_GATE)
 
 
 def test_regating_is_idempotent():

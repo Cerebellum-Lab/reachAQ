@@ -22,11 +22,6 @@ from autotrainer.inference.pose_plugins import (
     resolve,
 )
 
-# YOLO is still in core, registered after the entry points. DeepLabCut is not:
-# it is the auto-trainer-pose-deeplabcut distribution, tested in its plugin.
-IN_TREE = ["yolo"]
-
-
 class _FakeEntryPoint:
     def __init__(self, name, loaded=None, error=None):
         self.name = name
@@ -58,18 +53,18 @@ def entry_points(monkeypatch):
 def test_keypoint_plugin_is_always_first(entry_points):
     entry_points.append(_FakeEntryPoint("zeta", _plugin("zeta")))
     entry_points.append(_FakeEntryPoint("alpha", _plugin("alpha")))
-    assert [p.name for p in discover_plugins()] == ["keypoint", "alpha", "zeta", *IN_TREE]
+    assert [p.name for p in discover_plugins()] == ["keypoint", "alpha", "zeta"]
 
 
 def test_a_plugin_that_raises_on_load_is_skipped_and_reported(entry_points):
     entry_points.append(_FakeEntryPoint("bad", error=ImportError("boom")))
-    assert [p.name for p in discover_plugins()] == ["keypoint", *IN_TREE]
+    assert [p.name for p in discover_plugins()] == ["keypoint"]
     assert broken_plugins() == (("bad", "ImportError: boom"),)
 
 
 def test_a_plugin_with_another_api_version_is_skipped(entry_points):
     entry_points.append(_FakeEntryPoint("future", _plugin("future", api_version=2)))
-    assert [p.name for p in discover_plugins()] == ["keypoint", *IN_TREE]
+    assert [p.name for p in discover_plugins()] == ["keypoint"]
     ((name, reason),) = broken_plugins()
     assert name == "future"
     assert "api_version 2" in reason
@@ -77,7 +72,7 @@ def test_a_plugin_with_another_api_version_is_skipped(entry_points):
 
 def test_an_entry_point_that_is_not_a_plugin_is_reported(entry_points):
     entry_points.append(_FakeEntryPoint("odd", object()))
-    assert [p.name for p in discover_plugins()] == ["keypoint", *IN_TREE]
+    assert [p.name for p in discover_plugins()] == ["keypoint"]
     assert [name for name, _ in broken_plugins()] == ["odd"]
 
 
@@ -134,7 +129,7 @@ def test_an_entry_point_reusing_a_plugin_name_is_skipped_and_reported(entry_poin
     entry_points.append(_FakeEntryPoint("dup-a", first))
     entry_points.append(_FakeEntryPoint("impostor", _plugin("keypoint")))
     found = discover_plugins()
-    assert [p.name for p in found] == ["keypoint", "dup", *IN_TREE]
+    assert [p.name for p in found] == ["keypoint", "dup"]
     assert found[0] is KEYPOINT_PLUGIN
     assert found[1] is first
     assert sorted(name for name, _ in broken_plugins()) == ["dup-b", "impostor"]
@@ -147,20 +142,10 @@ def test_a_failing_entry_point_lookup_keeps_the_built_ins(monkeypatch):
     monkeypatch.setattr(pose_plugins, "_entry_points", explode)
     reset_discovery()
     try:
-        assert [p.name for p in discover_plugins()] == ["keypoint", *IN_TREE]
+        assert [p.name for p in discover_plugins()] == ["keypoint"]
         assert any("corrupt metadata" in reason for _, reason in broken_plugins())
     finally:
         reset_discovery()
-
-
-def test_an_entry_point_replaces_the_in_tree_plugin_of_its_name(entry_points):
-    """Once a plugin distribution is installed, it wins over the copy in core."""
-    external = _plugin("yolo")
-    entry_points.append(_FakeEntryPoint("yolo", external))
-    found = discover_plugins()
-    assert [p.name for p in found] == ["keypoint", "yolo"]
-    assert found[1] is external
-    assert broken_plugins() == ()
 
 
 # --- routing ------------------------------------------------------------------
@@ -184,9 +169,7 @@ def test_two_claiming_plugins_is_ambiguous(tmp_path, entry_points):
 
 
 def test_a_known_layout_without_its_plugin_names_the_install_command(
-        tmp_path, entry_points, monkeypatch):
-    monkeypatch.setattr(pose_plugins, "_in_tree_plugins", lambda: ())
-    reset_discovery()
+        tmp_path, entry_points):
     (tmp_path / "yolo_pose.yaml").write_text("bodyparts: [a]\n")
     with pytest.raises(PoseBackendNotInstalled) as raised:
         resolve(str(tmp_path))
@@ -195,6 +178,15 @@ def test_a_known_layout_without_its_plugin_names_the_install_command(
     assert "reachaq-plugin-install.sh yolo" in message
     assert raised.value.distribution == "auto-trainer-pose-yolo"
     assert raised.value.model_path == str(tmp_path)
+
+
+def test_a_yolo_model_without_its_plugin_points_at_the_keypoint_trainer(
+        tmp_path, entry_points):
+    """The AGPL plugin is optional; the way off it has to be in the message."""
+    (tmp_path / "yolo_pose.yaml").write_text("bodyparts: [a]\n")
+    with pytest.raises(PoseBackendNotInstalled) as raised:
+        resolve(str(tmp_path))
+    assert "autotrainer.inference.keypoint.train" in str(raised.value)
 
 
 def test_a_claiming_plugin_with_a_missing_engine_names_it(tmp_path, entry_points):
@@ -221,15 +213,20 @@ def test_deeplabcut_is_no_longer_shipped_in_core():
     of another checkout can still answer; a stale __pycache__ left by a pull
     does not count.
     """
-    assert "deeplabcut" not in [p.name for p in pose_plugins._in_tree_plugins()]
     inference_package = pathlib.Path(pose_plugins.__file__).resolve().parent
     assert not list((inference_package / "dlc").glob("*.py"))
 
 
+def test_yolo_is_no_longer_shipped_in_core():
+    """It left with its AGPL distribution; core keeps only the layout to name it."""
+    assert not hasattr(pose_plugins, "_in_tree_plugins")
+    inference_package = pathlib.Path(pose_plugins.__file__).resolve().parent
+    assert not list((inference_package / "yolo").glob("*.py"))
+
+
 def test_a_deeplabcut_project_without_its_plugin_names_the_distribution(
         tmp_path, monkeypatch):
-    """Real discovery and the real in-tree list, so nothing core still ships
-    may claim the project.
+    """Real discovery, so nothing core still ships may claim the project.
 
     The one thing taken away is the plugin's own entry point, so the test
     means the same on a machine that has auto-trainer-pose-deeplabcut
@@ -257,5 +254,5 @@ def test_an_unrecognised_directory_lists_the_installed_plugins(tmp_path, entry_p
         resolve(str(tmp_path))
     assert raised.value.engine is None
     message = str(raised.value)
-    for name in ("keypoint", *IN_TREE):
+    for name in ("keypoint",):
         assert name in message

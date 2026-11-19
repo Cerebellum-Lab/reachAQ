@@ -22,6 +22,8 @@ dependencies = [
 
     # DeepLabCut is not here: it ships in the auto-trainer-pose-deeplabcut
     # plugin (plugins/deeplabcut), with its TensorFlow extra.
+    # Nor is YOLO (an AGPL-3.0 engine): it ships in the
+    # auto-trainer-pose-yolo plugin (plugins/yolo).
     # The live keypoint backend needs nothing here: its framework comes from
     # the extra below, and its trainer reads frames with auto-trainer-video's
     # opencv-python.
@@ -32,13 +34,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# YOLO-pose (Ultralytics) models. Not installed by reachAQ: ultralytics is
-# AGPL-3.0, and the live model is the keypoint backend. Kept so a site that
-# installs it themselves can still run an existing YOLO model; without it a
-# YOLO model directory is refused at pre-validation with a message saying so.
-yolo = [
-    'ultralytics >= 8.4, < 9',
-]
 # Installed alongside the DeepLabCut plugin's tensorflow extra by
 # tools/install/reachaq-linux-install.sh; the conditions that makes safe are
 # recorded beside that extra in plugins/deeplabcut/pyproject.toml.

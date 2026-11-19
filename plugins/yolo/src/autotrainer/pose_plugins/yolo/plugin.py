@@ -1,10 +1,11 @@
 """YOLO-pose as a pose backend plugin.
 
-Still shipped inside core; it moves to its own distribution with the rest of
-this package. YOLO-pose runs on the AGPL ultralytics package, which is not a
-dependency of core, so this plugin is listed on every rig but is only usable
-where ultralytics is installed. Nothing here imports ultralytics or torch at
-module scope.
+Shipped as the auto-trainer-pose-yolo distribution and found through its entry
+point in the autotrainer.pose_backends group. YOLO-pose runs on the AGPL
+ultralytics package, so the distribution is AGPL-3.0 as well and is never part
+of a reachAQ install unless a site asks for it. Nothing here imports
+ultralytics or torch at module scope: discovery imports this module on every
+rig that has the distribution, and only build() may pay for an engine.
 """
 
 import os
@@ -15,7 +16,7 @@ from autotrainer.inference.backend_selection import TORCH_BACKEND
 from autotrainer.inference.pose_model import PoseModel
 
 # YOLO-pose reports keypoint confidence on its own scale again, so neither
-# the DeepLabCut backbones above nor the torch backend default describes it.
+# the DeepLabCut backbones nor the torch backend default describes it.
 # Measured the same way: every labelled keypoint of the 33 held-out frames of
 # the merged project (DeepLabCut shuffle 30), scored against its label.
 #

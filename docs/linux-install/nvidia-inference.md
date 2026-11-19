@@ -73,8 +73,9 @@ trains in about 3.5 minutes (300 epochs) on an RTX 5060 Ti.
 
 reachAQ no longer installs `ultralytics`: it is AGPL-3.0. A YOLO model
 directory (`yolo_pose.yaml`) is refused at start-up with a message saying so.
-Retrain it as a keypoint model, or install the optional extra yourself
-(`pip install "auto-trainer-inference[yolo]"`) to keep running it.
+Retrain it as a keypoint model, or install the optional AGPL plugin
+(`pip install -e plugins/yolo`, distribution `auto-trainer-pose-yolo`) to keep
+running it.
 
 The PyTorch build covers compute capability 7.5 through 12.0: T1000, RTX A2000
 and RTX 5060 Ti.

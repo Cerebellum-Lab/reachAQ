@@ -11,9 +11,8 @@ build() imports the engine.
 
 The keypoint backend is built in and always listed first, so a rig with no
 plugin distribution installed still has one engine. DeepLabCut ships as the
-auto-trainer-pose-deeplabcut distribution. YOLO is still in core for now,
-wrapped as an in-tree plugin and listed after the entry-point ones; an installed
-distribution of the same name replaces it.
+auto-trainer-pose-deeplabcut distribution and YOLO as auto-trainer-pose-yolo;
+each is found only through its entry point.
 
 A plugin that fails to load must not take live inference down with it: a
 half-removed distribution would otherwise stop every rig that merely has it
@@ -156,17 +155,6 @@ def _entry_points() -> typing.Iterable[typing.Any]:
     return importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)
 
 
-def _in_tree_plugins() -> typing.Tuple[PoseBackendPlugin, ...]:
-    """The engines still shipped inside core, until each moves to its own
-    distribution.
-
-    Imported here rather than at module scope so that importing this module
-    stays cheap; the plugin module does not import its engine.
-    """
-    from .yolo.plugin import YOLO_PLUGIN
-    return (YOLO_PLUGIN,)
-
-
 def _load(entry_point: typing.Any) -> PoseBackendPlugin:
     """Resolve one entry point to a plugin instance, or raise with the reason.
 
@@ -192,8 +180,7 @@ def _skip(entry_point_name: str, reason: str) -> None:
 
 @functools.cache
 def discover_plugins() -> typing.Tuple[PoseBackendPlugin, ...]:
-    """The usable plugins: keypoint first, then the installed ones by name,
-    then the in-tree ones no installed plugin replaces."""
+    """The usable plugins: keypoint first, then the installed ones by name."""
     _broken.clear()
     try:
         # Sorted so that which of two same-named plugins wins does not depend
@@ -220,9 +207,7 @@ def discover_plugins() -> typing.Tuple[PoseBackendPlugin, ...]:
         else:
             found[plugin.name] = plugin
 
-    in_tree = [plugin for plugin in _in_tree_plugins() if plugin.name not in found]
-    return (KEYPOINT_PLUGIN, *sorted(found.values(), key=lambda plugin: plugin.name),
-            *in_tree)
+    return (KEYPOINT_PLUGIN, *sorted(found.values(), key=lambda plugin: plugin.name))
 
 
 def broken_plugins() -> typing.Tuple[typing.Tuple[str, str], ...]:
@@ -254,13 +239,15 @@ class PoseBackendNotInstalled(ImportError):
                  distribution: typing.Optional[str] = None,
                  missing: typing.Sequence[str] = (), *,
                  plugin_name: typing.Optional[str] = None,
-                 installed: typing.Sequence[str] = ()):
+                 installed: typing.Sequence[str] = (),
+                 hint: str = ""):
         self.model_path = model_path
         self.engine = engine
         self.distribution = distribution
         self.missing = tuple(missing)
         self.plugin_name = plugin_name
         self.installed = tuple(installed)
+        self.hint = hint
         super().__init__(self._message())
 
     def _message(self) -> str:
@@ -271,6 +258,8 @@ class PoseBackendNotInstalled(ImportError):
                     f"with {INSTALL_COMMAND} <name>.")
         install = (f"Install it with {INSTALL_COMMAND} {self.plugin_name} "
                    f"(distribution {self.distribution}).")
+        if self.hint:
+            install = f"{install} {self.hint}"
         if self.missing:
             return (f"{self.model_path!r} is a {self.engine} model, and the "
                     f"{self.engine} pose backend cannot run here: "
@@ -296,6 +285,9 @@ class KnownLayout(typing.NamedTuple):
     plugin: str
     distribution: str
     matches: typing.Callable[[str], bool]
+    # Another way out, appended to the install instruction, for a layout with
+    # a supported alternative.
+    hint: str = ""
 
 
 def _is_yolo_layout(model_path: str) -> bool:
@@ -308,20 +300,37 @@ def _is_deeplabcut_layout(model_path: str) -> bool:
                     for path in glob.glob(os.path.join(model_path, "dlc-models*"))))
 
 
+# ultralytics is AGPL-3.0, so the plugin is optional and the supported way
+# off it is to retrain the model as a keypoint model.
+YOLO_HINT = ("Alternatively, retrain the model as a keypoint model with "
+             "python -m autotrainer.inference.keypoint.train.")
+
+
 # Used only to word the error when nothing installed claims a model, so an
 # operator is told which plugin to install rather than that the model is bad.
 KNOWN_LAYOUTS: typing.Tuple[KnownLayout, ...] = (
-    KnownLayout("YOLO", "yolo", "auto-trainer-pose-yolo", _is_yolo_layout),
+    KnownLayout("YOLO", "yolo", "auto-trainer-pose-yolo", _is_yolo_layout,
+                YOLO_HINT),
     KnownLayout("DeepLabCut", "deeplabcut", "auto-trainer-pose-deeplabcut",
                 _is_deeplabcut_layout),
 )
 
 
-def _engine_label(plugin_name: str) -> str:
+def _layout_for(plugin_name: str) -> typing.Optional[KnownLayout]:
     for layout in KNOWN_LAYOUTS:
         if layout.plugin == plugin_name:
-            return layout.engine
-    return plugin_name
+            return layout
+    return None
+
+
+def _hint_for(plugin_name: str) -> str:
+    layout = _layout_for(plugin_name)
+    return layout.hint if layout else ""
+
+
+def _engine_label(plugin_name: str) -> str:
+    layout = _layout_for(plugin_name)
+    return layout.engine if layout else plugin_name
 
 
 def _claims(plugin: PoseBackendPlugin, model_path: str) -> bool:
@@ -356,13 +365,15 @@ def resolve(model_path: typing.Optional[str]) -> PoseBackendPlugin:
         if missing:
             raise PoseBackendNotInstalled(model_path, _engine_label(plugin.name),
                                           plugin.distribution, missing,
-                                          plugin_name=plugin.name)
+                                          plugin_name=plugin.name,
+                                          hint=_hint_for(plugin.name))
         return plugin
     if model_path:
         for layout in KNOWN_LAYOUTS:
             if layout.matches(model_path):
                 raise PoseBackendNotInstalled(model_path, layout.engine,
                                               layout.distribution,
-                                              plugin_name=layout.plugin)
+                                              plugin_name=layout.plugin,
+                                              hint=layout.hint)
     raise PoseBackendNotInstalled(model_path, None,
                                   installed=[plugin.name for plugin in plugins])

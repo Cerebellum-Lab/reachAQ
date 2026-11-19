@@ -73,10 +73,12 @@ def test_both_extras_are_declared():
         _extras_block(text, "tensorflow")
 
 
-def test_yolo_runtime_is_only_an_optional_extra():
-    """ultralytics is AGPL-3.0: it may be offered as an extra, never required."""
-    assert "ultralytics" not in _dependencies_block(_text())
-    assert "ultralytics" in _extras_block(_text(), "yolo")
+def test_core_has_no_yolo_extra():
+    """ultralytics is AGPL-3.0: it lives in the auto-trainer-pose-yolo plugin,
+    not in a core extra."""
+    assert "ultralytics" not in _text()
+    with pytest.raises(AssertionError, match="no 'yolo' extra"):
+        _extras_block(_text(), "yolo")
 
 
 def test_torch_extra_is_capped_at_the_build_shown_to_share_a_process():

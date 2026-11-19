@@ -15,8 +15,9 @@ Live pose inference requires GPU acceleration on a CUDA-capable NVIDIA GPU. It
 intentionally refuses CPU fallback because the live acquisition rate cannot be
 supported reliably by CPU inference.
 
-The installed environment carries both engines: PyTorch runs YOLO models and
-DeepLabCut PyTorch models, TensorFlow runs DeepLabCut TensorFlow models, and
+The installed environment carries both engines: PyTorch runs the keypoint and
+DeepLabCut PyTorch models (and YOLO ones, with the optional plugin), TensorFlow
+runs DeepLabCut TensorFlow models, and
 `REACHAQ_POSE_BACKEND` picks the engine for a DeepLabCut model
 (`backend_selection.py`). Why the two can share an environment, and what that
 needs, is recorded beside the extras in `pyproject.toml`.

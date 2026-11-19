@@ -72,33 +72,6 @@ def test_backend_names_match_the_gpu_runtime_probe_names(backend, monkeypatch):
         gpu_runtime.detect_gpu_runtime(required_backend=backend + "-nonexistent")
 
 
-def test_a_yolo_model_selects_torch_whatever_is_installed(monkeypatch, tmp_path):
-    """YOLO weights are torch and cannot be anything else.
-
-    The model is chosen in the configuration while the backend can only be
-    chosen through the environment, so without this a YOLO model on a rig with
-    TensorFlow installed probes the wrong runtime.
-    """
-    monkeypatch.delenv(POSE_BACKEND_ENV_VAR, raising=False)
-    _only(monkeypatch, "ultralytics", "tensorflow", "torch")
-    (tmp_path / "yolo_pose.yaml").write_text("bodyparts: [a]")
-    assert backend_selection.selected_backend(
-        model_path=str(tmp_path)) == TORCH_BACKEND
-
-
-def test_a_yolo_model_keeps_torch_over_an_explicit_variable(monkeypatch, tmp_path):
-    """The variable chooses DeepLabCut's engine; YOLO weights have only one.
-
-    This used to answer TensorFlow, and the GPU probe then checked a runtime
-    the model could never run on.
-    """
-    monkeypatch.setenv(POSE_BACKEND_ENV_VAR, "tensorflow")
-    _only(monkeypatch, "ultralytics", "tensorflow", "torch")
-    (tmp_path / "yolo_pose.yaml").write_text("bodyparts: [a]")
-    assert backend_selection.selected_backend(
-        model_path=str(tmp_path)) == TORCH_BACKEND
-
-
 def test_with_nothing_resolvable_or_installed_the_answer_is_torch(monkeypatch, tmp_path):
     """No model, or one no installed plugin can run, and no TensorFlow.
 
@@ -212,9 +185,6 @@ def test_available_backends_names_each_usable_plugin_with_its_runtimes(monkeypat
     monkeypatch.setattr(pose_plugins, "_entry_points", lambda: [])
     pose_plugins.reset_discovery()
     try:
-        _only(monkeypatch, "ultralytics", "torch")
-        assert backend_selection.available_backends() == (
-            "keypoint (torch)", "yolo (torch)")
         _only(monkeypatch, "torch")
         assert backend_selection.available_backends() == ("keypoint (torch)",)
     finally:

@@ -134,7 +134,7 @@ def test_an_unset_variable_uses_torch_where_tensorflow_is_absent(monkeypatch, pr
     assert backend_selection.selected_backend(model_path=project) == TORCH_BACKEND
 
 
-def test_a_deeplabcut_project_is_not_mistaken_for_yolo(monkeypatch, project):
+def test_a_deeplabcut_project_keeps_its_own_engine_choice(monkeypatch, project):
     monkeypatch.delenv(POSE_BACKEND_ENV_VAR, raising=False)
     assert backend_selection.selected_backend(
         model_path=project) == TENSORFLOW_BACKEND
@@ -148,15 +148,36 @@ def test_a_typo_falls_through_to_detection_rather_than_a_blind_default(monkeypat
 
 
 def test_an_ambiguous_model_selects_a_runtime_but_fails_pre_validation(monkeypatch, tmp_path):
-    _only(monkeypatch, "deeplabcut", "ultralytics", "tensorflow", "torch")
+    """A second plugin claiming the same directory, here a fake one, so the test
+    does not depend on any other engine's distribution being installed."""
+    class _Claimant(pose_plugins.PoseBackendPlugin):
+        name = "claimant"
+        distribution = "dist-claimant"
+
+        def claims(self, model_path):
+            return True
+
+    class _Point:
+        name = "claimant"
+
+        def load(self):
+            return _Claimant()
+
+    installed = list(pose_plugins._entry_points())
+    monkeypatch.setattr(pose_plugins, "_entry_points",
+                        lambda: [*installed, _Point()])
+    pose_plugins.reset_discovery()
+    _only(monkeypatch, "deeplabcut", "tensorflow", "torch")
     (tmp_path / "config.yaml").write_text("bodyparts: [a]")
-    (tmp_path / "yolo_pose.yaml").write_text("bodyparts: [a]")
-    assert backend_selection.selected_backend(
-        {}, model_path=str(tmp_path)) == TENSORFLOW_BACKEND
-    with pytest.raises(AmbiguousPoseModel, match="deeplabcut"):
-        pre_validate_model(str(tmp_path))
-    with pytest.raises(AmbiguousPoseModel, match="yolo"):
-        build_pose_model(str(tmp_path))
+    try:
+        assert backend_selection.selected_backend(
+            {}, model_path=str(tmp_path)) == TENSORFLOW_BACKEND
+        with pytest.raises(AmbiguousPoseModel, match="deeplabcut"):
+            pre_validate_model(str(tmp_path))
+        with pytest.raises(AmbiguousPoseModel, match="claimant"):
+            build_pose_model(str(tmp_path))
+    finally:
+        pose_plugins.reset_discovery()
 
 
 def test_a_model_without_its_engine_fails_where_the_operator_sees_it(monkeypatch, tmp_path):
@@ -171,11 +192,9 @@ def test_a_model_without_its_engine_fails_where_the_operator_sees_it(monkeypatch
 def test_available_backends_names_each_usable_plugin_with_its_runtimes(monkeypatch):
     """The preflight message: what this rig could run, and on which runtime."""
     _only(monkeypatch, "deeplabcut", "tensorflow", "torch")
-    assert backend_selection.available_backends() == (
-        "keypoint (torch)", "deeplabcut (tensorflow, torch)")
-    _only(monkeypatch, "deeplabcut", "ultralytics", "torch")
-    assert backend_selection.available_backends() == (
-        "keypoint (torch)", "deeplabcut (torch)", "yolo (torch)")
+    assert "deeplabcut (tensorflow, torch)" in backend_selection.available_backends()
+    _only(monkeypatch, "deeplabcut", "torch")
+    assert "deeplabcut (torch)" in backend_selection.available_backends()
 
 
 def test_both_backends_satisfy_the_pose_model_contract(project):
