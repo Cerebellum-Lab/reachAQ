@@ -196,6 +196,23 @@ file (`python -m reachAQ.app --preferences-file "$SCRATCH/prefs.ini"`), type
 opens for FAKE-003. Animal JSONs it creates also go under `$SCRATCH/config`.
 Delete `$SCRATCH` afterwards.
 
+The same animals exist for the other kinds, built from the CSV by
+`tests/fixtures/make_fake_mice.py`:
+
+- **Spreadsheet (XLSX):** `tests/fixtures/fake-mice.xlsx`, worksheet `mice`
+  (identifiers are text cells). Worksheet `numeric-id` stores FAKE-001's RFID
+  as a number, and its refresh is refused with "stored as a numeric cell".
+- **Database:** `tests/fixtures/fake-mice.sqlite`, query
+  `SELECT * FROM mice ORDER BY physical_tag`. The columns are snake_case
+  (`physical_tag`, `name`, `rfid`), and setup suggests them.
+- **Shared publication:** set up the CSV with **Publish to** a scratch
+  directory and refresh. Then, under a second scratch preferences file, set up
+  **Shared publication** with `spreadsheet-AnimalList-current.manifest.json`
+  from that directory.
+
+Each one imports the same 7 animals, 4 with an RFID, and reports `DUP-0006`.
+`tests/animal_source_kinds_fake_mice_test.py` runs all of them.
+
 ## Status and errors
 
 **Preferences → Animal metadata** shows the source, the last refresh's
