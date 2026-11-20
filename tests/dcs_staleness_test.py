@@ -34,7 +34,7 @@ from reload_calib_multires_test import (
     BASE,
     BASE_PARAMS,
     _legacy_copy_without_offsets,
-    _save_left_camera_params,
+    _save_live_pair_params,
     _write_multires,
 )
 from tools.acquisition.model.app_model import AppModel
@@ -110,7 +110,7 @@ def stale(app_model, dcs_path, user_pref, system_config, trainer_config_dir):
     assert app_model.dcs_state is DcsState.MISSING, "nothing is loaded before a configuration load"
     _config().to_file(dcs_path)
     # The left camera at the base geometry, so the new calibration's preset loads without error.
-    _save_left_camera_params(system_config, trainer_config_dir, **BASE_PARAMS)
+    _save_live_pair_params(system_config, trainer_config_dir, **BASE_PARAMS)
     assert app_model.load_configuration() is True
     assert app_model.dcs_state is DcsState.VALID
     assert app_model.behavior.algorithm.diamond_triangle_config == _config()
@@ -158,13 +158,14 @@ def test_an_install_whose_reload_fails_turns_live_3d_off_and_blocks_recording(
     legacy = _legacy_copy_without_offsets(calib_dir, tmp_path, location / DEFAULT_3D_CALIB_DIR_NAME)
     app_model.reload_calib(legacy)
     _config().to_file(dcs_path)
-    _save_left_camera_params(system_config, trainer_config_dir, **BASE_PARAMS)
+    _save_live_pair_params(system_config, trainer_config_dir, **BASE_PARAMS)
     assert app_model.load_configuration() is True
     assert app_model.dcs_state is DcsState.VALID and app_model._pose_algorithm.stereo_params is not None
 
     new = _write_multires(tmp_path / "session" / f"{DEFAULT_3D_CALIB_DIR_NAME}.new")
-    installed, backup = install_calibration(new, location, now=datetime.now())
-    assert installed == legacy and backup is not None
+    installed = install_calibration(new, location, now=datetime.now())
+    # A library entry; the legacy folder from before the library stays where it was.
+    assert installed.parent == location / "calibrations" and legacy.is_dir()
     # An I/O fault straight after the copy.
     (installed / "presets" / BASE.name / "camera_matrix" / "stereo_params.pickle").unlink()
     with mock.patch.object(app_model, "on_error"):
@@ -202,7 +203,7 @@ def test_an_install_whose_reload_fails_turns_live_3d_off_and_blocks_recording(
 def test_the_record_button_is_told_when_dcs_goes_stale(app_model, dcs_path, user_pref, system_config,
                                                        trainer_config_dir):
     _config().to_file(dcs_path)
-    _save_left_camera_params(system_config, trainer_config_dir, **BASE_PARAMS)
+    _save_live_pair_params(system_config, trainer_config_dir, **BASE_PARAMS)
     assert app_model.load_configuration() is True
     published = []
     app_model.property_changed += lambda name, value, _: (
@@ -268,7 +269,7 @@ def test_a_configuration_load_holds_a_stale_dcs_before_positioning_the_animal(
     # The app restarts after a new 3D calibration went live: its first configuration load
     # reads the old DCS file, and then selects and positions the operator's last animal.
     folder = _write_multires(Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME)
-    _save_left_camera_params(system_config, trainer_config_dir, **BASE_PARAMS)
+    _save_live_pair_params(system_config, trainer_config_dir, **BASE_PARAMS)
     app_model.reload_calib(folder)
     assert app_model.dcs_state is DcsState.MISSING, "no DCS loaded yet"
     _config().to_file(dcs_path)
@@ -349,7 +350,7 @@ def test_the_dcs_calibration_writes_into_the_active_calibration_folder(
         app_model, dcs_path, user_pref, system_config, trainer_config_dir, tmp_path, monkeypatch):
     # The active calibration is not the default folder (the app was given another one).
     folder = _write_multires(tmp_path / "elsewhere" / DEFAULT_3D_CALIB_DIR_NAME)
-    _save_left_camera_params(system_config, trainer_config_dir, **BASE_PARAMS)
+    _save_live_pair_params(system_config, trainer_config_dir, **BASE_PARAMS)
     _config().to_file(dcs_path)
     assert app_model.load_configuration() is True
     with mock.patch.object(app_model, "on_error"):
@@ -449,7 +450,7 @@ def test_capture_start_holds_a_dcs_file_gone_stale_before_positioning_the_animal
     # The DCS file changed on disk after the configuration load (an older copy restored):
     # Run re-reads it, and must hold it off before it positions the selected animal.
     folder = _write_multires(Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME)
-    _save_left_camera_params(system_config, trainer_config_dir, **BASE_PARAMS)
+    _save_live_pair_params(system_config, trainer_config_dir, **BASE_PARAMS)
     app_model.reload_calib(folder)
     _config(calibration_id=app_model.active_calibration_index.id).to_file(dcs_path)
     assert app_model.load_configuration() is True

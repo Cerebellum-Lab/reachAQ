@@ -185,8 +185,8 @@ def write_calibration(
     """Write the calibration into `folder`, which must not exist yet, and return its index.
 
     `preset_sets` are the sets to write (geometry.presets_for_cameras); a camera in a set
-    that the fit did not calibrate is dropped from it, and every set must give each
-    calibrated camera a geometry. Without them, each of `presets` is a set of its own,
+    that the fit did not calibrate is dropped from it, a set that then repeats an earlier
+    one's geometries is left out, and every set must give each calibrated camera a geometry. Without them, each of `presets` is a set of its own,
     named g.name, with every calibrated camera at g. `cameras` are the capture's cameras
     in capture order, and must include every calibrated one; each one's verdict comes from
     report.cameras. Without them the cameras are the fit's, with no serial or camera_id.
@@ -210,7 +210,14 @@ def write_calibration(
         lacking = [cam for cam in calibrated if cam not in preset_set.cameras]
         if lacking:
             raise ValueError(f"preset set {preset_set.name} has no geometry for {', '.join(lacking)}")
-        sets.append(PresetSet(preset_set.name, {cam: preset_set.cameras[cam] for cam in calibrated}))
+        kept = PresetSet(preset_set.name, {cam: preset_set.cameras[cam] for cam in calibrated})
+        # Without its uncalibrated cameras a set can equal an earlier one; the first is kept.
+        same = next((s for s in sets if dict(s.cameras) == dict(kept.cameras)), None)
+        if same is not None:
+            logger.info("preset set %s is the same as %s for the calibrated cameras; not written twice",
+                        kept.name, same.name)
+            continue
+        sets.append(kept)
     names = [s.name for s in sets]
     if not sets or len(set(names)) != len(names):
         raise ValueError(f"expected preset sets with distinct names, got {names}")

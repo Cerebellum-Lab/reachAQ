@@ -37,7 +37,7 @@ from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 
 from autotrainer.inference import InferenceStatus, PoseResponse
 from autotrainer.inference.analysis import IntersessionResponse
-from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME, make_cam_offsets_dict
+from autotrainer.inference.analysis.prepare_jetson_data import make_cam_offsets_dict
 from autotrainer.inference.multires_calibration.report import QualityReport
 from autotrainer.inference.multires_calibration.store import CalibrationIndex, calibration_created
 
@@ -744,7 +744,9 @@ class MainWindow(QMainWindow):
             y_off=cam_off.y,
             z_off=cam_off.z,
         )
-        cam_offsets_path = calib_dir.joinpath(DEFAULT_CAM_OFFSET_FILE_NAME)
+        # Beside a library entry, never inside it: an entry is not written to once in place.
+        cam_offsets_path = app_model.camera_offsets_path(calib_dir)
+        cam_offsets_path.parent.mkdir(parents=True, exist_ok=True)
         if cam_offsets_path.exists():
             now = datetime.now()
             backup_path = cam_offsets_path.parent.joinpath(f"{cam_offsets_path.name}_{now.strftime(DATE_TIME_FORMAT)}")
@@ -881,7 +883,8 @@ class MainWindow(QMainWindow):
         def handle_3d_calib():
             nonlocal error, result
             try:
-                result = make_3d_calib(self._app_model)
+                # Left and right for now; the calibration dialog's choice of cameras replaces them.
+                result = make_3d_calib(self._app_model, [self._app_model.left_camera, self._app_model.right_camera])
             except Exception as err:
                 logger.exception("3d-calib failed: %s", err)
                 error = err
@@ -1001,7 +1004,7 @@ class MainWindow(QMainWindow):
             report = dataclasses.replace(report, override=record)
             logger.warning("3D calibration %s: override recorded (install pending): %s", index.id, record)
         try:
-            installed, _ = install_calibration(
+            installed = install_calibration(
                 new_dir, Path(self._preferences.configuration_location), now=datetime.now(),
                 by=getpass.getuser(), override=record if override else None)
         except Exception:

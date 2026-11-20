@@ -8,6 +8,7 @@ loads as before. A missing camera_offsets.pkl, which a fresh calibration has unt
 DCS is redone, gives zero offsets instead of a crash.
 """
 
+import dataclasses
 import logging
 import pickle
 import shutil
@@ -26,11 +27,12 @@ from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.logging import unregister_fatal_exception_callback
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
 from autotrainer.inference.multires_calibration import store
-from autotrainer.inference.multires_calibration.fit import BoardSpec
+from autotrainer.inference.multires_calibration.fit import BoardSpec, CaptureCamera
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
-from autotrainer.inference.multires_calibration.report import QualityReport
+from autotrainer.inference.multires_calibration.report import CameraVerdict, QualityReport
+from autotrainer.inference.multires_calibration import library
 from multires_calibration_fakes import BASE, FIT
-from tools.acquisition.model.app_model import AppModel
+from tools.acquisition.model.app_model import AppModel, SetupDifference
 
 
 BASE_PARAMS = dict(hbin=4, vbin=4, width=256, height=256, offsetx=52, offsety=6)
@@ -63,16 +65,27 @@ def _legacy_copy_without_offsets(calib_dir: Path, tmp_path: Path, folder: Option
     return folder
 
 
-def _configure_left(app_model, **params):
-    app_model.left_camera.load_configuration(
-        CameraConfiguration(id=CameraId.Left, name="left", scheme="random", params=params))
+def _configure_live_pair(app_model, **params):
+    """Configure left and right at the same params: live 3D needs the pair at one geometry."""
+    for camera, camera_id in ((app_model.left_camera, CameraId.Left), (app_model.right_camera, CameraId.Right)):
+        camera.load_configuration(
+            CameraConfiguration(id=camera_id, name=str(camera_id), scheme="random", params=dict(params)))
 
 
-def _save_left_camera_params(system_config, trainer_config_dir, **params):
-    """Set the left camera's params in the configuration file load_configuration reads."""
-    left = next(camera for camera in system_config.cameras if camera.id == CameraId.Left)
-    left.params = {**left.params, **params}
+def _save_live_pair_params(system_config, trainer_config_dir, **params):
+    """Set the left and right cameras' params in the configuration file load_configuration reads."""
+    for camera in system_config.cameras:
+        if camera.id in (CameraId.Left, CameraId.Right):
+            camera.params = {**camera.params, **params}
     system_config.save_default(trainer_config_dir)
+
+
+def _entry_of(app_model, legacy_or_format2_folder: Path) -> Path:
+    """The library entry the app imported `legacy_or_format2_folder` as, which it then loads."""
+    root = library.library_root(Path(app_model._preferences.configuration_location))
+    entry = root / library.active_id(root)
+    assert entry.is_dir() and legacy_or_format2_folder.is_dir()
+    return entry
 
 
 def _calibration_errors(on_error):
@@ -100,7 +113,7 @@ def test_reload_selects_the_base_preset(app_model, tmp_path):
     offsets = {"x_off": 1.5, "y_off": -2.0, "z_off": 140.0}
     folder = _write_multires(tmp_path / DEFAULT_3D_CALIB_DIR_NAME, base, binnings=(1, 2, 4),
                              offsets=offsets)
-    _configure_left(app_model, hbin=4, vbin=4, width=256, height=256, offset_x=40, offset_y=10)
+    _configure_live_pair(app_model, hbin=4, vbin=4, width=256, height=256, offset_x=40, offset_y=10)
     with mock.patch.object(app_model, "on_error") as on_error:
         app_model.reload_calib(folder)
     on_error.assert_not_called()
@@ -123,18 +136,23 @@ def test_reload_selects_the_base_preset(app_model, tmp_path):
     _assert_live_matches_reference(algorithm)
 
 
-def test_the_default_folder_is_in_the_configuration_location(app_model, user_pref):
+def test_the_default_is_the_library_s_active_entry_imported_on_first_load(app_model, user_pref):
+    # A rig from before the library: its 4mm_6r_8c_4x folder is imported and made active.
     folder = _write_multires(Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME)
-    _configure_left(app_model, **BASE_PARAMS)
+    _configure_live_pair(app_model, **BASE_PARAMS)
     app_model.reload_calib(None)
-    assert app_model.active_calibration_dir == folder
+    entry = _entry_of(app_model, folder)
+    assert entry.name == store.load_index(folder).id
+    assert app_model.active_calibration_dir == entry
     assert app_model._pose_algorithm.frame_transform is not None
+    # The old folder is only read.
+    assert store.load_index(folder) == store.load_index(entry)
 
 
 def test_geometry_mismatch_disables_3d_with_message(app_model, tmp_path):
     folder = _write_multires(tmp_path / DEFAULT_3D_CALIB_DIR_NAME)
     # The operator moved the ROI: no preset of this calibration has these pixels.
-    _configure_left(app_model, **{**BASE_PARAMS, "offsetx": 0, "offsety": 0})
+    _configure_live_pair(app_model, **{**BASE_PARAMS, "offsetx": 0, "offsety": 0})
     with mock.patch.object(app_model, "on_error") as on_error:
         app_model.reload_calib(folder)
     on_error.assert_called_once()
@@ -159,7 +177,7 @@ def test_geometry_mismatch_disables_3d_with_message(app_model, tmp_path):
 
 def test_unequal_binning_disables_3d_with_message(app_model, tmp_path):
     folder = _write_multires(tmp_path / DEFAULT_3D_CALIB_DIR_NAME)
-    _configure_left(app_model, **{**BASE_PARAMS, "vbin": 2})
+    _configure_live_pair(app_model, **{**BASE_PARAMS, "vbin": 2})
     with mock.patch.object(app_model, "on_error") as on_error:
         app_model.reload_calib(folder)
     on_error.assert_called_once()
@@ -177,7 +195,7 @@ def test_a_configuration_load_reloads_with_the_configured_geometry(
     with mock.patch.object(app_model, "on_error"):
         app_model.reload_calib(folder)
     assert app_model._pose_algorithm.stereo_params is None
-    _save_left_camera_params(system_config, trainer_config_dir, hbin=4, vbin=4, width=256,
+    _save_live_pair_params(system_config, trainer_config_dir, hbin=4, vbin=4, width=256,
                              height=256, offsetx=40, offsety=10, fps=150)
     with mock.patch.object(app_model, "on_error") as on_error:
         assert app_model.load_configuration() is True
@@ -197,7 +215,7 @@ def test_a_configured_roi_with_no_preset_disables_3d_on_load(
     app_model.reload_calib(folder)
     assert app_model._pose_algorithm._live_3d_reason() is None, "SpinCam's defaults are the base"
     # The operator's configuration moves the ROI to an offset no preset has.
-    _save_left_camera_params(system_config, trainer_config_dir, hbin=4, vbin=4, width=256,
+    _save_live_pair_params(system_config, trainer_config_dir, hbin=4, vbin=4, width=256,
                              height=256, offsetx=60, offsety=6)
     with mock.patch.object(app_model, "on_error") as on_error:
         assert app_model.load_configuration() is True
@@ -218,7 +236,7 @@ def test_a_broken_calibration_never_fails_a_configuration_load(
         # calibration.yaml stays valid and the configured geometry has a preset, so
         # neither of the failures reload_calib reports itself applies.
         folder = _write_multires(tmp_path / DEFAULT_3D_CALIB_DIR_NAME)
-        _save_left_camera_params(system_config, trainer_config_dir, **BASE_PARAMS)
+        _save_live_pair_params(system_config, trainer_config_dir, **BASE_PARAMS)
         broken = folder / "presets" / BASE.name / "camera_matrix" / "stereo_params.pickle"
     app_model.reload_calib(folder)
     assert app_model._pose_algorithm._live_3d_reason() is None, "3D ran before the damage"
@@ -249,7 +267,7 @@ def test_an_explicit_reload_that_fails_leaves_the_next_configuration_load_retryi
     # As after an install whose reload fails partway: the folder that was active (the legacy
     # fixture) is not the one reloaded, and the reload cannot read a preset file. The next
     # configuration load must try the installed folder, not the one before it.
-    _save_left_camera_params(system_config, trainer_config_dir, **BASE_PARAMS)
+    _save_live_pair_params(system_config, trainer_config_dir, **BASE_PARAMS)
     assert app_model.load_configuration() is True
     previous = app_model.active_calibration_dir
     folder = _write_multires(tmp_path / "installed" / DEFAULT_3D_CALIB_DIR_NAME)
@@ -291,7 +309,7 @@ def test_missing_offsets_file_uses_zero_offsets(app_model, calib_dir, tmp_path, 
         folder = _legacy_copy_without_offsets(calib_dir, tmp_path)
     else:
         folder = _write_multires(tmp_path / DEFAULT_3D_CALIB_DIR_NAME)
-        _configure_left(app_model, **BASE_PARAMS)
+        _configure_live_pair(app_model, **BASE_PARAMS)
     assert not (folder / DEFAULT_CAM_OFFSET_FILE_NAME).exists()
     with caplog.at_level(logging.WARNING):
         app_model.reload_calib(folder)
@@ -368,7 +386,7 @@ def test_startup_loads_the_base_preset_from_the_default_folder(start_app, user_p
     np.testing.assert_array_equal(algorithm.frame_transform, store.load_preset(folder, BASE).frame_transform)
     assert algorithm.cam_offsets == ZERO_OFFSETS
     assert algorithm._live_3d_reason() is None
-    assert app.active_calibration_dir == folder
+    assert app.active_calibration_dir == _entry_of(app, folder)
     assert app.active_calibration_index == store.load_index(folder)
 
 
@@ -379,16 +397,18 @@ def test_a_corrupt_default_calibration_never_stops_the_app_starting(start_app, u
     pickle_path.write_bytes(pickle_path.read_bytes()[:64])
 
     app, errors, records = start_app()
+    # Imported as it was, damage included, and loaded from the library.
+    entry = _entry_of(app, folder)
     assert errors == [], "construction told the operator; only the configuration load should"
-    assert any(r.exc_info and str(folder) in r.getMessage() for r in records), "no traceback logged"
+    assert any(r.exc_info and str(entry) in r.getMessage() for r in records), "no traceback logged"
     assert app._pose_algorithm.stereo_params is None
     assert app._pose_algorithm._live_3d_reason() == "no stereo params"
-    # The folder stays active, so the configuration load tries it again and reports it.
-    assert app.active_calibration_dir == folder
+    # The entry stays active, so the configuration load tries it again and reports it.
+    assert app.active_calibration_dir == entry
     with mock.patch.object(app, "on_error") as on_error:
         assert app.load_configuration() is True
     message, = _calibration_errors(on_error)
-    assert str(folder) in message
+    assert str(entry) in message
 
 
 # A base away from SpinCam's default ROI, so the geometry the constructor sees (the
@@ -399,7 +419,7 @@ _OFF_DEFAULT_BASE = PresetGeometry(4, 256, 256, 40, 10)
 def test_a_roi_with_no_preset_is_reported_once_after_the_configuration_loads(
         start_app, user_pref, system_config, trainer_config_dir):
     _write_multires(Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME, _OFF_DEFAULT_BASE)
-    _save_left_camera_params(system_config, trainer_config_dir, hbin=4, vbin=4, width=256,
+    _save_live_pair_params(system_config, trainer_config_dir, hbin=4, vbin=4, width=256,
                              height=256, offsetx=60, offsety=6)
     app, errors, records = start_app()
     assert errors == []
@@ -415,7 +435,7 @@ def test_a_roi_with_no_preset_is_reported_once_after_the_configuration_loads(
 def test_a_matching_configuration_is_never_reported(start_app, user_pref, system_config, trainer_config_dir):
     folder = _write_multires(Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME,
                              _OFF_DEFAULT_BASE)
-    _save_left_camera_params(system_config, trainer_config_dir, hbin=4, vbin=4, width=256,
+    _save_live_pair_params(system_config, trainer_config_dir, hbin=4, vbin=4, width=256,
                              height=256, offsetx=40, offsety=10)
     app, errors, _ = start_app()
     # The constructor's defaults match no preset of this calibration, which is not the
@@ -435,3 +455,131 @@ def test_no_calibration_folder_leaves_3d_off(app_model, tmp_path):
     assert app_model._pose_algorithm._live_3d_reason() == "no stereo params"
     assert app_model.active_calibration_dir is None
     assert app_model.active_calibration_index is None
+
+
+# Cameras are matched to the active calibration by serial, CameraConfiguration.host of a
+# Spinnaker camera: a renamed camera keeps its calibration, a swapped body loses it.
+SERIALS = {"left": "21000001", "right": "21000002"}
+
+
+def _set_serial(camera, serial: str) -> None:
+    camera.active_config.scheme = "spinnaker"
+    camera.active_config.host = serial
+
+
+def _active_entry(app_model, tmp_path, *, serials=SERIALS, extra=()) -> Path:
+    """A format-3 calibration of left and right with `serials`, plus `extra` (name, serial,
+    reason) cameras it left 2D only, added to the app's library and made active."""
+    built = tmp_path / "built" / DEFAULT_3D_CALIB_DIR_NAME
+    cameras = [CaptureCamera("left", serials["left"], 0), CaptureCamera("right", serials["right"], 1)]
+    cameras += [CaptureCamera(name, serial, 3 + i) for i, (name, serial, _) in enumerate(extra)]
+    report = dataclasses.replace(_REPORT, cameras={name: CameraVerdict(name, False, reason) for name, _, reason in extra})
+    built.parent.mkdir(parents=True)
+    store.write_calibration(built, fit=FIT, presets=presets_from_base(BASE, (4, 2, 1)), cameras=cameras,
+                            board=BoardSpec(), report=report, capture={})
+    root = library.library_root(Path(app_model._preferences.configuration_location))
+    calibration_id = library.add_entry(root, built)
+    library.set_active(root, calibration_id, by="test")
+    return root / calibration_id
+
+
+def _configure_with_serials(app_model, serials) -> None:
+    _configure_live_pair(app_model, **BASE_PARAMS)
+    for name, serial in serials.items():
+        _set_serial(getattr(app_model, f"{name}_camera"), serial)
+
+
+def test_the_app_loads_the_active_library_entry_matched_by_serial(app_model, tmp_path):
+    entry = _active_entry(app_model, tmp_path, extra=[("camera4", "21000004", "too few board views: 4 of 12 needed")])
+    _configure_with_serials(app_model, SERIALS)
+    with mock.patch.object(app_model, "on_error") as on_error:
+        app_model.reload_calib(None)
+    assert _calibration_errors(on_error) == []
+    assert app_model.active_calibration_dir == entry
+    assert app_model.calibrated_cameras == {"left": "left", "right": "right"}
+    assert "left" not in app_model.uncalibrated_reasons and "right" not in app_model.uncalibrated_reasons
+    algorithm = app_model._pose_algorithm
+    assert algorithm._live_3d_reason() is None
+    np.testing.assert_array_equal(algorithm.frame_transform, store.load_preset(entry, BASE).frame_transform)
+    # camera4 is the calibration's 2D-only camera and is not configured: no difference.
+    assert app_model.camera_setup_difference(["left", "right"]) == SetupDifference([], [], [], [])
+
+
+def test_swapped_serial_is_a_difference(app_model, tmp_path):
+    _active_entry(app_model, tmp_path)
+    _configure_with_serials(app_model, {"left": "21000099", "right": SERIALS["right"]})
+    with mock.patch.object(app_model, "on_error") as on_error:
+        app_model.reload_calib(None)
+    reason = "swapped: calibrated serial 21000001, now 21000099"
+    assert app_model.uncalibrated_reasons["left"] == reason
+    assert app_model.calibrated_cameras == {"right": "right"}
+    difference = app_model.camera_setup_difference(["left", "right"])
+    assert difference == SetupDifference(added=[], removed=[], swapped=["left"], uncalibrated_off=[])
+    assert difference.differs
+    # Live 3D does not triangulate with the old pose for the new body.
+    message, = _calibration_errors(on_error)
+    assert reason in message
+    assert app_model._pose_algorithm.stereo_params is None
+    assert app_model._live_3d_disabled_reason == message
+
+
+def test_renamed_camera_with_same_serial_is_not_a_difference(app_model, tmp_path):
+    # The two bodies' configured names are exchanged: each is still its calibrated self.
+    _active_entry(app_model, tmp_path)
+    _configure_with_serials(app_model, {"left": SERIALS["right"], "right": SERIALS["left"]})
+    with mock.patch.object(app_model, "on_error"):
+        app_model.reload_calib(None)
+    assert app_model.calibrated_cameras == {"left": "right", "right": "left"}
+    difference = app_model.camera_setup_difference(["left", "right"])
+    assert difference == SetupDifference([], [], [], []) and not difference.differs
+    # Today's live 3D needs the calibration's own left and right as left and right.
+    assert "left: it is the calibration's right" in app_model._live_3d_disabled_reason
+
+
+def test_subset_is_only_a_passive_note(app_model, tmp_path):
+    _active_entry(app_model, tmp_path)
+    _configure_with_serials(app_model, SERIALS)
+    app_model.reload_calib(None)
+    difference = app_model.camera_setup_difference(["left"])
+    assert difference == SetupDifference(added=[], removed=[], swapped=[], uncalibrated_off=["right"])
+    assert not difference.differs
+
+
+def test_a_calibrated_camera_no_longer_configured_is_removed(app_model, tmp_path):
+    _active_entry(app_model, tmp_path)
+    # right's body is replaced, and right is not selected: its calibrated body is gone.
+    _configure_with_serials(app_model, {"left": SERIALS["left"], "right": "21000077"})
+    with mock.patch.object(app_model, "on_error"):
+        app_model.reload_calib(None)
+    difference = app_model.camera_setup_difference(["left"])
+    assert difference == SetupDifference(added=[], removed=["right"], swapped=[], uncalibrated_off=[])
+
+
+def test_the_preset_needs_left_and_right_at_one_geometry(app_model, tmp_path):
+    folder = _write_multires(tmp_path / DEFAULT_3D_CALIB_DIR_NAME)
+    _configure_live_pair(app_model, **BASE_PARAMS)
+    app_model.right_camera.load_configuration(CameraConfiguration(
+        id=CameraId.Right, name="right", scheme="random", params={**BASE_PARAMS, "offsetx": 40}))
+    with mock.patch.object(app_model, "on_error") as on_error:
+        app_model.reload_calib(folder)
+    message, = _calibration_errors(on_error)
+    assert "same geometry" in message and "(52, 6)" in message and "(40, 6)" in message
+    assert app_model._pose_algorithm.stereo_params is None
+
+
+def test_dcs_offsets_for_a_library_entry_go_beside_it(app_model, tmp_path):
+    entry = _active_entry(app_model, tmp_path)
+    _configure_with_serials(app_model, SERIALS)
+    app_model.reload_calib(None)
+    path = app_model.camera_offsets_path()
+    root = library.library_root(Path(app_model._preferences.configuration_location))
+    assert path == root / ".offsets" / entry.name / DEFAULT_CAM_OFFSET_FILE_NAME
+    offsets = {"x_off": 1.0, "y_off": 2.0, "z_off": 3.0}
+    path.parent.mkdir(parents=True)
+    with path.open("wb") as fh:
+        pickle.dump(offsets, fh)
+    app_model.reload_calib(entry)
+    assert app_model._pose_algorithm.cam_offsets == offsets
+    assert not (entry / DEFAULT_CAM_OFFSET_FILE_NAME).exists()
+    # Not an entry, so never listed as one.
+    assert [e.id for e in library.list_entries(root)] == [entry.name]

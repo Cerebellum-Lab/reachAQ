@@ -1548,7 +1548,7 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
 
     serialized_json = output.with_suffix(".json").read_text()
     saved = json.loads(serialized_json)
-    assert saved["metadataSchemaVersion"] == 2
+    assert saved["metadataSchemaVersion"] == 3
     assert saved["scope"] == "session"
     assert saved["recording"]["firstPelletDeliveryOffsetSeconds"] is None
     assert saved["recording"]["firstPelletPresentationOffsetSeconds"] is None

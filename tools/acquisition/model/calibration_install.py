@@ -5,41 +5,34 @@ calibration unless the operator confirms an override. The override is a decision
 library's decisions.jsonl, not an edit of the calibration: library entries never change.
 
 An install adds the calibration to the library (<location>/calibrations) and makes it the
-active entry. Until the readers use the library, it also keeps the 4mm_6r_8c_4x folder
-current, which the app still loads.
-
-That folder is never left half-copied: the new folder is copied in beside the
-active one as <name>.partial, the active one is renamed to its dated backup, and the copy
-is then renamed into place. A copy that fails leaves the previous calibration untouched,
-and a final rename that fails puts it back.
+active entry, which is what the app loads. The 4mm_6r_8c_4x folder and its dated backups
+are no longer written: they stay as they are, read only, for the sessions recorded with
+them and for an older app version. A pointer that cannot be written discards the new
+entry again, so the previous calibration stays active and the install can be retried.
 
 camera_offsets.pkl is never installed with a calibration, nor carried over from the
 previous one: it is measured by DCS against a calibration, so the previous offsets are
-stale in the new frame, and DCS writes new ones once it is redone.
+stale in the new frame, and DCS writes new ones once it is redone, beside the library
+entry rather than in it (AppModel.camera_offsets_path).
 """
 
 import getpass
-import os
-import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Optional, Tuple
 
-from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.logging import get_verbose_logger
-from autotrainer.core.project.project_info import DATE_TIME_FORMAT
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
 from autotrainer.inference.multires_calibration.library import (
     add_entry,
     discard_entry,
+    entry_path,
     library_root,
     record_decision,
     set_active,
 )
 
 logger = get_verbose_logger(__name__)
-
-_PARTIAL_SUFFIX = ".partial"
 
 
 def decide_install(verdict: str, ask_override: Callable[[], bool]) -> Tuple[bool, bool]:
@@ -68,54 +61,26 @@ def install_calibration(
     now: datetime,
     by: Optional[str] = None,
     override: Optional[dict] = None,
-) -> Tuple[Path, Optional[Path]]:
+) -> Path:
     """Make `new_dir` the active calibration under `configuration_location`.
 
     `new_dir` is added to the library as a new entry, which is made the active one by `by`
     (the operating-system user when None); `override`, the operator's confirmation of a
-    failed report, is appended to the library's decisions then. Returns (the installed
-    4mm_6r_8c_4x folder, the previous one's dated backup or None). The previous folder is
-    renamed to <name>_<now in DATE_TIME_FORMAT>, the suffix the store reads as the time it
-    stopped being active. `new_dir` is copied, not moved, and stays as it is.
+    failed report, is appended to the library's decisions then. Returns the entry's folder,
+    <location>/calibrations/<id>. `new_dir` is copied, not moved, and stays as it is. `now`
+    is kept for the callers; the library stamps its own times.
 
-    When the folder swap fails the new entry is removed again and the previous calibration
-    stays active, so the install can be retried. A decision that cannot be written after the
-    install is logged, not raised: the calibration is installed by then.
+    When the pointer cannot be written the new entry is removed again and the previous
+    calibration stays active, so the install can be retried. A decision that cannot be
+    written after the install is logged, not raised: the calibration is installed by then.
     """
     new_dir = Path(new_dir)
     root = library_root(configuration_location)
-    target = Path(configuration_location) / DEFAULT_3D_CALIB_DIR_NAME
-    partial = target.with_name(target.name + _PARTIAL_SUFFIX)
-    backup = target.with_name(f"{target.name}_{now.strftime(DATE_TIME_FORMAT)}") if target.exists() else None
-    # Checked before anything changes: renaming onto an existing backup would replace it
-    # (an empty one) or fail only after the copy.
-    if backup is not None and backup.exists():
-        raise FileExistsError(f"{backup} already exists; the previous calibration cannot be backed up there")
-
-    if partial.exists():
-        logger.warning("removing %s, left by an interrupted calibration install", partial)
-        shutil.rmtree(partial)
+    if Path(new_dir, DEFAULT_CAM_OFFSET_FILE_NAME).exists():
+        raise ValueError(f"{new_dir} holds a {DEFAULT_CAM_OFFSET_FILE_NAME}; offsets come only from DCS")
     calibration_id = add_entry(root, new_dir)
     try:
-        shutil.copytree(new_dir, partial, ignore=_without_camera_offsets)
-        if backup is not None:
-            target.rename(backup)
-            logger.info("previous 3D calibration moved to %s", backup)
-        try:
-            os.replace(partial, target)
-        except BaseException:
-            if backup is not None:
-                backup.rename(target)
-                logger.warning("could not install %s; the previous calibration is back in place", new_dir)
-            raise
-        try:
-            set_active(root, calibration_id, by=by or getpass.getuser())
-        except BaseException:
-            # The folder swap is done; undo it so the previous calibration stays the active one.
-            shutil.rmtree(target)
-            if backup is not None:
-                backup.rename(target)
-            raise
+        set_active(root, calibration_id, by=by or getpass.getuser())
     except BaseException:
         discard_entry(root, calibration_id)
         raise
@@ -125,13 +90,6 @@ def install_calibration(
         except OSError:
             logger.exception("calibration %s is installed, but its override could not be recorded: %s",
                              calibration_id, override)
-    logger.success("installed the 3D calibration from %s into %s", new_dir, target)
-    return target, backup
-
-
-def _without_camera_offsets(directory: str, names: List[str]) -> List[str]:
-    """copytree's ignore: skip camera_offsets.pkl, which only DCS writes."""
-    if DEFAULT_CAM_OFFSET_FILE_NAME not in names:
-        return []
-    logger.warning("not installing %s: offsets come only from DCS", Path(directory, DEFAULT_CAM_OFFSET_FILE_NAME))
-    return [DEFAULT_CAM_OFFSET_FILE_NAME]
+    target = entry_path(root, calibration_id)
+    logger.success("installed the 3D calibration from %s as %s", new_dir, target)
+    return target

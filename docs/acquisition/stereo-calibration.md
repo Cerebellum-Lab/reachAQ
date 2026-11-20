@@ -24,6 +24,9 @@ used, see
   acquisition".
 - The left camera is configured at binning 4, the live preset. A binning that
   is not a multiple of 4 stops the capture before the stage moves.
+- The capture records left and right for now (the calibration dialog's choice of
+  2 to 6 cameras comes later). Each camera's own configured geometry gives its
+  presets, and `waypoints.yaml` records each camera's name, serial and camera id.
 
 ## Steps
 
@@ -125,7 +128,7 @@ loaded: <reason>. Restart the app." Live 3D is then off, never left on the
 previous calibration's parameters: the installed calibration is the active one,
 so a DCS measured against the previous one is out of date and Record is blocked,
 and a session recorded meanwhile carries `live3dDisabledReason`, which offline
-3D refuses. The next configuration load or a restart loads the installed folder
+3D refuses. The next configuration load or a restart loads the installed entry
 again. Any explicit reload that fails (the DCS run's too) leaves live 3D off the
 same way.
 
@@ -152,7 +155,10 @@ To redo it, set System Mode to Running, move the pellet spoon to a typical
 delivery position with the Set and Send buttons, and choose **Tools → Calibrate
 Coordinate System**. DCS records the id of the calibration it was measured
 against in `diamond_triangle_offset.yaml` and writes fresh `camera_offsets.pkl`
-into the active calibration folder. That clears the out-of-date state and
+for the active calibration: beside a library entry, as
+`calibrations/.offsets/<id>/camera_offsets.pkl`, because an entry is never
+written to; inside the folder for a calibration folder given explicitly (the
+simulator's). That clears the out-of-date state and
 unblocks Record. A DCS saved before calibration ids existed has none, so it is
 out of date against any format-2 calibration. A legacy calibration has no id: a
 DCS without one is accepted with it, but a DCS that records an id was measured
@@ -195,17 +201,18 @@ The capture creates a session folder in the normal data location. In it:
 - `4mm_6r_8c_4x.new/` is the new calibration, at format 3. It stays after an
   install as the session's record, and when a fail is kept out.
 
-An install copies `.new` into the configuration location (default
-`~/Autotrainer`) as `4mm_6r_8c_4x.partial`, renames the active folder to its
-**dated backup**, then renames the copy into place. The backup is
-`4mm_6r_8c_4x_<YYYYMMDD_HHMMSS>`, where the suffix is the local time the folder
-stopped being active. A backup is never overwritten or deleted by the app: an
-install refuses a backup name that already exists. A copy that fails leaves the
-previous calibration untouched, and a final rename that fails puts it back.
+An install adds `.new` to the **calibration library** (next section) as a new
+entry, `<configuration location>/calibrations/<id>/` (default `~/Autotrainer`),
+and makes it the active entry; the app loads it from there. If the active
+pointer cannot be written, the entry is removed again and the previous
+calibration stays active, so the install can be retried. A `.new` folder holding
+a `camera_offsets.pkl` is refused.
 
-The same install also adds the calibration to the **calibration library**
-(next section) and makes it the active entry there. If the folder swap fails,
-that entry is removed again, so the install can be retried.
+The `4mm_6r_8c_4x` folder and its dated backups `4mm_6r_8c_4x_<YYYYMMDD_HHMMSS>`
+from before the library are no longer written. They stay in place, read only,
+for the sessions recorded with them and for an older app version, which still
+loads `4mm_6r_8c_4x` and so sees the calibration that was active when the
+library took over.
 
 ## Calibration library
 
@@ -246,6 +253,29 @@ calibrations/
   first, then among the old folders. A session with no id is resolved by time:
   the entry the log shows as active then, or, for a time before the log begins,
   the old folders' dated backups as before.
+- **The app loads the active entry.** At start, and whenever no calibration
+  folder is given, it reads `active.yaml`. When the library has no `active.yaml`
+  yet, the app first runs `import_existing`, so a rig keeps its calibration on
+  its first start with the library. A missing, corrupt or dangling pointer, or
+  an entry that cannot be read (a half-written file after a power cut), never
+  stops the app: it records 2D, and `live3dDisabledReason` says why, for example
+  "no active 3D calibration: …/calibrations/active.yaml does not exist" or
+  "could not load …/calibrations/<id>: …".
+- **Cameras are matched by serial.** A configured camera is the calibration's
+  camera with the same serial (`host` of a Spinnaker camera), so renaming a
+  camera keeps its calibration. A camera with no serial on either side
+  (`random` or `playback`, or a format-2 or legacy calibration, which recorded
+  none) is matched by name. Each configured camera is either calibrated or 2D
+  only with a reason: `not in the active calibration`, `swapped: calibrated
+  serial X, now Y` (a new body under a calibrated camera's name), the
+  calibration's own reason for a camera it could not calibrate, or `no active 3D
+  calibration`. The reasons are recorded per camera in the session metadata.
+- **Live 3D is still the left-right pair.** It runs when the configured left and
+  right are the calibration's left and right, both calibrated, at the same
+  geometry, and the calibration holds that pair at it; the preset comes through
+  `load_preset_set(...).stereo`. Otherwise live 3D is off with the reason, for
+  example "live 3D needs left and right calibrated as left and right: left:
+  swapped: calibrated serial 21000001, now 21000099". 2D pose is unaffected.
 
 A format-3 folder, for any 2 to 6 cameras:
 
@@ -272,8 +302,11 @@ A format-3 folder, for any 2 to 6 cameras:
   quality_report.txt        the operator's summary
   coverage_<camera>.png     one per capture camera, calibrated or not
   waypoints.yaml            copied from the capture
-  camera_offsets.pkl        only after DCS is redone; written by DCS, never by the calibration
 ```
+
+DCS's `camera_offsets.pkl` for a library entry is kept beside it, in
+`calibrations/.offsets/<id>/`. An entry imported from an older folder carries
+that folder's own `camera_offsets.pkl`, which is read when `.offsets` has none.
 
 - A camera that saw too little is listed in `cameras` with `calibrated: false`
   and its reason. It is in no `calibration.toml` and no preset set: it is 2D
@@ -293,10 +326,10 @@ A format-3 folder, for any 2 to 6 cameras:
   modification time.
 - `calibration.yaml` is written last, into a `.partial` folder that is renamed
   into place, so a half-written folder never loads.
-- **`camera_offsets.pkl` is never carried over.** The install skips it if the
-  new folder has one, and nothing copies the previous calibration's into the
-  new one. Offsets are measured by DCS against a particular calibration, so the
-  previous ones are wrong in the new frame. They stay in the dated backup.
+- **`camera_offsets.pkl` is never carried over.** The install refuses a new
+  folder that has one, and nothing copies the previous calibration's to the new
+  one. Offsets are measured by DCS against a particular calibration, so the
+  previous ones are wrong in the new frame. They stay with the previous entry.
 - **The capture videos are not copied** into the calibration, nor into its
   install and backups. They stay in the session's capture folder, which
   `calibration.yaml` names as `capture.capture_folder` (absolute), so a
@@ -309,10 +342,14 @@ A preset set gives every calibrated camera one geometry. Per-camera sets come
 from `geometry.presets_for_cameras` of each camera's live geometry: `live` (the
 cameras as they record) and `bin1`, `bin2` and `bin4`, each camera's own live
 window at that binning. A binning is left out when some camera's window does
-not fall on whole pixels at it, or when it would repeat `live`. Until the
-capture passes each camera's own geometry, every camera shares each preset of
-`geometry.presets_from_base`, and each set is named after its preset, for
-example `presets/256x256_bin4/`.
+not fall on whole pixels at it, or when it would repeat `live`. The capture
+passes each camera's own geometry, and the sets are built after the fit from
+the calibrated cameras only (`pipeline.calibrated_preset_sets`), so a camera
+left 2D only costs no other camera a binning. The writer also drops a set that
+repeats an earlier one's geometries once its uncalibrated cameras are out.
+Older calibrations, and a capture given only presets, have every camera share
+each preset of `geometry.presets_from_base`, with each set named after its
+preset, for example `presets/256x256_bin4/`.
 
 The presets are `geometry.presets_from_base` of the live camera geometry, with
 binnings 4, 2 and 1. For the base geometry of 256 x 256 at binning 4 and ROI
@@ -328,13 +365,14 @@ Each preset holds intrinsics in that preset's exact pixels and the same
 extrinsics. A different base gives different presets; the base binning must be
 a multiple of 4.
 
-**Live inference** picks the preset by the left camera's configuration. Live
-frames reach inference pooled to the base capture whatever the capture-binning
-preset, so the base geometry (binning, size, ROI offset, as saved, with
-SpinCam's defaults for anything left out) is the pixel space live 3D works in.
-The preset whose geometry equals it is loaded. If there is none, live 3D stays
-off, the operator is told why, and 2D pose keeps running. Another preset is
-never substituted, because its pixels are not the frames' pixels.
+**Live inference** picks the preset by the left and right cameras'
+configurations, which must give the same geometry. Live frames reach inference
+pooled to the base capture whatever the capture-binning preset, so the base
+geometry (binning, size, ROI offset, as saved, with SpinCam's defaults for
+anything left out) is the pixel space live 3D works in. The preset whose
+geometry equals it is loaded. If there is none, or left and right differ, live
+3D stays off, the operator is told why, and 2D pose keeps running. Another
+preset is never substituted, because its pixels are not the frames' pixels.
 
 **Offline analysis** resolves the calibration a session used from its metadata,
 `hardware.configured.calibration3d`:
@@ -484,11 +522,10 @@ lists the geometries.
 - **Format-2 code cannot read a format-3 calibration folder.** It takes a
   `calibration.yaml` at another format for a legacy folder, which then fails to
   load. Install a format-3 calibration only on a rig whose code reads format 3.
-- **A crash between the install's two renames.** If the app dies after the
-  backup rename and before the final one, the configuration location has no
-  `4mm_6r_8c_4x`; the dated backup and `4mm_6r_8c_4x.partial` both survive. On
-  the next start live 3D is off with an error; rename one back into place by
-  hand.
+- **A crash during an install.** The entry is copied as `<id>.partial` and
+  renamed into place, then `active.yaml` is replaced whole, so a crash leaves
+  the previous calibration active, or the new one, never half of either. A
+  leftover `<id>.partial` is removed by the next write of that id.
 - **Camera movement is checked against the previous calibration only.** Both
   cameras shifting by the same vector cannot be told from the board being
   remounted, and the change metrics do not see it. The DCS, redone after every

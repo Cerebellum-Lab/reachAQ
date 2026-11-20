@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
-from typing import Optional, List, Dict, Callable, Any, Union, ClassVar, Protocol, Tuple
+from typing import Optional, List, Dict, Callable, Any, Union, ClassVar, Protocol, Tuple, Mapping, Sequence
 
 import numpy as np
 import yaml
@@ -100,6 +100,16 @@ from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.config import load_calib_stereo_params
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry
+from autotrainer.inference.multires_calibration.library import (
+    ACTIVE_FILE,
+    active_id,
+    derived_root,
+    import_existing,
+    is_legacy_entry,
+    latest_decision,
+    legacy_folder_name,
+    library_root,
+)
 from autotrainer.inference.multires_calibration.store import (
     INDEX_FILE,
     CalibrationGeometryError,
@@ -109,6 +119,7 @@ from autotrainer.inference.multires_calibration.store import (
     is_multires_calibration,
     load_index,
     load_preset,
+    load_preset_set,
 )
 
 from autotrainer.core.capture import CaptureProcessStatus
@@ -159,7 +170,13 @@ from tools.acquisition.model.capture_binning import (
     capture_binning_available,
     common_capture_binning,
 )
-from tools.acquisition.model.calibration_geometry import live_inference_geometry
+from tools.acquisition.model.calibration_geometry import (
+    NOT_IN_CALIBRATION,
+    CameraMatch,
+    camera_serial,
+    live_inference_geometry,
+    match_cameras,
+)
 from tools.acquisition.model.camera_timing_alignment import (
     CameraTimestampInput,
     align_camera_timestamp_files,
@@ -506,6 +523,14 @@ def _metadata_without_nonfinite_numbers(value):
     return value
 
 
+#: Schema 3 (2026-11-20) adds the calibration's cameras and identity by serial; readers keep 2.
+METADATA_SCHEMA_VERSION = 3
+
+
+def _describe_geometry(g: PresetGeometry) -> str:
+    return f"{g.name} at ROI offset ({g.offset_x}, {g.offset_y})"
+
+
 def _camera_configured_metadata(camera) -> Dict[str, Any]:
     """What a session records about one camera's capture.
 
@@ -524,8 +549,46 @@ def _camera_configured_metadata(camera) -> Dict[str, Any]:
     }
 
 
-def _load_camera_offsets(calib_dir: Path) -> Dict[str, Any]:
-    """The live 3D camera offsets saved in `calib_dir`, or zero offsets when it has none.
+#: Why a camera is 2D only when there is no active 3D calibration at all.
+NO_ACTIVE_CALIBRATION = "no active 3D calibration"
+#: Beside the library's entries: DCS's camera offsets for each entry, which an entry, never
+#: written to once in place, cannot hold. <library>/.offsets/<id>/camera_offsets.pkl
+_LIBRARY_OFFSETS_DIR = ".offsets"
+#: The two cameras today's live 3D triangulates, by their calibration names.
+_LIVE_PAIR = ("left", "right")
+#: The cameras of a legacy calibration, which records no list: left and right, no serials.
+_LEGACY_CAMERAS = (
+    {"name": "left", "serial": None, "camera_id": 0, "calibrated": True, "reason": ""},
+    {"name": "right", "serial": None, "camera_id": 1, "calibrated": True, "reason": ""},
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class SetupDifference:
+    """The cameras selected for a recording against the active calibration's.
+
+    `added`: selected cameras the calibration does not have. `removed`: calibrated cameras of
+    the calibration that no configured camera is any more (by serial). `swapped`: selected
+    cameras whose name the calibration has with another serial. These three need the
+    operator's confirmation. `uncalibrated_off`: calibrated cameras present but not
+    selected, which is only a passive note.
+    """
+
+    added: List[str]
+    removed: List[str]
+    swapped: List[str]
+    uncalibrated_off: List[str]
+
+    @property
+    def differs(self) -> bool:
+        return bool(self.added or self.removed or self.swapped)
+
+
+def _load_camera_offsets(calib_dir: Path, offsets_path: Optional[Path] = None) -> Dict[str, Any]:
+    """The live 3D camera offsets for the calibration in `calib_dir`, or zero offsets when it has none.
+
+    `offsets_path` is where DCS writes them for that calibration (AppModel.camera_offsets_path),
+    read first; a library entry imported from an older folder may hold its own copy, read next.
 
     DCS calibration (Calibrate Coordinate System) writes camera_offsets.pkl later, from
     the raw diamond position it measures with this calibration, so a freshly made
@@ -537,8 +600,11 @@ def _load_camera_offsets(calib_dir: Path) -> Dict[str, Any]:
     without the file only gives zero offsets, and a valid DCS without an id stays VALID
     (one with an id is STALE under any legacy folder, dcs_state.py).
     """
-    path_offsets = calib_dir.joinpath(DEFAULT_CAM_OFFSET_FILE_NAME)
-    if not path_offsets.is_file():
+    candidates = [calib_dir.joinpath(DEFAULT_CAM_OFFSET_FILE_NAME)]
+    if offsets_path is not None and offsets_path not in candidates:
+        candidates.insert(0, offsets_path)
+    path_offsets = next((path for path in candidates if path.is_file()), None)
+    if path_offsets is None:
         logger.warning("%s has no %s; live 3D uses zero camera offsets until DCS writes one",
                        calib_dir, DEFAULT_CAM_OFFSET_FILE_NAME)
         return {"x_off": 0.0, "y_off": 0.0, "z_off": 0.0}
@@ -1073,6 +1139,11 @@ class AppModel(ObservableObject):
         # why live 3D is off when it is, as the operator was told.
         self._active_calibration_preset: Optional[PresetGeometry] = None
         self._live_3d_disabled_reason: Optional[str] = None
+        # The active calibration's format (2, 3, "legacy"), None when none loaded; the folder
+        # the last resolution picked; the setup difference the operator said to record anyway.
+        self._active_calibration_format: Optional[Union[int, str]] = None
+        self._resolved_calibration_folder: Optional[Path] = None
+        self._acknowledged_difference: Optional[SetupDifference] = None
         # No DCS configuration is loaded before the first configuration load, which
         # recomputes this (refresh_dcs_state), as every later calibration or DCS load does.
         self._dcs_state = DcsState.MISSING
@@ -2313,15 +2384,72 @@ class AppModel(ObservableObject):
             with status_file_path.open("w") as fh:
                 print(f"status={status.value!r}", file=fh)
 
-    def _calibration_folder(self, calib_dir: Optional[Path]) -> Path:
-        """The folder reload_calib loads: `calib_dir`, else the default in the configuration location."""
-        return (
-            Path(self._preferences.configuration_location, DEFAULT_3D_CALIB_DIR_NAME) if calib_dir is None
-            else calib_dir
-        ).expanduser()
+    @property
+    def calibration_library_root(self) -> Path:
+        """<configuration location>/calibrations, where the calibrations are kept."""
+        return library_root(Path(self._preferences.configuration_location).expanduser())
+
+    def _resolve_calibration(self, calib_dir: Optional[Path]) -> Tuple[Optional[Path], Optional[str]]:
+        """(the folder reload_calib loads, None), or (None, why there is none).
+
+        `calib_dir` as given; else the library's active entry (active.yaml). A library with
+        no active.yaml first imports the folders that predate it (import_existing), so a rig
+        keeps its calibration on its first start with the library. The import is idempotent;
+        one that fails is logged, and the app starts without a calibration.
+        """
+        if calib_dir is not None:
+            folder = Path(calib_dir).expanduser()
+            self._resolved_calibration_folder = folder
+            return folder, None
+        config = Path(self._preferences.configuration_location).expanduser()
+        root = library_root(config)
+        pointer = root / ACTIVE_FILE
+        if not pointer.exists():
+            try:
+                added = import_existing(config)
+                if added:
+                    logger.notice("imported %d existing 3D calibration(s) into the library %s", len(added), root)
+            except Exception:
+                logger.exception("could not import the existing 3D calibrations under %s into the library", config)
+        try:
+            calibration_id = active_id(root)
+        except Exception:
+            logger.exception("could not read the active 3D calibration in %s", root)
+            calibration_id = None
+        if calibration_id is None:
+            self._resolved_calibration_folder = None
+            if pointer.exists():
+                return None, (f"{NO_ACTIVE_CALIBRATION}: {pointer} is unreadable or names a calibration"
+                              " that is not in the library")
+            return None, f"{NO_ACTIVE_CALIBRATION}: {pointer} does not exist"
+        folder = root / calibration_id
+        self._resolved_calibration_folder = folder
+        return folder, None
+
+    def _is_library_entry(self, folder: Optional[Path]) -> bool:
+        if folder is None:
+            return False
+        try:
+            return Path(folder).parent.resolve() == self.calibration_library_root.resolve()
+        except OSError:
+            return False
+
+    def camera_offsets_path(self, folder: Optional[Path] = None) -> Optional[Path]:
+        """Where DCS writes the camera offsets of the calibration in `folder` (the active one by default).
+
+        Beside a library entry, <library>/.offsets/<id>/camera_offsets.pkl, since nothing writes
+        inside an entry; in any other folder (a legacy folder or one given explicitly), inside
+        it, as before. None when there is no calibration.
+        """
+        folder = self._active_calibration_dir if folder is None else Path(folder)
+        if folder is None:
+            return None
+        if self._is_library_entry(folder):
+            return self.calibration_library_root / _LIBRARY_OFFSETS_DIR / folder.name / DEFAULT_CAM_OFFSET_FILE_NAME
+        return folder / DEFAULT_CAM_OFFSET_FILE_NAME
 
     def reload_calib(self, calib_dir: Optional[Path]):
-        """Load the 3D calibration in `calib_dir`, else the configuration location's.
+        """Load the 3D calibration in `calib_dir`, else the library's active one.
 
         A geometry with no preset and an unreadable index turn live 3D off and are
         reported through on_error. Any other failure turns live 3D off for that folder as
@@ -2337,7 +2465,8 @@ class AppModel(ObservableObject):
             # fails too is only logged: the caller gets the load's error.
             if isinstance(err, Exception):
                 try:
-                    self._live_3d_off_after_failed_load(self._calibration_folder(calib_dir), err, report=False)
+                    folder = Path(calib_dir).expanduser() if calib_dir is not None else self._resolved_calibration_folder
+                    self._live_3d_off_after_failed_load(folder, err, report=False)
                 except Exception:
                     logger.exception("could not turn live 3D off after the failed load of %s", calib_dir)
             try:
@@ -2355,7 +2484,7 @@ class AppModel(ObservableObject):
             logger.warning("3D calibration, before the camera configuration is loaded: %s", message)
 
     def _load_calibration(self, calib_dir: Optional[Path], *, report: bool):
-        calib_src_dir = self._calibration_folder(calib_dir)
+        calib_src_dir, no_calibration = self._resolve_calibration(calib_dir)
         logger.info("loading calib from %s", calib_src_dir)
         # The folder is committed before anything in it is read, so the next configuration
         # load retries it even when this load raises: after an install, the folder active
@@ -2363,13 +2492,24 @@ class AppModel(ObservableObject):
         # committed below, just before the pose algorithm is installed. A load that raises
         # anywhere is turned into live 3D off for this folder by its caller (reload_calib,
         # _reload_calib_guarded: _live_3d_off_after_failed_load).
-        self._active_calibration_dir = calib_src_dir if calib_src_dir.exists() else None
+        self._active_calibration_dir = calib_src_dir if calib_src_dir is not None and calib_src_dir.exists() else None
         frame_transform = None
         calibration_index = None
+        calibration_format = None
         live_preset = None
         disabled_reason = None
-        if (calib_src_dir.joinpath(INDEX_FILE).exists()
-                and not is_multires_calibration(calib_src_dir)):
+        if calib_src_dir is None:
+            # No active entry in the library: 2D only, and the reason recorded.
+            stereo_params = None
+            calib_metadata = None
+            square_size = None
+            cam_names = None
+            cam_offsets = None
+            disabled_reason = no_calibration
+            logger.warning("live 3D is off: %s", disabled_reason)
+        elif (calib_src_dir.joinpath(INDEX_FILE).exists()
+                and not is_multires_calibration(calib_src_dir)
+                and not is_legacy_entry(calib_src_dir)):
             # A legacy folder has no index at all, so this one is a format-2
             # calibration that cannot be read. Loading it the legacy way would
             # put another calibration's files in its place, or fail obscurely.
@@ -2382,27 +2522,31 @@ class AppModel(ObservableObject):
             self._calibration_problem(disabled_reason, report=report)
         elif calib_src_dir.exists() and is_multires_calibration(calib_src_dir):
             calibration_index = load_index(calib_src_dir)
+            calibration_format = calibration_index.format
             # The measured frame replaces the camera angles and the square size.
             calib_metadata = None
             square_size = None
-            cam_offsets = _load_camera_offsets(calib_src_dir)
-            live_preset, disabled_reason = self._load_live_preset(calib_src_dir, report=report)
+            cam_offsets = _load_camera_offsets(calib_src_dir, self.camera_offsets_path(calib_src_dir))
+            live_preset, disabled_reason = self._load_live_preset(calib_src_dir, calibration_index, report=report)
             if live_preset is None:
                 stereo_params = cam_names = None
             else:
                 stereo_params, frame_transform = live_preset.stereo_params, live_preset.frame_transform
-                # The pair a format-2 calibration's stereo parameters are keyed by (STEREO_KEY).
-                cam_names = ["left", "right"]
+                # The pair the left-right stereo parameters are keyed by (STEREO_KEY).
+                cam_names = list(_LIVE_PAIR)
         elif calib_src_dir.exists():
+            # A legacy folder, or its copy in the library (an imported entry).
+            calibration_format = "legacy"
             stereo_params = load_calib_stereo_params(
                 calib_src_dir.joinpath('camera_matrix', 'stereo_params.pickle')
             )
             metadata_path = calib_src_dir.joinpath('calibration_userset.yaml')
             with metadata_path.open() as fh:
                 calib_metadata = yaml.safe_load(fh)
-            square_size, _, _, _ = calibration_FLIR.get_calibration_info(calib_src_dir.as_posix())
+            # A library entry is named by its id; the board is in the name it was imported from.
+            square_size, _, _, _ = calibration_FLIR.get_calibration_info(legacy_folder_name(calib_src_dir))
             cam_names = calibration_FLIR.get_video_list(calib_src_dir.as_posix())
-            cam_offsets = _load_camera_offsets(calib_src_dir)
+            cam_offsets = _load_camera_offsets(calib_src_dir, self.camera_offsets_path(calib_src_dir))
         else:
             stereo_params = None
             calib_metadata = None
@@ -2412,6 +2556,7 @@ class AppModel(ObservableObject):
             disabled_reason = f"no 3D calibration at {calib_src_dir}"
             logger.warning("calib_src_dir=%r does not exist", calib_src_dir.as_posix())
         self._active_calibration_index = calibration_index
+        self._active_calibration_format = calibration_format
         self._active_calibration_preset = None if live_preset is None else live_preset.geometry
         self._live_3d_disabled_reason = disabled_reason
         self._install_pose_algorithm(
@@ -2434,13 +2579,13 @@ class AppModel(ObservableObject):
         without it, the log only. Explicit reloads (DCS, the 3D calibration) turn live 3D
         off the same way, then raise.
         """
-        folder = self._calibration_folder(calib_dir)
         try:
-            self._load_calibration(folder, report=report)
+            self._load_calibration(calib_dir, report=report)
         except Exception as err:
+            folder = Path(calib_dir).expanduser() if calib_dir is not None else self._resolved_calibration_folder
             self._live_3d_off_after_failed_load(folder, err, report=report)
 
-    def _live_3d_off_after_failed_load(self, folder: Path, err: Exception, *, report: bool) -> None:
+    def _live_3d_off_after_failed_load(self, folder: Optional[Path], err: Exception, *, report: bool) -> None:
         """After a load of `folder` raised: live 3D off, and `folder` the active calibration.
 
         The folder is kept, so the next configuration load tries it again, and so is its
@@ -2450,8 +2595,14 @@ class AppModel(ObservableObject):
         reason reaches the operator through on_error.
         """
         logger.exception("live 3D is off: the 3D calibration in %s could not be loaded", folder)
-        self._active_calibration_dir = folder if folder.exists() else None
-        self._active_calibration_index = _readable_index(folder)
+        exists = folder is not None and folder.exists()
+        self._active_calibration_dir = folder if exists else None
+        self._active_calibration_index = _readable_index(folder) if exists else None
+        self._active_calibration_format = (
+            self._active_calibration_index.format if self._active_calibration_index is not None
+            else "legacy" if exists and (is_legacy_entry(folder) or not folder.joinpath(INDEX_FILE).exists())
+            else None
+        )
         self._active_calibration_preset = None
         self._live_3d_disabled_reason = f"could not load {folder}: {type(err).__name__}: {err}"
         self._install_pose_algorithm()
@@ -2508,22 +2659,117 @@ class AppModel(ObservableObject):
         self._pose_algorithm = pose_algo
 
     def _load_live_preset(
-        self, calib_dir: Path, *, report: bool,
+        self, calib_dir: Path, index: CalibrationIndex, *, report: bool,
     ) -> Tuple[Optional[LoadedPreset], Optional[str]]:
-        """(the preset the live frames are in, None), or (None, why live 3D is off).
+        """(the left-right preset the live frames are in, None), or (None, why live 3D is off).
 
-        Live frames reach inference pooled to the base capture, so the left camera's
-        configured base geometry is their pixel space. Without a preset for it, live 3D
-        stays off and the operator is told why; another preset is never substituted,
+        Live 3D is still the left-right pair. Live frames reach inference pooled to the base
+        capture, so each camera's configured base geometry is its pixel space. The configured
+        left and right must be the calibration's left and right, matched by serial
+        (calibrated_cameras), both calibrated and at the same geometry, and the calibration
+        must hold the pair at it; the preset comes through load_preset_set's stereo. Otherwise
+        live 3D stays off and the operator is told why; another preset is never substituted,
         since its pixels are not the frames' pixels. 2D pose keeps running either way.
         """
-        left = self._left_camera
-        params = left.active_config.params if left is not None else {}
         try:
-            return load_preset(calib_dir, live_inference_geometry(params)), None
+            match = match_cameras(index.cameras, self._configured_serials())
+            problems = []
+            for name in _LIVE_PAIR:
+                calibrated_as = match.calibrated.get(name)
+                if calibrated_as == name:
+                    continue
+                problems.append(
+                    f"{name}: {match.reasons.get(name, NOT_IN_CALIBRATION)}" if calibrated_as is None
+                    else f"{name}: it is the calibration's {calibrated_as}"
+                )
+            if problems:
+                raise CalibrationGeometryError(
+                    "live 3D needs left and right calibrated as left and right: " + "; ".join(problems))
+            cameras = {"left": self._left_camera, "right": self._right_camera}
+            geometries = {
+                name: live_inference_geometry(camera.active_config.params if camera is not None else {})
+                for name, camera in cameras.items()
+            }
+            if geometries["left"] != geometries["right"]:
+                raise CalibrationGeometryError(
+                    "live 3D needs left and right at the same geometry; left is "
+                    f"{_describe_geometry(geometries['left'])}, right is {_describe_geometry(geometries['right'])}")
+            if geometries["left"] not in index.presets:
+                # Raises with the presets the calibration has.
+                return load_preset(calib_dir, geometries["left"]), None
+            loaded = load_preset_set(calib_dir, geometries, derived_root=derived_root(self.calibration_library_root))
+            if loaded.stereo is None:
+                raise CalibrationGeometryError(
+                    f"the calibration in {calib_dir} has no left-right preset at {_describe_geometry(geometries['left'])}")
+            return loaded.stereo, None
         except (CalibrationGeometryError, ValueError) as err:
             self._calibration_problem(str(err), report=report)
             return None, str(err)
+
+    def _configured_serials(self) -> Dict[str, Optional[str]]:
+        """Each configured camera's name -> its serial (camera_serial), in camera order."""
+        return {camera.name: camera_serial(camera.active_config) for camera in self._cameras}
+
+    def _calibration_cameras(self) -> Optional[List[dict]]:
+        """The active calibration's cameras ({name, serial, camera_id, calibrated, reason}),
+        left and right for a legacy one, None when there is none."""
+        if self._active_calibration_index is not None:
+            return list(self._active_calibration_index.cameras)
+        if self._active_calibration_format == "legacy":
+            return [dict(c) for c in _LEGACY_CAMERAS]
+        return None
+
+    def _camera_match(self) -> CameraMatch:
+        configured = self._configured_serials()
+        cameras = self._calibration_cameras()
+        if cameras is None:
+            return CameraMatch(reasons={name: NO_ACTIVE_CALIBRATION for name in configured})
+        return match_cameras(cameras, configured)
+
+    @property
+    def calibrated_cameras(self) -> Dict[str, str]:
+        """Configured camera name -> its name in the active calibration, for each configured
+        camera the calibration calibrated, matched by serial (by name without one)."""
+        return dict(self._camera_match().calibrated)
+
+    @property
+    def uncalibrated_reasons(self) -> Dict[str, str]:
+        """Configured camera name -> why it is 2D only, for every other configured camera:
+        "not in the active calibration", "swapped: calibrated serial X, now Y", the
+        calibration's own reason, or "no active 3D calibration"."""
+        return dict(self._camera_match().reasons)
+
+    def camera_setup_difference(self, selected: Sequence[str]) -> SetupDifference:
+        """The cameras `selected` for a recording against the active calibration's (SetupDifference).
+
+        Empty when there is no active calibration: there is nothing to differ from, and the
+        recording is 2D, as uncalibrated_reasons says.
+        """
+        selected = list(selected)
+        cameras = self._calibration_cameras()
+        if cameras is None:
+            return SetupDifference([], [], [], [])
+        match = match_cameras(cameras, self._configured_serials())
+        swapped = [name for name in selected if name in match.swapped]
+        removed = [
+            c["name"] for c in cameras
+            if c.get("calibrated", True) and c["name"] not in match.matched and c["name"] not in swapped
+        ]
+        return SetupDifference(
+            added=[name for name in selected if match.reasons.get(name) == NOT_IN_CALIBRATION],
+            removed=removed,
+            swapped=swapped,
+            uncalibrated_off=[name for name in match.calibrated if name not in selected],
+        )
+
+    def _recording_camera_names(self) -> List[str]:
+        return [camera.name for camera in self._cameras if camera.is_recording_enabled]
+
+    def acknowledge_setup_difference(self) -> None:
+        """The operator chose to record with the selected cameras although they differ from the
+        active calibration's. The session metadata records mismatchAcknowledged while the
+        difference stays the one acknowledged."""
+        self._acknowledged_difference = self.camera_setup_difference(self._recording_camera_names())
 
     @property
     def active_calibration_dir(self) -> Optional[Path]:
@@ -2573,14 +2819,20 @@ class AppModel(ObservableObject):
             cfg, unavailable_reason=STALE_RECORDING_BLOCKER if stale else None)
 
     def _calibration3d_metadata(self) -> Dict[str, Any]:
-        """hardware.configured.calibration3d: the 3D calibration live 3D used, or why it used none.
+        """hardware.configured.calibration3d: the active 3D calibration, and why live 3D used none.
 
-        The id finds a format-2 calibration again offline wherever it then sits; a legacy
-        one has none and is found by the session's time. created is the index's, or for a
-        legacy folder its stereo pickle's time, as offline dates it. preset is the name of
-        the preset live 3D loaded, None for legacy. With live 3D off (no stereo parameters
-        loaded) the calibration is still named, preset is None, and live3dDisabledReason
-        says why, as the operator was told.
+        The id finds a format-2 or 3 calibration again offline wherever it then sits (the
+        library first); a legacy one has none and is found by the session's time. created is
+        the index's, or for a legacy folder its stereo pickle's time, as offline dates it.
+        path is the folder relative to the configuration location (calibrations/<id> for a
+        library entry), None outside it; folder is its absolute path at record time. preset
+        is the name of the preset live 3D loaded, None for legacy. override is the latest
+        override decision for the id in the library's decisions.jsonl, else the index's own.
+        cameras are the calibration's; matchesRecording and mismatch compare them with the
+        cameras recording (camera_setup_difference), None without a calibration, and
+        mismatchAcknowledged says the operator chose to record anyway. With live 3D off (no
+        stereo parameters loaded) the calibration is still named, preset is None, and
+        live3dDisabledReason says why, as the operator was told.
         """
         folder = self._active_calibration_dir
         index = self._active_calibration_index
@@ -2593,12 +2845,41 @@ class AppModel(ObservableObject):
             except (OSError, ValueError) as err:
                 logger.warning("cannot date the 3D calibration in %s: %s", folder, err)
         preset = self._active_calibration_preset
+        override = None if index is None else index.override
+        if index is not None and self._is_library_entry(folder):
+            override = latest_decision(self.calibration_library_root, index.id, "override") or override
+        relative = None
+        if folder is not None:
+            try:
+                relative = Path(folder).resolve().relative_to(
+                    Path(self._preferences.configuration_location).expanduser().resolve()).as_posix()
+            except (OSError, ValueError):
+                relative = None
+        cameras = self._calibration_cameras()
+        difference = None if cameras is None else self.camera_setup_difference(self._recording_camera_names())
+        match = None if cameras is None else match_cameras(cameras, self._configured_serials())
         record = {
             "id": None if index is None else index.id,
             "created": None if created is None else created.isoformat(timespec="seconds"),
             "preset": None if preset is None else preset.name,
             "folder": None if folder is None else str(folder),
-            "override": None if index is None else index.override,
+            "override": override,
+            "path": relative,
+            "format": self._active_calibration_format,
+            "cameras": None if cameras is None else [
+                {"name": c["name"], "serial": c.get("serial"), "cameraId": c.get("camera_id")} for c in cameras
+            ],
+            "matchesRecording": None if difference is None else not difference.differs,
+            "mismatch": None if difference is None else {
+                "added": list(difference.added),
+                "removed": list(difference.removed),
+                "swapped": [
+                    {"name": name, "calibratedSerial": match.swapped[name][0], "recordedSerial": match.swapped[name][1]}
+                    for name in difference.swapped
+                ],
+            },
+            "mismatchAcknowledged": bool(
+                difference is not None and difference.differs and difference == self._acknowledged_difference),
         }
         if self._pose_algorithm is None or self._pose_algorithm.stereo_params is None:
             record["preset"] = None
@@ -11990,6 +12271,21 @@ class AppModel(ObservableObject):
                 # Only session metadata carries the live notes.
                 self._notes_saved_revision = notes_revision
 
+    @staticmethod
+    def _camera_calibration_metadata(camera, calibrated: Mapping[str, str], reasons: Mapping[str, str]) -> Dict[str, Any]:
+        """A camera's identity and its place in the active calibration, for hardware.configured.cameras.
+
+        serial is camera_serial's (None without one); inCalibration says the active
+        calibration calibrated this camera, so 3D can use it; uncalibratedReason says why
+        not otherwise (uncalibrated_reasons), and is None when it is in.
+        """
+        return {
+            "serial": camera_serial(camera.active_config),
+            "cameraId": None if camera.camera_id is None else int(camera.camera_id),
+            "inCalibration": camera.name in calibrated,
+            "uncalibratedReason": None if camera.name in calibrated else reasons.get(camera.name),
+        }
+
     def _save_metadata(self, project: ProjectInfo, when: datetime, file_name: str, session: Optional[int] = -1):
         when_as_utc = when.astimezone(timezone.utc)
         metadata_generation_id = (
@@ -12006,6 +12302,8 @@ class AppModel(ObservableObject):
         configuration = asdict(self._create_configuration(
             runtime_camera_modes=True,
         ))
+        camera_match = self._camera_match()
+        calibrated, reasons = camera_match.calibrated, camera_match.reasons
         hardware_configured = {
             "canEnabled": self._hardware.can_enabled,
             "pelletControllerEnabled": self._hardware.pellet_controller_enabled,
@@ -12014,7 +12312,10 @@ class AppModel(ObservableObject):
             "liveInferenceEnabled": self._inference.is_enabled,
             "pelletFirmwareCompatibility": self._hardware.firmware_compatibility,
             "cameras": {
-                camera.name: _camera_configured_metadata(camera)
+                camera.name: {
+                    **_camera_configured_metadata(camera),
+                    **self._camera_calibration_metadata(camera, calibrated, reasons),
+                }
                 for camera in self._cameras
             },
             # Beside the cameras, not in them: the calibration is the stereo pair's.
@@ -12024,7 +12325,7 @@ class AppModel(ObservableObject):
 
         if session is None:
             out = {
-                "metadataSchemaVersion": 2,
+                "metadataSchemaVersion": METADATA_SCHEMA_VERSION,
                 "metadataGenerationId": metadata_generation_id,
                 "scope": "acquisition",
                 "createdUtc": when_as_utc.timestamp(),
@@ -12049,7 +12350,7 @@ class AppModel(ObservableObject):
                 ),
             }
             out = {
-                "metadataSchemaVersion": 2,
+                "metadataSchemaVersion": METADATA_SCHEMA_VERSION,
                 "metadataGenerationId": metadata_generation_id,
                 "scope": "session",
                 "sessionId": project.short_id,

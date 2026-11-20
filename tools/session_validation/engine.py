@@ -154,10 +154,11 @@ def _schema_rule(context):
         "manifest": manifest.get("schemaVersion"),
         "metadata": metadata.get("metadataSchemaVersion"),
     }
-    if observed != {"manifest": 1, "metadata": 2}:
+    # Metadata schema 3 (2026-11-20) only adds fields to schema 2; both are read.
+    if observed["manifest"] != 1 or observed["metadata"] not in (2, 3):
         return _result(
             "session.schema", "fail", "Unsupported pre-release session schema",
-            expected={"manifest": 1, "metadata": 2}, observed=observed,
+            expected={"manifest": 1, "metadata": [2, 3]}, observed=observed,
             remediation="Record a new session with the current first-release schema.",
         )
     return _result("session.schema", "pass", "Current session schema is supported")

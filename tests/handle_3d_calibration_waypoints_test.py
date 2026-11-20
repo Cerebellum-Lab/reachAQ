@@ -27,9 +27,17 @@ from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.device import MotorConfigurationFile
+from autotrainer.inference.multires_calibration import store
 from autotrainer.inference.multires_calibration.extract import distinct_waypoints
-from autotrainer.inference.multires_calibration.geometry import PresetGeometry
-from autotrainer.inference.multires_calibration.pipeline import WAYPOINT_LOG, load_waypoint_log, write_waypoint_log
+from autotrainer.inference.multires_calibration.fit import BoardSpec, CaptureCamera
+from autotrainer.inference.multires_calibration.geometry import PresetGeometry, PresetSet, presets_for_cameras
+from autotrainer.inference.multires_calibration.pipeline import (
+    WAYPOINT_LOG,
+    calibrated_preset_sets,
+    load_waypoint_log,
+    write_waypoint_log,
+)
+from autotrainer.inference.multires_calibration.report import QualityReport
 from autotrainer.video.video_record import VideoRecordMode
 from tools.acquisition.model import handle_3d_calibration as h3d
 from tools.acquisition.model import hardware_model as hardware_model_module
@@ -47,7 +55,10 @@ from tools.acquisition.model.handle_3d_calibration import (
     wait_until_arrived,
 )
 
+from multires_calibration_fakes import FIT
+
 NAN = float("nan")
+_REPORT = QualityReport(created="2026-11-20T12:00:00-06:00", verdict="pass", metrics=[], thresholds={}, notes=[])
 # The live 256 preset's camera configuration: bin 4, 256x256 at ROI offset (52, 6).
 LIVE_PARAMS = dict(hbin=4, vbin=4, width=256, height=256, offsetx=52, offsety=6, exposure=140, fps=150)
 SETTINGS = {"gain_db": 1.0, "gamma": None, "exposure_us": 4500, "fps": 40}
@@ -659,15 +670,16 @@ def _app_model(*, effective, loaded):
     def make_project_info():
         raise _Stop
 
-    def camera(name, primary):
-        return SimpleNamespace(name=name, is_primary=primary, active_config=SimpleNamespace(params=dict(LIVE_PARAMS)),
+    def camera(name, primary, camera_id):
+        return SimpleNamespace(name=name, is_primary=primary, camera_id=camera_id,
+                               active_config=SimpleNamespace(params=dict(LIVE_PARAMS), scheme="random", host=""),
                                save_configuration=lambda: SimpleNamespace(params=dict(LIVE_PARAMS)))
 
     return SimpleNamespace(
         behavior=SimpleNamespace(algorithm=SimpleNamespace(
             diamond_triangle_config=effective, loaded_diamond_triangle_config=loaded)),
-        left_camera=camera("left", True),
-        right_camera=camera("right", False),
+        left_camera=camera("left", True, 0),
+        right_camera=camera("right", False, 1),
         hardware=SimpleNamespace(),  # any motor call would raise AttributeError
         make_project_info=make_project_info,
         active_calibration_dir=None,
@@ -676,21 +688,24 @@ def _app_model(*, effective, loaded):
 
 def test_calibration_uses_the_loaded_dcs_while_stale_and_refuses_without_one():
     # STALE: consumers see no DCS, but the capture still converts with the loaded one.
+    stale = _app_model(effective=None, loaded=_dcs())
     with pytest.raises(_Stop):
-        make_3d_calib(_app_model(effective=None, loaded=_dcs()))
+        make_3d_calib(stale, [stale.left_camera, stale.right_camera])
     for missing in (None, _dcs(version=1), _dcs(used=(NAN, 20, 30))):
+        refused = _app_model(effective=missing, loaded=missing)
         with pytest.raises(RuntimeError, match="calibrate diamond-triangle"):
-            make_3d_calib(_app_model(effective=missing, loaded=missing))
+            make_3d_calib(refused, [refused.left_camera, refused.right_camera])
 
 
 class _CaptureCamera:
     """A camera that records the calls make_3d_calib makes on it; `stops` is whether it
     reaches TERMINATED when stopped."""
 
-    def __init__(self, name, primary, calls, *, stops):
+    def __init__(self, name, primary, calls, *, stops, params=LIVE_PARAMS, camera_id=None):
         self.name = name
         self.is_primary = primary
-        self.saved = CameraConfiguration(name=name, params=dict(LIVE_PARAMS, primary="on" if primary else "off"))
+        self.camera_id = camera_id
+        self.saved = CameraConfiguration(name=name, params=dict(params, primary="on" if primary else "off"))
         self.active_config = self.saved
         self.project = None
         self._calls = calls
@@ -761,8 +776,8 @@ def _capture_app_model(tmp_path, calls, *, stops):
     return SimpleNamespace(
         behavior=SimpleNamespace(algorithm=SimpleNamespace(diamond_triangle_config=_dcs(),
                                                            loaded_diamond_triangle_config=_dcs())),
-        left_camera=_CaptureCamera("left", True, calls, stops=stops),
-        right_camera=_CaptureCamera("right", False, calls, stops=stops),
+        left_camera=_CaptureCamera("left", True, calls, stops=stops, camera_id=0),
+        right_camera=_CaptureCamera("right", False, calls, stops=stops, camera_id=1),
         hardware=_CaptureMotor(calls),
         message_handler=SimpleNamespace(input_queue=None),
         make_project_info=lambda: project,
@@ -796,7 +811,7 @@ def test_a_failed_capture_stops_and_restores_the_cameras_and_raises_its_own_erro
     monkeypatch.setattr(h3d, "calibrate_waypoint_capture", lambda *a, **k: calibrated.append(a))
 
     with pytest.raises(RuntimeError) as raised:
-        make_3d_calib(app_model)
+        make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
 
     # the capture's own error, also when the cameras then fail to stop as well
     assert raised.value is fault
@@ -818,7 +833,7 @@ def test_the_capture_triggers_recording_like_a_session(tmp_path, monkeypatch):
         (tmp_path / "session" / f"{name}_recording.mp4").write_bytes(b"")
         (tmp_path / "session" / f"{name}_recording_timestamps.txt").write_text("")
 
-    make_3d_calib(app_model)
+    make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
 
     for name in ("left", "right"):
         mine = [call[1:] for call in calls if call[0] == name]
@@ -839,7 +854,7 @@ def test_cameras_that_do_not_stop_fail_a_capture_that_ran(tmp_path, monkeypatch)
     monkeypatch.setattr(h3d, "calibrate_waypoint_capture", lambda *a, **k: calibrated.append(a))
 
     with pytest.raises(RuntimeError, match="TERMINATED"):
-        make_3d_calib(app_model)
+        make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
 
     _assert_cameras_stopped_and_restored(app_model, calls)
     assert calibrated == []  # videos that may still be being written are not calibrated from
@@ -863,7 +878,7 @@ def test_a_capture_that_ran_returns_where_its_calibration_was_written(tmp_path, 
     monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: log)
     monkeypatch.setattr(h3d, "calibrate_waypoint_capture", fake_calibrate_waypoint_capture)
 
-    result = make_3d_calib(app_model)
+    result = make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
 
     capture_dir = session / DEFAULT_3D_CALIB_DIR_NAME
     assert result == (capture_dir, session / "written-here", index, report)
@@ -876,3 +891,114 @@ def test_a_capture_that_ran_returns_where_its_calibration_was_written(tmp_path, 
         copied = capture_dir / "source_videos" / f"{camera}_timestamps.txt"
         assert copied.read_text() == f"{camera} frame times\n"
         assert (session / f"{camera}_recording_timestamps.txt").is_file()
+
+
+def _camera_set(calls, specs):
+    """_CaptureCameras from (name, camera id, primary, serial or None, params) specs."""
+    cameras = []
+    for name, camera_id, primary, serial, params in specs:
+        camera = _CaptureCamera(name, primary, calls, stops=True, params=params, camera_id=camera_id)
+        if serial is not None:
+            camera.saved.scheme, camera.saved.host = "spinnaker", serial
+        cameras.append(camera)
+    return cameras
+
+
+def _run_capture(tmp_path, monkeypatch, cameras, calls):
+    """make_3d_calib over `cameras`, the waypoints and the calibration faked; gives what each saw."""
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    session = tmp_path / "session"
+    for camera in cameras:
+        (session / f"{camera.name}_recording.mp4").touch()
+        (session / f"{camera.name}_recording_timestamps.txt").write_text("")
+    seen = {}
+
+    def fake_run_waypoints(hard, plan, **kwargs):
+        seen["log cameras"] = kwargs["cameras"]
+        return SimpleNamespace(verified=[True])
+
+    def fake_calibrate_waypoint_capture(capture_dir, waypoint_log, **kwargs):
+        seen.update(kwargs)
+        return session / "written-here", SimpleNamespace(id="abc"), SimpleNamespace(verdict="pass")
+
+    monkeypatch.setattr(h3d, "run_waypoints", fake_run_waypoints)
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture", fake_calibrate_waypoint_capture)
+    make_3d_calib(app_model, cameras)
+    return seen, session / DEFAULT_3D_CALIB_DIR_NAME
+
+
+def test_capture_uses_the_cameras_given(tmp_path, monkeypatch):
+    calls = []
+    cameras = _camera_set(calls, [
+        ("left", 0, False, "21000001", LIVE_PARAMS),
+        ("right", 1, False, "21000002", LIVE_PARAMS),
+        # The primary, given last: it goes first, for the trigger order.
+        ("camera4", 4, True, None, LIVE_PARAMS),
+    ])
+    seen, capture_dir = _run_capture(tmp_path, monkeypatch, cameras, calls)
+
+    assert seen["log cameras"] == [
+        CaptureCamera("camera4", None, 4), CaptureCamera("left", "21000001", 0), CaptureCamera("right", "21000002", 1)]
+    assert sorted(p.name for p in (capture_dir / "source_videos").iterdir()) == sorted(
+        f"{name}{suffix}" for name in ("left", "right", "camera4") for suffix in (".mp4", "_timestamps.txt"))
+    for camera in cameras:
+        mine = [call[1:] for call in calls if call[0] == camera.name]
+        assert ("on_prepare_capture",) in mine and ("on_trigger_recording", True) in mine
+        assert mine[-1] == ("load_configuration", camera.saved)
+    # The primary is prepared before the others.
+    prepared = [call[0] for call in calls if call[1:] == ("on_prepare_capture",)]
+    assert prepared[0] == "camera4"
+
+
+def test_presets_are_per_camera(tmp_path, monkeypatch):
+    calls = []
+    other_roi = {**LIVE_PARAMS, "offsetx": 40, "offsety": 10}
+    cameras = _camera_set(calls, [
+        ("left", 0, True, None, LIVE_PARAMS),
+        ("right", 1, False, None, other_roi),
+        ("camera4", 4, False, None, {**LIVE_PARAMS, "hbin": 2, "vbin": 2, "width": 512, "height": 512}),
+    ])
+    seen, _ = _run_capture(tmp_path, monkeypatch, cameras, calls)
+
+    assert seen["live_geometries"] == {
+        "left": PresetGeometry(4, 256, 256, 52, 6),
+        "right": PresetGeometry(4, 256, 256, 40, 10),
+        "camera4": PresetGeometry(2, 512, 512, 52, 6),
+    }
+    # The report grades against the primary's presets.
+    assert seen["presets"] == capture_presets(LIVE_PARAMS)
+
+
+@pytest.mark.parametrize("names", [("left",), ("left", "left"), tuple(f"c{i}" for i in range(7))],
+                         ids=["one camera", "a camera twice", "seven cameras"])
+def test_capture_refuses_a_camera_list_it_cannot_calibrate(tmp_path, names):
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    cameras = _camera_set(calls, [(name, i % 6, i == 0, None, LIVE_PARAMS) for i, name in enumerate(names)])
+    with pytest.raises(ValueError):
+        make_3d_calib(app_model, cameras)
+    assert calls == []  # refused before any camera or motor is touched
+
+
+def test_preset_sets_come_from_the_calibrated_cameras_only(tmp_path):
+    # camera4's window falls on whole pixels at bin 1 only: built from every camera, the sets
+    # would lose bin2 for left and right, though camera4 ends up 2D only.
+    left_right = PresetGeometry(4, 256, 256, 52, 6)
+    live = {"left": left_right, "right": left_right, "camera4": PresetGeometry(1, 1001, 801, 3, 5)}
+    every = presets_for_cameras(live)
+    assert "bin2" not in [s.name for s in every]
+
+    sets = calibrated_preset_sets(live, ["left", "right"])
+    assert [s.name for s in sets] == ["live", "bin1", "bin2"]
+    assert all(set(s.cameras) == {"left", "right"} for s in sets)
+    assert len({tuple(sorted(s.cameras.items())) for s in sets}) == len(sets)
+    with pytest.raises(ValueError, match="camera5"):
+        calibrated_preset_sets(live, ["left", "camera5"])
+
+    # The writer drops a set that repeats an earlier one once the 2D-only camera is out.
+    repeated = [PresetSet("live", {"left": left_right, "right": left_right, "camera4": live["camera4"]}),
+                PresetSet("bin4", {"left": left_right, "right": left_right, "camera4": left_right})]
+    index = store.write_calibration(
+        tmp_path / "calibration", fit=FIT, preset_sets=repeated, board=BoardSpec(), report=_REPORT, capture={},
+        cameras=[CaptureCamera("left", None, 0), CaptureCamera("right", None, 1), CaptureCamera("camera4", None, 4)])
+    assert [s["name"] for s in index.preset_sets] == ["live"]

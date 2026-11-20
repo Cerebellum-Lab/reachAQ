@@ -11,9 +11,14 @@ import dataclasses
 import pytest
 
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry
+from types import SimpleNamespace
+
 from tools.acquisition.model.calibration_geometry import (
+    NOT_IN_CALIBRATION,
     SPINCAM_DEFAULT_GEOMETRY,
+    camera_serial,
     live_inference_geometry,
+    match_cameras,
 )
 
 BASE_SIZE = {"hbin": 4, "vbin": 4, "width": 256, "height": 256}
@@ -70,3 +75,42 @@ def test_defaults_mirror_spincam():
     assert {key: defaults[key] for key in SPINCAM_DEFAULT_GEOMETRY} == SPINCAM_DEFAULT_GEOMETRY
     # live_inference_geometry takes a missing vbin as the hbin default.
     assert defaults["vbin"] == SPINCAM_DEFAULT_GEOMETRY["hbin"]
+
+
+def _cal(name, serial, calibrated=True, reason=""):
+    return {"name": name, "serial": serial, "camera_id": None, "calibrated": calibrated, "reason": reason}
+
+
+def test_the_serial_is_a_spinnaker_camera_s_host():
+    assert camera_serial(SimpleNamespace(scheme="spinnaker", host="21000001")) == "21000001"
+    assert camera_serial(SimpleNamespace(scheme="Spinnaker", host=" 21000001 ")) == "21000001"
+    assert camera_serial(SimpleNamespace(scheme="random", host="localhost")) is None
+    assert camera_serial(SimpleNamespace(scheme="spinnaker", host="")) is None
+    assert camera_serial(None) is None
+
+
+def test_cameras_match_by_serial_then_by_name_without_one():
+    calibration = [_cal("left", "1"), _cal("right", "2"), _cal("stimCam", None),
+                   _cal("camera4", "4", False, "too few board views: 4 of 12 needed")]
+    match = match_cameras(calibration, {"left": "2", "right": "1", "stimCam": None, "camera4": "4", "camera5": "5"})
+    # Renamed by serial; matched by name without a serial; the calibration's own 2D-only reason.
+    assert match.calibrated == {"left": "right", "right": "left", "stimCam": "stimCam"}
+    assert match.reasons == {"camera4": "too few board views: 4 of 12 needed", "camera5": NOT_IN_CALIBRATION}
+    assert match.swapped == {}
+    assert set(match.matched) == {"left", "right", "stimCam", "camera4"}
+
+
+def test_a_calibration_without_serials_matches_every_camera_by_name():
+    # Format 2 and legacy calibrations record no serials.
+    match = match_cameras([_cal("left", None), _cal("right", None)], {"left": "1", "right": "2"})
+    assert match.calibrated == {"left": "left", "right": "right"} and match.reasons == {}
+
+
+def test_a_new_body_under_a_calibrated_name_is_swapped_unless_the_old_body_is_elsewhere():
+    calibration = [_cal("left", "1"), _cal("right", "2")]
+    swapped = match_cameras(calibration, {"left": "9", "right": "2"})
+    assert swapped.reasons == {"left": "swapped: calibrated serial 1, now 9"}
+    assert swapped.swapped == {"left": ("1", "9")}
+    # left's calibrated body is now configured as camera4: left is a new camera, not a swap.
+    moved = match_cameras(calibration, {"left": "9", "right": "2", "camera4": "1"})
+    assert moved.reasons == {"left": NOT_IN_CALIBRATION} and moved.calibrated == {"right": "right", "camera4": "left"}

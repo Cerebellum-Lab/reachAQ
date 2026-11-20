@@ -212,6 +212,20 @@ def is_legacy_entry(folder: Path) -> bool:
     return isinstance(data, dict) and data.get("format") == LEGACY_FORMAT
 
 
+def legacy_folder_name(folder: Path) -> str:
+    """The name a legacy calibration's board is read from (calibration_FLIR.get_calibration_info):
+    the folder it was imported from for a library entry, whose own name is its id; else its own."""
+    folder = Path(folder)
+    if is_legacy_entry(folder):
+        try:
+            source = yaml.safe_load((folder / INDEX_FILE).read_text(encoding="utf-8")).get("source")
+        except (OSError, UnicodeDecodeError, yaml.YAMLError, AttributeError):
+            source = None
+        if isinstance(source, str) and source:
+            return source
+    return folder.name
+
+
 def active_at(root: Path, when: datetime) -> Optional[str]:
     """The entry that was active at `when` (local, naive): the last set_active at or before it.
 
@@ -241,6 +255,27 @@ def active_at(root: Path, when: datetime) -> Optional[str]:
     except CalibrationResolutionError:
         return None
     return best[1]
+
+
+def latest_decision(root: Path, calibration_id: str, kind: str) -> Optional[dict]:
+    """The detail of the last `kind` decision recorded for `calibration_id`, or None.
+
+    None too when decisions.jsonl cannot be read. Unreadable lines are skipped.
+    """
+    try:
+        lines = (Path(root) / DECISIONS_FILE).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    found = None
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("event") == kind and record.get("id") == calibration_id:
+            detail = record.get("detail")
+            found = detail if isinstance(detail, dict) else {}
+    return found
 
 
 def import_existing(config_dir: Path) -> List[str]:

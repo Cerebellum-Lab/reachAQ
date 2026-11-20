@@ -12,8 +12,11 @@ from autotrainer.video import VideoRecordMode
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from autotrainer.inference.multires_calibration.fit import CaptureCamera
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
 from autotrainer.inference.multires_calibration.pipeline import (
+    MAX_CAMERAS,
+    MIN_CAMERAS,
     SOURCE_VIDEOS,
     TIMESTAMPS_SUFFIX,
     WAYPOINT_LOG,
@@ -25,7 +28,7 @@ from autotrainer.inference.multires_calibration.report import QualityReport
 from autotrainer.inference.multires_calibration.store import CalibrationIndex
 
 from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.calibration_geometry import live_inference_geometry
+from tools.acquisition.model.calibration_geometry import camera_serial, live_inference_geometry
 from tools.acquisition.model.video_capture_model import VideoCaptureModel
 
 logger = get_verbose_logger(__name__)
@@ -311,6 +314,7 @@ def run_waypoints(
     tolerance: float = 0.05,
     arrival_timeout: float = 2.0,
     capture_settings: Optional[Mapping[str, Any]] = None,
+    cameras: Optional[Sequence[CaptureCamera]] = None,
 ) -> WaypointLog:
     """Visit each waypoint of `plan` (plan_waypoints) in turn and log it.
 
@@ -327,6 +331,7 @@ def run_waypoints(
     `now` stamps arrive and leave (time.time(), as WaypointLog.times records). `clock`
     times the arrival wait, so a step of the wall clock cannot stretch or cut it short; a
     test may pass one fake for both. `capture_settings` are those of default_params unless
+    given. `cameras` are the capture's cameras (capture_camera_list), left and right unless
     given.
     """
     if capture_settings is None:
@@ -337,6 +342,8 @@ def run_waypoints(
                     ", ".join(f"{axis} {limits[axis]}" for axis in AXES))
     log = WaypointLog(motor=[], reported=[], verified=[], dcs_moves=[], times=[],
                       capture_settings=dict(capture_settings))
+    if cameras is not None:
+        log.cameras = list(cameras)
     origin = _reported_position(hard)  # where prepare() left the stage, if the motor said
     for i, (axis, value, motor) in enumerate(plan):
         moved = AXES if i == 0 else (axis,)
@@ -375,12 +382,28 @@ def wait_cams_capture_status(cameras, capture_status: CaptureProcessStatus, time
 
 
 def capture_presets(live_params: Mapping[str, Any]) -> List[PresetGeometry]:
-    """Every preset the capture calibrates: the presets covering the live camera geometry.
+    """The presets the capture's report grades against: those covering one camera's live geometry.
 
-    `live_params` are the left camera's configured params, read before the capture replaces
-    them with its own bin-1 full-frame params, which are no base for the binned presets.
+    `live_params` are the primary camera's configured params, read before the capture
+    replaces them with its own bin-1 full-frame params, which are no base for the binned presets.
     """
     return presets_from_base(live_inference_geometry(live_params))
+
+
+def capture_live_geometries(cameras: Sequence[VideoCaptureModel]) -> Dict[str, PresetGeometry]:
+    """camera name -> its own live geometry, from its configured params; the calibration's
+    preset sets are made from these for the cameras it calibrates (presets_for_cameras)."""
+    return {camera.name: live_inference_geometry(camera.active_config.params) for camera in cameras}
+
+
+def capture_camera_list(cameras: Sequence[VideoCaptureModel]) -> List[CaptureCamera]:
+    """The waypoint log's cameras: each one's name, its serial (camera_serial: the configured
+    host of a Spinnaker camera, else None) and its camera id."""
+    return [
+        CaptureCamera(camera.name, camera_serial(camera.active_config),
+                      None if camera.camera_id is None else int(camera.camera_id))
+        for camera in cameras
+    ]
 
 
 def calibrate_waypoint_capture(
@@ -390,9 +413,11 @@ def calibrate_waypoint_capture(
     session_dir: Path,
     presets: Sequence[PresetGeometry],
     previous_dir: Optional[Path],
+    live_geometries: Optional[Mapping[str, PresetGeometry]] = None,
 ) -> Tuple[Path, CalibrationIndex, QualityReport]:
     """Write `log` as the capture's waypoints.yaml beside its source_videos, then calibrate
-    every preset into <session_dir>/<DEFAULT_3D_CALIB_DIR_NAME>.new.
+    every preset into <session_dir>/<DEFAULT_3D_CALIB_DIR_NAME>.new. With `live_geometries`
+    (capture_live_geometries), the preset sets are each calibrated camera's own.
 
     Returns (that folder, the calibration's index, its quality report). The folder is
     named here only, and its installer takes it from the return value.
@@ -400,21 +425,30 @@ def calibrate_waypoint_capture(
     """
     write_waypoint_log(Path(capture_dir, WAYPOINT_LOG), log)
     output_dir = Path(session_dir, f"{DEFAULT_3D_CALIB_DIR_NAME}.new")
+    extra = {} if live_geometries is None else {"live_geometries": dict(live_geometries)}
     index, report = calibrate_capture(
         Path(capture_dir),
         output_dir=output_dir,
         presets=presets,
         previous_dir=previous_dir,
+        **extra,
     )
     return output_dir, index, report
 
 
 def make_3d_calib(
     app_model: AppModel,
+    cameras: Sequence[VideoCaptureModel],
     cam_params: Optional[Dict[str, Any]] = None,
     record_mode: VideoRecordMode = VideoRecordMode.TRIGGER,
+    move_list: Optional[str] = None,
 ) -> Tuple[Path, Path, CalibrationIndex, QualityReport]:
-    """Capture the board paused at every waypoint, then calibrate every preset from it.
+    """Capture the board paused at every waypoint with `cameras`, then calibrate them from it.
+
+    `cameras` are 2 to 6 distinct cameras; the primary is put first, for the trigger order.
+    Each camera's own live geometry gives its presets (capture_live_geometries), and the
+    waypoint log records each one's name, serial and camera id (capture_camera_list).
+    `move_list` is "handwritten" (the default, `moves`); the scout pass comes later.
 
     The cameras record in TRIGGER mode, as a session's do. On christielab10 (2026-11-19)
     START_CONTINUOUS never reached RECORDING ("left: no RECORDING within 5 s", three runs),
@@ -433,18 +467,21 @@ def make_3d_calib(
     diamond_triangle_cfg = app_model.behavior.algorithm.loaded_diamond_triangle_config
     if diamond_triangle_cfg is None or not diamond_triangle_cfg.fully_valid:
         raise RuntimeError(f"Please first calibrate diamond-triangle by starting the acquisition")
+    if move_list not in (None, "handwritten"):
+        raise ValueError(f"unknown move list {move_list!r}; only the hand-written list is available")
+    given = list(cameras)
+    names = [camera.name for camera in given]
+    if not MIN_CAMERAS <= len(given) <= MAX_CAMERAS:
+        raise ValueError(f"a 3D calibration takes {MIN_CAMERAS} to {MAX_CAMERAS} cameras, not {len(given)}")
+    if len(set(names)) != len(names):
+        raise ValueError(f"a camera is given twice: {', '.join(names)}")
     plan = plan_waypoints(start, moves, diamond_triangle_cfg)
-    left = app_model.left_camera
-    right = app_model.right_camera
-    # Read before prepare() replaces the camera configurations with the capture's own.
-    presets = capture_presets(left.active_config.params)
-    cameras: List[VideoCaptureModel] = []
     # put primary first:
-    for camera in (left, right):
-        if camera.is_primary:
-            cameras.insert(0, camera)
-        else:
-            cameras.append(camera)
+    cameras = [camera for camera in given if camera.is_primary] + [camera for camera in given if not camera.is_primary]
+    # Read before prepare() replaces the camera configurations with the capture's own.
+    presets = capture_presets(cameras[0].active_config.params)
+    live_geometries = capture_live_geometries(cameras)
+    capture_list = capture_camera_list(cameras)
     cams_before_cfg = tuple(camera.save_configuration() for camera in cameras)
     hard = app_model.hardware
     #
@@ -529,7 +566,8 @@ def make_3d_calib(
         logger.notice("Running 3d calib ..")
         logger.info("Now executing calib moves, pausing at each waypoint ..")
 
-        waypoint_log = run_waypoints(hard, plan, capture_settings=capture_settings_of(cam_params))
+        waypoint_log = run_waypoints(hard, plan, capture_settings=capture_settings_of(cam_params),
+                                     cameras=capture_list)
 
         logger.success("executed %s moves; the motor reported %d of %d waypoints at their commanded position",
                        len(moves), sum(waypoint_log.verified), len(waypoint_log.verified))
@@ -595,6 +633,7 @@ def make_3d_calib(
         session_dir=Path(sess_path.location),
         presets=presets,
         previous_dir=app_model.active_calibration_dir,
+        live_geometries=live_geometries,
     )
 
     logger.success("Successfully calibrated the capture: %s, verdict %s", index.id, report.verdict)

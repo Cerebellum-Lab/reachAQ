@@ -14,11 +14,11 @@ def _write(path, value):
     path.write_text(value, encoding="utf-8")
 
 
-def _session(tmp_path):
+def _session(tmp_path, metadata_schema=2):
     root = tmp_path / "session001"
     generation = "session001-g1"
     metadata = {
-        "metadataSchemaVersion": 2,
+        "metadataSchemaVersion": metadata_schema,
         "metadataGenerationId": generation,
         "sessionId": "session001",
     }
@@ -72,6 +72,14 @@ def test_quick_validator_is_read_only(tmp_path):
     }
     assert report.exit_code == 0
     assert before == after
+
+
+@pytest.mark.parametrize("schema, status", [(2, "pass"), (3, "pass"), (4, "fail")])
+def test_metadata_schemas_2_and_3_are_both_read(tmp_path, schema, status):
+    # Schema 3 (the calibration's cameras, identity by serial) only adds fields to 2.
+    report = validate_session(_session(tmp_path, metadata_schema=schema), profile=ValidationProfile.QUICK)
+    rule = next(item for item in report.results if item.rule_id == "session.schema")
+    assert rule.status.value == status
 
 
 def test_full_validator_detects_manifest_hash_failure(tmp_path):

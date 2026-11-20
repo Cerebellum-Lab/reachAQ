@@ -538,7 +538,10 @@ def reorient_and_center(
     with open(metadata_path, 'r') as file:
         calib_metadata = yaml.safe_load(file)
 
-    square_size, _, _, _ = cal_flir.get_calibration_info(src_dir)
+    # A library entry is named by its id; the board is in the name it was imported from.
+    from autotrainer.inference.multires_calibration.library import legacy_folder_name
+
+    square_size, _, _, _ = cal_flir.get_calibration_info(legacy_folder_name(Path(src_dir)))
     cam_names = cal_flir.get_video_list(src_dir)
 
     cam_offsets, save_offsets = _load_saved_offsets(src_dir)

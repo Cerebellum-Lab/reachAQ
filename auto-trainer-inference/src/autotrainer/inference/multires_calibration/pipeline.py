@@ -90,6 +90,7 @@ from autotrainer.inference.multires_calibration.geometry import (
     PresetGeometry,
     PresetSet,
     map_intrinsics,
+    presets_for_cameras,
     sensor_to_preset_points,
 )
 from autotrainer.inference.multires_calibration.report import (
@@ -336,6 +337,7 @@ def calibrate_capture(
     previous_dir: Optional[Path] = None,
     refine: str = "subpix",
     preset_sets: Optional[Sequence[PresetSet]] = None,
+    live_geometries: Optional[Mapping[str, PresetGeometry]] = None,
 ) -> Tuple[CalibrationIndex, QualityReport]:
     """Calibrate every preset in `presets` from the capture in `capture_dir` and write the
     calibration to `output_dir`, which must not exist yet.
@@ -345,6 +347,9 @@ def calibrate_capture(
     from presets_from_base covers the same sensor window. `presets` are cross-checked.
     `preset_sets` (geometry.presets_for_cameras) are the per-camera geometries written;
     without them each preset is a set of every calibrated camera at that geometry.
+    `live_geometries` (camera -> its live geometry) gives the sets instead, built after the
+    fit from the calibrated cameras only (calibrated_preset_sets), so a camera left 2D only
+    neither duplicates a set nor costs the others a binning; it must name every camera.
     `previous_dir` is the calibration this one replaces, if any. `refine` is
     extract.detect_board's corner refinement.
 
@@ -374,6 +379,8 @@ def calibrate_capture(
     for preset_set in preset_sets or ():
         for g in preset_set.cameras.values():
             _check_inside_sensor(g, image_size)
+    for g in (live_geometries or {}).values():
+        _check_inside_sensor(g, image_size)
 
     motor = [np.asarray(p, float) for p in log.motor]
     frame_times = load_frame_times(capture_dir, cameras)
@@ -388,6 +395,10 @@ def calibrate_capture(
             logger.warning("calibration capture: %s is not calibrated (2D only): %s", v.name, v.reason)
     if len(calibrated) < MIN_CAMERAS:
         raise CalibrationRefused(verdicts)
+    if live_geometries is not None:
+        if preset_sets is not None:
+            raise ValueError("give preset_sets or live_geometries, not both")
+        preset_sets = calibrated_preset_sets(live_geometries, calibrated)
     # The fit, the corner order and the cross-check see only the calibrated cameras. Every
     # waypoint stays, even one no calibrated camera saw, so observations[i] is still
     # extraction's segments[cam][i].
@@ -489,6 +500,19 @@ def calibrate_capture(
         )
     logger.info("calibration %s written to %s: %s", index.id, output_dir, report.verdict)
     return index, report
+
+
+def calibrated_preset_sets(live: Mapping[str, PresetGeometry], calibrated: Sequence[str]) -> List[PresetSet]:
+    """presets_for_cameras over the `calibrated` cameras' live geometries only.
+
+    Built from all the capture's cameras, a set would be dropped for a binning only a 2D-only
+    camera's window misses, and two sets could hold the same geometries once that camera is
+    left out. Raises ValueError when `live` has no geometry for a calibrated camera.
+    """
+    missing = [cam for cam in calibrated if cam not in live]
+    if missing:
+        raise ValueError(f"no live geometry for {', '.join(missing)}")
+    return presets_for_cameras({cam: live[cam] for cam in calibrated})
 
 
 def _cross_checks(
