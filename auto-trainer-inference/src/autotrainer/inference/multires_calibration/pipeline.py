@@ -17,11 +17,17 @@ calibrate_capture turns it into a calibration folder (store.py):
    COMMANDED motor position. The waypoint's frames are those of its logged dwell when every
    camera has a timestamps file, and its stationary segment by motion otherwise. The fit measures the motor scale against the board's squares,
    so a measured position would hide exactly the error the fit is there to find.
-2. Every camera is put in one 180-degree board order (fit.reconcile_corner_order); the
-   report notes a camera that had to be reversed.
-3. Every camera is fitted once in sensor pixels (fit.fit_motor_frame), and every preset's
-   intrinsics are mapped from that fit (geometry.map_intrinsics) when the store writes it.
-4. Each binned preset is cross-checked: the frames the detection used are pooled the way the
+2. Each camera is held to the per-camera rule (per_camera_rule): enough views, spread over
+   the stage, enough of them shared with another calibrated camera, and connected to the
+   others through shared views. A camera that fails it is not calibrated, so it is 2D only:
+   the report names it and the reason, first, and the rest are fitted without it. Fewer
+   than 2 calibrated cameras refuse the calibration (CalibrationRefused).
+3. Every calibrated camera is put in one 180-degree board order
+   (fit.reconcile_corner_order); the report notes a camera that had to be reversed.
+4. The calibrated cameras are fitted jointly, once, in sensor pixels (fit.fit_motor_frame),
+   and every preset's intrinsics are mapped from that fit (geometry.map_intrinsics) when
+   the store writes it.
+5. Each binned preset is cross-checked: the frames the detection used are pooled the way the
    camera bins them (INTER_AREA by the binning) and cropped to the preset's ROI, the board is
    detected there and the preset is fitted directly in its own pixels, starting from the
    mapped sensor fit. The report records the mean offset of the preset's corners from the
@@ -32,15 +38,17 @@ calibrate_capture turns it into a calibration folder (store.py):
    cross-checked. A preset whose direct fit fails gets an undetermined (inf) K difference
    and a note, which warns; its corner offset is graded all the same, and the calibration
    is not aborted.
-5. The report compares with the previous calibration when that is one of these folders; a
+6. The report compares with the previous calibration when that is one of these folders; a
    legacy folder has no motor-frame fit to compare with.
-6. The calibration is written with the coverage images and waypoints.yaml, both before its
-   index (store.write_calibration's extra_files). The source videos are not copied: the
+7. The calibration is written with the coverage images (one per capture camera, calibrated
+   or not) and waypoints.yaml, both before its index (store.write_calibration's
+   extra_files). The source videos are not copied: the
    index's capture.capture_folder names the capture folder, absolute, where they stay.
 
-Errors are not caught here: WaypointAlignmentError from extraction, RuntimeError and
-ValueError from the sensor fit and FileExistsError for an existing output folder reach the
-caller, which reports them to the operator.
+Errors are not caught here: WaypointAlignmentError from extraction, CalibrationRefused
+from the per-camera rule, RuntimeError and ValueError from the sensor fit and
+FileExistsError for an existing output folder reach the caller, which reports them to the
+operator. None of them leaves anything written.
 """
 
 import dataclasses
@@ -81,6 +89,7 @@ from autotrainer.inference.multires_calibration.geometry import (
     sensor_to_preset_points,
 )
 from autotrainer.inference.multires_calibration.report import (
+    CameraVerdict,
     CaptureSummary,
     PresetCrossCheck,
     PreviousCalibration,
@@ -118,6 +127,29 @@ _PER_WAYPOINT_FIELDS = ("reported", "verified", "dcs_moves", "times")
 # (2026-10-26) measured arrivals within 0.007 mm, and a stage stopped at its travel limit
 # 1.72 mm short.
 UNREACHED_TOLERANCE_MM = 0.1
+# The per-camera rule (per_camera_rule): a camera needs MIN_VIEWS kept board views, and
+# MIN_COVISIBLE of them shared with another calibrated camera. The motor frame makes shared
+# views unnecessary to the fit itself; they are required to expose stage geometry the model
+# leaves out (axis skew).
+MIN_VIEWS = 12
+MIN_COVISIBLE = 8
+# Commanded positions that differ by no more than this on an axis (mm) do not span it.
+_SPAN_TOLERANCE_MM = 1e-6
+
+
+class CalibrationRefused(RuntimeError):
+    """Fewer than 2 cameras meet the per-camera rule, so there is nothing to calibrate.
+    `verdicts` is every camera's CameraVerdict, and the message names each failed camera
+    and its reason."""
+
+    def __init__(self, verdicts: Mapping[str, CameraVerdict]):
+        self.verdicts = dict(verdicts)
+        calibrated = [v.name for v in self.verdicts.values() if v.calibrated]
+        reasons = "; ".join(f"{v.name}: {v.reason}" for v in self.verdicts.values() if not v.calibrated)
+        super().__init__(
+            f"the calibration needs at least {MIN_CAMERAS} calibrated cameras and has"
+            f" {len(calibrated)}{' (' + ', '.join(calibrated) + ')' if calibrated else ''}: {reasons}"
+        )
 
 
 @dataclass(frozen=True)
@@ -223,6 +255,72 @@ def load_frame_times(capture_dir: Path, cameras: Sequence[str]) -> Optional[Dict
     return {cam: np.loadtxt(path, delimiter=",", usecols=0, ndmin=1) for cam, path in paths.items()}
 
 
+def per_camera_rule(observations: Sequence[WaypointObservation], cameras: Sequence[str]) -> Dict[str, CameraVerdict]:
+    """Each camera's verdict, in the order of `cameras`. A camera is calibrated when
+
+    1. it kept at least MIN_VIEWS board views ("too few board views: {n} of 12 needed");
+    2. their commanded positions vary on each of x, y and z ("board views do not span all 3
+       stage axes");
+    3. at least MIN_COVISIBLE of its views were also seen by another calibrated camera ("too
+       few views shared with another camera: {n} of 8 needed"). This is repeated until
+       nothing changes, so a camera whose shared views are only with cameras the rule
+       dropped is dropped too;
+    4. it is in the largest group of calibrated cameras connected through shared views ("not
+       connected to the other cameras through shared views"). Two cameras are connected
+       when they saw the board at a common waypoint. Of equal groups, the one holding the
+       camera listed first wins.
+
+    The first rule a camera fails gives its reason. Dropping a camera from the shared views
+    (rule 3) can only lower the others' counts, so the cameras left are the largest set in
+    which every camera meets it; rule 4 then changes no count, since no shared view crosses
+    between groups.
+    """
+    cameras = list(cameras)
+    reasons: Dict[str, str] = {}
+    for cam in cameras:
+        motor = np.array([np.asarray(o.motor_mm, float).reshape(3) for o in observations if cam in o.corners])
+        if len(motor) < MIN_VIEWS:
+            reasons[cam] = f"too few board views: {len(motor)} of {MIN_VIEWS} needed"
+        elif not np.all(np.ptp(motor, axis=0) > _SPAN_TOLERANCE_MM):
+            reasons[cam] = "board views do not span all 3 stage axes"
+
+    def seen_by_calibrated(o: WaypointObservation) -> List[str]:
+        return [cam for cam in cameras if cam in o.corners and cam not in reasons]
+
+    while True:
+        shared = {cam: 0 for cam in cameras if cam not in reasons}
+        for o in observations:
+            seen = seen_by_calibrated(o)
+            if len(seen) > 1:
+                for cam in seen:
+                    shared[cam] += 1
+        dropped = {
+            cam: f"too few views shared with another camera: {n} of {MIN_COVISIBLE} needed"
+            for cam, n in shared.items()
+            if n < MIN_COVISIBLE
+        }
+        if not dropped:
+            break
+        reasons.update(dropped)
+
+    # Connected groups, by merging the groups of the cameras that share each waypoint.
+    group = {cam: {cam} for cam in cameras if cam not in reasons}
+    for o in observations:
+        seen = seen_by_calibrated(o)
+        for cam in seen[1:]:
+            if group[cam] is not group[seen[0]]:
+                merged = group[seen[0]] | group[cam]
+                for member in merged:
+                    group[member] = merged
+    if group:
+        # max keeps the first of equal groups, and `group` is in camera order.
+        largest = max(group.values(), key=len)
+        for cam in group:
+            if cam not in largest:
+                reasons[cam] = "not connected to the other cameras through shared views"
+    return {cam: CameraVerdict(cam, cam not in reasons, reasons.get(cam, "")) for cam in cameras}
+
+
 def unreached_waypoints(log: WaypointLog, tolerance: float = UNREACHED_TOLERANCE_MM) -> List[int]:
     """The waypoints whose reported position is more than `tolerance` mm from the commanded
     one on some axis. A waypoint with no finite reported position carries no evidence
@@ -252,6 +350,9 @@ def calibrate_capture(
     against, is the one with the largest binning: the live inference preset. Every preset
     from presets_from_base covers the same sensor window. `previous_dir` is the calibration
     this one replaces, if any. `refine` is extract.detect_board's corner refinement.
+
+    Only the cameras that meet per_camera_rule are fitted; the report's `cameras` gives
+    every camera's verdict. Raises CalibrationRefused, writing nothing, when fewer than 2 do.
     """
     capture_dir, output_dir = Path(capture_dir), Path(output_dir)
     # Refused before minutes of extraction and fitting, not after.
@@ -280,12 +381,33 @@ def calibrate_capture(
         videos, motor, board, frames_per_waypoint=_FRAMES_PER_WAYPOINT, refine=refine,
         frame_times=frame_times, dwells=None if frame_times is None else log.times,
     )
-    observations, reversed_order = reconcile_corner_order(extraction.observations, board, image_size, cameras)
-    logger.info("calibration capture: %d distinct waypoints; fitting %d cameras", len(observations), len(cameras))
-    fit = fit_motor_frame(observations, board, image_size, cameras)
+    verdicts = per_camera_rule(extraction.observations, cameras)
+    calibrated = tuple(cam for cam in cameras if verdicts[cam].calibrated)
+    for v in verdicts.values():
+        if not v.calibrated:
+            logger.warning("calibration capture: %s is not calibrated (2D only): %s", v.name, v.reason)
+    if len(calibrated) < MIN_CAMERAS:
+        raise CalibrationRefused(verdicts)
+    # The fit, the corner order and the cross-check see only the calibrated cameras. Every
+    # waypoint stays, even one no calibrated camera saw, so observations[i] is still
+    # extraction's segments[cam][i].
+    kept = [
+        WaypointObservation(
+            index=o.index,
+            motor_mm=o.motor_mm,
+            corners={cam: c for cam, c in o.corners.items() if cam in calibrated},
+        )
+        for o in extraction.observations
+    ]
+    observations, reversed_order = reconcile_corner_order(kept, board, image_size, calibrated)
+    logger.info("calibration capture: %d distinct waypoints; fitting %d of %d cameras",
+                len(observations), len(calibrated), len(cameras))
+    fit = fit_motor_frame(observations, board, image_size, calibrated)
 
     notes: List[str] = []
-    cross_checks = _cross_checks(videos, extraction.segments, observations, fit, presets, board, refine, notes)
+    cross_checks = _cross_checks(
+        {cam: videos[cam] for cam in calibrated}, extraction.segments, observations, fit, presets, board, refine, notes
+    )
     for cam, flipped in reversed_order.items():
         if flipped:
             notes.append(
@@ -323,12 +445,12 @@ def calibrate_capture(
         waypoints_total=len(log.motor),
         waypoints_verified=sum(log.verified),
         waypoints_unreached=len(unreached),
-        views_kept={cam: sum(cam in o.corners for o in observations) for cam in cameras},
+        views_kept={cam: sum(cam in o.corners for o in extraction.observations) for cam in cameras},
         rejections=rejections,
     )
     previous = _previous(previous_dir, notes)
     report = build_report(fit, observations, board, base.sensor_roi(), summary, cross_checks, previous,
-                          presets=presets)
+                          presets=presets, cameras=verdicts)
     report.notes.extend(notes)
 
     capture = {
@@ -349,7 +471,9 @@ def calibrate_capture(
         "capture_folder": str(capture_dir.resolve()),
     }
     with tempfile.TemporaryDirectory(prefix="calibration_coverage_") as tmp:
-        coverage = write_coverage_images(observations, image_size, base.sensor_roi(), Path(tmp), cameras)
+        # Every camera's, from extraction: a 2D-only camera's shows what it did see. The
+        # hulls do not depend on the corner order.
+        coverage = write_coverage_images(extraction.observations, image_size, base.sensor_roi(), Path(tmp), cameras)
         extra_files = {path.name: path for path in coverage}
         extra_files[WAYPOINT_LOG] = capture_dir / WAYPOINT_LOG
         index = write_calibration(
@@ -377,9 +501,9 @@ def _cross_checks(
 ) -> List[PresetCrossCheck]:
     """A PresetCrossCheck per binned preset, in the order of `presets`; a failed fit adds a note.
 
-    observations[i] is the waypoint of every camera's segments[cam][i], as extraction
-    returned them. A camera is detected only at the waypoints where it was kept, in the same
-    frames extraction used there, and its corners are the per-corner median over the frames
+    `videos` holds the calibrated cameras, the fit's. observations[i] is the waypoint of every
+    camera's segments[cam][i], as extraction returned them. A camera is detected only at the
+    waypoints where it was kept, in the same frames extraction used there, and its corners are the per-corner median over the frames
     that found the board. Each detection is put in the order of the sensor detection mapped
     into the preset, so the direct fit labels the board as the sensor fit did.
     """

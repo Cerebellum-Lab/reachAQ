@@ -22,6 +22,7 @@ from autotrainer.inference.multires_calibration.fit import WaypointObservation, 
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
 from autotrainer.inference.multires_calibration.report import (
     DEFAULT_THRESHOLDS,
+    CameraVerdict,
     CaptureSummary,
     PresetCrossCheck,
     PreviousCalibration,
@@ -38,6 +39,7 @@ PRESETS = presets_from_base(BASE)
 BASE_ROI = BASE.sensor_roi()  # (208, 24, 1232, 1048), pixel edges
 IMAGE_SIZE = (1440, 1080)
 CAMERAS = ("left", "right")
+PAIR = "left-right"  # a pair metric's camera
 CHANGE_METRICS = {"camera_rotation_change_deg", "baseline_change_mm", "focal_change_rel"}
 STATUS_WORDS = ("FAIL", "WARN", "PASS")
 
@@ -49,7 +51,7 @@ def rig():
 
 @pytest.fixture(scope="module")
 def fitted(rig):
-    return fit_motor_frame(rig.observations, rig.board, IMAGE_SIZE)
+    return fit_motor_frame(rig.observations, rig.board, IMAGE_SIZE, CAMERAS)
 
 
 @pytest.fixture(scope="module")
@@ -67,13 +69,14 @@ def swept_roi(observations):
 
 
 def capture_for(observations, unverified=0, views_kept=None, rejections=None, unreached=0):
-    counted = {cam: sum(cam in o.corners for o in observations) for cam in CAMERAS}
+    cameras = sorted({cam for o in observations for cam in o.corners})
+    counted = {cam: sum(cam in o.corners for o in observations) for cam in cameras}
     return CaptureSummary(
         waypoints_total=len(observations),
         waypoints_verified=len(observations) - unverified,
         waypoints_unreached=unreached,
         views_kept=counted if views_kept is None else views_kept,
-        rejections={cam: {} for cam in CAMERAS} if rejections is None else rejections,
+        rejections={cam: {} for cam in cameras} if rejections is None else rejections,
     )
 
 
@@ -87,7 +90,7 @@ def cross_checks(deltas=(0.1, 0.1), offsets=(0.01, 0.01)):
     ]
 
 
-def report_for(fit, observations, board, roi, *, previous=None, capture=None, checks=None):
+def report_for(fit, observations, board, roi, *, previous=None, capture=None, checks=None, cameras=None):
     return build_report(
         fit,
         observations,
@@ -97,6 +100,7 @@ def report_for(fit, observations, board, roi, *, previous=None, capture=None, ch
         cross_checks() if checks is None else checks,
         previous,
         presets=PRESETS,
+        cameras=cameras,
     )
 
 
@@ -136,9 +140,10 @@ def test_clean_synthetic_fit_passes(rig, fitted):
     assert report.verdict == "pass", not_passing(report)
     assert set(DEFAULT_THRESHOLDS) <= set(report.thresholds)
     assert report.thresholds == DEFAULT_THRESHOLDS
-    # Every metric that applies without a previous calibration is graded, per camera where it is per camera.
-    assert {m.name for m in report.metrics} == set(DEFAULT_THRESHOLDS) - CHANGE_METRICS
-    for name in ("views_kept", "reprojection_rms_px", "coverage_roi_fraction", "fx_fy_ratio_dev",
+    # Every metric that applies without a previous calibration is graded, per camera where it
+    # is per camera; the leave-one-camera-out check needs a third camera.
+    assert {m.name for m in report.metrics} == set(DEFAULT_THRESHOLDS) - CHANGE_METRICS - {"loo_triangulation_px"}
+    for name in ("views_kept", "covisible_views", "reprojection_rms_px", "coverage_roi_fraction", "fx_fy_ratio_dev",
                  "focal_rel_std", "principal_point_offset_frac", "max_distortion_shift_px"):
         for cam in CAMERAS:
             metric(report, name, cam)
@@ -212,7 +217,7 @@ def test_previous_calibration_change_warns_camera_moved(rig, fitted):
     assert left.status == "warn"
     assert "moved" in left.note
     # Turned about its own centre, the left camera did not translate; the right one did not change.
-    assert metric(report, "baseline_change_mm").value == pytest.approx(0.0, abs=1e-9)
+    assert metric(report, "baseline_change_mm", PAIR).value == pytest.approx(0.0, abs=1e-9)
     assert metric(report, "camera_rotation_change_deg", "right").status == "pass"
     assert metric(report, "camera_rotation_change_deg", "right").value == pytest.approx(0.0, abs=1e-9)
     assert any("left" in note and "moved" in note for note in report.notes)
@@ -233,7 +238,7 @@ def test_a_common_shift_of_both_cameras_does_not_read_as_moved(rig, fitted):
         previous=PreviousCalibration(legacy=False, fit=previous),
     )
 
-    baseline = metric(report, "baseline_change_mm")
+    baseline = metric(report, "baseline_change_mm", PAIR)
     assert baseline.value == pytest.approx(0.0, abs=1e-9)
     assert baseline.status == "pass"
     assert "moved" not in baseline.note
@@ -250,7 +255,7 @@ def test_moving_one_camera_changes_the_baseline(rig, fitted):
         previous=PreviousCalibration(legacy=False, fit=previous),
     )
 
-    baseline = metric(report, "baseline_change_mm")
+    baseline = metric(report, "baseline_change_mm", PAIR)
     assert baseline.value == pytest.approx(2.0, abs=1e-9)
     assert baseline.status == "warn"
     assert "moved" in baseline.note
@@ -345,8 +350,8 @@ def test_text_lists_failures_first(rig, fitted):
 def test_noise_free_truth_has_no_stereo_error(exact_rig):
     report = report_for(exact_rig.truth, exact_rig.observations, exact_rig.board, swept_roi(exact_rig.observations))
 
-    assert metric(report, "epipolar_error_px").value < 1e-6
-    assert metric(report, "square_size_rel_error").value < 1e-8
+    assert metric(report, "epipolar_error_px", PAIR).value < 1e-6
+    assert metric(report, "square_size_rel_error", PAIR).value < 1e-8
     assert report.verdict == "pass", not_passing(report)
 
 
@@ -357,7 +362,7 @@ def test_epipolar_error_detects_a_stereo_inconsistency(exact_rig):
 
     report = report_for(fit, exact_rig.observations, exact_rig.board, swept_roi(exact_rig.observations))
 
-    epipolar = metric(report, "epipolar_error_px")
+    epipolar = metric(report, "epipolar_error_px", PAIR)
     assert epipolar.value > 1.0
     assert epipolar.status == "fail"
 
@@ -468,7 +473,7 @@ def test_the_baseline_length_is_the_distance_between_the_camera_centres(exact_ri
     for cam in CAMERAS:
         model = exact_rig.truth.cameras[cam]
         centres[cam] = -cv2.Rodrigues(np.asarray(model.rvec, float))[0].T @ np.asarray(model.tvec, float).reshape(3)
-    baseline = metric(report, "baseline_mm")
+    baseline = metric(report, "baseline_mm", PAIR)
     assert baseline.value == pytest.approx(float(np.linalg.norm(centres["right"] - centres["left"])), rel=1e-12)
     assert baseline.unit == "mm" and baseline.value > 0
 
@@ -518,3 +523,107 @@ def test_write_coverage_images(rig, tmp_path):
         assert image is not None
         assert image.shape[:2] == (IMAGE_SIZE[1], IMAGE_SIZE[0])
         assert image.std() > 0
+
+
+THREE = ("left", "right", "top")
+
+
+@pytest.fixture(scope="module")
+def rig3():
+    return synthetic_rig(cameras=THREE, noise_px=0.1)
+
+
+@pytest.fixture(scope="module")
+def exact_rig3():
+    return synthetic_rig(cameras=THREE, noise_px=0.0)
+
+
+def test_pair_metrics_cover_every_covisible_pair(exact_rig3):
+    report = report_for(exact_rig3.truth, exact_rig3.observations, exact_rig3.board,
+                        swept_roi(exact_rig3.observations))
+    pairs = ["left-right", "left-top", "right-top"]
+    for name in ("epipolar_error_px", "square_size_rel_error", "focal_pair_rel", "baseline_mm"):
+        assert [m.camera for m in report.metrics if m.name == name] == pairs, name
+    for pair in pairs:
+        assert metric(report, "epipolar_error_px", pair).value < 1e-6
+        assert metric(report, "square_size_rel_error", pair).value < 1e-8
+    assert report.verdict == "pass", not_passing(report)
+
+
+def test_a_pair_that_shares_no_waypoint_has_no_pair_metrics(exact_rig3):
+    # top sees only the first half of the move list and right only the second, so the two
+    # never see the board together; left sees all of it.
+    observations = [
+        WaypointObservation(o.index, o.motor_mm, {
+            cam: c for cam, c in o.corners.items()
+            if not (cam == "top" and o.index >= 18) and not (cam == "right" and o.index < 18)
+        })
+        for o in exact_rig3.observations
+    ]
+    report = report_for(exact_rig3.truth, observations, exact_rig3.board, swept_roi(observations))
+    assert [m.camera for m in report.metrics if m.name == "epipolar_error_px"] == ["left-right", "left-top"]
+
+
+def test_covisible_views_count_the_views_shared_with_another_camera(rig, fitted):
+    observations = [
+        WaypointObservation(o.index, o.motor_mm, dict(o.corners)) for o in rig.observations
+    ]
+    for o in observations[:30]:
+        del o.corners["right"]
+    report = report_for(fitted, observations, rig.board, swept_roi(observations))
+    # Both cameras saw the last 7 waypoints; the left camera saw 30 more on its own.
+    for cam in CAMERAS:
+        shared = metric(report, "covisible_views", cam)
+        assert shared.value == 7 and shared.status == "warn" and shared.lower_is_worse
+    assert DEFAULT_THRESHOLDS["covisible_views"] == (8.0, 4.0)
+
+
+def test_loo_triangulation_is_small_on_the_truth(rig3):
+    report = report_for(rig3.truth, rig3.observations, rig3.board, swept_roi(rig3.observations))
+    assert DEFAULT_THRESHOLDS["loo_triangulation_px"] == (0.5, 1.0)
+    for cam in THREE:
+        loo = metric(report, "loo_triangulation_px", cam)
+        assert loo.value < 0.3 and loo.status == "pass", loo
+        assert loo.unit == "sensor px"
+
+
+def test_loo_triangulation_catches_a_camera_the_others_disagree_with(exact_rig3):
+    # The top camera turned 0.1 degrees: the other two still agree with each other, so
+    # it is top's own detections that land away from what they triangulate.
+    fit = with_camera(exact_rig3.truth, "top", turned(exact_rig3.truth.cameras["top"], 0.1, (1.0, 0.0, 0.0)))
+    report = report_for(fit, exact_rig3.observations, exact_rig3.board, swept_roi(exact_rig3.observations))
+    assert metric(report, "loo_triangulation_px", "top").value > 1.0
+    assert metric(report, "loo_triangulation_px", "top").status == "fail"
+
+
+def test_uncalibrated_cameras_come_first_and_make_the_verdict_warn(rig, fitted):
+    verdicts = {
+        "left": CameraVerdict("left", True, ""),
+        "right": CameraVerdict("right", True, ""),
+        "camera4": CameraVerdict("camera4", False, "too few board views: 4 of 12 needed"),
+    }
+    report = report_for(fitted, rig.observations, rig.board, swept_roi(rig.observations), cameras=verdicts)
+    assert report.cameras == verdicts
+    assert list(report.cameras) == ["left", "right", "camera4"]
+    # Every metric passes; the 2D-only camera alone makes the verdict warn.
+    assert not not_passing(report)
+    assert report.verdict == "warn"
+    lines = report.to_text().splitlines()
+    assert lines[0] == "NOT CALIBRATED (2D only): camera4: too few board views: 4 of 12 needed"
+    assert "WARN" in lines[1]
+    assert QualityReport.from_json(report.to_json()) == report
+    assert json.loads(report.to_json())["cameras"]["camera4"] == {
+        "name": "camera4", "calibrated": False, "reason": "too few board views: 4 of 12 needed"}
+
+
+def test_every_fitted_camera_is_calibrated_by_default(rig, fitted):
+    report = report_for(fitted, rig.observations, rig.board, swept_roi(rig.observations))
+    assert report.cameras == {cam: CameraVerdict(cam, True, "") for cam in CAMERAS}
+    assert not report.to_text().startswith("NOT CALIBRATED")
+
+
+def test_a_report_written_before_the_camera_verdicts_still_loads(rig, fitted):
+    report = report_for(fitted, rig.observations, rig.board, swept_roi(rig.observations))
+    data = json.loads(report.to_json())
+    del data["cameras"]
+    assert QualityReport.from_json(json.dumps(data)).cameras == {}

@@ -1,4 +1,4 @@
-"""Fit both cameras in the motor frame from the board at paused waypoints.
+"""Fit every camera in the motor frame from the board at paused waypoints.
 
 The stage slides the board between waypoints and never tilts it, so every view a
 camera has of the board lies in a parallel plane. A planar calibration of those
@@ -126,8 +126,8 @@ class MotorFrameFit:
     per_view_rms_px: Dict[str, Dict[int, float]]  # camera -> waypoint index -> RMS px
     param_std: Dict[str, Dict[str, float]]  # camera -> INTRINSIC_NAMES -> 1-sigma
 
-    def stereo(self, first: str = "left", second: str = "right") -> Tuple[np.ndarray, np.ndarray]:
-        """(R, T) with X_second = R @ X_first + T, T in mm."""
+    def stereo(self, first: str, second: str) -> Tuple[np.ndarray, np.ndarray]:
+        """(R, T) with X_second = R @ X_first + T, T in mm, for cameras `first` and `second`."""
         a, b = self.cameras[first], self.cameras[second]
         R_a = cv2.Rodrigues(np.asarray(a.rvec, float))[0]
         R_b = cv2.Rodrigues(np.asarray(b.rvec, float))[0]
@@ -146,11 +146,12 @@ def fit_motor_frame(
     observations: Sequence[WaypointObservation],
     board: BoardSpec,
     image_size: Tuple[int, int],
-    camera_names: Sequence[str] = ("left", "right"),
+    camera_names: Sequence[str],
     *,
     initial: Optional[MotorFrameFit] = None,
 ) -> MotorFrameFit:
-    """Fit every camera's intrinsics and motor-frame pose, the board rotation and the motor scale.
+    """Fit every camera in `camera_names` jointly: its intrinsics and motor-frame pose, and the
+    shared board rotation and motor scale.
 
     A waypoint seen by only one camera still constrains that camera: each camera's
     residuals come from exactly the waypoints it observed.
@@ -296,7 +297,7 @@ def reconcile_corner_order(
     observations: Sequence[WaypointObservation],
     board: BoardSpec,
     image_size: Tuple[int, int],
-    camera_names: Sequence[str] = ("left", "right"),
+    camera_names: Sequence[str],
 ) -> Tuple[List[WaypointObservation], Dict[str, bool]]:
     """Put every camera's corners in the board order of the camera with the most views.
 

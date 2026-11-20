@@ -17,6 +17,12 @@ status its thresholds allow: an undetermined quantity cannot pass a check. JSON 
 infinity, so non-finite floats are written as the strings "inf", "-inf" and "nan", which
 keeps the file strict JSON, and from_json turns them back into floats.
 
+The fit has 2 to 6 cameras. Per-camera metrics are graded for every fitted camera, and the
+pair metrics for every co-visible pair (two cameras that saw the board at a common
+waypoint), with the pair named "a-b" in the fit's camera order. A camera the pipeline's
+per-camera rule left out of the fit is listed in `cameras` as not calibrated (2D only),
+first in the text report, and makes the verdict at least "warn".
+
 Pixel conventions are geometry.py's: corners and principal points are pixel-centre
 coordinates (pixel i is centred on i), and roi_sensor is in pixel edges, as
 PresetGeometry.sensor_roi() returns it, so a pixel-centre coordinate u sits at edge
@@ -27,20 +33,21 @@ frame's origin is the board's corner 0 at motor position 0 (fit.py), a choice ra
 a measurement, and the board is remounted on the stage every month. Between calibrations
 the origin therefore moves by an unknown vector, and every camera centre (-R^T t) shifts
 with it, so comparing each camera's centre on its own would report "moved" every month.
-The report compares the baseline instead, the vector from the left camera's centre to
-the right's, which a common shift leaves unchanged: baseline_change_mm catches one camera
-moving relative to the other. A shift of both cameras together by the same vector cannot
-be told from an origin shift and is not visible here; the DCS calibration, redone after
-every 3D calibration, measures the origin. Camera rotations are relative to the motor
+The report compares the baselines instead, the vector from one camera's centre to
+another's for every pair, which a common shift leaves unchanged: baseline_change_mm catches
+one camera moving relative to another. A shift of every camera together by the same vector
+cannot be told from an origin shift and is not visible here; the DCS calibration, redone
+after every 3D calibration, measures the origin. Camera rotations are relative to the motor
 axes, which are physical, so camera_rotation_change_deg compares each camera on its own.
 """
 
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from itertools import combinations
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -59,15 +66,21 @@ Thresholds = Dict[str, Tuple[Optional[float], Optional[float]]]
 # captures; a report always carries the limits it was graded with.
 DEFAULT_THRESHOLDS: Thresholds = {
     "views_kept": (20.0, 10.0),
+    # The views a camera shares with another fitted camera; the fit does not need them, but
+    # they expose stage geometry the model leaves out (axis skew).
+    "covisible_views": (8.0, 4.0),
     "reprojection_rms_px": (0.5, 1.0),
     "coverage_roi_fraction": (0.5, 0.25),
     "fx_fy_ratio_dev": (0.01, 0.03),
     "focal_rel_std": (0.005, 0.02),
-    "focal_left_right_rel": (0.10, None),
+    "focal_pair_rel": (0.10, None),
     "principal_point_offset_frac": (0.2, 0.4),
     "max_distortion_shift_px": (60.0, 150.0),
     "epipolar_error_px": (0.5, 1.0),
     "square_size_rel_error": (0.01, 0.03),
+    # With 3 or more cameras: the median distance between a camera's corners and the points
+    # the other cameras triangulate, projected into it.
+    "loo_triangulation_px": (0.5, 1.0),
     "motor_scale_dev": (0.01, None),
     "waypoints_unverified": (0.0, None),
     # A waypoint the motor reported elsewhere than commanded puts its view where the board
@@ -84,21 +97,23 @@ DEFAULT_THRESHOLDS: Thresholds = {
     "baseline_change_mm": (1.0, None),
     "focal_change_rel": (0.02, None),
     # Informational (ruling R50): reported for the record and for months to be compared,
-    # never graded. The stereo fit's RMS over every corner of both cameras, in sensor px;
-    # each camera's RMS in each preset's own px (sensor RMS / binning); the length of the
-    # left-to-right baseline; and each camera's board coverage of the full sensor frame.
+    # never graded. The joint fit's RMS over every corner of every camera, in sensor px;
+    # each camera's RMS in each preset's own px (sensor RMS / binning); the length of each
+    # pair's baseline; and each camera's board coverage of the full sensor frame.
     "stereo_reprojection_rms_px": (None, None),
     "preset_reprojection_rms_px": (None, None),
     "baseline_mm": (None, None),
     "coverage_frame_fraction": (None, None),
 }
 # The metrics where a smaller value is worse; see the module docstring.
-LOWER_IS_WORSE = frozenset({"views_kept", "coverage_roi_fraction", "coverage_frame_fraction"})
+LOWER_IS_WORSE = frozenset({"views_kept", "covisible_views", "coverage_roi_fraction", "coverage_frame_fraction"})
 NO_PREVIOUS_NOTE = "no comparable previous calibration"
 MOVED_NOTE = "camera moved since the previous calibration"
 # The motor's position report echoes its target (christielab10 motor check, 2026-10-26), so a
 # waypoint counts as verified on the motor's word alone.
 VERIFIED_NOTE = "verified: the motor reported the commanded position, not a traced arrival"
+# The first lines of the text report, one per camera the calibration left out.
+NOT_CALIBRATED = "NOT CALIBRATED (2D only)"
 
 _STATUS_ORDER = ("fail", "warn", "pass")
 # The coverage mask is rasterised at 1/4 of sensor resolution: one mask pixel is 16 sensor
@@ -128,13 +143,26 @@ class Metric:
 
 
 @dataclass
+class CameraVerdict:
+    """Whether a capture camera is calibrated. `reason` is "" when it is, and otherwise says
+    in plain words why not (pipeline.per_camera_rule): the camera is then 2D only."""
+
+    name: str
+    calibrated: bool
+    reason: str
+
+
+@dataclass
 class QualityReport:
     created: str  # ISO 8601, local time with its UTC offset
-    verdict: str  # the worst metric status
+    # the worst metric status, and at least "warn" when a camera is not calibrated
+    verdict: str
     metrics: List[Metric]
     thresholds: Thresholds  # name -> (warn, fail), the limits the metrics were graded with
     notes: List[str]
     override: Optional[dict] = None  # the operator's confirmation to install despite a fail
+    # Every capture camera in capture order; empty in a report written before 2026-11-20.
+    cameras: Dict[str, CameraVerdict] = field(default_factory=dict)
 
     def to_json(self) -> str:
         data = {
@@ -144,6 +172,7 @@ class QualityReport:
             "thresholds": {name: list(limits) for name, limits in self.thresholds.items()},
             "notes": list(self.notes),
             "override": self.override,
+            "cameras": {name: asdict(v) for name, v in self.cameras.items()},
         }
         return json.dumps(_encode_non_finite(data), indent=2, allow_nan=False)
 
@@ -174,12 +203,18 @@ class QualityReport:
             thresholds=thresholds,
             notes=list(data["notes"]),
             override=data.get("override"),
+            cameras={
+                name: CameraVerdict(name=v["name"], calibrated=bool(v["calibrated"]), reason=v["reason"])
+                for name, v in (data.get("cameras") or {}).items()
+            },
         )
 
     def to_text(self) -> str:
-        """A summary for the operator: the verdict, then every metric, failures first."""
+        """A summary for the operator: every camera that is not calibrated, then the verdict,
+        then every metric, failures first."""
         counts = {s: sum(m.status == s for m in self.metrics) for s in _STATUS_ORDER}
-        lines = [
+        lines = [f"{NOT_CALIBRATED}: {v.name}: {v.reason}" for v in self.cameras.values() if not v.calibrated]
+        lines += [
             f"3D calibration quality: {self.verdict.upper()}"
             f" ({counts['fail']} fail, {counts['warn']} warn, {counts['pass']} pass; created {self.created})"
         ]
@@ -219,8 +254,8 @@ class PresetCrossCheck:
     """A preset fitted directly from its own pooled frames, against the mapped sensor fit."""
 
     geometry: PresetGeometry
-    max_intrinsic_delta_px: float  # max |dfx, dfy, dcx, dcy| over both cameras, preset px
-    # |mean over every corner of both cameras of (corner detected in the preset's frames -
+    max_intrinsic_delta_px: float  # max |dfx, dfy, dcx, dcy| over every fitted camera, preset px
+    # |mean over every corner of every camera of (corner detected in the preset's frames -
     # the sensor detection mapped into the preset)|, preset px: the mapping, free of fit noise
     corner_offset_px: float
 
@@ -243,13 +278,18 @@ def build_report(
     previous: Optional[PreviousCalibration],
     thresholds: Thresholds = DEFAULT_THRESHOLDS,
     presets: Sequence[PresetGeometry] = (),
+    cameras: Optional[Mapping[str, CameraVerdict]] = None,
 ) -> QualityReport:
     """Grade `fit` and its capture against `thresholds`.
 
-    roi_sensor is the base preset's sensor_roi(), in pixel edges. The stereo checks use
-    the first two cameras of the fit. Each camera's RMS is also reported in the pixels of
-    every preset in `presets`. The verdict is "fail" if any metric fails, else "warn" if
-    any warns, else "pass".
+    roi_sensor is the base preset's sensor_roi(), in pixel edges. Only the fit's cameras are
+    graded, and only their corners in `observations` are used. The pair checks cover every
+    pair of them that saw the board at a common waypoint. Each camera's RMS is also reported
+    in the pixels of every preset in `presets`.
+
+    `cameras` is every capture camera's verdict, in capture order; a fitted camera it leaves
+    out is calibrated, and by default every fitted camera is. The verdict is "fail" if any
+    metric fails, else "warn" if any warns or any camera is not calibrated, else "pass".
     """
     missing = sorted(set(DEFAULT_THRESHOLDS) - set(thresholds))
     if missing:
@@ -266,12 +306,15 @@ def build_report(
         metrics.append(graded)
         return graded
 
-    cameras = list(fit.cameras)
+    fitted = list(fit.cameras)
+    # The fitted cameras that found the board at each waypoint.
+    seen = [{cam for cam in o.corners if cam in fit.cameras} for o in observations]
 
     # The capture.
-    for cam in cameras:
+    for cam in fitted:
         counted = sum(cam in o.corners for o in observations)
         add("views_kept", cam, capture.views_kept.get(cam, counted), "views")
+        add("covisible_views", cam, sum(cam in s and len(s) > 1 for s in seen), "views")
     add("waypoints_unverified", None, capture.waypoints_total - capture.waypoints_verified, "waypoints",
         VERIFIED_NOTE)
     add("waypoints_unreached", None, capture.waypoints_unreached, "waypoints")
@@ -283,7 +326,7 @@ def build_report(
 
     # Each camera: its residual, its coverage and the sanity of its intrinsics.
     frame = (0.0, 0.0, float(fit.image_size[0]), float(fit.image_size[1]))
-    for cam in cameras:
+    for cam in fitted:
         model = fit.cameras[cam]
         fx, fy = model.K[0, 0], model.K[1, 1]
         rms = fit.rms_px.get(cam, math.inf)
@@ -300,22 +343,32 @@ def build_report(
         add("principal_point_offset_frac", cam, _principal_point_offset(model, roi), "of ROI half-side")
         add("max_distortion_shift_px", cam, _max_distortion_shift(model, roi), "sensor px")
 
-    # The pair.
+    # Every co-visible pair, and each camera against the rest.
     add("stereo_reprojection_rms_px", None, _joint_rms(fit), "sensor px")
-    if len(cameras) >= 2:
-        first, second = cameras[:2]
+    pairs = [(a, b) for a, b in combinations(fitted, 2) if any(a in s and b in s for s in seen)]
+    for first, second in pairs:
+        pair = f"{first}-{second}"
         fx_a, fx_b = fit.cameras[first].K[0, 0], fit.cameras[second].K[0, 0]
-        add("focal_left_right_rel", None, abs(fx_a - fx_b) / ((fx_a + fx_b) / 2), "ratio")
-        add("baseline_mm", None, float(np.linalg.norm(_centre(fit.cameras[second]) - _centre(fit.cameras[first]))),
+        add("focal_pair_rel", pair, abs(fx_a - fx_b) / ((fx_a + fx_b) / 2), "ratio")
+        add("baseline_mm", pair, float(np.linalg.norm(_centre(fit.cameras[second]) - _centre(fit.cameras[first]))),
             "mm")
         epipolar, square, stereo_note = _stereo_checks(fit, observations, board, first, second)
-    else:
-        stereo_note = f"the fit has {len(cameras)} camera(s); a pair is needed"
-        add("focal_left_right_rel", None, math.inf, "ratio", stereo_note)
+        add("epipolar_error_px", pair, epipolar, "sensor px", stereo_note)
+        add("square_size_rel_error", pair, square, "ratio", stereo_note)
+    if not pairs:
+        # Undetermined, so the pair checks cannot pass.
+        stereo_note = (
+            f"the fit has {len(fitted)} camera(s); a pair is needed" if len(fitted) < 2
+            else "no two cameras found the board at the same waypoint"
+        )
+        add("focal_pair_rel", None, math.inf, "ratio", stereo_note)
         add("baseline_mm", None, math.inf, "mm", stereo_note)
-        epipolar = square = math.inf
-    add("epipolar_error_px", None, epipolar, "sensor px", stereo_note)
-    add("square_size_rel_error", None, square, "ratio", stereo_note)
+        add("epipolar_error_px", None, math.inf, "sensor px", stereo_note)
+        add("square_size_rel_error", None, math.inf, "ratio", stereo_note)
+    if len(fitted) >= 3:
+        for cam in fitted:
+            loo, loo_note = _leave_one_out(fit, observations, cam)
+            add("loo_triangulation_px", cam, loo, "sensor px", loo_note)
     add("motor_scale_dev", None, abs(fit.motor_scale - 1.0), "ratio")
     for check in cross_checks:
         add("cross_check_delta_px", None, check.max_intrinsic_delta_px, "preset px", f"preset {check.geometry.name}")
@@ -327,7 +380,12 @@ def build_report(
     else:
         notes.extend(_change_metrics(fit, previous.fit, add))
 
+    verdicts = dict(cameras or {})
+    for cam in fit.cameras:
+        verdicts.setdefault(cam, CameraVerdict(cam, True, ""))
     statuses = {m.status for m in metrics}
+    if any(not v.calibrated for v in verdicts.values()):
+        statuses.add("warn")  # a 2D-only camera never leaves the calibration a plain pass
     verdict = next((s for s in _STATUS_ORDER if s in statuses), "pass")
     return QualityReport(
         created=datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -335,6 +393,7 @@ def build_report(
         metrics=metrics,
         thresholds={name: (_as_limit(warn), _as_limit(fail)) for name, (warn, fail) in thresholds.items()},
         notes=notes,
+        cameras=verdicts,
     )
 
 
@@ -498,7 +557,8 @@ def _stereo_checks(fit: MotorFrameFit, observations, board: BoardSpec, first: st
 
 def _change_metrics(fit: MotorFrameFit, previous: MotorFrameFit, add: Callable[..., Metric]) -> List[str]:
     """Grade the change since `previous`: each camera's rotation and focal length, and the
-    baseline between the first two cameras (see the module docstring). Return the report notes."""
+    baseline of every pair of cameras both calibrations have (see the module docstring).
+    Return the report notes."""
     notes = []
     for cam, now in fit.cameras.items():
         before = previous.cameras.get(cam)
@@ -517,24 +577,60 @@ def _change_metrics(fit: MotorFrameFit, previous: MotorFrameFit, add: Callable[.
         if focal.status != "pass":
             focal.note = "focal length changed since the previous calibration"
 
-    pair = list(fit.cameras)[:2]
-    if len(pair) == 2 and all(cam in previous.cameras for cam in pair):
-        first, second = pair
+    both = [cam for cam in fit.cameras if cam in previous.cameras]
+    for first, second in combinations(both, 2):
         baseline_now = _centre(fit.cameras[second]) - _centre(fit.cameras[first])
         baseline_before = _centre(previous.cameras[second]) - _centre(previous.cameras[first])
         change = float(np.linalg.norm(baseline_now - baseline_before))
-        baseline = add("baseline_change_mm", None, change, "mm")
+        baseline = add("baseline_change_mm", f"{first}-{second}", change, "mm")
         if baseline.status != "pass":
             baseline.note = f"a camera moved since the previous calibration: the {first}-{second} baseline changed"
             notes.append(f"{baseline.note} by {change:.2f} mm")
-    else:
-        notes.append("the previous calibration lacks one of the pair, so the baseline change is not reported")
+    if len(both) < 2:
+        notes.append("the previous calibration has fewer than two of these cameras, so no baseline change is reported")
     return notes
+
+
+def _leave_one_out(fit: MotorFrameFit, observations, cam: str) -> Tuple[float, str]:
+    """(median px, note): over every corner of every waypoint where `cam` and at least two
+    other fitted cameras found the board, the distance between `cam`'s corner and the point
+    the others triangulate (each undistorted, then a linear DLT), projected through `cam`'s
+    model. Infinite when no waypoint has two others."""
+    others = [c for c in fit.cameras if c != cam]
+    model = fit.cameras[cam]
+    distances, waypoints = [], 0
+    for o in observations:
+        seen = [c for c in others if c in o.corners]
+        if cam not in o.corners or len(seen) < 2:
+            continue
+        X = _triangulate([fit.cameras[c] for c in seen], [o.corners[c] for c in seen])
+        projected = cv2.projectPoints(X, np.asarray(model.rvec, float), np.asarray(model.tvec, float),
+                                      model.K, model.dist)[0].reshape(-1, 2)
+        distances.append(np.linalg.norm(projected - np.asarray(o.corners[cam], float), axis=1))
+        waypoints += 1
+    if not distances:
+        return math.inf, f"no waypoint where {cam} found the board has it in two other cameras"
+    return float(np.median(np.concatenate(distances))), f"{waypoints} waypoints with {cam} and 2 or more others"
+
+
+def _triangulate(models: Sequence[CameraModel], pixels: Sequence[np.ndarray]) -> np.ndarray:
+    """(n, 3) motor-frame points from n corners seen in every one of `models` (2 or more):
+    each camera's pixels are undistorted to normalised coordinates, and each point is the
+    least-squares null vector of its DLT system, 2 rows per camera."""
+    rows = []
+    for model, p in zip(models, pixels):
+        n = _normalised(p, model)
+        P = _projection(model)
+        rows.append(n[:, :1] * P[2] - P[0])
+        rows.append(n[:, 1:] * P[2] - P[1])
+    A = np.stack(rows, axis=1)  # (n, 2 * cameras, 4)
+    X = np.linalg.svd(A)[2][:, -1, :]
+    return X[:, :3] / X[:, 3:]
 
 
 def _joint_rms(fit: MotorFrameFit) -> float:
     """The RMS reprojection distance over every corner of every camera together, in sensor
-    px: the residual of the stereo fit itself. Every view has the same corners, so the mean
+    px: the residual of the joint fit itself. Every view has the same corners, so the mean
     of the per-view mean squares is the mean over the corners. Infinite with no views."""
     squares = [v * v for views in fit.per_view_rms_px.values() for v in views.values()]
     return math.sqrt(sum(squares) / len(squares)) if squares else math.inf

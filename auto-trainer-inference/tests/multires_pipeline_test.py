@@ -41,19 +41,24 @@ from autotrainer.inference.multires_calibration.extract import (
     find_stationary_segments,
 )
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
+from autotrainer.inference.multires_calibration.fit import WaypointObservation
 from autotrainer.inference.multires_calibration.pipeline import (
+    MIN_COVISIBLE,
+    MIN_VIEWS,
     SOURCE_VIDEOS,
     TIMESTAMPS_SUFFIX,
     WAYPOINT_LOG,
+    CalibrationRefused,
     CaptureCamera,
     WaypointLog,
     calibrate_capture,
     capture_cameras,
     load_frame_times,
     load_waypoint_log,
+    per_camera_rule,
     write_waypoint_log,
 )
-from autotrainer.inference.multires_calibration.report import NO_PREVIOUS_NOTE, Metric, QualityReport
+from autotrainer.inference.multires_calibration.report import NO_PREVIOUS_NOTE, CameraVerdict, Metric, QualityReport
 from autotrainer.inference.multires_calibration.store import (
     INDEX_FILE,
     CalibrationIndex,
@@ -75,6 +80,10 @@ MOVING_FRAMES = 6
 UNVERIFIED = 7  # the waypoint the second run logs as not verified
 LEGACY_FIXTURE = Path(__file__).parent / DEFAULT_3D_CALIB_DIR_NAME
 RIG = synthetic_rig(frame_rotation_deg=35.0)
+# A third camera that sees the board at only 4 of the waypoints, too few to calibrate. Its
+# rig has the same left and right cameras as RIG.
+CAMERA4_SEEN = (0, 4, 8, 12)
+CAMERA4 = synthetic_rig(cameras=(*CAMERAS, "camera4"), frame_rotation_deg=35.0).truth.cameras["camera4"]
 MOTOR = [o.motor_mm.copy() for o in RIG.observations[:N_WAYPOINTS]]
 # Not the defaults, so the main run shows they are read from waypoints.yaml.
 LOGGED_SETTINGS = {"gain_db": 2.5, "gamma": None, "exposure_us": 4000, "fps": 40}
@@ -94,15 +103,20 @@ class Run:
 
 @pytest.fixture(scope="module")
 def videos(tmp_path_factory) -> Dict[str, Path]:
-    """left.mp4, right.mp4, and right_turned.mp4: the right camera's frames turned 180 degrees."""
+    """left.mp4, right.mp4, right_turned.mp4 (the right camera's frames turned 180 degrees)
+    and camera4.mp4, which shows the board only at the CAMERA4_SEEN waypoints."""
     folder = tmp_path_factory.mktemp("rendered")
-    paths = {name: folder / f"{name}.mp4" for name in ("left", "right", "right_turned")}
-    outputs = {"left": ["left"], "right": ["right", "right_turned"]}
+    paths = {name: folder / f"{name}.mp4" for name in ("left", "right", "right_turned", "camera4")}
+    outputs = {"left": ["left"], "right": ["right", "right_turned"], "camera4": ["camera4"]}
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     for cam, names in outputs.items():
         writers = {name: cv2.VideoWriter(str(paths[name]), fourcc, FPS, IMAGE_SIZE, isColor=False) for name in names}
         assert all(w.isOpened() for w in writers.values())
-        for image in capture_frames(RIG.truth.cameras[cam]):
+        if cam == "camera4":
+            frames = capture_frames(CAMERA4, seen=CAMERA4_SEEN)
+        else:
+            frames = capture_frames(RIG.truth.cameras[cam])
+        for image in frames:
             for name, writer in writers.items():
                 writer.write(cv2.rotate(image, cv2.ROTATE_180) if name == "right_turned" else image)
         for writer in writers.values():
@@ -110,15 +124,25 @@ def videos(tmp_path_factory) -> Dict[str, Path]:
     return paths
 
 
-def capture_frames(model):
-    """The camera's frames: a dwell at each waypoint, with moving frames between dwells."""
+def capture_frames(model, seen=None):
+    """The camera's frames: a dwell at each waypoint, with moving frames between dwells.
+
+    With `seen`, the board shows only in the dwells at those waypoints; every other frame
+    is the bare background, as if the board were out of the camera's view."""
+    blank = np.full((IMAGE_SIZE[1], IMAGE_SIZE[0]), 100, np.uint8)
     for k, position in enumerate(MOTOR):
         if k > 0:
             previous = MOTOR[k - 1]
             for j in range(1, MOVING_FRAMES + 1):
                 between = previous + (position - previous) * j / (MOVING_FRAMES + 1)
-                yield render_board_frame(model, RIG.world_corners(between), IMAGE_SIZE, RIG.board)
-        still = render_board_frame(model, RIG.world_corners(position), IMAGE_SIZE, RIG.board)
+                if seen is None:
+                    yield render_board_frame(model, RIG.world_corners(between), IMAGE_SIZE, RIG.board)
+                else:
+                    yield blank
+        if seen is not None and k not in seen:
+            still = blank
+        else:
+            still = render_board_frame(model, RIG.world_corners(position), IMAGE_SIZE, RIG.board)
         for _ in range(STILL_FRAMES):
             yield still
 
@@ -137,9 +161,14 @@ def make_log(motor=None, verified=None, capture_settings=None, reported=None) ->
 
 
 def make_capture(folder: Path, left: Path, right: Path, log: WaypointLog) -> Path:
+    return make_capture_of(folder, {"left": left, "right": right}, log)
+
+
+def make_capture_of(folder: Path, videos: Dict[str, Path], log: WaypointLog) -> Path:
+    """A capture folder with each camera's video, named for its camera, and `log`."""
     (folder / SOURCE_VIDEOS).mkdir(parents=True)
-    shutil.copyfile(left, folder / SOURCE_VIDEOS / "left.mp4")
-    shutil.copyfile(right, folder / SOURCE_VIDEOS / "right.mp4")
+    for cam, video in videos.items():
+        shutil.copyfile(video, folder / SOURCE_VIDEOS / f"{cam}.mp4")
     write_waypoint_log(folder / WAYPOINT_LOG, log)
     return folder
 
@@ -184,6 +213,25 @@ def timed(videos, tmp_path_factory) -> Run:
     n = N_WAYPOINTS * STILL_FRAMES + (N_WAYPOINTS - 1) * MOVING_FRAMES
     times = T0 + np.arange(n) / FPS
     write_timestamps(capture, {cam: times for cam in CAMERAS})
+    return run(capture, folder / "out" / NAME)
+
+
+def timed_capture_of(folder: Path, videos: Dict[str, Path], cameras) -> Path:
+    """A capture of `cameras`, each with its video in `videos`, with timed_log's dwells, the
+    cameras in its log, and every camera's timestamps file."""
+    log = timed_log()
+    log.cameras = [CaptureCamera(cam, None, i) for i, cam in enumerate(cameras)]
+    capture = make_capture_of(folder, {cam: videos[cam] for cam in cameras}, log)
+    n = N_WAYPOINTS * STILL_FRAMES + (N_WAYPOINTS - 1) * MOVING_FRAMES
+    write_timestamps(capture, {cam: T0 + np.arange(n) / FPS for cam in cameras})
+    return capture
+
+
+@pytest.fixture(scope="module")
+def with_camera4(videos, tmp_path_factory) -> Run:
+    """left, right and camera4, which saw the board at only 4 waypoints."""
+    folder = tmp_path_factory.mktemp("camera4")
+    capture = timed_capture_of(folder / "capture", videos, ("left", "right", "camera4"))
     return run(capture, folder / "out" / NAME)
 
 
@@ -626,3 +674,97 @@ def test_waypoint_log_with_lists_of_different_lengths_is_refused(tmp_path, field
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
     with pytest.raises(ValueError, match=field):
         load_waypoint_log(path)
+
+
+def test_a_camera_with_four_views_is_uncalibrated_and_the_rest_fit(with_camera4):
+    report = with_camera4.report
+    assert report.cameras["camera4"] == CameraVerdict("camera4", False, "too few board views: 4 of 12 needed")
+    assert report.cameras["left"] == CameraVerdict("left", True, "")
+    assert report.cameras["right"] == CameraVerdict("right", True, "")
+    assert report.to_text().splitlines()[0].startswith("NOT CALIBRATED (2D only): camera4")
+    # The other two are fitted as they are without it, and the 2D-only camera makes it warn.
+    fit = load_sensor_fit(with_camera4.output_dir)
+    assert set(fit.cameras) == set(CAMERAS)
+    for cam in CAMERAS:
+        truth, got = RIG.truth.cameras[cam], fit.cameras[cam]
+        np.testing.assert_allclose(np.diag(got.K)[:2], np.diag(truth.K)[:2], rtol=2e-3, err_msg=cam)
+        assert fit.rms_px[cam] < 0.1, cam
+    assert report.verdict == "warn", report.to_text()
+    assert {m.camera for m in metrics(report, "reprojection_rms_px")} == set(CAMERAS)
+    # What it saw stays on record, and the saved report carries the verdicts.
+    assert with_camera4.index.capture["still_frames"]["camera4"]["min"] == STILL_FRAMES
+    assert (with_camera4.output_dir / "coverage_camera4.png").is_file()
+    saved = QualityReport.from_json((with_camera4.output_dir / "quality_report.json").read_text(encoding="utf-8"))
+    assert saved.cameras == report.cameras
+
+
+def test_one_calibrated_camera_refuses(videos, tmp_path):
+    # Without the right camera, the left one has no calibrated camera to share its views with.
+    capture = timed_capture_of(tmp_path / "capture", videos, ("left", "camera4"))
+    out = tmp_path / "out" / NAME
+    with pytest.raises(CalibrationRefused) as raised:
+        calibrate_capture(capture, output_dir=out, presets=PRESETS)
+    message = str(raised.value)
+    assert "left: too few views shared with another camera: 0 of 8 needed" in message
+    assert "camera4: too few board views: 4 of 12 needed" in message
+    assert isinstance(raised.value, RuntimeError)
+    assert raised.value.verdicts["camera4"] == CameraVerdict("camera4", False, "too few board views: 4 of 12 needed")
+    assert not out.parent.exists()
+
+
+# Commanded positions that vary on every axis between any two waypoints, for the rule's tests.
+SPREAD_MOTOR = [(float(w), float(7 * w % 11), float(3 * w % 13)) for w in range(37)]
+
+
+def observations_seen_by(seen, motor=SPREAD_MOTOR):
+    """One observation per waypoint of `motor`, holding the cameras in `seen` (camera -> the
+    waypoints it saw); the rule does not read the corners."""
+    return [
+        WaypointObservation(w, np.asarray(m, float), {cam: np.zeros((48, 2)) for cam, ws in seen.items() if w in ws})
+        for w, m in enumerate(motor)
+    ]
+
+
+def test_the_rule_thresholds():
+    assert (MIN_VIEWS, MIN_COVISIBLE) == (12, 8)
+
+
+def test_cameras_that_saw_enough_together_are_calibrated():
+    verdicts = per_camera_rule(observations_seen_by({"a": range(37), "b": range(37), "c": range(25)}), "abc")
+    assert verdicts == {cam: CameraVerdict(cam, True, "") for cam in "abc"}
+    assert list(verdicts) == ["a", "b", "c"]
+
+
+def test_views_that_do_not_span_three_axes_are_refused():
+    # Every waypoint at one height: the views lie in one plane of the stage.
+    flat = [(x, y, -30.0) for x, y, _ in SPREAD_MOTOR]
+    verdicts = per_camera_rule(observations_seen_by({cam: range(37) for cam in "abc"}, motor=flat), "abc")
+    assert verdicts == {cam: CameraVerdict(cam, False, "board views do not span all 3 stage axes") for cam in "abc"}
+
+
+def test_too_few_views_or_too_few_shared_views_are_refused():
+    verdicts = per_camera_rule(observations_seen_by({"a": range(37), "b": range(37), "c": range(30, 37)}), "abc")
+    assert verdicts["c"] == CameraVerdict("c", False, "too few board views: 7 of 12 needed")
+    verdicts = per_camera_rule(observations_seen_by({"a": range(30), "b": range(30), "c": range(23, 37)}), "abc")
+    assert verdicts["c"] == CameraVerdict("c", False, "too few views shared with another camera: 7 of 8 needed")
+    assert verdicts["a"].calibrated and verdicts["b"].calibrated
+
+
+def test_a_camera_whose_shared_views_are_with_dropped_cameras_is_dropped_too():
+    # a and b see 0-15 together. t sees 12-23: 4 views shared with a, and 4 with s (20-23).
+    # s sees 20-31 and shares only those 4 with t, so it goes first; then t has 4 left.
+    seen = {"a": range(16), "b": range(12), "t": range(12, 24), "s": range(20, 32)}
+    verdicts = per_camera_rule(observations_seen_by(seen), ["a", "b", "t", "s"])
+    assert verdicts["s"] == CameraVerdict("s", False, "too few views shared with another camera: 4 of 8 needed")
+    assert verdicts["t"] == CameraVerdict("t", False, "too few views shared with another camera: 4 of 8 needed")
+    assert verdicts["a"].calibrated and verdicts["b"].calibrated
+
+
+def test_cameras_outside_the_largest_connected_group_are_refused():
+    # a, b and c see 0-17 together, d and e 18-36 together: two groups that never see the
+    # board at once. The larger one is calibrated.
+    seen = {"a": range(18), "b": range(18), "c": range(18), "d": range(18, 37), "e": range(18, 37)}
+    verdicts = per_camera_rule(observations_seen_by(seen), "abcde")
+    assert all(verdicts[cam].calibrated for cam in "abc")
+    for cam in "de":
+        assert verdicts[cam] == CameraVerdict(cam, False, "not connected to the other cameras through shared views")

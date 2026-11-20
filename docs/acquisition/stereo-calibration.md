@@ -51,8 +51,9 @@ used, see
    before it. On christielab10 (120 mm/s and 600 mm/s² on every axis) the settles
    run from 0.45 s to 0.59 s, the longest for the 17 mm x move. Each settle is
    logged at debug level.
-4. The app finds the board at each pause, fits both cameras, grades the fit, and
-   shows the **report** (below).
+4. The app finds the board at each pause, fits the cameras jointly, grades the
+   fit, and shows the **report** (below). A camera that saw too little of the
+   board is left out of the fit and is **2D only** (below).
 5. **Redo the coordinate system.** Every new calibration makes the DCS out of
    date (below).
 
@@ -63,9 +64,38 @@ below the stage's lower limit is commanded at the limit and logged; see
 
 ## The report
 
-The report lists failures first, then warnings, then passes, each with its
-value and limits, then notes. The thresholds are in
-[The quality report](#the-quality-report).
+The report starts with every camera that could not be calibrated, then lists
+failures, warnings and passes, each with its value and limits, then notes. The
+thresholds are in [The quality report](#the-quality-report).
+
+### A camera that saw too little: 2D only
+
+Each camera must meet the per-camera rule before it is fitted:
+
+1. at least 12 board views kept;
+2. the views' commanded positions vary along each of the stage's x, y and z;
+3. at least 8 of its views were also seen by another calibrated camera;
+4. it is connected to the other calibrated cameras through shared views (two
+   cameras are connected when they saw the board at the same position). Only the
+   largest connected group is calibrated.
+
+A camera that fails is **not calibrated**: the other cameras are fitted without
+it, it records 2D only, and the report's first lines name it and the reason, for
+example
+
+```
+NOT CALIBRATED (2D only): camera4: too few board views: 4 of 12 needed
+```
+
+The reasons are `too few board views: n of 12 needed`, `board views do not span
+all 3 stage axes`, `too few views shared with another camera: n of 8 needed` and
+`not connected to the other cameras through shared views`. Rule 3 is applied
+until nothing changes, so a camera whose shared views are only with cameras that
+were left out is left out too. A 2D-only camera makes the verdict at least warn.
+Its views, rejections and coverage image are still in the report.
+
+If fewer than 2 cameras meet the rule, the calibration is refused, nothing is
+written, and **3D calibration failed** names each camera and its reason.
 
 | Verdict | Meaning | What happens |
 | --- | --- | --- |
@@ -84,7 +114,8 @@ value and limits, then notes. The thresholds are in
   Every later session that uses this calibration records it in its metadata as
   `hardware.configured.calibration3d.override`.
 - If the capture or the fit itself raises (for example, a camera's pauses do not
-  match the waypoints, or the fit does not converge), nothing is installed and
+  match the waypoints, fewer than 2 cameras meet the per-camera rule, or the fit
+  does not converge), nothing is installed and
   **3D calibration failed** shows the reason. The capture folder stays in the
   session folder.
 
@@ -263,35 +294,42 @@ external tools (see Exports).
 ## The quality report
 
 Each metric has a (warn, fail) pair. For most, the status is fail when the value
-is above the fail limit, else warn when above the warn limit. For `views_kept`
-and `coverage_roi_fraction`, a smaller value is worse. The verdict is the worst
-status. A value that cannot be determined is infinite and takes the worst status
-its limits allow, so an undetermined quantity cannot pass. The report records the
-thresholds it was graded with.
+is above the fail limit, else warn when above the warn limit. For `views_kept`,
+`covisible_views` and the two coverage metrics, a smaller value is worse. The
+verdict is the worst status, and at least warn when a camera is 2D only. A value
+that cannot be determined is infinite and takes the worst status its limits
+allow, so an undetermined quantity cannot pass. The report records the thresholds
+it was graded with.
+
+Only the calibrated cameras are graded. A pair metric is graded for every pair
+of them that saw the board at the same position, and its camera is the pair,
+for example `left-right`.
 
 | Metric | Scope | Warn | Fail | Meaning |
 | --- | --- | --- | --- | --- |
 | `views_kept` | camera | < 20 | < 10 | Distinct positions where this camera's board detection was kept (at most 36) |
+| `covisible_views` | camera | < 8 | < 4 | Its views that another calibrated camera also saw. The fit does not need them; they expose stage geometry the model leaves out (axis skew) |
 | `reprojection_rms_px` | camera | > 0.5 | > 1.0 | RMS distance between detected corners and the fit's projection, sensor px |
 | `preset_reprojection_rms_px` | camera, per preset | none | none | Informational. The same RMS in that preset's pixels (sensor RMS / binning); the note names the preset |
 | `coverage_roi_fraction` | camera | < 0.5 | < 0.25 | Fraction of the base preset's sensor window inside the union of the detected-corner hulls |
 | `coverage_frame_fraction` | camera | none | none | Informational. The same coverage as a fraction of the full 1440 x 1080 sensor frame |
 | `fx_fy_ratio_dev` | camera | > 0.01 | > 0.03 | \|fx/fy - 1\|; a large value is a sign of a poorly constrained fit |
 | `focal_rel_std` | camera | > 0.005 | > 0.02 | One-sigma uncertainty of fx, relative to fx; fails if the capture does not determine it |
-| `focal_left_right_rel` | pair | > 0.10 | none | \|fx left - fx right\| over their mean |
-| `stereo_reprojection_rms_px` | pair | none | none | Informational. RMS of the joint (stereo) fit over every corner of both cameras, sensor px |
-| `baseline_mm` | pair | none | none | Informational. Distance between the left and right camera centres, mm |
+| `focal_pair_rel` | pair | > 0.10 | none | \|fx a - fx b\| over their mean |
+| `stereo_reprojection_rms_px` | capture | none | none | Informational. RMS of the joint fit over every corner of every calibrated camera, sensor px |
+| `baseline_mm` | pair | none | none | Informational. Distance between the two camera centres, mm |
 | `principal_point_offset_frac` | camera | > 0.2 | > 0.4 | Distance of (cx, cy) from the window centre, each axis as a fraction of the window half-side |
 | `max_distortion_shift_px` | camera | > 60 | > 150 | Largest displacement the distortion model makes along the window border, sensor px |
 | `epipolar_error_px` | pair | > 0.5 | > 1.0 | Mean symmetric epipolar distance, sensor px, over positions both cameras saw |
 | `square_size_rel_error` | pair | > 0.01 | > 0.03 | \|mean triangulated square - 4 mm\| / 4 mm |
+| `loo_triangulation_px` | camera, 3 or more cameras | > 0.5 | > 1.0 | Median distance, sensor px, between this camera's corners and the points the other calibrated cameras triangulate, projected into it, over positions it and at least two others saw |
 | `motor_scale_dev` | capture | > 0.01 | none | \|motor scale - 1\|: true travel (from the board's squares) against commanded travel |
 | `waypoints_unverified` | capture | > 0 | none | Positions where the motor's reported position did not come within 0.05 mm of the command in time. Verified means the motor reported the commanded position, not a traced arrival |
 | `waypoints_unreached` | capture | none | > 0 | Positions where the reported position was more than 0.1 mm from the commanded one on some axis. The fit places the board at the commanded position, so any such view is in the wrong place. A position with no finite reported position is not counted |
 | `cross_check_delta_px` | binned preset | > 1.5 | none | Largest difference in fx, fy, cx or cy between a direct fit in the preset's own pooled frames and the mapped sensor fit, preset px. Informational: the direct fit has a noise floor near 0.5 px |
 | `cross_check_corner_offset_px` | binned preset | > 0.1 | > 0.25 | Mean offset between corners detected in the preset's pooled frames and the sensor corners mapped into it, preset px. Tests the pixel-centre mapping itself |
 | `camera_rotation_change_deg` | camera, vs previous | > 0.5 | none | Rotation relative to the motor axes since the previous calibration; above the limit the report says the camera moved |
-| `baseline_change_mm` | pair, vs previous | > 1.0 | none | Change of the left-to-right camera-centre vector since the previous calibration |
+| `baseline_change_mm` | pair, vs previous | > 1.0 | none | Change of the vector between the two camera centres since the previous calibration, for every pair both calibrations have |
 | `focal_change_rel` | camera, vs previous | > 0.02 | none | Relative change of fx since the previous calibration |
 
 - An informational metric has no limits: it is recorded so months can be
@@ -303,7 +341,7 @@ thresholds it was graded with.
   cross-check.
 - Notes list what the metrics do not: views rejected per camera and the reason
   (`not found`, `inconsistent`), a camera whose corner order was reversed to
-  match the other, each unreached waypoint with the position the motor
+  match the others, each unreached waypoint with the position the motor
   reported, and the still frames per waypoint (shortest, where, median).
 - `coverage_<cam>.png` shows the full sensor, the covered area, the ROI
   rectangle and every detected corner.
@@ -437,7 +475,8 @@ X_cam = R(rvec_c) X_w + tvec_c        (mm)
 
 with `P_j` the board corner, `m_w` the commanded position of waypoint w and
 `sigma` the motor scale, which the fit measures against the board's squares.
-Both cameras' intrinsics and poses are fitted jointly by least squares.
+Every calibrated camera's intrinsics and pose are fitted jointly by least
+squares, 2 to 6 cameras, each from the waypoints it saw.
 
 - **Gauge.** `board_tvec` is held at zero. Moving the board origin by d and
   every camera by -R_c d changes no projection, so the motor frame's origin is a

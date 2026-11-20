@@ -24,6 +24,8 @@ from autotrainer.inference.multires_calibration.fit import (
 )
 from multires_synthetic import render_board_frame, synthetic_rig
 
+CAMERAS = ("left", "right")
+
 
 def rotation_angle_deg(a, b):
     """The angle of R(a)^T R(b), in degrees."""
@@ -63,7 +65,7 @@ def distortion_displacement(model, pixels):
 
 def test_fit_recovers_the_synthetic_rig():
     rig = synthetic_rig(noise_px=0.1)
-    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080), CAMERAS)
     for cam in ("left", "right"):
         t, f = rig.truth.cameras[cam], fit.cameras[cam]
         assert f.K[0, 0] == pytest.approx(t.K[0, 0], rel=0.005)
@@ -84,16 +86,74 @@ def test_fit_recovers_the_synthetic_rig():
     assert fit.motor_scale == pytest.approx(1.0, abs=0.002)
 
 
+def test_three_cameras_fit_jointly():
+    names = ("left", "right", "top")
+    rig = synthetic_rig(cameras=names, noise_px=0.1)
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080), names)
+    assert set(fit.cameras) == set(fit.rms_px) == set(names)
+    for cam in names:
+        t, f = rig.truth.cameras[cam], fit.cameras[cam]
+        # The bounds of test_fit_recovers_the_synthetic_rig.
+        assert f.K[0, 0] == pytest.approx(t.K[0, 0], rel=0.005), cam
+        assert f.K[1, 1] == pytest.approx(t.K[1, 1], rel=0.005), cam
+        assert abs(f.K[0, 2] - t.K[0, 2]) < 4.0 and abs(f.K[1, 2] - t.K[1, 2]) < 4.0, cam
+        assert rotation_angle_deg(f.rvec, t.rvec) < 0.15, cam
+        assert np.linalg.norm(f.tvec - t.tvec) < 0.5, cam
+        assert fit.rms_px[cam] < 0.2, cam
+        assert sorted(fit.per_view_rms_px[cam]) == [o.index for o in rig.observations]
+    assert fit.motor_scale == pytest.approx(1.0, abs=0.002)
+
+
+def test_six_cameras_fit():
+    names = ("left", "right", "cam3", "cam4", "cam5", "cam6")
+    rig = synthetic_rig(cameras=names, noise_px=0.1)
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080), names)
+    assert set(fit.cameras) == set(names)
+    for cam in names:
+        t, f = rig.truth.cameras[cam], fit.cameras[cam]
+        assert f.K[0, 0] == pytest.approx(t.K[0, 0], rel=0.005), cam
+        assert f.K[1, 1] == pytest.approx(t.K[1, 1], rel=0.005), cam
+        assert rotation_angle_deg(f.rvec, t.rvec) < 0.15, cam
+        assert fit.rms_px[cam] < 0.2, cam
+    assert fit.motor_scale == pytest.approx(1.0, abs=0.002)
+
+
+def test_a_camera_that_sees_some_waypoints_is_fitted_from_them():
+    rig = synthetic_rig(cameras=("left", "right", "top"), seen={"top": range(0, 37, 2)}, noise_px=0.1)
+    assert [o.index for o in rig.observations if "top" in o.corners] == list(range(0, 37, 2))
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080), ("left", "right", "top"))
+    assert sorted(fit.per_view_rms_px["top"]) == list(range(0, 37, 2))
+    assert fit.cameras["top"].K[0, 0] == pytest.approx(rig.truth.cameras["top"].K[0, 0], rel=0.005)
+
+
+def test_left_and_right_are_the_same_whatever_else_the_rig_has():
+    pair, more = synthetic_rig(noise_px=0.0), synthetic_rig(cameras=("cam3", "left", "right"), noise_px=0.0)
+    for cam in ("left", "right"):
+        for a, b in zip(dataclasses.astuple(pair.truth.cameras[cam]), dataclasses.astuple(more.truth.cameras[cam])):
+            np.testing.assert_array_equal(a, b)
+
+
+def test_the_fit_assumes_no_camera_names():
+    # A capture names its own 2 to 6 cameras, so nothing defaults to a left-right pair.
+    rig = synthetic_rig(noise_px=0.0)
+    with pytest.raises(TypeError):
+        fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    with pytest.raises(TypeError):
+        reconcile_corner_order(rig.observations, rig.board, (1440, 1080))
+    with pytest.raises(TypeError):
+        rig.truth.stereo()
+
+
 def test_fit_measures_a_motor_scale_error():
     rig = synthetic_rig(motor_scale=1.01)
-    assert fit_motor_frame(rig.observations, rig.board, (1440, 1080)).motor_scale == pytest.approx(1.01, abs=0.002)
+    assert fit_motor_frame(rig.observations, rig.board, (1440, 1080), CAMERAS).motor_scale == pytest.approx(1.01, abs=0.002)
 
 
 def test_waypoints_seen_by_one_camera_still_constrain_that_camera():
     rig = synthetic_rig()
     for obs in rig.observations[::3]:
         obs.corners.pop("right")
-    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080), CAMERAS)
     assert fit.cameras["right"].K[0, 0] == pytest.approx(rig.truth.cameras["right"].K[0, 0], rel=0.01)
     # Each camera keeps exactly the waypoints it saw: the left camera all of them,
     # the right camera all but the ones it missed.
@@ -103,8 +163,8 @@ def test_waypoints_seen_by_one_camera_still_constrain_that_camera():
 
 def test_stereo_is_consistent_with_the_camera_poses():
     rig = synthetic_rig(noise_px=0.0)
-    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
-    R, T = fit.stereo()
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080), CAMERAS)
+    R, T = fit.stereo("left", "right")
     # A motor-frame point mapped to the left camera, then through (R, T), equals its right-camera mapping.
     X = np.random.default_rng(1).uniform(-60.0, 60.0, (20, 3))
     left, right = fit.cameras["left"], fit.cameras["right"]
@@ -112,7 +172,7 @@ def test_stereo_is_consistent_with_the_camera_poses():
     X_right = X @ cv2.Rodrigues(right.rvec)[0].T + right.tvec
     np.testing.assert_allclose(X_left @ R.T + T, X_right, rtol=0, atol=1e-6)
     # Without noise the fit lands on the truth, so the pair is the true one too.
-    R_true, T_true = rig.truth.stereo()
+    R_true, T_true = rig.truth.stereo("left", "right")
     assert rotation_angle_deg(cv2.Rodrigues(R)[0], cv2.Rodrigues(R_true)[0]) < 1e-4
     np.testing.assert_allclose(T, T_true, rtol=0, atol=1e-4)
 
@@ -123,7 +183,7 @@ def test_fit_converges_when_the_planar_start_is_far_off():
     # with all five distortion terms free there it started at 5.5x, k2 = -2800, and the
     # joint fit diverged to rms 4.4 px.
     rig = synthetic_rig(seed=12)
-    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080), CAMERAS)
     for cam in ("left", "right"):
         assert fit.rms_px[cam] < 0.2
         assert fit.cameras[cam].K[0, 0] == pytest.approx(rig.truth.cameras[cam].K[0, 0], rel=0.005)
@@ -135,7 +195,7 @@ def test_fit_triangulates_the_working_volume_like_truth(frame_rotation_deg):
     # At 35 degrees the motor axes are turned against the board and cameras about an
     # oblique axis, so nothing in the fit can lean on them being aligned.
     rig = synthetic_rig(noise_px=0.1, frame_rotation_deg=frame_rotation_deg)
-    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080), CAMERAS)
     # A 10 x 10 x 5 grid over the bounding box of every corner at every waypoint. Motor
     # z, the axis the stage moves least, gets the 5 steps.
     corners = np.concatenate([rig.world_corners(o.motor_mm) for o in rig.observations])
@@ -184,7 +244,7 @@ def test_reconcile_reverses_a_camera_that_labels_the_board_from_the_other_end():
     rig = synthetic_rig(noise_px=0.1)
     flipped = with_reversed_corners(rig.observations, "right")
     inputs = [{c: v.copy() for c, v in o.corners.items()} for o in flipped]
-    reconciled, reversed_cameras = reconcile_corner_order(flipped, rig.board, (1440, 1080))
+    reconciled, reversed_cameras = reconcile_corner_order(flipped, rig.board, (1440, 1080), CAMERAS)
     assert reversed_cameras == {"left": False, "right": True}
     for o, before in zip(flipped, inputs):
         for c in before:
@@ -193,13 +253,13 @@ def test_reconcile_reverses_a_camera_that_labels_the_board_from_the_other_end():
         assert r.index == o.index
         for c in ("left", "right"):
             np.testing.assert_array_equal(r.corners[c], o.corners[c])
-    fit = fit_motor_frame(reconciled, rig.board, (1440, 1080))
+    fit = fit_motor_frame(reconciled, rig.board, (1440, 1080), CAMERAS)
     assert working_volume_error_mm(rig, fit.cameras) < 0.05
 
 
 def test_reconcile_leaves_consistent_cameras_alone():
     rig = synthetic_rig(noise_px=0.1)
-    reconciled, reversed_cameras = reconcile_corner_order(rig.observations, rig.board, (1440, 1080))
+    reconciled, reversed_cameras = reconcile_corner_order(rig.observations, rig.board, (1440, 1080), CAMERAS)
     assert reversed_cameras == {"left": False, "right": False}
     for r, o in zip(reconciled, rig.observations):
         assert r is not o and r.index == o.index
@@ -216,7 +276,7 @@ def test_reconcile_takes_the_camera_with_the_most_views_as_reference():
     flipped = with_reversed_corners(rig.observations, "right")
     for o in flipped[:5]:
         del o.corners["left"]
-    reconciled, reversed_cameras = reconcile_corner_order(flipped, rig.board, (1440, 1080))
+    reconciled, reversed_cameras = reconcile_corner_order(flipped, rig.board, (1440, 1080), CAMERAS)
     assert reversed_cameras == {"left": True, "right": False}
     for r, f in zip(reconciled, flipped):
         np.testing.assert_array_equal(r.corners["right"], f.corners["right"])
@@ -253,7 +313,7 @@ def test_fit_recovers_the_truth_when_the_planar_start_is_ten_times_the_focal_len
         return result
 
     monkeypatch.setattr(fit_module, "_solve", solve, raising=False)
-    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080), CAMERAS)
     # Precondition: from the planar start alone the fit fails (it runs out of evaluations).
     planar, _, outcome = outcomes[0]
     assert planar is None or max(planar.rms_px.values()) > 1.0, outcome
@@ -278,7 +338,7 @@ def test_reconcile_detects_a_reversed_camera_when_the_planar_start_is_ten_times_
     rig = synthetic_rig(noise_px=0.1)
     planar_start_at_ten_times_the_focal_length(monkeypatch, rig.truth.cameras["left"].K[0, 0])
     flipped = with_reversed_corners(rig.observations, "right")
-    _, reversed_cameras = reconcile_corner_order(flipped, rig.board, (1440, 1080))
+    _, reversed_cameras = reconcile_corner_order(flipped, rig.board, (1440, 1080), CAMERAS)
     assert reversed_cameras == {"left": False, "right": True}
 
 
@@ -307,7 +367,7 @@ def test_reconcile_decides_from_a_converged_fit_not_the_planar_board_rotation(mo
     }
     from_start = rotation_angle_deg(cv2.Rodrigues(starts["left"])[0], cv2.Rodrigues(starts["right"])[0])
     assert 60.0 < from_start < 90.0  # precondition: the start alone would not reverse the right camera
-    _, reversed_cameras = reconcile_corner_order(flipped, rig.board, (1440, 1080))
+    _, reversed_cameras = reconcile_corner_order(flipped, rig.board, (1440, 1080), CAMERAS)
     assert reversed_cameras == {"left": False, "right": True}
 
 
@@ -327,7 +387,7 @@ def test_reconcile_warns_when_the_board_rotations_are_ambiguous(monkeypatch, cap
 
     monkeypatch.setattr(fit_module, "fit_motor_frame", fit)
     with caplog.at_level("WARNING", logger=fit_module.__name__):
-        _, reversed_cameras = reconcile_corner_order(rig.observations, rig.board, (1440, 1080))
+        _, reversed_cameras = reconcile_corner_order(rig.observations, rig.board, (1440, 1080), CAMERAS)
     assert reversed_cameras == {"left": False, "right": False}
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert any(w.startswith("right:") and "degrees from left" in w and "ambiguous" in w for w in warnings), warnings
@@ -335,7 +395,7 @@ def test_reconcile_warns_when_the_board_rotations_are_ambiguous(monkeypatch, cap
 
 def test_fitted_distortion_matches_truth_at_the_1024_roi_corners():
     rig = synthetic_rig(noise_px=0.1)
-    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080), CAMERAS)
     # The sensor ROI of the 1024x1024 bin-1 preset, PresetGeometry(1, 1024, 1024, 208, 24).
     # The board does not reach these corners, so this is where the fitted distortion
     # extrapolates furthest.
@@ -348,7 +408,7 @@ def test_fitted_distortion_matches_truth_at_the_1024_roi_corners():
 
 def test_param_std_covers_every_intrinsic():
     rig = synthetic_rig(noise_px=0.1)
-    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080), CAMERAS)
     for cam in ("left", "right"):
         std = fit.param_std[cam]
         assert tuple(std) == INTRINSIC_NAMES == ("fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3")
@@ -371,7 +431,7 @@ def test_a_camera_the_capture_cannot_determine_reports_infinite_std():
     for obs in rig.observations:
         if obs.motor_mm[2] != -29.4:
             obs.corners.pop("right")
-    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    fit = fit_motor_frame(rig.observations, rig.board, (1440, 1080), CAMERAS)
     right, left = fit.param_std["right"], fit.param_std["left"]
     assert right["fx"] == np.inf
     # Never 0.0, which would read as perfectly determined; k3 is held at 0 by design.
@@ -392,7 +452,7 @@ def test_a_fit_that_runs_out_of_evaluations_raises(monkeypatch):
     monkeypatch.setattr(fit_module, "least_squares", capped)
     rig = synthetic_rig()
     with pytest.raises(RuntimeError, match=r"status 0 after \d+ evaluations"):
-        fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+        fit_motor_frame(rig.observations, rig.board, (1440, 1080), CAMERAS)
 
 
 def test_a_given_start_replaces_the_planar_start_and_reaches_the_same_optimum(monkeypatch):
@@ -400,7 +460,7 @@ def test_a_given_start_replaces_the_planar_start_and_reaches_the_same_optimum(mo
     # because the planar start is degenerate in focal length. A start must change where the
     # solver begins, never where it ends.
     rig = synthetic_rig(noise_px=0.1, frame_rotation_deg=35.0)
-    planar = fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+    planar = fit_motor_frame(rig.observations, rig.board, (1440, 1080), CAMERAS)
     # The truth, 2 % off in focal length and 5 px off in the principal point.
     off = np.array([[0.02, 0.0, 5.0], [0.0, 0.02, -5.0], [0.0, 0.0, 0.0]])
     start = dataclasses.replace(
@@ -413,7 +473,7 @@ def test_a_given_start_replaces_the_planar_start_and_reaches_the_same_optimum(mo
         raise AssertionError("the planar start ran although a start was given")
 
     monkeypatch.setattr(fit_module, "_initial_camera", no_planar_start)
-    given = fit_motor_frame(rig.observations, rig.board, (1440, 1080), initial=start)
+    given = fit_motor_frame(rig.observations, rig.board, (1440, 1080), CAMERAS, initial=start)
 
     def intrinsics(m):
         return np.array([m.K[0, 0], m.K[1, 1], m.K[0, 2], m.K[1, 2], *np.ravel(m.dist)[:4]])
@@ -450,7 +510,7 @@ def test_a_camera_with_too_few_waypoints_is_refused():
     for obs in rig.observations[2:]:
         obs.corners.pop("right")
     with pytest.raises(ValueError, match="right"):
-        fit_motor_frame(rig.observations, rig.board, (1440, 1080))
+        fit_motor_frame(rig.observations, rig.board, (1440, 1080), CAMERAS)
 
 
 def test_board_object_points_are_row_major_with_columns_fastest():
