@@ -2,8 +2,9 @@
 
 reachAQ reads each lab's mouse records (ID, RFID, sex, date of birth, strain,
 genotype, cage, protocol, state) from wherever the lab keeps them, into a local
-cache on each computer. A first RFID scan or a manual link copies a record into
-the animal's JSON, and every session's metadata snapshot carries it.
+cache on each computer. A first RFID scan (from the reader, a barcode scanner
+or typed in) or a manual link copies a record into the animal's JSON, and every
+session's metadata snapshot carries it.
 
 Each computer's user sets up **one** source:
 
@@ -27,10 +28,13 @@ Set it up as the operator who runs reachAQ on that computer, not with `sudo`.
    username and password, then click **List** to log in and choose the colony.
 2. Click **Read columns**. reachAQ fetches the source once and lists its
    columns.
-3. Choose the two columns that identify an animal: **Physical tag** (its
-   permanent ID, also the name a new animal gets) and **RFID** (**(none)** if
-   the source has no RFID column). For SoftMouse they default to Physical Tag
-   and Plate ID. Every column of the source is kept in each animal's metadata;
+3. Choose the three columns that identify an animal: **Physical tag** (its
+   permanent ID), **Name** (the name a new animal gets; by default the
+   physical tag) and **RFID** (its unique scan code: an ISO 11784 RFID, a
+   barcode or any other ID; **(none)** if the source has none). For SoftMouse
+   they default to Physical Tag, Physical Tag and Plate ID; a lab that keeps
+   its codes in **Alt. ID** chooses that instead. Every column of the source
+   is kept in each animal's metadata;
    state, sex, date of birth, strain, genotype, cage and protocol are also read
    by name when a column matches, and the dialog lists which ones it found.
 4. Decide **Skip animals without a valid RFID** (see "RFID" below).
@@ -118,8 +122,8 @@ its first name). A refresh replaces it in one transaction, or not at all:
 - The source must be reachable and return a complete snapshot. A snapshot
   that is empty, or more than 35% smaller than the last one, is refused as a
   likely filtered export.
-- Duplicate IDs or RFIDs, a missing required column, or an ambiguous column
-  name fail the refresh.
+- Duplicate physical tags, a missing required column, or an ambiguous column
+  name fail the refresh. A duplicate RFID does not (see "RFID").
 - On any failure the previous cache stays in use, and RFID scans keep
   resolving against it.
 
@@ -132,15 +136,65 @@ Animals already linked keep their link and metadata.
 
 ## RFID
 
-With **Skip animals without a valid RFID** on (the SoftMouse default), only
-rows holding an exact 15-digit ISO 11784 RFID are imported; the others are
-counted as "without RFID".
+The RFID column holds each animal's unique scan code. Any non-empty value is
+accepted: a 15-digit ISO 11784 RFID (what the RFID reader reports), a barcode,
+or a lab's own code. Surrounding spaces are removed; everything else is kept
+exactly, and matching is case-sensitive (`bc-1` and `BC-1` are different
+animals).
 
-With it off (the default for other kinds), every active row is imported.
-Animals with an RFID resolve on a scan as before. Animals without one appear
-in **Animal RFID links and duplicates → Link RFID** and are linked to a local
-animal by hand; a scan can never select them. A value in the RFID column that
-is not a 15-digit RFID is treated as no RFID.
+A value that more than one active animal has is not unique, so it is ignored
+for **all** of them: those animals are still imported, without an RFID, and
+the refresh reports the value and the animals (in **Preferences → Animal
+metadata**, the status line, the CLI and the log). For example, SoftMouse
+Alt. ID `201B` on both E978 and E980 gives neither of them an RFID. Ended
+animals do not count.
+
+With **Skip animals without a valid RFID** on (the SoftMouse default), rows
+whose RFID cell is empty are skipped and counted as "without RFID". Animals
+whose RFID was ignored as a duplicate are imported regardless. With it off
+(the default for other kinds), every active row is imported.
+
+Animals without an RFID appear in **Animal RFID links and duplicates → Link
+RFID** and are linked to a local animal by hand; a scan can never select them.
+
+### Scanning or typing an RFID
+
+Besides the RFID reader, the **Scan or type RFID** field in the main toolbar,
+next to **Subject**, takes a code from a USB barcode scanner (one that types
+the code and Enter, like a keyboard), or typed or pasted by hand. Enter looks
+it up exactly as a reader scan does: a linked animal is selected, a first
+scan opens the set-up dialog, and an unknown code shows in the **RFID** label.
+Click into the field before scanning. It is disabled while a session runs.
+
+### Trying it with fake mice
+
+`tests/fixtures/fake-mice.csv` is a spreadsheet of seven fake animals:
+FAKE-001 and FAKE-002 with test-range ISO RFIDs (`999000000000001`,
+`999000000000002`), FAKE-003 and FAKE-004 with barcode IDs (`BC-0003-A`,
+`bc-0004-b`), FAKE-005 with none, and FAKE-006 and FAKE-007 sharing
+`DUP-0006`, which neither gets. Use it only with scratch preferences and a
+scratch settings directory, so the real source, cache and `~/Autotrainer`
+are untouched:
+
+```bash
+cd ~/Documents/reachAQ
+conda activate reachaq
+export SCRATCH=$HOME/reachaq-fake-mice
+mkdir -p "$SCRATCH/config"
+# Settings directory: where the cache goes (softmouse/animal-registry.sqlite3).
+printf '[system]\nconfiguration_location=%s\n' "$SCRATCH/config" > "$SCRATCH/prefs.ini"
+reachaq-animal-metadata --preferences "$SCRATCH/prefs.ini" setup --kind spreadsheet
+#   Spreadsheet file: ~/Documents/reachAQ/tests/fixtures/fake-mice.csv
+#   Columns: Physical Tag, Name, RFID (the suggestions); skip: n; no publication
+reachaq-animal-metadata --preferences "$SCRATCH/prefs.ini" refresh
+```
+
+The refresh prints `Imported 7 of 7 rows (4 with RFID)` and a warning for
+`DUP-0006`. To try the scan field, start the app with the same preferences
+file (`python -m reachAQ.app --preferences-file "$SCRATCH/prefs.ini"`), type
+`BC-0003-A` in **Scan or type RFID** and press Enter: the first-scan dialog
+opens for FAKE-003. Animal JSONs it creates also go under `$SCRATCH/config`.
+Delete `$SCRATCH` afterwards.
 
 ## Status and errors
 
