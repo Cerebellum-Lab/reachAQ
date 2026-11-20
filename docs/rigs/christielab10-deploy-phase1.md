@@ -288,9 +288,12 @@ reachaq-animal-metadata setup --kind softmouse
 
 The username is the short SoftMouse login, `benjamin.g.reynolds`, not the email:
 that is the account the old publisher stored the password under, so the password
-prompt can then be left empty. Choose the lab's colony. For the two columns, accept
-**Physical tag** = `Physical Tag` and **RFID** = `Plate ID` unless the export uses
-other names; every other column is kept in the metadata without being asked.
+prompt can then be left empty. Choose the lab's colony. For the columns, choose
+**Physical tag** = `Physical Tag`, **Name** = `Physical Tag` (or the column whose
+value a new animal should be named after) and **RFID** = `Alt. ID`, the lab's
+choice: it accepts RFIDs, barcodes or any other unique code. A value two animals
+share (`201B` on E978 and E980 today) is ignored for both and reported. Every other
+column is kept in the metadata without being asked.
 **Publish to** `/mnt/isilon/Data/ReachingData/SoftMouse` and **Only if mounted**
 `/mnt/isilon` are paths, not yes/no answers. Until this step is done, the
 nightly run stops with "This computer reads a shared publication, so it has nothing

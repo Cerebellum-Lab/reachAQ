@@ -748,6 +748,12 @@ class PreferencesContent(QWidget):
             f"{batch.total_source_rows} total · {batch.accepted_rows} imported "
             f"({with_rfid} with RFID) · {batch.ignored_missing_rfid_rows} skipped "
             f"without RFID · {batch.ignored_ended_rows} ended"
+            + (
+                " · RFID ignored (shared): "
+                + ", ".join(value for value, _ in batch.duplicate_rfids)
+                if batch.duplicate_rfids
+                else ""
+            )
         )
         self._animal_metadata_mapped_columns.setText(
             ", ".join(preview.mapped_columns) or "—"

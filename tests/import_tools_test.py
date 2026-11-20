@@ -119,7 +119,7 @@ def test_the_daq_monitor_is_offered_only_while_idle():
         "_app_model_status_combo", "run_action", "preferences_action",
         "edit_camera_settings_action", "edit_daq_ports_action",
         "make_3d_calib_action", "refresh_hardware_action",
-        "_animal_dropdown_combo", "animal_metadata_action",
+        "_animal_dropdown_combo", "_rfid_entry", "animal_metadata_action",
         "_training_plan_combo", "_notes", "calib_diamond_triangle_action",
         "daq_monitor_action",
     )

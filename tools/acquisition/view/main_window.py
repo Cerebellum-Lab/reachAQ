@@ -348,6 +348,7 @@ class MainWindow(QMainWindow):
         self._set_hardware_menu_actions_enabled(state.idle_configuration)
         self._set_capture_binning_actions_enabled(state.idle_configuration)
         self._animal_dropdown_combo.setEnabled(state.subject)
+        self._rfid_entry.setEnabled(state.subject)
         self.animal_metadata_action.setEnabled(state.subject)
         self._training_plan_combo.setEnabled(state.protocol_selection)
         self._notes.setEnabled(state.notes)
@@ -1531,6 +1532,17 @@ class MainWindow(QMainWindow):
         self._rfid_status_label = QLabel("RFID: —")
         self._rfid_status_label.setContentsMargins(8, 0, 8, 0)
         toolbar.addWidget(self._rfid_status_label)
+        # A USB barcode scanner types its code and Enter here, like a keyboard.
+        entry = self._rfid_entry = QLineEdit()
+        entry.setPlaceholderText("Scan or type RFID, Enter")
+        entry.setToolTip(
+            "An RFID, barcode or other unique animal ID. Enter selects the "
+            "animal as an RFID reader scan does."
+        )
+        entry.setClearButtonEnabled(True)
+        entry.setMinimumWidth(150)
+        entry.returnPressed.connect(self._rfid_entered)
+        toolbar.addWidget(entry)
         toolbar.addAction(self.animal_metadata_action)
 
         toolbar.addSeparator()
@@ -1885,6 +1897,19 @@ class MainWindow(QMainWindow):
 
     def _add_animal(self):
         self._app_model.add_animal(self._animal_dropdown_combo.currentText(), select=True)
+
+    def _rfid_entered(self) -> None:
+        text = self._rfid_entry.text()
+        self._rfid_entry.clear()
+        if not text.strip():
+            return
+        try:
+            self._app_model.resolve_entered_rfid(text)
+        except ValueError as exc:
+            self.statusBar().showMessage(f"RFID not accepted: {exc}", 8000)
+        except Exception:
+            logger.exception("Typed animal identifier resolution failed")
+            self.statusBar().showMessage("RFID lookup failed; see the log", 8000)
 
     def _animal_changed(self, _):
         if self._animal_dropdown_combo.currentIndex() in (0, -1):
