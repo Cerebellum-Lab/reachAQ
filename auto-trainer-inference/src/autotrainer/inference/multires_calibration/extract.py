@@ -22,7 +22,9 @@ the board still moving through the dwell after the 17 mm move and found no segme
 The logged dwells lay inside the still frames of every waypoint the motion did find.
 
 The cameras are hardware-synchronised, so the same dwell must start at the same frame in
-every camera; segments that drift apart also raise WaypointAlignmentError.
+every camera; segments that drift apart also raise WaypointAlignmentError. With logged
+dwells that is judged by the cameras' frame times (75 ms), not frame indices, so a camera
+with its own frame rate can be one of the cameras.
 
 In every segment the board is detected in a few frames at its middle, and the per-corner
 median of those detections is the waypoint's observation. The 6x8 board looks the same
@@ -73,6 +75,13 @@ _STATIC_RATIO = 2.0
 # The cameras are hardware-synchronised, so a dwell starts at the same frame in each; this
 # allows for the threshold catching the slow end of a move a frame or two apart.
 _MAX_START_OFFSET_FRAMES = 3
+# The same rule for segments from the logged dwells, in seconds between the cameras' frame
+# times at a dwell's start. Three frames at the capture's 40 fps; a camera at another rate
+# still has its dwell start within a frame of the others.
+_MAX_START_OFFSET_S = 0.075
+# How many cameras a capture may have.
+MIN_CAMERAS = 2
+MAX_CAMERAS = 6
 # The gamma the legacy calibration passed to create_corner_matrix (the former
 # handle_3d_calibration.process_capture). refine_corners' fixed Canny thresholds were tuned
 # on the image after that step.
@@ -307,7 +316,7 @@ def extract_observations(
     number exactly the distinct waypoints, or with logged dwells, when it has no frame
     times, they do not number its frames or do not increase, or a dwell holds fewer than 8
     frames; and naming both cameras when a segment starts more than 3 frames apart in two
-    of them. A board found in none of the frames, or whose detections disagree by more than
+    of them (more than 75 ms apart, by frame time, with logged dwells). A board found in none of the frames, or whose detections disagree by more than
     1 px within the segment, only drops that camera from that waypoint and is listed in
     `rejected`.
     """
@@ -331,7 +340,7 @@ def extract_observations(
             raise WaypointAlignmentError(
                 f"{cam}: expected {len(distinct)} stationary segments, found {len(segments[cam])}"
             )
-    _check_segments_agree(segments)
+    _check_segments_agree(segments, frame_times if dwells is not None else None)
 
     corners: List[Dict[str, np.ndarray]] = [{} for _ in distinct]
     rejected: List[Tuple[int, str, str]] = []
@@ -401,10 +410,29 @@ def _checked_dwell_segments(
     return segments
 
 
-def _check_segments_agree(segments: Mapping[str, List[Tuple[int, int]]]) -> None:
-    """Raise WaypointAlignmentError when a segment starts more than _MAX_START_OFFSET_FRAMES
-    apart in two cameras. The counts already match."""
+def _check_segments_agree(
+    segments: Mapping[str, List[Tuple[int, int]]],
+    frame_times: Optional[Mapping[str, Sequence[float]]] = None,
+) -> None:
+    """Raise WaypointAlignmentError when a segment starts further apart in two cameras than
+    the cameras can be out of step. The counts already match.
+
+    With `frame_times` (the logged dwells' segments) the starts are compared as times,
+    within _MAX_START_OFFSET_S: a free-running camera, such as the stimulus camera, has its
+    own frame rate, so equal frame indices mean nothing. Without them the starts are compared
+    as frame indices, within _MAX_START_OFFSET_FRAMES.
+    """
     cams = list(segments)
+    if frame_times is not None:
+        for cam in cams[1:]:
+            for i, ((first, _), (other, _)) in enumerate(zip(segments[cams[0]], segments[cam])):
+                offset = abs(float(frame_times[cams[0]][first]) - float(frame_times[cam][other]))
+                if offset > _MAX_START_OFFSET_S:
+                    raise WaypointAlignmentError(
+                        f"segment {i}: {cams[0]} starts {offset * 1000:.0f} ms from {cam};"
+                        f" the cameras must agree within {_MAX_START_OFFSET_S * 1000:.0f} ms"
+                    )
+        return
     for cam in cams[1:]:
         for i, ((first, _), (other, _)) in enumerate(zip(segments[cams[0]], segments[cam])):
             if abs(first - other) > _MAX_START_OFFSET_FRAMES:

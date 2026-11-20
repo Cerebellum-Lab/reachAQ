@@ -4,11 +4,12 @@ A capture folder holds what the capture wrote:
 
     waypoints.yaml          the WaypointLog: the commanded motor position of every waypoint,
                             whether the motor reported arriving there, and the times
-    source_videos/left.mp4  both cameras at full sensor resolution, bin 1, while the stage
-    source_videos/right.mp4 paused at each waypoint in turn
-    source_videos/left_timestamps.txt   each camera's timestamps file, whose column 0 is
-    source_videos/right_timestamps.txt  every frame's wall-clock time (a capture made before
-                                        2026-11-20 has none)
+    source_videos/<camera>.mp4  each camera at full sensor resolution, bin 1, while the
+                            stage paused at each waypoint in turn. The cameras are the
+                            log's `cameras`, 2 to 6 of them; a log without them is left and right
+    source_videos/<camera>_timestamps.txt  each camera's timestamps file, whose column 0 is
+                            every frame's wall-clock time (a capture made before 2026-11-20
+                            has none)
 
 calibrate_capture turns it into a calibration folder (store.py):
 
@@ -16,9 +17,9 @@ calibrate_capture turns it into a calibration folder (store.py):
    COMMANDED motor position. The waypoint's frames are those of its logged dwell when every
    camera has a timestamps file, and its stationary segment by motion otherwise. The fit measures the motor scale against the board's squares,
    so a measured position would hide exactly the error the fit is there to find.
-2. Both cameras are put in one 180-degree board order (fit.reconcile_corner_order); the
+2. Every camera is put in one 180-degree board order (fit.reconcile_corner_order); the
    report notes a camera that had to be reversed.
-3. Both cameras are fitted once in sensor pixels (fit.fit_motor_frame), and every preset's
+3. Every camera is fitted once in sensor pixels (fit.fit_motor_frame), and every preset's
    intrinsics are mapped from that fit (geometry.map_intrinsics) when the store writes it.
 4. Each binned preset is cross-checked: the frames the detection used are pooled the way the
    camera bins them (INTER_AREA by the binning) and cropped to the preset's ROI, the board is
@@ -61,6 +62,8 @@ from autotrainer.inference.multires_calibration.extract import (
     _grey_frames,
     _middle_frames,
     FROM_DWELLS,
+    MAX_CAMERAS,
+    MIN_CAMERAS,
     detect_board,
     extract_observations,
     normalize_corner_order,
@@ -96,7 +99,6 @@ logger = get_verbose_logger(__name__)
 
 WAYPOINT_LOG = "waypoints.yaml"
 SOURCE_VIDEOS = "source_videos"
-CAMERAS = ("left", "right")
 # source_videos/<camera><TIMESTAMPS_SUFFIX>: the camera's timestamps file as the recorder
 # wrote it, "frame_time, fps, camera stamp, perf_counter, frame id" per frame. frame_time is
 # time.time() at the first frame plus frame-id steps at the configured fps, the clock
@@ -118,6 +120,22 @@ _PER_WAYPOINT_FIELDS = ("reported", "verified", "dcs_moves", "times")
 UNREACHED_TOLERANCE_MM = 0.1
 
 
+@dataclass(frozen=True)
+class CaptureCamera:
+    """A camera in a capture: its `name` (the video's file name and the calibration's camera
+    name), its `serial` (None when it has none, as a random or playback camera), and its
+    `camera_id`, the index the capture's cameras had in the recording configuration."""
+
+    name: str
+    serial: Optional[str]
+    camera_id: Optional[int]
+
+
+def _default_cameras() -> List[CaptureCamera]:
+    """The cameras of a log that names none: every capture before 2026-11-20 was left and right."""
+    return [CaptureCamera("left", None, 0), CaptureCamera("right", None, 1)]
+
+
 @dataclass
 class WaypointLog:
     """What the capture logged at each waypoint, in the order the stage visited them."""
@@ -132,6 +150,13 @@ class WaypointLog:
     times: List[Tuple[float, float]]  # (arrive, leave), time.time()
     # gain_db, gamma, exposure_us and fps as the capture set them; empty when not logged
     capture_settings: dict = field(default_factory=dict)
+    # The capture's cameras, in order; 2 to 6 (calibrate_capture checks)
+    cameras: List[CaptureCamera] = field(default_factory=_default_cameras)
+
+
+def capture_cameras(log: WaypointLog) -> List[str]:
+    """The names of the log's cameras, in order."""
+    return [camera.name for camera in log.cameras]
 
 
 def write_waypoint_log(path: Path, log: WaypointLog) -> None:
@@ -144,6 +169,11 @@ def write_waypoint_log(path: Path, log: WaypointLog) -> None:
         "dcs_moves": [[str(axis), float(value)] for axis, value in log.dcs_moves],
         "times": [[float(arrive), float(leave)] for arrive, leave in log.times],
         "capture_settings": _yaml_safe(dict(log.capture_settings)),
+        "cameras": [
+            {"name": str(c.name), "serial": None if c.serial is None else str(c.serial),
+             "camera_id": None if c.camera_id is None else int(c.camera_id)}
+            for c in log.cameras
+        ],
     }
     Path(path).write_text(yaml.safe_dump(data, sort_keys=False, default_flow_style=None), encoding="utf-8")
 
@@ -162,6 +192,14 @@ def load_waypoint_log(path: Path) -> WaypointLog:
             dcs_moves=[(str(axis), float(value)) for axis, value in data["dcs_moves"]],
             times=[(float(arrive), float(leave)) for arrive, leave in data["times"]],
             capture_settings=dict(data.get("capture_settings") or {}),
+            cameras=_default_cameras() if data.get("cameras") is None else [
+                CaptureCamera(
+                    name=str(c["name"]),
+                    serial=None if c.get("serial") is None else str(c["serial"]),
+                    camera_id=None if c.get("camera_id") is None else int(c["camera_id"]),
+                )
+                for c in data["cameras"]
+            ],
         )
     except (KeyError, TypeError, ValueError, AttributeError) as error:
         raise ValueError(f"{path} is not a waypoint log: {type(error).__name__}: {error}") from error
@@ -169,13 +207,13 @@ def load_waypoint_log(path: Path) -> WaypointLog:
     return log
 
 
-def load_frame_times(capture_dir: Path) -> Optional[Dict[str, np.ndarray]]:
+def load_frame_times(capture_dir: Path, cameras: Sequence[str]) -> Optional[Dict[str, np.ndarray]]:
     """camera -> column 0 of source_videos/<camera>_timestamps.txt, every frame's wall-clock
-    time, when every camera has the file; None when none has, as before 2026-11-20.
+    time, when every camera in `cameras` has the file; None when none has, as before 2026-11-20.
 
     Raises FileNotFoundError when only some have it: the cameras would be segmented two ways.
     """
-    paths = {cam: Path(capture_dir, SOURCE_VIDEOS, f"{cam}{TIMESTAMPS_SUFFIX}") for cam in CAMERAS}
+    paths = {cam: Path(capture_dir, SOURCE_VIDEOS, f"{cam}{TIMESTAMPS_SUFFIX}") for cam in cameras}
     present = [cam for cam, path in paths.items() if path.is_file()]
     if not present:
         return None
@@ -223,7 +261,12 @@ def calibrate_capture(
     if not presets:
         raise ValueError("no presets to calibrate")
     log = load_waypoint_log(capture_dir / WAYPOINT_LOG)
-    videos = {cam: capture_dir / SOURCE_VIDEOS / f"{cam}.mp4" for cam in CAMERAS}
+    cameras = tuple(capture_cameras(log))
+    if not MIN_CAMERAS <= len(cameras) <= MAX_CAMERAS:
+        raise ValueError(f"a capture has {MIN_CAMERAS} to {MAX_CAMERAS} cameras, the log lists {len(cameras)}")
+    if len(set(cameras)) != len(cameras):
+        raise ValueError(f"the log names a camera twice: {', '.join(cameras)}")
+    videos = {cam: capture_dir / SOURCE_VIDEOS / f"{cam}.mp4" for cam in cameras}
     for video in videos.values():
         if not video.is_file():
             raise FileNotFoundError(f"the capture has no video {video}")
@@ -232,14 +275,14 @@ def calibrate_capture(
         _check_inside_sensor(g, image_size)
 
     motor = [np.asarray(p, float) for p in log.motor]
-    frame_times = load_frame_times(capture_dir)
+    frame_times = load_frame_times(capture_dir, cameras)
     extraction = extract_observations(
         videos, motor, board, frames_per_waypoint=_FRAMES_PER_WAYPOINT, refine=refine,
         frame_times=frame_times, dwells=None if frame_times is None else log.times,
     )
-    observations, reversed_order = reconcile_corner_order(extraction.observations, board, image_size, CAMERAS)
-    logger.info("calibration capture: %d distinct waypoints; fitting both cameras", len(observations))
-    fit = fit_motor_frame(observations, board, image_size, CAMERAS)
+    observations, reversed_order = reconcile_corner_order(extraction.observations, board, image_size, cameras)
+    logger.info("calibration capture: %d distinct waypoints; fitting %d cameras", len(observations), len(cameras))
+    fit = fit_motor_frame(observations, board, image_size, cameras)
 
     notes: List[str] = []
     cross_checks = _cross_checks(videos, extraction.segments, observations, fit, presets, board, refine, notes)
@@ -273,14 +316,14 @@ def calibrate_capture(
         )
 
     base = max(presets, key=lambda g: g.binning)
-    rejections: Dict[str, Dict[str, int]] = {cam: {} for cam in CAMERAS}
+    rejections: Dict[str, Dict[str, int]] = {cam: {} for cam in cameras}
     for _, cam, reason in extraction.rejected:
         rejections[cam][reason] = rejections[cam].get(reason, 0) + 1
     summary = CaptureSummary(
         waypoints_total=len(log.motor),
         waypoints_verified=sum(log.verified),
         waypoints_unreached=len(unreached),
-        views_kept={cam: sum(cam in o.corners for o in observations) for cam in CAMERAS},
+        views_kept={cam: sum(cam in o.corners for o in observations) for cam in cameras},
         rejections=rejections,
     )
     previous = _previous(previous_dir, notes)
@@ -306,7 +349,7 @@ def calibrate_capture(
         "capture_folder": str(capture_dir.resolve()),
     }
     with tempfile.TemporaryDirectory(prefix="calibration_coverage_") as tmp:
-        coverage = write_coverage_images(observations, image_size, base.sensor_roi(), Path(tmp), CAMERAS)
+        coverage = write_coverage_images(observations, image_size, base.sensor_roi(), Path(tmp), cameras)
         extra_files = {path.name: path for path in coverage}
         extra_files[WAYPOINT_LOG] = capture_dir / WAYPOINT_LOG
         index = write_calibration(
@@ -384,7 +427,7 @@ def _cross_checks(
             # from the mapped K, from one 1 % and 2 px off, and from the edge-convention
             # mapping, the fit reached the same K to 1e-4 px.
             direct = fit_motor_frame(
-                preset_observations, board, (g.width, g.height), CAMERAS, initial=_mapped_fit(fit, g)
+                preset_observations, board, (g.width, g.height), tuple(videos), initial=_mapped_fit(fit, g)
             )
         except (RuntimeError, ValueError) as error:
             logger.warning("cross-check %s: the direct fit failed: %s", g.name, error)
@@ -392,7 +435,7 @@ def _cross_checks(
             checks.append(PresetCrossCheck(geometry=g, max_intrinsic_delta_px=math.inf, corner_offset_px=offset))
             continue
         delta = max(
-            _intrinsic_delta(direct.cameras[cam].K, map_intrinsics(fit.cameras[cam].K, g)) for cam in CAMERAS
+            _intrinsic_delta(direct.cameras[cam].K, map_intrinsics(fit.cameras[cam].K, g)) for cam in videos
         )
         checks.append(PresetCrossCheck(geometry=g, max_intrinsic_delta_px=delta, corner_offset_px=offset))
     return checks

@@ -45,8 +45,10 @@ from autotrainer.inference.multires_calibration.pipeline import (
     SOURCE_VIDEOS,
     TIMESTAMPS_SUFFIX,
     WAYPOINT_LOG,
+    CaptureCamera,
     WaypointLog,
     calibrate_capture,
+    capture_cameras,
     load_frame_times,
     load_waypoint_log,
     write_waypoint_log,
@@ -374,10 +376,71 @@ def test_the_logged_dwells_and_column_0_reach_extraction(tmp_path, monkeypatch):
 
 def test_frame_times_are_none_without_timestamps_and_refused_for_only_some_cameras(tmp_path):
     (tmp_path / SOURCE_VIDEOS).mkdir()
-    assert load_frame_times(tmp_path) is None
+    assert load_frame_times(tmp_path, CAMERAS) is None
     write_timestamps(tmp_path, {"left": T0 + np.arange(3) / FPS})
     with pytest.raises(FileNotFoundError, match="right_timestamps.txt"):
-        load_frame_times(tmp_path)
+        load_frame_times(tmp_path, CAMERAS)
+
+
+def three_camera_log() -> WaypointLog:
+    log = make_log()
+    log.cameras = [CaptureCamera("a", "111", 0), CaptureCamera("b", None, 1), CaptureCamera("c", "333", 5)]
+    return log
+
+
+def test_waypoint_log_round_trips_its_cameras(tmp_path):
+    log = three_camera_log()
+    write_waypoint_log(tmp_path / WAYPOINT_LOG, log)
+    loaded = load_waypoint_log(tmp_path / WAYPOINT_LOG)
+    assert loaded == log
+    assert capture_cameras(loaded) == ["a", "b", "c"]
+    assert yaml.safe_load((tmp_path / WAYPOINT_LOG).read_text())["cameras"][1] == {
+        "name": "b", "serial": None, "camera_id": 1}
+
+
+def test_a_log_without_cameras_is_left_and_right(tmp_path):
+    write_waypoint_log(tmp_path / WAYPOINT_LOG, make_log())
+    data = yaml.safe_load((tmp_path / WAYPOINT_LOG).read_text())
+    del data["cameras"]
+    (tmp_path / WAYPOINT_LOG).write_text(yaml.safe_dump(data))
+    loaded = load_waypoint_log(tmp_path / WAYPOINT_LOG)
+    assert loaded.cameras == [CaptureCamera("left", None, 0), CaptureCamera("right", None, 1)]
+    assert capture_cameras(loaded) == ["left", "right"]
+
+
+def test_a_capture_names_its_own_cameras(tmp_path, monkeypatch):
+    capture = tmp_path / "capture"
+    (capture / SOURCE_VIDEOS).mkdir(parents=True)
+    for cam in "abc":
+        (capture / SOURCE_VIDEOS / f"{cam}.mp4").write_bytes(b"")
+    write_waypoint_log(capture / WAYPOINT_LOG, three_camera_log())
+    write_timestamps(capture, {cam: T0 + np.arange(4) / FPS for cam in "abc"})
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def extract(videos, motor, board, **kwargs):
+        seen["videos"], seen["frame_times"] = list(videos.keys()), kwargs["frame_times"]
+        raise Stop
+
+    monkeypatch.setattr(pipeline, "_video_size", lambda videos: IMAGE_SIZE)
+    monkeypatch.setattr(pipeline, "extract_observations", extract)
+    with pytest.raises(Stop):
+        calibrate_capture(capture, output_dir=tmp_path / "out" / NAME, presets=PRESETS)
+    assert seen["videos"] == ["a", "b", "c"]
+    assert list(seen["frame_times"]) == ["a", "b", "c"]
+
+
+@pytest.mark.parametrize("count", [1, 7])
+def test_more_than_six_or_fewer_than_two_cameras_are_refused(tmp_path, count):
+    log = make_log()
+    log.cameras = [CaptureCamera(f"cam{i}", None, i) for i in range(count)]
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    write_waypoint_log(capture / WAYPOINT_LOG, log)
+    with pytest.raises(ValueError, match="2 to 6 cameras"):
+        calibrate_capture(capture, output_dir=tmp_path / "out" / NAME, presets=PRESETS)
 
 
 def test_unverified_waypoints_warn(second):

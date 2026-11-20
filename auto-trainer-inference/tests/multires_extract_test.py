@@ -419,6 +419,25 @@ def test_frame_times_and_dwells_go_together(capture):
         extract_observations(videos, capture.positions, capture.board, dwells=logged_dwells(capture))
 
 
+def test_logged_dwell_segments_agree_by_time_not_frame_index():
+    # The stimulus camera free-runs, so its dwell starts at another frame index: what must
+    # agree is the time. Frame 15 of b is 10 ms from frame 10 of a, 5 frames later.
+    a = T0 + np.arange(100) / FPS
+    b = T0 + 0.010 + (np.arange(100) - 5) / FPS
+    segments = {"a": [(10, 30), (50, 70)], "b": [(15, 35), (55, 75)]}
+    extract_module._check_segments_agree(segments, {"a": a, "b": b})
+    # 100 ms apart at the second dwell
+    late = b.copy()
+    late[55:] += 0.090
+    with pytest.raises(WaypointAlignmentError) as raised:
+        extract_module._check_segments_agree(segments, {"a": a, "b": late})
+    message = str(raised.value)
+    assert "segment 1" in message and "a" in message and "b" in message and "75 ms" in message
+    # without frame times the 3-frame rule stands
+    with pytest.raises(WaypointAlignmentError, match="within 3 frames"):
+        extract_module._check_segments_agree(segments)
+
+
 def test_cameras_out_of_step_raise_alignment_error(capture):
     # The cameras are hardware-synchronised, so the same dwell starts at the same frame in
     # both; ten extra frames in one camera's first dwell put every later dwell out of step.
