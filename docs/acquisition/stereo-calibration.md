@@ -193,7 +193,7 @@ The capture creates a session folder in the normal data location. In it:
   `source_videos/left_timestamps.txt` and `right_timestamps.txt`, and
   `waypoints.yaml` (the commanded and reported motor positions, which waypoints
   were verified, the times, and the camera settings).
-- `4mm_6r_8c_4x.new/` is the new calibration, at format 2. It stays after an
+- `4mm_6r_8c_4x.new/` is the new calibration, at format 3. It stays after an
   install as the session's record, and when a fail is kept out.
 
 An install copies `.new` into the configuration location (default
@@ -204,33 +204,50 @@ stopped being active. A backup is never overwritten or deleted by the app: an
 install refuses a backup name that already exists. A copy that fails leaves the
 previous calibration untouched, and a final rename that fails puts it back.
 
-A format-2 folder:
+A format-3 folder, for any 2 to 6 cameras:
 
 ```
 4mm_6r_8c_4x/
   calibration.yaml          the index, written last: format, id, created, board,
-                            presets (name, binning, size, ROI offset), verdict,
-                            override, motor_scale, capture (settings, statistics,
-                            and capture_folder: the capture's absolute path)
+                            cameras (name, serial, camera_id, calibrated, reason),
+                            preset_sets (name, and each calibrated camera's binning,
+                            size and ROI offset), verdict, override, motor_scale,
+                            capture (settings, statistics, and capture_folder: the
+                            capture's absolute path)
   sensor/fit.yaml           the full fit in sensor pixels: K, dist, rvec, tvec per
-                            camera, board rotation, motor scale, RMS, parameter std
-  presets/<WxH_binB>/       one per preset, for example presets/256x256_bin4/
-    camera_matrix/stereo_params.pickle
-    camera_matrix/left_intrinsic_params.pickle
-    camera_matrix/right_intrinsic_params.pickle
-    frame.yaml              the 3D frame: transform, units, signs
-    calibration.toml        the anipose export
+                            calibrated camera, board rotation, motor scale, RMS,
+                            parameter std
+  calibration.toml          the anipose export of every calibrated camera, in sensor pixels
+  presets/<set>/            one per preset set (see Presets), for example presets/live/
+    calibration.toml        the anipose export, each camera at its geometry in the set
     README.txt
+    camera_matrix/stereo_params.pickle           } only when left and right are both
+    camera_matrix/left_intrinsic_params.pickle   } calibrated and share a geometry in
+    camera_matrix/right_intrinsic_params.pickle  } this set: today's left-right files,
+    frame.yaml              the 3D frame         } read by live 3D and DeepLabCut
   quality_report.json       the report, with the thresholds it was graded with
   quality_report.txt        the operator's summary
-  coverage_left.png, coverage_right.png
+  coverage_<camera>.png     one per capture camera, calibrated or not
   waypoints.yaml            copied from the capture
   camera_offsets.pkl        only after DCS is redone; written by DCS, never by the calibration
 ```
 
-- A folder without `calibration.yaml` at format 2 is a **legacy** calibration
-  (`camera_matrix/stereo_params.pickle` at the top) and is loaded the old way.
-  It has no id; its date is its `stereo_params.pickle` modification time.
+- A camera that saw too little is listed in `cameras` with `calibrated: false`
+  and its reason. It is in no `calibration.toml` and no preset set: it is 2D
+  only.
+- Nothing inside the folder is written again by reading it. A geometry no
+  stored set has (a camera recorded at another binning or ROI) gets its anipose
+  file derived from `sensor/fit.yaml` on demand, into a cache outside the
+  folder, `.derived/<id>/<key>/calibration.toml` beside the calibrations.
+- **Format 2** (calibrations made before 2026-11-20) still loads: left and right
+  only, one folder per preset, `presets/<WxH_binB>/`, each with the
+  `camera_matrix` files, `frame.yaml` and a two-camera `calibration.toml`, and no
+  top-level `calibration.toml`. Its index reads as cameras left and right, both
+  calibrated, with one preset set per preset.
+- A folder without `calibration.yaml` at format 2 or 3 is a **legacy**
+  calibration (`camera_matrix/stereo_params.pickle` at the top) and is loaded
+  the old way. It has no id; its date is its `stereo_params.pickle`
+  modification time.
 - `calibration.yaml` is written last, into a `.partial` folder that is renamed
   into place, so a half-written folder never loads.
 - **`camera_offsets.pkl` is never carried over.** The install skips it if the
@@ -244,6 +261,15 @@ A format-2 folder:
   see Part 3.
 
 ## Presets
+
+A preset set gives every calibrated camera one geometry. Per-camera sets come
+from `geometry.presets_for_cameras` of each camera's live geometry: `live` (the
+cameras as they record) and `bin1`, `bin2` and `bin4`, each camera's own live
+window at that binning. A binning is left out when some camera's window does
+not fall on whole pixels at it, or when it would repeat `live`. Until the
+capture passes each camera's own geometry, every camera shares each preset of
+`geometry.presets_from_base`, and each set is named after its preset, for
+example `presets/256x256_bin4/`.
 
 The presets are `geometry.presets_from_base` of the live camera geometry, with
 binnings 4, 2 and 1. For the base geometry of 256 x 256 at binning 4 and ROI
@@ -335,8 +361,10 @@ for example `left-right`.
 - An informational metric has no limits: it is recorded so months can be
   compared and never changes the verdict.
 - The change metrics appear only when the previous calibration is a format-2
-  folder whose fit can be read. Otherwise the report notes "no comparable
-  previous calibration".
+  or format-3 folder whose fit can be read. Otherwise the report notes "no
+  comparable previous calibration". They compare the cameras both calibrations
+  have, so a format-2 (left and right) previous is compared on left and right,
+  and the report notes each newly added camera as not in the previous one.
 - A binning-1 preset is a crop of the frames the sensor fit used, so it has no
   cross-check.
 - Notes list what the metrics do not: views rejected per camera and the reason
@@ -348,10 +376,11 @@ for example `left-right`.
 
 ## Exports
 
-Every preset folder is a DeepLabCut 3D `camera_matrix` folder and an anipose
-calibration. All pixel values are in that preset's pixels, so use a preset's
-files only with video recorded at that binning and ROI. `README.txt` in the
-folder repeats this.
+Every preset set folder is an anipose calibration, and, when it holds left and
+right at one geometry, a DeepLabCut 3D `camera_matrix` folder. All pixel values
+are in the set's pixels, each camera's own, so use a set's files only with
+video each camera recorded at its binning and ROI. `README.txt` in the folder
+lists the geometries.
 
 - **DeepLabCut 3D.** `camera_matrix/stereo_params.pickle` holds one key,
   `"left-right"`, with the keys and shapes of the pre-existing file
@@ -362,11 +391,17 @@ folder repeats this.
   DLC keys the pair by the project's camera names, so the DLC project's
   `config.yaml` must set `camera_names: ["left", "right"]`. Triangulated points
   are in the rectified left-camera frame, in mm.
-- **anipose.** `calibration.toml` is in aniposelib's `CameraGroup` format:
-  `cam_0` (left) and `cam_1` (right) each with name, size `[w, h]`, matrix, five
-  distortion coefficients, rotation (Rodrigues, motor frame to camera) and
-  translation in mm, plus `[metadata]`. The camera poses are in the motor frame.
-  `metadata.error` is the mean of the two cameras' RMS in the preset's pixels.
+- **anipose.** `calibration.toml` is in aniposelib's `CameraGroup` format and
+  loads with aniposelib 0.8.0's `CameraGroup.load`. It has one table per
+  calibrated camera, `cam_0` to at most `cam_5` in capture order, each with
+  name (the camera's name, as its video files carry it), size `[w, h]`, matrix,
+  five distortion coefficients, rotation (Rodrigues, motor frame to camera) and
+  translation in mm. The camera poses are in the motor frame. `[metadata]`
+  holds `adjusted = false`, `error` (the mean of the cameras' RMS, each in its
+  own pixels), `calibration_id`, `cameras` (`[{name, serial}]`, with no serial
+  key for a camera that has none), `units = "mm"` and `frame = "motor"`.
+  A format-2 folder's file has only left and right and only `adjusted` and
+  `error` in its metadata.
 - **Frame transform.** `frame.yaml` holds the 3 x 3 `transform` M, `units: mm`
   and the per-axis `signs`. Live and offline 3D compute
   `oriented = (raw - camera_offsets) @ M`, where `raw` is the triangulation
@@ -403,6 +438,9 @@ folder repeats this.
   against a format-2 calibration has a `calibration_id` field it does not
   accept. Install a format-2 calibration only on a rig running this branch or
   later.
+- **Format-2 code cannot read a format-3 calibration folder.** It takes a
+  `calibration.yaml` at another format for a legacy folder, which then fails to
+  load. Install a format-3 calibration only on a rig whose code reads format 3.
 - **A crash between the install's two renames.** If the app dies after the
   backup rename and before the final one, the configuration location has no
   `4mm_6r_8c_4x`; the dated backup and `4mm_6r_8c_4x.partial` both survive. On
@@ -542,7 +580,7 @@ index, report = calibrate_capture(
     Path("<session>/4mm_6r_8c_4x"),
     output_dir=Path("recalibrated/4mm_6r_8c_4x.new"),  # must not exist
     presets=presets_from_base(base),
-    previous_dir=None,        # a format-2 folder, to get the change metrics
+    previous_dir=None,        # a format-2 or 3 folder, to get the change metrics
     refine="subpix",          # or "legacy"
 )
 print(report.to_text())

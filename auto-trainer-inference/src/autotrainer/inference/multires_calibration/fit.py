@@ -95,6 +95,17 @@ class BoardSpec:
         return np.column_stack([col.ravel(), row.ravel(), np.zeros(row.size)]).astype(float) * self.square_mm
 
 
+@dataclass(frozen=True)
+class CaptureCamera:
+    """A camera in a capture: its `name` (the video's file name and the calibration's camera
+    name), its `serial` (None when it has none, as a random or playback camera), and its
+    `camera_id`, the index the capture's cameras had in the recording configuration."""
+
+    name: str
+    serial: Optional[str]
+    camera_id: Optional[int]
+
+
 @dataclass
 class WaypointObservation:
     """The board at one paused waypoint. A camera is absent when it did not detect the board."""

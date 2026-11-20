@@ -19,7 +19,7 @@ intrinsic matrix, so binning and cropping do not change them.
 """
 
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -105,3 +105,50 @@ def presets_from_base(base: PresetGeometry, binnings: Sequence[int] = (4, 2, 1))
         k = base.binning // b
         presets.append(PresetGeometry(b, base.width * k, base.height * k, base.offset_x * k, base.offset_y * k))
     return presets
+
+
+
+@dataclass(frozen=True)
+class PresetSet:
+    """One geometry per camera, for the cameras recorded together: `name` is "live" for the
+    cameras' live geometries and f"bin{b}" for the set derived at binning b from each camera's
+    live window. It names the set's folder in a calibration (presets/<name>/)."""
+
+    name: str
+    cameras: Mapping[str, PresetGeometry]
+
+
+def rebinned(g: PresetGeometry, binning: int) -> Optional[PresetGeometry]:
+    """`g`'s sensor window at `binning`, or None when the window's edges do not fall on whole
+    pixels at that binning."""
+    if binning <= 0:
+        raise ValueError(f"binning must be positive, got {binning}")
+    x0, y0, x1, y1 = (int(v) for v in g.sensor_roi())
+    if any(v % binning for v in (x0, y0, x1, y1)):
+        return None
+    return PresetGeometry(binning, (x1 - x0) // binning, (y1 - y0) // binning, x0 // binning, y0 // binning)
+
+
+def presets_for_cameras(live: Mapping[str, PresetGeometry], binnings: Sequence[int] = (1, 2, 4)) -> List[PresetSet]:
+    """The "live" set, then a f"bin{b}" set for each b in `binnings`: every camera's own live
+    window at binning b.
+
+    A binning is left out when some camera's window does not fall on whole pixels at it, and
+    when its set is the live set again (every camera already records at b). Any geometry left
+    out can still be derived on demand (store.load_preset_set).
+    """
+    if not live:
+        raise ValueError("no cameras to make presets for")
+    live = dict(live)
+    sets = [PresetSet("live", live)]
+    for b in binnings:
+        cameras: Dict[str, PresetGeometry] = {}
+        for cam, g in live.items():
+            at_b = rebinned(g, b)
+            if at_b is None:
+                break
+            cameras[cam] = at_b
+        else:
+            if cameras != live:
+                sets.append(PresetSet(f"bin{b}", cameras))
+    return sets

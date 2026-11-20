@@ -29,8 +29,10 @@ import pytest
 from autotrainer.core import Offset3DTuple
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.inference.analysis.prepare_jetson_data import _undistort_points
+from autotrainer.inference.multires_calibration.fit import CaptureCamera
 from autotrainer.inference.multires_calibration.geometry import (
     PresetGeometry,
+    PresetSet,
     map_intrinsics,
     presets_from_base,
     sensor_to_preset_points,
@@ -55,6 +57,23 @@ RIGS = {"symmetric": RIG, "turned": synthetic_rig(noise_px=0.0, frame_rotation_d
 
 def preset_id(g):
     return g.name
+
+
+def toml_loads():
+    """tomllib where Python has it (3.11+), else its backport tomli, which the rig's 3.10 has."""
+    try:
+        import tomllib
+    except ImportError:
+        tomllib = pytest.importorskip("tomli")
+    return tomllib.loads
+
+
+def pair_toml(fit, g):
+    """The anipose export of left and right, both at preset `g`."""
+    return anipose_toml(
+        fit, PresetSet(g.name, {cam: g for cam in CAMERAS}), calibration_id="0" * 32,
+        cameras=[CaptureCamera(cam, None, i) for i, cam in enumerate(CAMERAS)],
+    )
 
 
 def working_volume_points(rig=RIG):
@@ -266,11 +285,11 @@ def test_a_motor_step_maps_back_through_diamond_to_motor(g, frame):
 
 
 def test_anipose_toml_reads_back():
-    tomli = pytest.importorskip("tomli")
+    loads = toml_loads()
     # A noisy rig's truth carries the injected noise as its rms_px, so the error is not 0.
     fit = synthetic_rig(noise_px=0.1).truth
     g = PresetGeometry(1, 1024, 1024, 208, 24)
-    data = tomli.loads(anipose_toml(fit, g))
+    data = loads(pair_toml(fit, g))
     assert sorted(data) == ["cam_0", "cam_1", "metadata"]
     for key, cam in (("cam_0", "left"), ("cam_1", "right")):
         table, m = data[key], fit.cameras[cam]
@@ -286,7 +305,7 @@ def test_anipose_toml_reads_back():
     sensor_rms = np.mean([fit.rms_px[c] for c in CAMERAS])
     assert data["metadata"]["error"] == sensor_rms > 0
     binned = PresetGeometry(4, 256, 256, 52, 6)
-    assert tomli.loads(anipose_toml(fit, binned))["metadata"]["error"] == pytest.approx(sensor_rms / 4, rel=1e-15)
+    assert loads(pair_toml(fit, binned))["metadata"]["error"] == pytest.approx(sensor_rms / 4, rel=1e-15)
 
 
 @pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf], ids=["nan", "inf", "-inf"])
@@ -299,18 +318,17 @@ def test_anipose_toml_refuses_non_finite_camera_parameters(field, value):
     broken.flat[-1] = value
     fit = dataclasses.replace(FIT, cameras={**FIT.cameras, "right": dataclasses.replace(model, **{field: broken})})
     with pytest.raises(ValueError, match="right") as refused:
-        anipose_toml(fit, PRESETS[0])
+        pair_toml(fit, PRESETS[0])
     assert "finite" in str(refused.value)
     # The cameras as fitted still export.
-    anipose_toml(FIT, PRESETS[0])
+    pair_toml(FIT, PRESETS[0])
 
 
 @pytest.mark.parametrize("g", PRESETS, ids=preset_id)
 def test_anipose_toml_cameras_triangulate_preset_pixels_to_motor_points(g):
     # aniposelib is not installed, so do what CameraGroup.triangulate does with the read-back
     # cameras: cv2.undistortPoints to normalised coordinates, then a DLT with each [R|t].
-    tomli = pytest.importorskip("tomli")
-    data = tomli.loads(anipose_toml(FIT, g))
+    data = toml_loads()(pair_toml(FIT, g))
     X = working_volume_points()
     pixels = preset_pixels(X, g)
     normalised, projections = [], []
@@ -356,3 +374,70 @@ def test_deeplabcut_triangulates_the_export_like_reachaq(g, tmp_path):
     dlc = auxiliaryfunctions_3d.triangulatePoints(stereo_matrix["P1"], stereo_matrix["P2"], x1, x2)[:3].T
 
     np.testing.assert_allclose(dlc, reachaq, rtol=0, atol=1e-6)
+
+
+# Three cameras in capture order with an uncalibrated one among them: the export lists the
+# calibrated ones in that order, each at its own geometry, and leaves stimCam out.
+RIG3 = synthetic_rig(noise_px=0.1, frame_rotation_deg=35.0, cameras=("left", "right", "camera4"))
+CAPTURE3 = [
+    CaptureCamera("camera4", "24152535", 4),
+    CaptureCamera("left", "24152533", 0),
+    CaptureCamera("stimCam", "20142630", 2),
+    CaptureCamera("right", None, 1),
+]
+MIXED = PresetSet("live", {
+    "left": PresetGeometry(4, 256, 256, 52, 6),
+    "right": PresetGeometry(2, 512, 512, 104, 12),
+    "camera4": PresetGeometry(1, 1024, 1024, 208, 24),
+    "stimCam": PresetGeometry(1, 720, 540, 0, 0),
+})
+CALIBRATION_ID = "5d1f0e5a9c2b4c39a7e6f1b2c3d4e5f6"
+
+
+def test_toml_has_one_table_per_calibrated_camera_in_capture_order():
+    data = toml_loads()(anipose_toml(RIG3.truth, MIXED, calibration_id=CALIBRATION_ID, cameras=CAPTURE3))
+    assert sorted(data) == ["cam_0", "cam_1", "cam_2", "metadata"]
+    names = [data[f"cam_{i}"]["name"] for i in range(3)]
+    assert names == ["camera4", "left", "right"]
+    for i, cam in enumerate(names):
+        g = MIXED.cameras[cam]
+        assert data[f"cam_{i}"]["size"] == [g.width, g.height]
+        assert set(data[f"cam_{i}"]) == {"name", "size", "matrix", "distortions", "rotation", "translation"}
+    metadata = data["metadata"]
+    assert set(metadata) == {"adjusted", "error", "calibration_id", "cameras", "units", "frame"}
+    assert metadata["calibration_id"] == CALIBRATION_ID
+    # TOML has no null: a camera without a serial has no serial key.
+    assert metadata["cameras"] == [
+        {"name": "camera4", "serial": "24152535"}, {"name": "left", "serial": "24152533"}, {"name": "right"},
+    ]
+    assert metadata["units"] == "mm" and metadata["frame"] == "motor" and metadata["adjusted"] is False
+    # The error is in each camera's own preset px: sensor px / its binning, averaged.
+    expected = np.mean([RIG3.truth.rms_px[cam] / MIXED.cameras[cam].binning for cam in names])
+    assert metadata["error"] == pytest.approx(expected, rel=1e-15)
+
+
+def test_toml_projects_like_the_fit():
+    # What aniposelib's Camera.project does with a table: cv2.projectPoints with its matrix,
+    # distortions, rotation and translation. It must land where the fit's camera puts the
+    # point in the sensor, mapped into that camera's preset.
+    data = toml_loads()(anipose_toml(RIG3.truth, MIXED, calibration_id=CALIBRATION_ID, cameras=CAPTURE3))
+    X = np.concatenate([RIG3.world_corners(o.motor_mm) for o in RIG3.observations])
+    for i in range(3):
+        table = data[f"cam_{i}"]
+        cam = table["name"]
+        got = cv2.projectPoints(X, np.array(table["rotation"]), np.array(table["translation"]),
+                                np.array(table["matrix"]), np.array(table["distortions"]))[0].reshape(-1, 2)
+        expected = sensor_to_preset_points(sensor_pixels(X, cam, RIG3.truth), MIXED.cameras[cam])
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-9, err_msg=cam)
+
+
+def test_toml_refuses_more_than_six_cameras_and_a_set_without_a_fitted_camera():
+    fit = RIG3.truth
+    with pytest.raises(ValueError, match="no calibrated camera"):
+        anipose_toml(fit, PresetSet("x", {"stimCam": MIXED.cameras["stimCam"]}), calibration_id=CALIBRATION_ID,
+                     cameras=CAPTURE3)
+    many = dataclasses.replace(fit, cameras={f"c{i}": fit.cameras["left"] for i in range(7)},
+                               rms_px={f"c{i}": 0.1 for i in range(7)})
+    seven = PresetSet("x", {f"c{i}": MIXED.cameras["left"] for i in range(7)})
+    with pytest.raises(ValueError, match="6"):
+        anipose_toml(many, seven, calibration_id=CALIBRATION_ID, cameras=[CaptureCamera(f"c{i}", None, i) for i in range(7)])

@@ -1,21 +1,26 @@
-"""What each preset gets from a motor-frame fit: stereo parameters, the 3D frame and an anipose export.
+"""What each preset set gets from a motor-frame fit: an anipose export and the left-right extras.
 
-The fit (fit.py) is in full-sensor pixels with X_cam = R(rvec) @ X_motor + tvec in mm.
-Each preset gets:
+The fit (fit.py) is in full-sensor pixels with X_cam = R(rvec) @ X_motor + tvec in mm, for
+2 to 6 cameras. A preset set (geometry.PresetSet) gives each camera its own geometry, and gets:
 
-- stereo parameters with today's keys, so the existing loaders, the live path and
-  DeepLabCut read them unchanged. The intrinsics are mapped to the preset's pixels;
-  R and T are the fitted extrinsics; rectification is recomputed at the preset's
-  (width, height). rot_cor is 0.0 because new calibrations rotate no pixels.
-- the 3D frame: the matrix M in the live path's `oriented = (raw - offsets) @ M`.
-  It replaces the reorientation from hand-entered camera angles and the square-size
-  scaling. T is in mm, so the triangulated points already are.
-- an anipose calibration.toml with the cameras' motor-frame poses.
+- an anipose calibration.toml (anipose_toml) with every calibrated camera's motor-frame
+  pose and its intrinsics mapped to its own geometry. Anything N-camera reads this.
+- when left and right are both in the set at the same geometry (stereo_pair_geometry),
+  today's extras for that pair, so the existing loaders, the live path and DeepLabCut read
+  them unchanged:
+  - stereo parameters with today's keys (preset_stereo_params). The intrinsics are mapped
+    to the preset's pixels; R and T are the fitted extrinsics; rectification is
+    recomputed at the preset's (width, height). rot_cor is 0.0 because new calibrations
+    rotate no pixels.
+  - the 3D frame (frame_transform): the matrix M in the live path's
+    `oriented = (raw - offsets) @ M`. It replaces the reorientation from hand-entered
+    camera angles and the square-size scaling. T is in mm, so the triangulated points
+    already are.
 """
 
 import json
 import math
-from typing import Tuple
+from typing import Mapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -23,12 +28,21 @@ import numpy as np
 from autotrainer.core import Offset3DTuple
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.inference.config import StereoParams
-from autotrainer.inference.multires_calibration.fit import MotorFrameFit
-from autotrainer.inference.multires_calibration.geometry import PresetGeometry, map_intrinsics
+from autotrainer.inference.multires_calibration.fit import CaptureCamera, MotorFrameFit
+from autotrainer.inference.multires_calibration.geometry import PresetGeometry, PresetSet, map_intrinsics
 
 # DeepLabCut keys the pair "{cam1}-{cam2}" by the project's camera names.
 STEREO_KEY = "left-right"
 _CAMERAS = ("left", "right")
+# aniposelib up to 0.9 sorts the tables by name, so a cam_10 would load before cam_2.
+MAX_TOML_CAMERAS = 6
+
+
+def stereo_pair_geometry(cameras: Mapping[str, PresetGeometry]) -> Optional[PresetGeometry]:
+    """The geometry left and right share in `cameras`, or None when either is missing or
+    they differ: only then do the left-right extras (stereo parameters, frame) exist."""
+    left, right = cameras.get(_CAMERAS[0]), cameras.get(_CAMERAS[1])
+    return left if left is not None and left == right else None
 
 
 def preset_stereo_params(fit: MotorFrameFit, g: PresetGeometry, *, alpha: float = 1.0) -> StereoParams:
@@ -111,21 +125,39 @@ def frame_transform(fit: MotorFrameFit, stereo: StereoParams, signs: Tuple[int, 
     return (np.diag(np.asarray(signs, float)) @ R_left.T @ R1.T).T
 
 
-def anipose_toml(fit: MotorFrameFit, g: PresetGeometry) -> str:
-    """An anipose calibration.toml for preset `g`, in the layout aniposelib's CameraGroup.dump writes.
+def anipose_toml(
+    fit: MotorFrameFit, preset_set: PresetSet, *, calibration_id: str, cameras: Sequence[CaptureCamera]
+) -> str:
+    """An anipose calibration.toml for `preset_set`, in the layout aniposelib's CameraGroup.dump writes.
 
-    One table per camera, cam_0 (left) and cam_1 (right), holding its name, size [w, h],
-    the preset's intrinsic matrix, the 5 distortion coefficients and the motor-frame
-    pose: rotation is the Rodrigues vector of the motor-frame -> camera rotation and
-    translation is in mm, as aniposelib's Camera projects with cv2.projectPoints.
-    metadata.error is the mean of the fit's per-camera RMS in the preset's px (sensor px /
-    binning), like every other pixel value in the file.
+    One table, cam_0, cam_1, ..., for each of `cameras` (the capture's, in its order) that
+    the fit calibrated and the set gives a geometry; an uncalibrated camera is left out.
+    Each holds the camera's name, its size [w, h] and intrinsic matrix in its own
+    geometry, the 5 distortion coefficients and the motor-frame pose: rotation is the
+    Rodrigues vector of the motor-frame -> camera rotation and translation is in mm, as
+    aniposelib's Camera projects with cv2.projectPoints.
+
+    [metadata] holds adjusted = false; error, the mean over the tables of each camera's fit
+    RMS in its own px (sensor px / its binning), like every other pixel value in the file;
+    and reachAQ's keys, which CameraGroup.load keeps as a plain dict: calibration_id,
+    cameras ([{name, serial}] in table order; TOML has no null, so a camera without a
+    serial has no serial key), units = "mm" and frame = "motor".
 
     Raises ValueError, naming the camera, for a camera parameter that is not finite: TOML
-    can spell nan and inf, and anipose would read them back as a calibration.
+    can spell nan and inf, and anipose would read them back as a calibration. Raises
+    ValueError too when no camera, or more than MAX_TOML_CAMERAS, would have a table.
     """
+    tables = [c for c in cameras if c.name in fit.cameras and c.name in preset_set.cameras]
+    if not tables:
+        raise ValueError(f"anipose export of preset set {preset_set.name}: no calibrated camera in it")
+    if len(tables) > MAX_TOML_CAMERAS:
+        raise ValueError(
+            f"anipose export of preset set {preset_set.name}: {len(tables)} cameras, at most {MAX_TOML_CAMERAS}"
+        )
     lines = []
-    for i, cam in enumerate(_CAMERAS):
+    errors = []
+    for i, camera in enumerate(tables):
+        cam, g = camera.name, preset_set.cameras[camera.name]
         m = fit.cameras[cam]
         try:
             lines += [
@@ -139,15 +171,30 @@ def anipose_toml(fit: MotorFrameFit, g: PresetGeometry) -> str:
                 "",
             ]
         except ValueError as error:
-            raise ValueError(f"anipose export of preset {g.name}, camera {cam}: {error}") from error
-    error = float(np.mean([fit.rms_px[cam] for cam in _CAMERAS])) / g.binning
-    lines += ["[metadata]", f"adjusted = {_toml_value(False)}", f"error = {_toml_value(error)}"]
+            raise ValueError(f"anipose export of preset set {preset_set.name}, camera {cam}: {error}") from error
+        errors.append(fit.rms_px[cam] / g.binning)
+    listed = ", ".join(_toml_inline({"name": c.name, "serial": c.serial}) for c in tables)
+    lines += [
+        "[metadata]",
+        f"adjusted = {_toml_value(False)}",
+        f"error = {_toml_value(float(np.mean(errors)))}",
+        f"calibration_id = {_toml_value(str(calibration_id))}",
+        f"cameras = [{listed}]",
+        f"units = {_toml_value('mm')}",
+        f"frame = {_toml_value('motor')}",
+    ]
     return "\n".join(lines) + "\n"
 
 
 def _cross_matrix(t: np.ndarray) -> np.ndarray:
     """[t]x, the matrix with [t]x @ v = t x v."""
     return np.array([[0.0, -t[2], t[1]], [t[2], 0.0, -t[0]], [-t[1], t[0], 0.0]])
+
+
+def _toml_inline(entries: Mapping[str, object]) -> str:
+    """A TOML inline table of the string `entries`, leaving out those that are None."""
+    pairs = [f"{key} = {_toml_value(str(value))}" for key, value in entries.items() if value is not None]
+    return "{" + ", ".join(pairs) + "}"
 
 
 def _toml_value(value) -> str:

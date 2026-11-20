@@ -26,7 +26,8 @@ calibrate_capture turns it into a calibration folder (store.py):
    (fit.reconcile_corner_order); the report notes a camera that had to be reversed.
 4. The calibrated cameras are fitted jointly, once, in sensor pixels (fit.fit_motor_frame),
    and every preset's intrinsics are mapped from that fit (geometry.map_intrinsics) when
-   the store writes it.
+   the store writes it: an anipose TOML for every calibrated camera in sensor pixels and
+   for each preset set, plus the left-right extras where left and right share a geometry.
 5. Each binned preset is cross-checked: the frames the detection used are pooled the way the
    camera bins them (INTER_AREA by the binning) and cropped to the preset's ROI, the board is
    detected there and the preset is fitted directly in its own pixels, starting from the
@@ -38,8 +39,9 @@ calibrate_capture turns it into a calibration folder (store.py):
    cross-checked. A preset whose direct fit fails gets an undetermined (inf) K difference
    and a note, which warns; its corner offset is graded all the same, and the calibration
    is not aborted.
-6. The report compares with the previous calibration when that is one of these folders; a
-   legacy folder has no motor-frame fit to compare with.
+6. The report compares with the previous calibration when that is one of these folders, at
+   format 2 or 3, on the cameras both calibrated; a legacy folder has no motor-frame fit to
+   compare with.
 7. The calibration is written with the coverage images (one per capture camera, calibrated
    or not) and waypoints.yaml, both before its index (store.write_calibration's
    extra_files). The source videos are not copied: the
@@ -78,6 +80,7 @@ from autotrainer.inference.multires_calibration.extract import (
 )
 from autotrainer.inference.multires_calibration.fit import (
     BoardSpec,
+    CaptureCamera,
     MotorFrameFit,
     WaypointObservation,
     fit_motor_frame,
@@ -85,6 +88,7 @@ from autotrainer.inference.multires_calibration.fit import (
 )
 from autotrainer.inference.multires_calibration.geometry import (
     PresetGeometry,
+    PresetSet,
     map_intrinsics,
     sensor_to_preset_points,
 )
@@ -150,17 +154,6 @@ class CalibrationRefused(RuntimeError):
             f"the calibration needs at least {MIN_CAMERAS} calibrated cameras and has"
             f" {len(calibrated)}{' (' + ', '.join(calibrated) + ')' if calibrated else ''}: {reasons}"
         )
-
-
-@dataclass(frozen=True)
-class CaptureCamera:
-    """A camera in a capture: its `name` (the video's file name and the calibration's camera
-    name), its `serial` (None when it has none, as a random or playback camera), and its
-    `camera_id`, the index the capture's cameras had in the recording configuration."""
-
-    name: str
-    serial: Optional[str]
-    camera_id: Optional[int]
 
 
 def _default_cameras() -> List[CaptureCamera]:
@@ -342,14 +335,18 @@ def calibrate_capture(
     board: BoardSpec = BoardSpec(),
     previous_dir: Optional[Path] = None,
     refine: str = "subpix",
+    preset_sets: Optional[Sequence[PresetSet]] = None,
 ) -> Tuple[CalibrationIndex, QualityReport]:
     """Calibrate every preset in `presets` from the capture in `capture_dir` and write the
     calibration to `output_dir`, which must not exist yet.
 
     The base preset, whose sensor ROI the report grades coverage and the principal point
     against, is the one with the largest binning: the live inference preset. Every preset
-    from presets_from_base covers the same sensor window. `previous_dir` is the calibration
-    this one replaces, if any. `refine` is extract.detect_board's corner refinement.
+    from presets_from_base covers the same sensor window. `presets` are cross-checked.
+    `preset_sets` (geometry.presets_for_cameras) are the per-camera geometries written;
+    without them each preset is a set of every calibrated camera at that geometry.
+    `previous_dir` is the calibration this one replaces, if any. `refine` is
+    extract.detect_board's corner refinement.
 
     Only the cameras that meet per_camera_rule are fitted; the report's `cameras` gives
     every camera's verdict. Raises CalibrationRefused, writing nothing, when fewer than 2 do.
@@ -374,6 +371,9 @@ def calibrate_capture(
     image_size = _video_size(videos)
     for g in presets:
         _check_inside_sensor(g, image_size)
+    for preset_set in preset_sets or ():
+        for g in preset_set.cameras.values():
+            _check_inside_sensor(g, image_size)
 
     motor = [np.asarray(p, float) for p in log.motor]
     frame_times = load_frame_times(capture_dir, cameras)
@@ -480,6 +480,8 @@ def calibrate_capture(
             output_dir,
             fit=fit,
             presets=presets,
+            preset_sets=preset_sets,
+            cameras=log.cameras,
             board=board,
             report=report,
             capture=_yaml_safe(capture),
@@ -631,9 +633,11 @@ def _intrinsic_delta(K_direct: np.ndarray, K_mapped: np.ndarray) -> float:
 
 
 def _previous(previous_dir: Optional[Path], notes: List[str]) -> Optional[PreviousCalibration]:
-    """The calibration to compare with. A folder without a format-2 index is legacy.
+    """The calibration to compare with. A folder without a format-2 or format-3 index is legacy.
+    The report compares the cameras the two have in common (report._change_metrics), so a
+    format-2 (left and right) previous serves a calibration of more cameras.
 
-    A format-2 folder whose fit cannot be read is compared with nothing, and a note says
+    A format-2 or 3 folder whose fit cannot be read is compared with nothing, and a note says
     why: it is only the reference for the change metrics, and a damaged previous folder
     must not stop the rig from being calibrated again.
     """

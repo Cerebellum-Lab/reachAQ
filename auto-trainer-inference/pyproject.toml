@@ -54,6 +54,10 @@ torch = [
     # TensorFlow; a newer one needs that check repeated before the cap moves.
     'torchvision >= 0.22, < 0.23',
 ]
+# Test-only: tests/multires_anipose_compat_check.py checks the calibration's anipose TOMLs
+# against aniposelib. Install it only in a separate virtualenv, never in the reachaq
+# environment: aniposelib depends on opencv-contrib-python, which replaces opencv-python's cv2.
+anipose-check = ["aniposelib==0.8.0"]
 
 [tool.setuptools_scm]
 root = ".."

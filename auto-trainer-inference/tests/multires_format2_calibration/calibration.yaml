@@ -1,0 +1,12 @@
+format: 2
+id: 2692b0b23fa2499f8189447f9631aa4a
+created: '2026-11-20T15:36:56'
+board: {square_mm: 4.0, rows: 6, cols: 8}
+presets:
+- {name: 256x256_bin4, binning: 4, width: 256, height: 256, offset_x: 52, offset_y: 6}
+- {name: 512x512_bin2, binning: 2, width: 512, height: 512, offset_x: 104, offset_y: 12}
+- {name: 1024x1024_bin1, binning: 1, width: 1024, height: 1024, offset_x: 208, offset_y: 24}
+verdict: warn
+override: null
+motor_scale: 1.0
+capture: {gain_db: 1.0, fps: 40, waypoints_total: 37}

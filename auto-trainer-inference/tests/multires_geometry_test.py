@@ -17,8 +17,10 @@ import pytest
 
 from autotrainer.inference.multires_calibration.geometry import (
     PresetGeometry,
+    PresetSet,
     map_intrinsics,
     preset_to_sensor_points,
+    presets_for_cameras,
     presets_from_base,
     sensor_to_preset_points,
 )
@@ -118,3 +120,31 @@ def test_projection_then_mapping_equals_projection_with_mapped_intrinsics():
         expected = sensor_to_preset_points(sensor_px, g)
         via_mapped_k = cv2.projectPoints(points, zero, zero, map_intrinsics(K_SENSOR, g), DIST)[0].reshape(-1, 2)
         np.testing.assert_allclose(via_mapped_k, expected, rtol=0.0, atol=1e-9, err_msg=g.name)
+
+
+def test_presets_for_cameras_derives_each_cameras_own_window_at_every_binning():
+    # Each camera keeps its own window: left is the rig's bin-4 preset, camera4 a bin-2 one
+    # elsewhere on the sensor. bin2 and bin4 sets exist only where every window is whole there.
+    live = {"left": BASE, "camera4": PresetGeometry(2, 300, 200, 10, 40)}
+    sets = presets_for_cameras(live)
+    assert [s.name for s in sets] == ["live", "bin1", "bin2", "bin4"]
+    by_name = {s.name: s for s in sets}
+    assert by_name["live"] == PresetSet("live", live)
+    assert by_name["bin1"].cameras == {
+        "left": PresetGeometry(1, 1024, 1024, 208, 24),
+        "camera4": PresetGeometry(1, 600, 400, 20, 80),
+    }
+    assert by_name["bin2"].cameras == {"left": PresetGeometry(2, 512, 512, 104, 12), "camera4": live["camera4"]}
+    assert by_name["bin4"].cameras == {"left": BASE, "camera4": PresetGeometry(4, 150, 100, 5, 20)}
+    for s in sets:
+        for cam, g in s.cameras.items():
+            assert g.sensor_roi() == live[cam].sensor_roi(), (s.name, cam)
+
+
+def test_presets_for_cameras_leaves_out_a_binning_a_window_does_not_divide_and_a_copy_of_live():
+    # 302 sensor px at bin 1 do not bin by 4; and with every camera at bin 4 the bin4 set is the live one.
+    odd = {"left": BASE, "camera4": PresetGeometry(1, 302, 200, 10, 40)}
+    assert [s.name for s in presets_for_cameras(odd)] == ["live", "bin1", "bin2"]
+    assert [s.name for s in presets_for_cameras({"left": BASE, "right": BASE})] == ["live", "bin1", "bin2"]
+    with pytest.raises(ValueError):
+        presets_for_cameras({})
