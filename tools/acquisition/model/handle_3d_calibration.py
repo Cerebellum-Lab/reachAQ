@@ -409,9 +409,13 @@ def calibrate_waypoint_capture(
 def make_3d_calib(
     app_model: AppModel,
     cam_params: Optional[Dict[str, Any]] = None,
-    record_mode: VideoRecordMode = VideoRecordMode.START_CONTINUOUS,
+    record_mode: VideoRecordMode = VideoRecordMode.TRIGGER,
 ) -> Tuple[Path, Path, CalibrationIndex, QualityReport]:
     """Capture the board paused at every waypoint, then calibrate every preset from it.
+
+    The cameras record in TRIGGER mode, as a session's do. On christielab10 (2026-11-19)
+    START_CONTINUOUS never reached RECORDING ("left: no RECORDING within 5 s", three runs),
+    while TRIGGER recorded every waypoint.
 
     Returns (the capture folder, the folder the new calibration was written to, its index,
     its quality report). That folder is <session>/<DEFAULT_3D_CALIB_DIR_NAME>.new; installing

@@ -30,6 +30,7 @@ from autotrainer.device import MotorConfigurationFile
 from autotrainer.inference.multires_calibration.extract import distinct_waypoints
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry
 from autotrainer.inference.multires_calibration.pipeline import WAYPOINT_LOG, load_waypoint_log, write_waypoint_log
+from autotrainer.video.video_record import VideoRecordMode
 from tools.acquisition.model import handle_3d_calibration as h3d
 from tools.acquisition.model import hardware_model as hardware_model_module
 from tools.acquisition.model.hardware_model import HardwareModel
@@ -801,6 +802,30 @@ def test_a_failed_capture_stops_and_restores_the_cameras_and_raises_its_own_erro
     terminated = [call for call in calls if call[1:] == ("wait_for_capture_status", CaptureProcessStatus.TERMINATED)]
     assert terminated  # the stop was waited for, and failed in the second case
     assert calibrated == []
+
+
+def test_the_capture_triggers_recording_like_a_session(tmp_path, monkeypatch):
+    # START_CONTINUOUS never reached RECORDING on christielab10 (2026-11-19); the capture
+    # records as a session does: TRIGGER on after capture start, before the RECORDING wait,
+    # and off after the waypoints.
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: SimpleNamespace(verified=[True]))
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture", lambda *a, **k: (None, SimpleNamespace(id="cal"), SimpleNamespace(verdict="pass")))
+    for name in ("left", "right"):  # what the cameras would have recorded
+        (tmp_path / "session" / f"{name}_recording.mp4").write_bytes(b"")
+
+    make_3d_calib(app_model)
+
+    for name in ("left", "right"):
+        mine = [call[1:] for call in calls if call[0] == name]
+        loaded = [call[1] for call in mine if call[0] == "load_configuration"][0]
+        assert loaded.record_mode == VideoRecordMode.TRIGGER
+        start = mine.index(("on_capture_start",))
+        on = mine.index(("on_trigger_recording", True))
+        recording = mine.index(("wait_for_capture_status", CaptureProcessStatus.RECORDING))
+        off = mine.index(("on_trigger_recording", False))
+        assert start < on < recording < off
 
 
 def test_cameras_that_do_not_stop_fail_a_capture_that_ran(tmp_path, monkeypatch):
