@@ -1,4 +1,5 @@
 import math
+import shutil
 import time
 import dataclasses
 from typing import Dict, Any, Optional, List, Mapping, Sequence, Tuple
@@ -13,6 +14,8 @@ from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
 from autotrainer.inference.multires_calibration.pipeline import (
+    SOURCE_VIDEOS,
+    TIMESTAMPS_SUFFIX,
     WAYPOINT_LOG,
     WaypointLog,
     calibrate_capture,
@@ -570,14 +573,20 @@ def make_3d_calib(
         raise failed
 
     for camera in cameras:
-        vp = Path(project.get_video_path(
+        video_path, timestamps_path, *_ = project.get_video_path(
             camera.name,
             allow_overwrite=True,
             interval=ProjectInterval.HOUR if record_mode == VideoRecordMode.CONTINUOUS else ProjectInterval.NONE
-        )[0])
-        target = src_dir.joinpath(f"source_videos/{camera.name}.mp4")
+        )
+        vp = Path(video_path)
+        target = src_dir.joinpath(f"{SOURCE_VIDEOS}/{camera.name}.mp4")
         logger.verbose("%s -> %s", vp.as_posix(), target.as_posix())
         vp.rename(target)
+        # Extraction takes each waypoint's frames by the times its dwell was logged, from
+        # this file; a copy, so the session keeps its own.
+        ts_target = src_dir.joinpath(SOURCE_VIDEOS, f"{camera.name}{TIMESTAMPS_SUFFIX}")
+        logger.verbose("%s -> %s", timestamps_path, ts_target.as_posix())
+        shutil.copyfile(timestamps_path, ts_target)
 
     logger.notice("Calibrating every preset from the capture in %s", src_dir)
     output_dir, index, report = calibrate_waypoint_capture(

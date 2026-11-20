@@ -754,7 +754,9 @@ def _capture_app_model(tmp_path, calls, *, stops):
     project = SimpleNamespace(
         calculate_next_session_index=lambda: None,
         get_session_path=lambda: SimpleNamespace(location=str(session), prefix="20261023_000000"),
-        get_video_path=lambda name, **kwargs: (str(session / f"{name}_recording.mp4"),),
+        get_video_path=lambda name, **kwargs: (str(session / f"{name}_recording.mp4"),
+                                               str(session / f"{name}_recording_timestamps.txt"),
+                                               str(session / f"{name}_recording_processed_frames.txt")),
     )
     return SimpleNamespace(
         behavior=SimpleNamespace(algorithm=SimpleNamespace(diamond_triangle_config=_dcs(),
@@ -814,6 +816,7 @@ def test_the_capture_triggers_recording_like_a_session(tmp_path, monkeypatch):
     monkeypatch.setattr(h3d, "calibrate_waypoint_capture", lambda *a, **k: (None, SimpleNamespace(id="cal"), SimpleNamespace(verdict="pass")))
     for name in ("left", "right"):  # what the cameras would have recorded
         (tmp_path / "session" / f"{name}_recording.mp4").write_bytes(b"")
+        (tmp_path / "session" / f"{name}_recording_timestamps.txt").write_text("")
 
     make_3d_calib(app_model)
 
@@ -848,6 +851,7 @@ def test_a_capture_that_ran_returns_where_its_calibration_was_written(tmp_path, 
     session = tmp_path / "session"
     for camera in ("left", "right"):
         (session / f"{camera}_recording.mp4").touch()
+        (session / f"{camera}_recording_timestamps.txt").write_text(f"{camera} frame times\n")
     log = SimpleNamespace(verified=[True])
     index, report = SimpleNamespace(id="abc123"), SimpleNamespace(verdict="pass")
     calibrated = []
@@ -865,4 +869,10 @@ def test_a_capture_that_ran_returns_where_its_calibration_was_written(tmp_path, 
     assert result == (capture_dir, session / "written-here", index, report)
     [(calibrated_dir, calibrated_log, kwargs)] = calibrated
     assert (calibrated_dir, calibrated_log, kwargs["session_dir"]) == (capture_dir, log, session)
-    assert sorted(p.name for p in (capture_dir / "source_videos").iterdir()) == ["left.mp4", "right.mp4"]
+    assert sorted(p.name for p in (capture_dir / "source_videos").iterdir()) == [
+        "left.mp4", "left_timestamps.txt", "right.mp4", "right_timestamps.txt"]
+    # extraction takes the waypoints' frames by these files' times; the session keeps its own
+    for camera in ("left", "right"):
+        copied = capture_dir / "source_videos" / f"{camera}_timestamps.txt"
+        assert copied.read_text() == f"{camera} frame times\n"
+        assert (session / f"{camera}_recording_timestamps.txt").is_file()

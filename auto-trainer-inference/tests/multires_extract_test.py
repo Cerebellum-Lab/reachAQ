@@ -6,7 +6,9 @@ rig's true cameras at the full 1440x1080 sensor: 12 commanded positions includin
 no-op move, 15 still frames per waypoint and 6 moving frames between waypoints, written
 as mp4v at 40 fps. They check that every dwell is found and mapped to its distinct
 waypoint, that the corners land on the truth in one consistent order, and that a missed
-dwell or a board that cannot be found is reported rather than silently mis-tagged.
+dwell or a board that cannot be found is reported rather than silently mis-tagged. With
+logged dwells, the frames are taken by time instead, also where a flicker inside a dwell
+splits it for the motion.
 
 The truth is where render_board_frame draws the inner corners: the projection of each
 waypoint's world corners with zero distortion.
@@ -24,11 +26,14 @@ import pytest
 from autotrainer.inference.calibration_FLIR import adjust_gamma
 from autotrainer.inference.multires_calibration import extract as extract_module
 from autotrainer.inference.multires_calibration.extract import (
+    FROM_DWELLS,
+    FROM_MOTION,
     WaypointAlignmentError,
     _middle_frames,
     _segments_from_motion,
     detect_board,
     distinct_waypoints,
+    dwell_segments,
     extract_observations,
     find_stationary_segments,
     normalize_corner_order,
@@ -49,6 +54,15 @@ BLANKED = 7  # the waypoint whose dwell the not-found right video blanks out
 JITTERED = 9  # the waypoint whose right detections the inconsistency test perturbs
 OUTLIER = 10  # the waypoint whose right detections the median test perturbs
 BLANK_GREY = 100
+# The "_flicker" videos blank one frame of waypoint FLICKERED's dwell, the FLICKER_AT-th.
+# FLICKERED is the no-op move, so the flicker falls 17 frames into the 30-frame still run of
+# waypoints 4 and 5 and splits it into two runs the motion finds (17 and 11 frames, both at
+# least 8), as a flicker split dwells in the dark left video of the 2026-11-19 capture. The
+# centred detection window (frames 12-16 of the run) misses it.
+FLICKERED = DUPLICATE
+FLICKER_AT = 2
+# The wall-clock time of frame 0 in the synthetic timestamps.
+T0 = 1_795_134_208.5
 # Extra still frames at the start of the right_shifted video's first dwell, which puts
 # every later dwell this many frames behind the left video's.
 SHIFT = 10
@@ -62,7 +76,8 @@ SENSOR_NOISE = 2.0
 class Capture:
     board: BoardSpec
     positions: List[np.ndarray]
-    # "left", "right", "left_noisy", "right_missing_dwell", "right_blank", "right_shifted"
+    # "left", "right", "left_noisy", "left_flicker", "right_missing_dwell", "right_blank",
+    # "right_shifted", "right_flicker"
     videos: Dict[str, Path]
     frame_count: int  # of the left, right and left_noisy videos
     still: Dict[int, Tuple[int, int]]  # waypoint -> [first, last + 1) still frame in those videos
@@ -77,8 +92,8 @@ def capture(tmp_path_factory) -> Capture:
     positions.insert(DUPLICATE, positions[DUPLICATE - 1].copy())
     folder = tmp_path_factory.mktemp("multires_extract")
     names = {
-        "left": ["left", "left_noisy"],
-        "right": ["right", "right_missing_dwell", "right_blank", "right_shifted"],
+        "left": ["left", "left_noisy", "left_flicker"],
+        "right": ["right", "right_missing_dwell", "right_blank", "right_shifted", "right_flicker"],
     }
     videos = {name: folder / f"{name}.mp4" for cam in names for name in names[cam]}
     blank = np.full((IMAGE_SIZE[1], IMAGE_SIZE[0]), BLANK_GREY, np.uint8)
@@ -116,11 +131,13 @@ def capture(tmp_path_factory) -> Capture:
             if "right_shifted" in writers and k == 0:
                 for _ in range(SHIFT):
                     writers["right_shifted"].write(image)
-            for _ in range(STILL_FRAMES):
+            for j in range(STILL_FRAMES):
                 for name, w in writers.items():
                     if name == "right_missing_dwell" and k == DROPPED:
                         continue
-                    write(name, w, blank if name == "right_blank" and k == BLANKED else image, frame)
+                    blanked = (name == "right_blank" and k == BLANKED) or (
+                        name.endswith("_flicker") and k == FLICKERED and j == FLICKER_AT)
+                    write(name, w, blank if blanked else image, frame)
                 frame += 1
         for w in writers.values():
             w.release()
@@ -317,6 +334,89 @@ def test_segmentation_stats_are_recorded(capture, extraction):
         assert 0.0 <= stats["p20"] < stats["tau"] < stats["p95"]
         # p20 of a clean video is 0, so tau is set by the noise floor.
         assert stats["tau"] == pytest.approx(np.sqrt(max(stats["p20"], extract_module._NOISE_FLOOR) * stats["p95"]))
+
+
+def frame_times(capture) -> np.ndarray:
+    """Column 0 of a timestamps file for the left, right and _flicker videos."""
+    return T0 + np.arange(capture.frame_count) / FPS
+
+
+def logged_dwells(capture) -> List[Tuple[float, float]]:
+    """Each waypoint's (arrive, leave): its first and last still frame's time, as the capture
+    stamps arrive after the settle and leave after the dwell."""
+    return [(T0 + capture.still[k][0] / FPS, T0 + (capture.still[k][1] - 1) / FPS)
+            for k in range(len(capture.positions))]
+
+
+def test_logged_dwells_find_the_waypoints_where_motion_cannot(capture):
+    # The 2026-11-19 capture: a flicker inside a dwell splits it, so motion finds one segment
+    # too many and refuses; the logged dwells still put every waypoint on its own frames.
+    videos = {"left": capture.videos["left_flicker"], "right": capture.videos["right_flicker"]}
+    with pytest.raises(WaypointAlignmentError) as raised:
+        extract_observations(videos, capture.positions, capture.board)
+    assert str(raised.value) == f"left: expected {len(DISTINCT)} stationary segments, found {len(DISTINCT) + 1}"
+
+    times = frame_times(capture)
+    result = extract_observations(videos, capture.positions, capture.board,
+                                  frame_times={"left": times, "right": times}, dwells=logged_dwells(capture))
+    assert result.segments_from == FROM_DWELLS
+    assert [o.index for o in result.observations] == DISTINCT
+    # the no-op move's dwell joins the one before it
+    expected = [(capture.still[k][0], capture.still[DUPLICATE if k == DUPLICATE - 1 else k][1]) for k in DISTINCT]
+    for cam in ("left", "right"):
+        assert result.segments[cam] == expected, cam
+        assert result.segmentation_stats[cam]["motion_segments"] == len(DISTINCT) + 1, cam
+    assert result.rejected == []
+    errors = corner_errors(capture, result.observations)
+    assert np.median(errors) < 0.3 and errors.max() < 0.5
+
+
+def test_without_logged_dwells_the_segments_come_from_motion(extraction):
+    assert extraction.segments_from == FROM_MOTION
+    assert all("motion_segments" not in stats for stats in extraction.segmentation_stats.values())
+
+
+def test_dwell_segments_take_frames_by_time():
+    # Frame 3 was dropped, so frame times skip a step there; the later segments stay on
+    # their own frames instead of shifting by one. Waypoints 1 and 2 are one position.
+    times = np.array([0.0, 0.1, 0.2, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+    positions = [np.zeros(3), np.ones(3), np.ones(3), np.full(3, 2.0)]
+    dwells = [(0.0, 0.15), (0.35, 0.5), (0.55, 0.6), (0.8, 1.0)]
+    assert dwell_segments(times, positions, dwells) == [(0, 2), (3, 6), (7, 10)]
+    with pytest.raises(ValueError, match="3 logged dwells for 4 waypoints"):
+        dwell_segments(times, positions, dwells[:3])
+
+
+@pytest.mark.parametrize("change, message", [
+    ("missing", "right: no frame times for the logged dwells"),
+    ("short", "left: {n} frame times for {m} frames in the video"),
+    ("unordered", "left: the frame times do not increase"),
+    ("brief", "left: waypoint 0's logged dwell holds 1 frames; at least 8 are needed"),
+])
+def test_logged_dwells_that_cannot_place_the_frames_raise(capture, change, message):
+    videos = {"left": capture.videos["left"], "right": capture.videos["right"]}
+    times = frame_times(capture)
+    dwells = logged_dwells(capture)
+    frame_times_by_cam = {"left": times, "right": times}
+    if change == "missing":
+        del frame_times_by_cam["right"]
+    elif change == "short":
+        frame_times_by_cam["left"] = times[:-1]
+    elif change == "unordered":
+        frame_times_by_cam["left"] = times[::-1]
+    elif change == "brief":
+        dwells[0] = (dwells[0][0], dwells[0][0])
+    with pytest.raises(WaypointAlignmentError) as raised:
+        extract_observations(videos, capture.positions, capture.board, frame_times=frame_times_by_cam, dwells=dwells)
+    assert str(raised.value) == message.format(n=capture.frame_count - 1, m=capture.frame_count)
+
+
+def test_frame_times_and_dwells_go_together(capture):
+    videos = {"left": capture.videos["left"]}
+    with pytest.raises(ValueError, match="together"):
+        extract_observations(videos, capture.positions, capture.board, frame_times={"left": frame_times(capture)})
+    with pytest.raises(ValueError, match="together"):
+        extract_observations(videos, capture.positions, capture.board, dwells=logged_dwells(capture))
 
 
 def test_cameras_out_of_step_raise_alignment_error(capture):

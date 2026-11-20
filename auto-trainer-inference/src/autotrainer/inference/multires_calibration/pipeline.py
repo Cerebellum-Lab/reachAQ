@@ -6,11 +6,15 @@ A capture folder holds what the capture wrote:
                             whether the motor reported arriving there, and the times
     source_videos/left.mp4  both cameras at full sensor resolution, bin 1, while the stage
     source_videos/right.mp4 paused at each waypoint in turn
+    source_videos/left_timestamps.txt   each camera's timestamps file, whose column 0 is
+    source_videos/right_timestamps.txt  every frame's wall-clock time (a capture made before
+                                        2026-11-20 has none)
 
 calibrate_capture turns it into a calibration folder (store.py):
 
 1. The board is detected at each paused waypoint (extract.py) and tagged with the waypoint's
-   COMMANDED motor position. The fit measures the motor scale against the board's squares,
+   COMMANDED motor position. The waypoint's frames are those of its logged dwell when every
+   camera has a timestamps file, and its stationary segment by motion otherwise. The fit measures the motor scale against the board's squares,
    so a measured position would hide exactly the error the fit is there to find.
 2. Both cameras are put in one 180-degree board order (fit.reconcile_corner_order); the
    report notes a camera that had to be reversed.
@@ -56,6 +60,7 @@ from autotrainer.inference.multires_calibration.extract import (
     _MIN_FRAMES,
     _grey_frames,
     _middle_frames,
+    FROM_DWELLS,
     detect_board,
     extract_observations,
     normalize_corner_order,
@@ -92,6 +97,11 @@ logger = get_verbose_logger(__name__)
 WAYPOINT_LOG = "waypoints.yaml"
 SOURCE_VIDEOS = "source_videos"
 CAMERAS = ("left", "right")
+# source_videos/<camera><TIMESTAMPS_SUFFIX>: the camera's timestamps file as the recorder
+# wrote it, "frame_time, fps, camera stamp, perf_counter, frame id" per frame. frame_time is
+# time.time() at the first frame plus frame-id steps at the configured fps, the clock
+# WaypointLog.times uses.
+TIMESTAMPS_SUFFIX = "_timestamps.txt"
 
 # The capture settings recorded when waypoints.yaml has none: the settings the capture sets
 # (gain 1.0 dB, camera gamma off, 4500 us exposure, 40 fps).
@@ -159,6 +169,22 @@ def load_waypoint_log(path: Path) -> WaypointLog:
     return log
 
 
+def load_frame_times(capture_dir: Path) -> Optional[Dict[str, np.ndarray]]:
+    """camera -> column 0 of source_videos/<camera>_timestamps.txt, every frame's wall-clock
+    time, when every camera has the file; None when none has, as before 2026-11-20.
+
+    Raises FileNotFoundError when only some have it: the cameras would be segmented two ways.
+    """
+    paths = {cam: Path(capture_dir, SOURCE_VIDEOS, f"{cam}{TIMESTAMPS_SUFFIX}") for cam in CAMERAS}
+    present = [cam for cam, path in paths.items() if path.is_file()]
+    if not present:
+        return None
+    if len(present) != len(paths):
+        missing = ", ".join(str(path) for cam, path in paths.items() if cam not in present)
+        raise FileNotFoundError(f"the capture has no timestamps file {missing}")
+    return {cam: np.loadtxt(path, delimiter=",", usecols=0, ndmin=1) for cam, path in paths.items()}
+
+
 def unreached_waypoints(log: WaypointLog, tolerance: float = UNREACHED_TOLERANCE_MM) -> List[int]:
     """The waypoints whose reported position is more than `tolerance` mm from the commanded
     one on some axis. A waypoint with no finite reported position carries no evidence
@@ -206,8 +232,10 @@ def calibrate_capture(
         _check_inside_sensor(g, image_size)
 
     motor = [np.asarray(p, float) for p in log.motor]
+    frame_times = load_frame_times(capture_dir)
     extraction = extract_observations(
-        videos, motor, board, frames_per_waypoint=_FRAMES_PER_WAYPOINT, refine=refine
+        videos, motor, board, frames_per_waypoint=_FRAMES_PER_WAYPOINT, refine=refine,
+        frame_times=frame_times, dwells=None if frame_times is None else log.times,
     )
     observations, reversed_order = reconcile_corner_order(extraction.observations, board, image_size, CAMERAS)
     logger.info("calibration capture: %d distinct waypoints; fitting both cameras", len(observations))
@@ -231,15 +259,17 @@ def calibrate_capture(
             f"waypoint {k}: the motor reported {_format_xyz(log.reported[k])}, {off:.2f} mm from the"
             f" commanded {_format_xyz(log.motor[k])}"
         )
-    # How long the board held still at each waypoint, against what extraction needs: the
-    # margin the settle and the dwell leave, which only a real capture measures.
+    # How many frames extraction had at each waypoint, against what it needs: the margin the
+    # settle and the dwell leave, which only a real capture measures.
     still = _still_frames(extraction.segments, extraction.observations)
+    from_dwells = extraction.segments_from == FROM_DWELLS
     if still:
         notes.append(
-            "still frames per waypoint: "
+            ("frames per logged dwell: " if from_dwells else "still frames per waypoint: ")
             + "; ".join(f"{cam} min {s['min']} (waypoint {s['min_waypoint']}), median {s['median']:g}"
                         for cam, s in still.items())
-            + f" (segments shorter than {_MIN_FRAMES} frames are not found)"
+            + f" (segments shorter than {_MIN_FRAMES} frames are "
+            + ("refused)" if from_dwells else "not found)")
         )
 
     base = max(presets, key=lambda g: g.binning)
@@ -267,6 +297,7 @@ def calibrate_capture(
         "waypoints_unreached": len(unreached),
         "corner_refinement": refine,
         "segmentation_stats": extraction.segmentation_stats,
+        "segments_from": extraction.segments_from,
         "still_frames": still,
         "corner_order_reversed": reversed_order,
         "corner_scatter_px": extraction.corner_scatter_px,

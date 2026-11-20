@@ -1,11 +1,25 @@
 """Find the paused waypoints in a calibration capture and detect the board at each.
 
 The capture records the board while the stage steps through its move list, stopping at
-every waypoint for a settle and a dwell. Each camera's video is split into stationary
-segments by frame-to-frame motion, and segment i is matched to distinct waypoint i (a
-no-op move leaves the board still, so it adds no segment). If a camera's segment count
-differs from the number of distinct waypoints, frames cannot be matched to positions
-safely, and WaypointAlignmentError is raised instead of guessing.
+every waypoint for a settle and a dwell. Each distinct waypoint gets one segment of frames
+per camera (a no-op move leaves the board still, so it adds no segment), found one of two
+ways:
+
+- From the logged dwells, when the capture has them: the frames whose wall-clock time
+  (column 0 of the camera's timestamps file) lies in the waypoint's (arrive, leave), from
+  the first of a run of equal positions to the last. The arrival is stamped after the
+  settle, so these are the frames of the paused board whatever the image shows.
+- Otherwise by frame-to-frame motion: the video is split into stationary segments, and
+  segment i is matched to distinct waypoint i. If the count differs from the number of
+  distinct waypoints, frames cannot be matched to positions safely, and
+  WaypointAlignmentError is raised instead of guessing.
+
+Motion alone failed the first real capture (christielab10, 2026-11-19, 36 distinct
+waypoints): both cameras found 39 segments, but not the same 39. The dark left image put
+the threshold at 0.08 grey levels, so a one-frame flicker inside a dwell split it, while
+moves the left camera barely saw merged two or three dwells into one; the right camera saw
+the board still moving through the dwell after the 17 mm move and found no segment there.
+The logged dwells lay inside the still frames of every waypoint the motion did find.
 
 The cameras are hardware-synchronised, so the same dwell must start at the same frame in
 every camera; segments that drift apart also raise WaypointAlignmentError.
@@ -67,6 +81,9 @@ _LEGACY_GAMMA = 2.0
 _NOT_FOUND = "not found"
 _INCONSISTENT = "inconsistent"
 
+FROM_DWELLS = "logged dwells"
+FROM_MOTION = "motion"
+
 
 class WaypointAlignmentError(RuntimeError):
     """A camera's stationary segments do not match the distinct waypoints one to one."""
@@ -81,8 +98,11 @@ class ExtractionResult:
     # camera -> median over its kept waypoints of the median per-corner std, in sensor px
     corner_scatter_px: Dict[str, float]
     # camera -> p20, p95 and tau of the motion m_t, moving_fraction (the fraction of frames
-    # in no segment) and n_frames, so a real capture's segmentation can be checked
+    # in no stationary segment) and n_frames, so a real capture's segmentation can be
+    # checked; with logged dwells also motion_segments, the count the motion alone found
     segmentation_stats: Dict[str, Dict[str, float]]
+    # How the segments were found: FROM_DWELLS or FROM_MOTION
+    segments_from: str = "motion"
 
 
 def distinct_waypoints(motor_positions: Sequence[np.ndarray], tol: float = 1e-6) -> List[int]:
@@ -112,6 +132,32 @@ def find_stationary_segments(
     run of at least `min_frames`. A video that never moved is one segment.
     """
     return _segment_video(video, min_frames=min_frames, scale=scale)[0]
+
+
+def dwell_segments(
+    frame_times: Sequence[float],
+    motor_positions: Sequence[np.ndarray],
+    dwells: Sequence[Tuple[float, float]],
+    tol: float = 1e-6,
+) -> List[Tuple[int, int]]:
+    """Half-open frame ranges, one per distinct waypoint, from the logged dwells.
+
+    `frame_times` is every frame's wall-clock time in decoded order, increasing, and
+    `dwells` each waypoint's (arrive, leave) on the same clock. A run of equal positions is
+    one segment, from the run's first arrival to its last leave; a frame is in it when its
+    time lies in that closed interval. Frames are taken by time, not counted, so a dropped
+    frame shortens a segment rather than shifting the later ones.
+    """
+    times = np.asarray(frame_times, float)
+    if len(dwells) != len(motor_positions):
+        raise ValueError(f"{len(dwells)} logged dwells for {len(motor_positions)} waypoints")
+    distinct = distinct_waypoints(motor_positions, tol)
+    ends = distinct[1:] + [len(motor_positions)]
+    segments = []
+    for first, stop in zip(distinct, ends):
+        arrive, leave = dwells[first][0], dwells[stop - 1][1]
+        segments.append((int(np.searchsorted(times, arrive, "left")), int(np.searchsorted(times, leave, "right"))))
+    return segments
 
 
 def _segment_video(video: Path, *, min_frames: int, scale: int) -> Tuple[List[Tuple[int, int]], Dict[str, float]]:
@@ -244,28 +290,44 @@ def extract_observations(
     *,
     frames_per_waypoint: int = 5,
     refine: str = "subpix",
+    frame_times: Optional[Mapping[str, Sequence[float]]] = None,
+    dwells: Optional[Sequence[Tuple[float, float]]] = None,
 ) -> ExtractionResult:
     """One observation per distinct waypoint from each camera's capture video.
+
+    With `frame_times` (camera -> every frame's wall-clock time, in decoded order) and
+    `dwells` (each waypoint's logged (arrive, leave), on the same clock), the segments are
+    dwell_segments'; otherwise they are the video's stationary segments, matched to the
+    distinct waypoints in order.
 
     The board is detected in the `frames_per_waypoint` frames at the middle of each
     segment, and a camera's corners for the waypoint are the per-corner median over the
     frames in which it was found, all in the order of the camera's first detection.
-    Raises WaypointAlignmentError, naming the camera, when a camera's stationary segments
-    do not number exactly the distinct waypoints, and naming both cameras when a segment
-    starts more than 3 frames apart in two of them. A board found in none of the frames,
-    or whose detections disagree by more than 1 px within the segment, only drops that
-    camera from that waypoint and is listed in `rejected`.
+    Raises WaypointAlignmentError, naming the camera, when its stationary segments do not
+    number exactly the distinct waypoints, or with logged dwells, when it has no frame
+    times, they do not number its frames or do not increase, or a dwell holds fewer than 8
+    frames; and naming both cameras when a segment starts more than 3 frames apart in two
+    of them. A board found in none of the frames, or whose detections disagree by more than
+    1 px within the segment, only drops that camera from that waypoint and is listed in
+    `rejected`.
     """
     _check_refine(refine)
     if frames_per_waypoint < 1:
         raise ValueError(f"frames_per_waypoint must be at least 1, got {frames_per_waypoint}")
+    if (frame_times is None) != (dwells is None):
+        raise ValueError("frame_times and dwells are given together or not at all")
     distinct = distinct_waypoints(motor_positions)
 
     segments: Dict[str, List[Tuple[int, int]]] = {}
     stats: Dict[str, Dict[str, float]] = {}
     for cam, video in videos.items():
         segments[cam], stats[cam] = _segment_video(Path(video), min_frames=_MIN_FRAMES, scale=_SCALE)
-        if len(segments[cam]) != len(distinct):
+        if dwells is not None:
+            stats[cam]["motion_segments"] = float(len(segments[cam]))
+            segments[cam] = _checked_dwell_segments(
+                cam, frame_times, int(stats[cam]["n_frames"]), motor_positions, dwells, distinct
+            )
+        elif len(segments[cam]) != len(distinct):
             raise WaypointAlignmentError(
                 f"{cam}: expected {len(distinct)} stationary segments, found {len(segments[cam])}"
             )
@@ -308,7 +370,35 @@ def extract_observations(
         rejected=rejected,
         corner_scatter_px=scatter,
         segmentation_stats=stats,
+        segments_from=FROM_MOTION if dwells is None else FROM_DWELLS,
     )
+
+
+def _checked_dwell_segments(
+    cam: str,
+    frame_times: Mapping[str, Sequence[float]],
+    n_frames: int,
+    motor_positions: Sequence[np.ndarray],
+    dwells: Sequence[Tuple[float, float]],
+    distinct: List[int],
+) -> List[Tuple[int, int]]:
+    """dwell_segments for `cam`, whose video decoded `n_frames` frames; refused when its
+    frame times cannot be that video's or a dwell holds too few frames."""
+    if cam not in frame_times:
+        raise WaypointAlignmentError(f"{cam}: no frame times for the logged dwells")
+    times = np.asarray(frame_times[cam], float)
+    if len(times) != n_frames:
+        raise WaypointAlignmentError(f"{cam}: {len(times)} frame times for {n_frames} frames in the video")
+    if np.any(np.diff(times) <= 0):
+        raise WaypointAlignmentError(f"{cam}: the frame times do not increase")
+    segments = dwell_segments(times, motor_positions, dwells)
+    for index, (start, stop) in zip(distinct, segments):
+        if stop - start < _MIN_FRAMES:
+            raise WaypointAlignmentError(
+                f"{cam}: waypoint {index}'s logged dwell holds {stop - start} frames;"
+                f" at least {_MIN_FRAMES} are needed"
+            )
+    return segments
 
 
 def _check_segments_agree(segments: Mapping[str, List[Tuple[int, int]]]) -> None:

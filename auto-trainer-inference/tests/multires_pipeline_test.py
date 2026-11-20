@@ -15,8 +15,9 @@ calibration), a second run (one waypoint unverified and reported 1.7 mm from whe
 commanded, no capture settings logged, the main run as the previous calibration), a run
 against the legacy fixture folder, a run whose
 right camera labels the board from the other end, a degraded run (the 256 cross-check
-fit fails and the previous calibration's fit cannot be read), and a run whose cross-check
-maps the sensor corners with the pixel-edge convention.
+fit fails and the previous calibration's fit cannot be read), a run whose cross-check
+maps the sensor corners with the pixel-edge convention, and a run whose capture has the
+cameras' timestamps files, so its frames come from the logged dwells.
 """
 
 import math
@@ -33,13 +34,20 @@ import yaml
 
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.inference.multires_calibration import pipeline
-from autotrainer.inference.multires_calibration.extract import WaypointAlignmentError, find_stationary_segments
+from autotrainer.inference.multires_calibration.extract import (
+    FROM_DWELLS,
+    FROM_MOTION,
+    WaypointAlignmentError,
+    find_stationary_segments,
+)
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
 from autotrainer.inference.multires_calibration.pipeline import (
     SOURCE_VIDEOS,
+    TIMESTAMPS_SUFFIX,
     WAYPOINT_LOG,
     WaypointLog,
     calibrate_capture,
+    load_frame_times,
     load_waypoint_log,
     write_waypoint_log,
 )
@@ -69,6 +77,8 @@ MOTOR = [o.motor_mm.copy() for o in RIG.observations[:N_WAYPOINTS]]
 # Not the defaults, so the main run shows they are read from waypoints.yaml.
 LOGGED_SETTINGS = {"gain_db": 2.5, "gamma": None, "exposure_us": 4000, "fps": 40}
 DEFAULT_SETTINGS = {"gain_db": 1.0, "gamma": None, "exposure_us": 4500, "fps": 40}
+# The wall-clock time of frame 0 in the timestamps files the timed run writes.
+T0 = 1_795_134_208.5
 
 
 @dataclass
@@ -132,6 +142,22 @@ def make_capture(folder: Path, left: Path, right: Path, log: WaypointLog) -> Pat
     return folder
 
 
+def write_timestamps(capture: Path, frame_times: Dict[str, np.ndarray]) -> None:
+    """Each camera's timestamps file as the recorder writes it, with `frame_times` in column 0."""
+    for cam, times in frame_times.items():
+        rows = [f"{t!r}, {FPS}, {1000 * i}, {500.0 + i / FPS!r}, {i}" for i, t in enumerate(times)]
+        (capture / SOURCE_VIDEOS / f"{cam}{TIMESTAMPS_SUFFIX}").write_text("\n".join(rows) + "\n")
+
+
+def timed_log() -> WaypointLog:
+    """make_log, with every waypoint's dwell logged at its still frames' times: waypoint k
+    holds still over frames k * (MOVING_FRAMES + STILL_FRAMES) on, for STILL_FRAMES frames."""
+    log = make_log()
+    step = MOVING_FRAMES + STILL_FRAMES
+    log.times = [(T0 + k * step / FPS, T0 + (k * step + STILL_FRAMES - 1) / FPS) for k in range(N_WAYPOINTS)]
+    return log
+
+
 def run(capture_dir: Path, output_dir: Path, **kwargs) -> Run:
     start = time.perf_counter()
     index, report = calibrate_capture(capture_dir, output_dir=output_dir, presets=PRESETS, **kwargs)
@@ -146,6 +172,16 @@ def metrics(report: QualityReport, name: str) -> List[Metric]:
 def main(videos, tmp_path_factory) -> Run:
     folder = tmp_path_factory.mktemp("main")
     capture = make_capture(folder / "capture", videos["left"], videos["right"], make_log(capture_settings=LOGGED_SETTINGS))
+    return run(capture, folder / "out" / NAME)
+
+
+@pytest.fixture(scope="module")
+def timed(videos, tmp_path_factory) -> Run:
+    folder = tmp_path_factory.mktemp("timed")
+    capture = make_capture(folder / "capture", videos["left"], videos["right"], timed_log())
+    n = N_WAYPOINTS * STILL_FRAMES + (N_WAYPOINTS - 1) * MOVING_FRAMES
+    times = T0 + np.arange(n) / FPS
+    write_timestamps(capture, {cam: times for cam in CAMERAS})
     return run(capture, folder / "out" / NAME)
 
 
@@ -290,6 +326,58 @@ def test_the_still_frames_at_each_waypoint_are_recorded(main):
     (note,) = [n for n in main.report.notes if n.startswith("still frames per waypoint")]
     for cam in CAMERAS:
         assert f"{cam} min {still[cam]['min']} (waypoint {still[cam]['min_waypoint']})" in note
+
+
+def test_a_capture_without_timestamps_is_segmented_by_motion(main):
+    assert main.index.capture["segments_from"] == FROM_MOTION
+    assert any(n.startswith("still frames per waypoint") for n in main.report.notes)
+
+
+def test_a_capture_with_timestamps_takes_each_waypoint_from_its_logged_dwell(timed):
+    assert timed.index.capture["segments_from"] == FROM_DWELLS
+    # the logged dwells are exactly the still frames, so each holds all of them
+    for cam in CAMERAS:
+        assert timed.index.capture["still_frames"][cam]["min"] == STILL_FRAMES
+        assert timed.index.capture["segmentation_stats"][cam]["motion_segments"] == N_WAYPOINTS
+    (note,) = [n for n in timed.report.notes if n.startswith("frames per logged dwell")]
+    assert f"left min {STILL_FRAMES}" in note
+    assert timed.report.verdict != "fail", timed.report.to_text()
+
+
+def test_the_logged_dwells_and_column_0_reach_extraction(tmp_path, monkeypatch):
+    capture = tmp_path / "capture"
+    (capture / SOURCE_VIDEOS).mkdir(parents=True)
+    for cam in CAMERAS:
+        (capture / SOURCE_VIDEOS / f"{cam}.mp4").write_bytes(b"")
+    log = timed_log()
+    write_waypoint_log(capture / WAYPOINT_LOG, log)
+    times = {"left": T0 + np.arange(4) / FPS, "right": T0 + 0.001 + np.arange(4) / FPS}
+    write_timestamps(capture, times)
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def extract(videos, motor, board, **kwargs):
+        seen.update(kwargs)
+        raise Stop
+
+    monkeypatch.setattr(pipeline, "_video_size", lambda videos: IMAGE_SIZE)
+    monkeypatch.setattr(pipeline, "extract_observations", extract)
+    with pytest.raises(Stop):
+        calibrate_capture(capture, output_dir=tmp_path / "out" / NAME, presets=PRESETS)
+    assert seen["dwells"] == log.times
+    assert set(seen["frame_times"]) == set(CAMERAS)
+    for cam in CAMERAS:
+        np.testing.assert_array_equal(seen["frame_times"][cam], times[cam])
+
+
+def test_frame_times_are_none_without_timestamps_and_refused_for_only_some_cameras(tmp_path):
+    (tmp_path / SOURCE_VIDEOS).mkdir()
+    assert load_frame_times(tmp_path) is None
+    write_timestamps(tmp_path, {"left": T0 + np.arange(3) / FPS})
+    with pytest.raises(FileNotFoundError, match="right_timestamps.txt"):
+        load_frame_times(tmp_path)
 
 
 def test_unverified_waypoints_warn(second):
