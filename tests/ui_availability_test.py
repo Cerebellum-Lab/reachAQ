@@ -112,7 +112,7 @@ class _Window(SimpleNamespace):
 _WIDGETS = (
     "_app_model_status_combo", "run_action", "preferences_action", "edit_camera_settings_action",
     "edit_daq_ports_action", "make_3d_calib_action", "daq_monitor_action", "refresh_hardware_action",
-    "_animal_dropdown_combo", "animal_metadata_action", "_training_plan_combo", "_notes",
+    "_animal_dropdown_combo", "_rfid_entry", "animal_metadata_action", "_training_plan_combo", "_notes",
     "calib_diamond_triangle_action",
 )
 
