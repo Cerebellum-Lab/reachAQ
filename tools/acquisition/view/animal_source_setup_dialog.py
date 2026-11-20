@@ -65,7 +65,7 @@ class AnimalSourceSetupDialog(QDialog):
         self._kinds = available_source_kinds() if kinds is None else kinds
         self._existing = load_source_configuration(preferences)
         self._field_widgets: Dict[str, QWidget] = {}
-        # The fields setup fills in itself; only the tag and RFID columns are chosen.
+        # The fields setup fills in itself; only the tag, name and RFID columns are chosen.
         self._suggestion: Dict[str, Optional[str]] = {}
         self.saved = None
 
@@ -284,6 +284,7 @@ class AnimalSourceSetupDialog(QDialog):
             self._suggestion,
             columns["external_identity_column"],
             columns["rfid_column"],
+            name_column=columns["new_animal_name_column"],
             require_rfid=self.require_rfid.isChecked(),
             ended_states=tuple(
                 part.strip() for part in self.ended_states.text().split(",") if part.strip()

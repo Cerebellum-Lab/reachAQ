@@ -12,6 +12,7 @@ RFID_DECIMAL_LENGTH = 15
 RFID_READER_PAYLOAD_LENGTH = 26
 _RFID_RE = re.compile(r"^[0-9]{15}$")
 _RFID_READER_PAYLOAD_RE = re.compile(r"^[0-9A-Fa-f]{26}$")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def normalize_optional_text(value: Any) -> Optional[str]:
@@ -30,12 +31,23 @@ def normalize_external_subject_id(value: Any) -> str:
     return text
 
 
+def is_iso11784_rfid(value: Any) -> bool:
+    """Whether ``value`` is a 15-digit ISO 11784 RFID, as the reader reports."""
+    text = normalize_optional_text(value)
+    return text is not None and _RFID_RE.fullmatch(text) is not None
+
+
 def normalize_rfid(value: Any) -> str:
+    """An animal's unique identifier: an ISO 11784 RFID or any other code.
+
+    Surrounding whitespace is stripped; the rest is kept exactly and matched
+    case-sensitively, so a barcode such as ``BC-0003-A`` is a valid value.
+    """
     text = normalize_optional_text(value)
     if text is None:
         raise ValueError("RFID cannot be empty")
-    if _RFID_RE.fullmatch(text) is None:
-        raise ValueError("RFID must be the 15-digit ISO 11784 identifier")
+    if _CONTROL_RE.search(text) is not None:
+        raise ValueError("RFID cannot contain control characters")
     return text
 
 
@@ -263,11 +275,19 @@ class NormalizedAnimalBatch:
     ignored_ended_rows: int
     records: Tuple[ExternalAnimalRecord, ...]
     warnings: Tuple[str, ...] = ()
+    #: Each identifier the source gave to more than one animal, with those
+    #: animals' subject IDs. The records carry no identifier for these.
+    duplicate_rfids: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "provider", self.provider.casefold())
         object.__setattr__(self, "records", tuple(self.records))
         object.__setattr__(self, "warnings", tuple(self.warnings))
+        object.__setattr__(
+            self,
+            "duplicate_rfids",
+            tuple((value, tuple(subjects)) for value, subjects in self.duplicate_rfids),
+        )
         identities = [record.identity.key for record in self.records]
         rfids = [
             record.physical_rfid

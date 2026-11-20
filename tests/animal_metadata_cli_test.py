@@ -55,6 +55,7 @@ def test_softmouse_setup_logs_in_lists_colonies_and_keeps_the_password_out_of_pr
         "ben",        # username
         "1",          # colony: the first one listed
         "",           # physical tag column: the suggested Physical Tag
+        "",           # name column: the suggested Physical Tag
         "",           # RFID column: the suggested Plate ID
         "",           # keep "skip animals without RFID" (SoftMouse: yes)
         str(tmp_path / "share"),  # publish to
@@ -87,6 +88,7 @@ def test_spreadsheet_setup_maps_columns_then_refresh_and_status_use_it(
         str(sheet), "",               # path, no sheet
         "Alt. ID",                    # not a column in the file: asked again
         "Mouse",                      # physical tag column
+        "",                           # name column: defaults to the tag
         "Chip",                       # RFID column
         "n",                          # keep animals without RFID
         "",                           # no publication

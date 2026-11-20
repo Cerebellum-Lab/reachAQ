@@ -76,7 +76,7 @@ def test_invalid_snapshot_never_replaces_previous_publication(tmp_path):
 
     with pytest.raises(ValueError, match="no importable active animals"):
         AnimalTablePublisher(destination).publish(
-            csv_table(tmp_path, [["PT-2", "bad", "Stock"]]), SOFTMOUSE
+            csv_table(tmp_path, [["PT-2", "", "Stock"]]), SOFTMOUSE
         )
 
     assert first.export_path.read_bytes() == old_export

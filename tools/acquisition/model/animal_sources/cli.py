@@ -110,11 +110,14 @@ def run_setup(
     if existing is not None and existing.kind == kind_name and existing.mapping is not None:
         chosen.update(
             external_identity_column=existing.mapping.external_identity_column,
+            new_animal_name_column=existing.mapping.new_animal_name_column,
             rfid_column=existing.mapping.rfid_column,
         )
-    print("Every column is kept in each animal's metadata. Choose the two that identify it.")
+    print("Every column is kept in each animal's metadata. Choose the ones that identify it.")
     tag_default = chosen.get("external_identity_column") or ""
     physical_tag = _choose(prompt, "Physical tag column", headers, tag_default)
+    name_default = chosen.get("new_animal_name_column") or physical_tag
+    name_column = _choose(prompt, "Name column (a new animal's name)", headers, name_default)
     rfid_default = chosen.get("rfid_column") or "-"
     rfid_answer = _choose(prompt, "RFID column (- for none)", headers + ["-"], rfid_default)
     rfid_column = None if rfid_answer == "-" else rfid_answer
@@ -128,7 +131,8 @@ def run_setup(
         or require_default
     ).startswith("y")
     mapping = build_mapping(
-        kind, suggestion, physical_tag, rfid_column, require_rfid=require_rfid
+        kind, suggestion, physical_tag, rfid_column,
+        name_column=name_column, require_rfid=require_rfid,
     )
     print(f"Also read by name: {describe_other_columns(mapping)}")
     publish_directory = publish_mount = ""
@@ -255,8 +259,11 @@ def main(argv=None) -> int:
             batch = result.preview.batch
             print(
                 f"Imported {batch.accepted_rows} of {batch.total_source_rows} rows "
+                f"({sum(r.physical_rfid is not None for r in batch.records)} with RFID) "
                 f"from {service.describe()}"
             )
+            for warning in batch.warnings:
+                print(f"Warning: {warning}")
             return 0
         status = service.cache_status()
         print(f"Source: {service.describe()}")

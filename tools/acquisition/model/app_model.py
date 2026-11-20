@@ -57,6 +57,7 @@ from autotrainer.core import (
     ExternalAnimalRecord,
     ExternalIdentity,
     FixedArrayMultiQueue,
+    normalize_rfid,
 )
 from autotrainer.core.configuration.json_compat import SystemConfigurationJSONEncoder
 from autotrainer.core.interfaces import RecordingEndingReason, CaptureAnalysisResult
@@ -66,6 +67,7 @@ from autotrainer.core.configuration import SystemConfigurationDumper, DEFAULT_3D
 from autotrainer.core.multiproc import no_op_timer
 from autotrainer.core.simulation import is_simulation
 from autotrainer.core.logging import (
+    ALWAYS_CONSOLE_LOG_ATTRIBUTE,
     get_verbose_logger,
     log_hardware_initialization,
     register_fatal_exception_callback,
@@ -204,7 +206,10 @@ from tools.acquisition.model.animal_reconciliation import (
     reconcile_animals,
 )
 from tools.acquisition.model.animal_registry import AnimalRegistry
-from tools.acquisition.model.rfid_metadata_controller import RfidMetadataController
+from tools.acquisition.model.rfid_metadata_controller import (
+    RfidMetadataController,
+    lookup_rfid,
+)
 from tools.acquisition.model.animal_sources.config import (
     build_source,
     load_source_configuration,
@@ -3913,6 +3918,8 @@ class AppModel(ObservableObject):
             f"ignored {batch.ignored_missing_rfid_rows} without RFID and "
             f"{batch.ignored_ended_rows} ended"
         )
+        if batch.duplicate_rfids:
+            status += "; " + "; ".join(batch.warnings)
         if result.registry_result.unchanged:
             status = "Already current; " + status
         status += (
@@ -4187,7 +4194,7 @@ class AppModel(ObservableObject):
     ) -> RfidResolution:
         if self.session_recording_status is not SessionRecordingStatus.READY:
             raise RuntimeError("RFID setup is disabled while a session is active")
-        if record.physical_rfid != scanned_rfid:
+        if record.physical_rfid != normalize_rfid(scanned_rfid):
             raise ValueError("Scanned RFID does not match the selected SoftMouse record")
         name = str(name).strip()
         if not name:
@@ -4276,6 +4283,35 @@ class AppModel(ObservableObject):
             reason=getattr(status, "reason", "") or state_value,
             error=(getattr(status, "reason", "") if state is SubsystemState.FAILED else ""),
             required_for_recording=False,
+        )
+
+    def resolve_entered_rfid(self, value: str) -> RfidResolution:
+        """Resolve an identifier typed, pasted or read by a keyboard barcode scanner.
+
+        It is looked up and resolved exactly as an RFID reader scan is.
+        """
+        rfid = normalize_rfid(value)
+        logger.info(
+            "Animal identifier entered: rfid=%s",
+            rfid,
+            extra={ALWAYS_CONSOLE_LOG_ATTRIBUTE: True},
+        )
+        if self._animal_registry is None:
+            result = RfidResolution(
+                RfidResolutionKind.UNKNOWN_RFID,
+                rfid,
+                message="Animal metadata is not configured on this computer",
+            )
+            self._publish_rfid_resolution(result)
+            return result
+        record, ledger, cache_stale = lookup_rfid(self._animal_registry, rfid)
+        return self.handle_rfid_scan(
+            record,
+            scanned_rfid=rfid,
+            registry_import_id=None if ledger is None else ledger["import_id"],
+            source_file_sha256=None if ledger is None else ledger["source_file_sha256"],
+            imported_utc=None if ledger is None else ledger["imported_utc"],
+            cache_stale=cache_stale,
         )
 
     def handle_rfid_scan(self, record, **kwargs) -> RfidResolution:

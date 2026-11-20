@@ -75,12 +75,13 @@ def test_source_keeps_only_tagged_current_animals(tmp_path):
     assert record.genotype == ("Cre+", "WT")
 
 
-def test_source_ignores_non_rfid_plate_ids_and_rejects_ambiguous_headers(tmp_path):
-    path = tmp_path / "bad.csv"
-    write_export(path, [row("PT-1", "not-a-tag")])
+def test_source_keeps_non_iso_codes_and_rejects_ambiguous_headers(tmp_path):
+    path = tmp_path / "codes.csv"
+    write_export(path, [row("PT-1", "BC-0001")])
     preview = SoftMouseSpreadsheetSource().preview(path)
-    assert preview.batch.accepted_rows == 0
-    assert preview.batch.ignored_missing_rfid_rows == 1
+    assert preview.batch.accepted_rows == 1
+    assert preview.batch.records[0].physical_rfid == "BC-0001"
+    assert preview.batch.ignored_missing_rfid_rows == 0
 
     write_export(
         path,
@@ -155,6 +156,17 @@ def test_registry_replacement_is_current_and_idempotent(tmp_path):
     assert registry.resolve_rfid(TAG_B).identity.subject_id == "PT-2"
 
 
+def test_shared_rfid_is_dropped_from_every_animal_that_has_it(tmp_path):
+    export = tmp_path / "animals.csv"
+    write_export(export, [row("PT-2", TAG_B), row("PT-3", TAG_B), row("PT-4", TAG_A)])
+
+    batch = SoftMouseSpreadsheetSource().preview(export).batch
+
+    rfids = {r.identity.subject_id: r.physical_rfid for r in batch.records}
+    assert rfids == {"PT-2": None, "PT-3": None, "PT-4": TAG_A}
+    assert batch.duplicate_rfids == ((TAG_B, ("PT-2", "PT-3")),)
+
+
 def test_failed_replacement_preserves_last_good_cache(tmp_path):
     export = tmp_path / "animals.csv"
     registry = AnimalRegistry(tmp_path / "cache.sqlite3")
@@ -162,8 +174,8 @@ def test_failed_replacement_preserves_last_good_cache(tmp_path):
     write_export(export, [row("PT-1", TAG_A)])
     registry.replace(source.preview(export).batch)
 
-    write_export(export, [row("PT-2", TAG_B), row("PT-3", TAG_B)])
-    with pytest.raises(ValueError, match="duplicate active RFID"):
+    write_export(export, [row("PT-2", TAG_B), row("PT-2", TAG_A)])
+    with pytest.raises(ValueError, match="duplicate external subject"):
         source.preview(export)
 
     assert registry.resolve_rfid(TAG_A).identity.subject_id == "PT-1"

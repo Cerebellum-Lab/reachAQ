@@ -190,6 +190,30 @@ class ColumnMapping:
         return ColumnMapping(**arguments)
 
 
+def _drop_shared_rfids(
+    records: Sequence[ExternalAnimalRecord],
+) -> Tuple[List[ExternalAnimalRecord], Tuple[Tuple[str, Tuple[str, ...]], ...]]:
+    """Remove each identifier that more than one animal has, from all of them.
+
+    A shared value cannot identify one animal, so those animals are kept
+    without an identifier (they can still be linked by hand).
+    """
+    holders: Dict[str, List[str]] = {}
+    for record in records:
+        if record.physical_rfid is not None:
+            holders.setdefault(record.physical_rfid, []).append(record.identity.subject_id)
+    shared = {value: tuple(subjects) for value, subjects in holders.items() if len(subjects) > 1}
+    if not shared:
+        return list(records), ()
+    kept = [
+        dataclasses.replace(record, physical_rfid=None)
+        if record.physical_rfid in shared
+        else record
+        for record in records
+    ]
+    return kept, tuple(shared.items())
+
+
 def softmouse_mapping(new_animal_name_column: str = "Physical Tag") -> ColumnMapping:
     """The mapping for SoftMouse's Animals export, as it has always been read."""
     return ColumnMapping(
@@ -421,6 +445,14 @@ class AnimalTableMapper:
                 )
             )
 
+        records, duplicates = _drop_shared_rfids(records)
+        warnings = tuple(
+            f"RFID {value!r} is shared by {', '.join(subjects)}; "
+            "it is ignored for all of them"
+            for value, subjects in duplicates
+        )
+        for warning in warnings:
+            logger.warning("Animal metadata duplicate identifier: %s", warning)
         header_signature = hashlib.sha256(
             json.dumps(headers, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -439,6 +471,8 @@ class AnimalTableMapper:
             ignored_missing_rfid_rows=ignored_missing_rfid,
             ignored_ended_rows=ignored_ended,
             records=tuple(records),
+            warnings=warnings,
+            duplicate_rfids=duplicates,
         )
         stat = table.path.stat() if table.path is not None else None
         preview = SpreadsheetImportPreview(
@@ -491,10 +525,13 @@ class AnimalTableMapper:
                 "precision loss"
             )
         try:
+            # Any non-empty code is an identifier: an ISO 11784 RFID, a
+            # barcode, or a lab's own ID (SoftMouse Alt. ID).
             return normalize_rfid(raw_rfid)
-        except ValueError:
-            # The RFID column may also hold other identifiers (SoftMouse Plate
-            # ID does). Only an exact ISO 11784 15-digit value is an RFID.
+        except ValueError as exc:
+            logger.warning(
+                "Animal metadata RFID at source row %d ignored: %s", row_number, exc
+            )
             return None
 
     def _resolve_headers(self, headers: Sequence[str]) -> Dict[str, int]:
