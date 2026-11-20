@@ -158,9 +158,10 @@ noticed until the next launch.
 The capture creates a session folder in the normal data location. In it:
 
 - `4mm_6r_8c_4x/` is the capture: `source_videos/left.mp4`,
-  `source_videos/right.mp4` and `waypoints.yaml` (the commanded and reported
-  motor positions, which waypoints were verified, the times, and the camera
-  settings).
+  `source_videos/right.mp4`, a copy of each camera's timestamps file as
+  `source_videos/left_timestamps.txt` and `right_timestamps.txt`, and
+  `waypoints.yaml` (the commanded and reported motor positions, which waypoints
+  were verified, the times, and the camera settings).
 - `4mm_6r_8c_4x.new/` is the new calibration, at format 2. It stays after an
   install as the session's record, and when a fail is kept out.
 
@@ -459,10 +460,19 @@ Both cameras' intrinsics and poses are fitted jointly by least squares.
   that has not converged in 400 evaluations is abandoned; `RuntimeError` is
   raised only when every start fails.
 
-Extraction splits each video into stationary segments by frame-to-frame motion
-and matches segment i to distinct waypoint i by order, not by timestamp. A camera
-whose segment count differs from the number of distinct waypoints, or whose
-dwells start more than 3 frames apart, raises `WaypointAlignmentError`. At each
+Extraction takes each distinct waypoint's frames from its logged dwell: the
+frames whose wall-clock time (column 0 of the camera's timestamps file) lies
+between the waypoint's logged arrival and leave, from the first of a run of equal
+positions to the last. The arrival is stamped after the settle, so these are the
+paused board's frames whatever the image shows. A capture without timestamps
+files (made before 2026-11-20) is split into stationary segments by frame-to-frame
+motion instead, and segment i matched to distinct waypoint i by order. Motion
+alone failed the first real capture: a dark image's flicker split dwells and
+moves it barely saw merged them. `WaypointAlignmentError` is raised when a
+camera's frame times do not number its frames, a dwell holds fewer than 8 frames,
+a motion-segmented camera's segment count differs from the number of distinct
+waypoints, or two cameras' dwells start more than 3 frames apart. The
+calibration's `capture.segments_from` records which way was used. At each
 segment the board is detected in the 5 middle frames and the per-corner median is
 the observation. A camera is dropped from a waypoint as `not found` if no frame
 has the board, or as `inconsistent` if any corner's detections spread by more
@@ -478,7 +488,7 @@ drift monitor uses, not copied from its flips and not taken from the test-only
 
 `calibrate_capture` takes a capture folder and writes a new calibration. The
 capture folder needs `waypoints.yaml` and `source_videos/left.mp4` and
-`right.mp4`: a session's `4mm_6r_8c_4x/`, which an installed calibration names
+`right.mp4`, and for extraction by the logged dwells, both timestamps files: a session's `4mm_6r_8c_4x/`, which an installed calibration names
 as `capture.capture_folder` in its `calibration.yaml`. The calibration folder
 itself holds no videos.
 
