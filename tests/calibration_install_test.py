@@ -1,14 +1,18 @@
 """Installing a new 3D calibration: its quality report decides, an override is explicit and recorded.
 
 A pass or warn report installs at once; a fail keeps the previous calibration unless the
-operator confirms an override twice, and the override is written into the calibration
-before it is installed. The previous calibration is renamed to a dated backup, and the new
-one is copied in beside it and swapped into place, so the location never holds a half copy.
+operator confirms an override twice, and the override is recorded as a decision in the
+calibration library, never written into the calibration. An install adds the calibration to
+the library and makes it active. The previous calibration folder is renamed to a dated
+backup, and the new one is copied in beside it and swapped into place, so the location never
+holds a half copy.
 camera_offsets.pkl is never carried over: offsets come only from DCS, redone against the
 new calibration.
 """
 
 import getpass
+import importlib
+import json
 import logging
 import os
 from datetime import datetime
@@ -23,11 +27,12 @@ from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.event.api_event_kind import ApiEventKind
 from autotrainer.core.project.project_info import DATE_TIME_FORMAT
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
-from autotrainer.inference.multires_calibration import store
+from autotrainer.inference.multires_calibration import library, store
 from autotrainer.inference.multires_calibration.fit import BoardSpec
 from autotrainer.inference.multires_calibration.geometry import presets_from_base
 from autotrainer.inference.multires_calibration.report import QualityReport
 from multires_calibration_fakes import BASE, FIT
+from multires_synthetic import synthetic_rig
 from tools.acquisition.model.app_model_status import AppModelStatus
 from tools.acquisition.model.calibration_install import decide_install, install_calibration, override_record
 from tools.acquisition.model.dcs_state import DcsState
@@ -35,7 +40,11 @@ from tools.acquisition.view import main_window as main_window_module
 from tools.acquisition.view.main_window import MainWindow
 
 
+calibration_install_module = importlib.import_module("tools.acquisition.model.calibration_install")
+
 NOW = datetime(2026, 10, 23, 14, 5, 6)
+RIG = synthetic_rig(noise_px=0.0)
+_REPORT = QualityReport(created="2026-10-23T09:00:00-06:00", verdict="pass", metrics=[], thresholds={}, notes=[])
 STALE_DCS_TEXT = "Redo Tools → Calibrate Coordinate System before running sessions."
 
 
@@ -50,69 +59,104 @@ def _contents(path: Path) -> dict:
     return {p.relative_to(path).as_posix(): p.read_bytes() for p in path.rglob("*") if p.is_file()}
 
 
+def _calibration(path: Path, rig=RIG) -> str:
+    """A real calibration folder in `path`; its id."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return store.write_calibration(
+        path, fit=rig.truth, presets=presets_from_base(BASE), board=BoardSpec(), report=_REPORT, capture={},
+    ).id
+
+
+def _decisions(root: Path) -> list:
+    return [json.loads(line) for line in (root / "decisions.jsonl").read_text().splitlines()]
+
+
 def test_install_backs_up_and_never_copies_offsets(tmp_path):
     location = tmp_path / "config"
-    old = {"calibration.yaml": b"old", DEFAULT_CAM_OFFSET_FILE_NAME: b"old offsets", "presets/a/frame.yaml": b"a"}
-    _folder(location / DEFAULT_3D_CALIB_DIR_NAME, old)
+    old_id = _calibration(location / DEFAULT_3D_CALIB_DIR_NAME)
+    (location / DEFAULT_3D_CALIB_DIR_NAME / DEFAULT_CAM_OFFSET_FILE_NAME).write_bytes(b"old offsets")
+    old = _contents(location / DEFAULT_3D_CALIB_DIR_NAME)
     # An offsets file in the new folder is skipped too: none is ever installed with a calibration.
-    new = {"calibration.yaml": b"new", "presets/b/frame.yaml": b"b", DEFAULT_CAM_OFFSET_FILE_NAME: b"stray"}
-    new_dir = _folder(tmp_path / "session" / f"{DEFAULT_3D_CALIB_DIR_NAME}.new", new)
+    new_dir = tmp_path / "session" / f"{DEFAULT_3D_CALIB_DIR_NAME}.new"
+    new_id = _calibration(new_dir)
+    (new_dir / DEFAULT_CAM_OFFSET_FILE_NAME).write_bytes(b"stray")
+    new = _contents(new_dir)
 
-    installed, backup = install_calibration(new_dir, location, now=NOW)
+    installed, backup = install_calibration(new_dir, location, now=NOW, by="ben")
 
     assert installed == location / DEFAULT_3D_CALIB_DIR_NAME
     assert backup == location / f"{DEFAULT_3D_CALIB_DIR_NAME}_{NOW.strftime(DATE_TIME_FORMAT)}"
     assert _contents(backup) == old
-    assert _contents(installed) == {"calibration.yaml": b"new", "presets/b/frame.yaml": b"b"}
+    assert _contents(installed) == {k: v for k, v in new.items() if k != DEFAULT_CAM_OFFSET_FILE_NAME}
     assert _contents(new_dir) == new, "the session's folder is copied, not moved"
-    assert sorted(p.name for p in location.iterdir()) == sorted([installed.name, backup.name])
+    assert sorted(p.name for p in location.iterdir()) == sorted([installed.name, backup.name, "calibrations"])
+    # The library holds the new calibration, active; the previous one is not in it yet.
+    root = library.library_root(location)
+    assert library.active_id(root) == new_id != old_id
+    assert [e.id for e in library.list_entries(root)] == [new_id]
+    assert [(d["event"], d["id"], d["by"]) for d in _decisions(root)] == [("set_active", new_id, "ben")]
 
 
 def test_install_into_empty_location(tmp_path):
     location = tmp_path / "config"
     location.mkdir()
-    new_dir = _folder(tmp_path / "new", {"calibration.yaml": b"new"})
+    new_dir = tmp_path / "new"
+    _calibration(new_dir)
 
     installed, backup = install_calibration(new_dir, location, now=NOW)
 
     assert (installed, backup) == (location / DEFAULT_3D_CALIB_DIR_NAME, None)
-    assert _contents(installed) == {"calibration.yaml": b"new"}
-    assert [p.name for p in location.iterdir()] == [DEFAULT_3D_CALIB_DIR_NAME]
+    assert _contents(installed) == _contents(new_dir)
+    assert sorted(p.name for p in location.iterdir()) == sorted([DEFAULT_3D_CALIB_DIR_NAME, "calibrations"])
+    assert library.active_id(library.library_root(location)) == store.load_index(new_dir).id
 
 
 def test_install_clears_a_partial_copy_left_by_an_earlier_crash(tmp_path):
     location = tmp_path / "config"
     _folder(location / f"{DEFAULT_3D_CALIB_DIR_NAME}.partial", {"calibration.yaml": b"half", "junk": b"x"})
-    new_dir = _folder(tmp_path / "new", {"calibration.yaml": b"new"})
+    new_dir = tmp_path / "new"
+    _calibration(new_dir)
 
     installed, _ = install_calibration(new_dir, location, now=NOW)
 
-    assert _contents(installed) == {"calibration.yaml": b"new"}
-    assert [p.name for p in location.iterdir()] == [DEFAULT_3D_CALIB_DIR_NAME]
+    assert _contents(installed) == _contents(new_dir)
+    assert sorted(p.name for p in location.iterdir()) == sorted([DEFAULT_3D_CALIB_DIR_NAME, "calibrations"])
 
 
 def test_a_failed_copy_leaves_the_previous_calibration_in_place(tmp_path):
     location = tmp_path / "config"
-    old = {"calibration.yaml": b"old", DEFAULT_CAM_OFFSET_FILE_NAME: b"old offsets"}
-    _folder(location / DEFAULT_3D_CALIB_DIR_NAME, old)
+    _calibration(location / DEFAULT_3D_CALIB_DIR_NAME)
+    (location / DEFAULT_3D_CALIB_DIR_NAME / DEFAULT_CAM_OFFSET_FILE_NAME).write_bytes(b"old offsets")
+    old = _contents(location / DEFAULT_3D_CALIB_DIR_NAME)
 
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(ValueError, match="not a multi-resolution calibration"):
         install_calibration(tmp_path / "missing", location, now=NOW)
 
     assert [p.name for p in location.iterdir()] == [DEFAULT_3D_CALIB_DIR_NAME]
     assert _contents(location / DEFAULT_3D_CALIB_DIR_NAME) == old
 
 
-def test_a_failed_swap_puts_the_previous_calibration_back(tmp_path, monkeypatch):
+def _refuse_swap(target: Path):
+    """An os.replace that fails only for the swap into the configuration location."""
+    real = os.replace
+
+    def replace(src, dst):
+        if Path(dst) == target:
+            raise PermissionError(f"cannot replace {dst}")
+        return real(src, dst)
+
+    return replace
+
+
+def test_a_failed_swap_puts_the_previous_calibration_back_and_leaves_no_entry(tmp_path, monkeypatch):
     location = tmp_path / "config"
-    old = {"calibration.yaml": b"old", DEFAULT_CAM_OFFSET_FILE_NAME: b"old offsets"}
-    _folder(location / DEFAULT_3D_CALIB_DIR_NAME, old)
-    new_dir = _folder(tmp_path / "new", {"calibration.yaml": b"new"})
+    _calibration(location / DEFAULT_3D_CALIB_DIR_NAME)
+    (location / DEFAULT_3D_CALIB_DIR_NAME / DEFAULT_CAM_OFFSET_FILE_NAME).write_bytes(b"old offsets")
+    old = _contents(location / DEFAULT_3D_CALIB_DIR_NAME)
+    new_dir = tmp_path / "new"
+    _calibration(new_dir)
 
-    def refuse(src, dst):
-        raise PermissionError(f"cannot replace {dst}")
-
-    monkeypatch.setattr(os, "replace", refuse)
+    monkeypatch.setattr(os, "replace", _refuse_swap(location / DEFAULT_3D_CALIB_DIR_NAME))
     with pytest.raises(PermissionError):
         install_calibration(new_dir, location, now=NOW)
     monkeypatch.undo()
@@ -120,21 +164,65 @@ def test_a_failed_swap_puts_the_previous_calibration_back(tmp_path, monkeypatch)
     assert _contents(location / DEFAULT_3D_CALIB_DIR_NAME) == old
     backup = location / f"{DEFAULT_3D_CALIB_DIR_NAME}_{NOW.strftime(DATE_TIME_FORMAT)}"
     assert not backup.exists()
+    root = library.library_root(location)
+    assert library.list_entries(root) == [] and library.active_id(root) is None
+    # Retrying works: the discarded entry does not block its own id.
+    install_calibration(new_dir, location, now=NOW)
+    assert library.active_id(root) == store.load_index(new_dir).id
+
+
+def test_a_failed_pointer_write_undoes_the_swap(tmp_path, monkeypatch):
+    location = tmp_path / "config"
+    _calibration(location / DEFAULT_3D_CALIB_DIR_NAME)
+    old = _contents(location / DEFAULT_3D_CALIB_DIR_NAME)
+    new_dir = tmp_path / "new"
+    _calibration(new_dir)
+
+    def refuse(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(calibration_install_module, "set_active", refuse)
+    with pytest.raises(OSError, match="disk full"):
+        install_calibration(new_dir, location, now=NOW)
+    monkeypatch.undo()
+
+    assert _contents(location / DEFAULT_3D_CALIB_DIR_NAME) == old
+    assert sorted(p.name for p in location.iterdir()) == sorted([DEFAULT_3D_CALIB_DIR_NAME, "calibrations"])
+    assert library.list_entries(library.library_root(location)) == []
 
 
 def test_install_refuses_to_overwrite_a_backup_of_the_same_second(tmp_path):
     location = tmp_path / "config"
-    old = {"calibration.yaml": b"old"}
-    _folder(location / DEFAULT_3D_CALIB_DIR_NAME, old)
+    _calibration(location / DEFAULT_3D_CALIB_DIR_NAME)
+    old = _contents(location / DEFAULT_3D_CALIB_DIR_NAME)
     earlier = {"calibration.yaml": b"earlier"}
     backup = _folder(location / f"{DEFAULT_3D_CALIB_DIR_NAME}_{NOW.strftime(DATE_TIME_FORMAT)}", earlier)
-    new_dir = _folder(tmp_path / "new", {"calibration.yaml": b"new"})
+    new_dir = tmp_path / "new"
+    _calibration(new_dir)
 
     with pytest.raises(FileExistsError):
         install_calibration(new_dir, location, now=NOW)
 
     assert _contents(location / DEFAULT_3D_CALIB_DIR_NAME) == old
     assert _contents(backup) == earlier
+    assert not (location / "calibrations").exists()
+
+
+def test_an_override_is_a_decision_and_the_calibration_is_not_edited(tmp_path):
+    location = tmp_path / "config"
+    new_dir = tmp_path / "new"
+    new_id = _calibration(new_dir)
+    before = _contents(new_dir)
+    record = override_record("ben", NOW)
+
+    install_calibration(new_dir, location, now=NOW, by="ben", override=record)
+
+    root = library.library_root(location)
+    assert _contents(root / new_id) == before
+    assert store.load_index(root / new_id).override is None
+    events = _decisions(root)
+    assert [(d["event"], d["id"]) for d in events] == [("set_active", new_id), ("override", new_id)]
+    assert events[1]["detail"] == record
 
 
 def test_override_record_fields():
@@ -282,8 +370,14 @@ def test_a_confirmed_override_is_recorded_in_the_installed_calibration(tmp_path,
     installed = location / DEFAULT_3D_CALIB_DIR_NAME
     index = store.load_index(installed)
     assert index.id == produced[2].id
-    assert index.override["confirmed"] is True and index.override["by"] == getpass.getuser()
-    assert datetime.fromisoformat(index.override["at"]) <= datetime.now()
+    # The override is a decision about the calibration; the calibration is not edited.
+    assert index.override is None
+    root = library.library_root(location)
+    assert library.active_id(root) == index.id
+    override, = [d for d in _decisions(root) if d["event"] == "override"]
+    assert override["id"] == index.id
+    assert override["detail"]["confirmed"] is True and override["detail"]["by"] == getpass.getuser()
+    assert datetime.fromisoformat(override["detail"]["at"]) <= datetime.now()
     assert not (installed / DEFAULT_CAM_OFFSET_FILE_NAME).exists()
     assert seen.reloaded == [installed]
     assert [title for title, _ in seen.boxes] == ["3D calibration installed", "Coordinate system out of date"]
@@ -398,7 +492,7 @@ def test_an_install_error_is_shown_and_reported_as_a_failure(tmp_path, location,
     before = _contents(location)
     window, seen = _window(location, monkeypatch)
 
-    monkeypatch.setattr(os, "replace", _refuse_replace)
+    monkeypatch.setattr(os, "replace", _refuse_swap(location / DEFAULT_3D_CALIB_DIR_NAME))
     _finish(window, None, produced)
     monkeypatch.undo()
 
@@ -416,15 +510,14 @@ def test_an_override_whose_install_fails_is_logged_as_failed(tmp_path, location,
     produced = _produced(tmp_path / "session", "fail")
     window, seen = _window(location, monkeypatch, override_answer=True)
 
-    def refuse_install(new_dir, configuration_location, *, now):
+    def refuse_install(new_dir, configuration_location, **kwargs):
         raise PermissionError(f"cannot install {new_dir}")
 
-    # Not os.replace: record_override replaces its files with it too.
     monkeypatch.setattr(main_window_module, "install_calibration", refuse_install)
     with caplog.at_level(logging.DEBUG):
         _finish(window, None, produced)
 
-    assert store.load_index(produced[1]).override["confirmed"] is True
+    assert store.load_index(produced[1]).override is None, "the session's calibration is never edited"
     logs = _calibration_logs(caplog, produced[2].id)
     assert [m.split(":")[0] for m in logs] == ["override recorded (install pending)", "install failed"]
     assert [kind for kind, *_ in seen.events] == [ApiEventKind.calibration3dFailed]
@@ -516,7 +609,7 @@ def test_a_calibration_or_an_install_that_fails_leaves_the_due_label_shown(tmp_p
     _finish(window, ValueError("the board was not seen"), None)
     assert window._calibration_due_label.visible is True
 
-    def refuse_install(new_dir, configuration_location, *, now):
+    def refuse_install(new_dir, configuration_location, **kwargs):
         raise PermissionError(f"cannot install {new_dir}")
 
     monkeypatch.setattr(main_window_module, "install_calibration", refuse_install)

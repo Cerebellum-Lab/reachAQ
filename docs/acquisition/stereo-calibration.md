@@ -109,10 +109,9 @@ written, and **3D calibration failed** names each camera and its reason.
   run the capture again.
 - **Install anyway…** asks a second time, defaulting to No. On Yes the override
   is recorded as `confirmed`, `by` (the operating-system user) and `at` (local
-  time). It is written into the new calibration before it is installed, in
-  `calibration.yaml`, `quality_report.json`, and a line in `quality_report.txt`.
-  Every later session that uses this calibration records it in its metadata as
-  `hardware.configured.calibration3d.override`.
+  time). It is recorded as a line in the library's `decisions.jsonl`
+  (`event: override`, with the record under `detail`); the calibration itself is
+  never edited, because sessions name it by id (see Calibration library).
 - If the capture or the fit itself raises (for example, a camera's pauses do not
   match the waypoints, fewer than 2 cameras meet the per-camera rule, or the fit
   does not converge), nothing is installed and
@@ -204,6 +203,50 @@ stopped being active. A backup is never overwritten or deleted by the app: an
 install refuses a backup name that already exists. A copy that fails leaves the
 previous calibration untouched, and a final rename that fails puts it back.
 
+The same install also adds the calibration to the **calibration library**
+(next section) and makes it the active entry there. If the folder swap fails,
+that entry is removed again, so the install can be retried.
+
+## Calibration library
+
+Every calibration is kept as an immutable entry under
+`<configuration location>/calibrations/` (`~/Autotrainer/calibrations/`):
+
+```
+calibrations/
+  <id>/               one calibration, at format 3 (or a copy of an older one)
+  active.yaml         the one mutable pointer: id, by (who), at (when)
+  decisions.jsonl     append-only, one JSON object per line: event, id, at, ...
+  settings.yaml       library-wide switches (only the file is named here)
+  .derived/           anipose files derived on demand; never inside an entry
+```
+
+- **An entry never changes.** A session records the calibration's id, so the
+  entry it names must still be the one it was recorded with. An entry is copied
+  to `<id>.partial` and renamed into place, so a power cut leaves no entry that
+  loads, and nothing writes inside it afterwards. Adding an id that is already
+  there is refused.
+- **What happens to an entry afterwards is a decision.** Making it active and
+  installing it over a failed quality check (**Install anyway…**) are lines in
+  `decisions.jsonl`, for example
+  `{"event": "set_active", "id": "…", "by": "ben", "at": "2026-11-20T14:05:06"}`.
+  The log is only ever appended to.
+- **`active.yaml` is replaced whole** (temp file, then rename), so a power cut
+  leaves the old pointer or the new one. A missing or corrupt `active.yaml`, or
+  one that names an entry that is not there, means there is no active
+  calibration: the library reports none and logs why; it never raises.
+- **Older calibrations are imported, not moved.** `import_existing` copies the
+  `4mm_6r_8c_4x` folder and every dated backup into the library. A format-2
+  folder keeps its id. A legacy folder (no `calibration.yaml`) gets a new id,
+  its `stereo_params.pickle` time as its date, and a generated
+  `calibration.yaml` marked `format: legacy`. It sets the active pointer to the
+  active folder's entry when there is none yet, skips anything already in the
+  library (so it can run again), and leaves the old folders as they were.
+- **Finding a calibration.** A session's metadata id is looked up in the library
+  first, then among the old folders. A session with no id is resolved by time:
+  the entry the log shows as active then, or, for a time before the log begins,
+  the old folders' dated backups as before.
+
 A format-3 folder, for any 2 to 6 cameras:
 
 ```
@@ -238,7 +281,7 @@ A format-3 folder, for any 2 to 6 cameras:
 - Nothing inside the folder is written again by reading it. A geometry no
   stored set has (a camera recorded at another binning or ROI) gets its anipose
   file derived from `sensor/fit.yaml` on demand, into a cache outside the
-  folder, `.derived/<id>/<key>/calibration.toml` beside the calibrations.
+  folder, `calibrations/.derived/<id>/<key>/calibration.toml` in the library.
 - **Format 2** (calibrations made before 2026-11-20) still loads: left and right
   only, one folder per preset, `presets/<WxH_binB>/`, each with the
   `camera_matrix` files, `frame.yaml` and a two-camera `calibration.toml`, and no
@@ -472,6 +515,7 @@ lists the geometries.
 | `report.py` | `build_report`, `DEFAULT_THRESHOLDS`, coverage |
 | `products.py` | per-preset stereo parameters, the frame transform, the anipose export |
 | `store.py` | the folder format, loading, resolving by id or time |
+| `library.py` | the calibration library: entries, the active pointer, decisions, import |
 | `pipeline.py` | `calibrate_capture`, which ties them together |
 
 Capture and install live in `tools/acquisition`: `model/handle_3d_calibration.py`

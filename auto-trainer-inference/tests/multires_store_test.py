@@ -66,7 +66,6 @@ from autotrainer.inference.multires_calibration.store import (
     load_preset,
     load_preset_set,
     load_sensor_fit,
-    record_override,
     resolve_for_time,
     write_calibration,
 )
@@ -454,27 +453,11 @@ def test_a_corrupt_backup_index_blocks_only_its_own_folder(tmp_path, report, cap
         "load_preset": lambda folder: load_preset(folder, BASE),
         "load_sensor_fit": load_sensor_fit,
         "calibration_created": calibration_created,
-        "record_override": lambda folder: record_override(folder, {"confirmed": True}),
     }
     for name, load in loaders.items():
         with pytest.raises(ValueError, match=INDEX_FILE):
             load(damaged)
             pytest.fail(f"{name} accepted a corrupt index")
-
-
-def test_record_override_persists(tmp_path, report):
-    folder = tmp_path / NAME
-    written = write(folder, report)
-    override = {"confirmed": True, "by": "operator", "at": "2026-10-20T15:04:05.123456"}
-    record_override(folder, override)
-
-    index = load_index(folder)
-    assert index.override == override
-    assert dataclasses.replace(index, override=None) == written
-    data = json.loads((folder / "quality_report.json").read_text())
-    assert data["override"] == override
-    assert QualityReport.from_json((folder / "quality_report.json").read_text()).override == override
-    assert "Override recorded" in (folder / "quality_report.txt").read_text()
 
 
 # --- Format 3: any 2-6 cameras ----------------------------------------------------------

@@ -9,6 +9,7 @@ The app's intersession analysis is given the calibration root, not a folder, so 
 is processed with its own calibration, as live 3D was.
 """
 
+import dataclasses
 import json
 from datetime import datetime
 from pathlib import Path
@@ -22,9 +23,13 @@ from autotrainer.core import ProjectInfo
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.logging import unregister_fatal_exception_callback
 from autotrainer.inference.multires_calibration import store
+from autotrainer.inference.multires_calibration.fit import BoardSpec
+from autotrainer.inference.multires_calibration.geometry import presets_from_base
+from multires_calibration_fakes import FIT
 from reload_calib_multires_test import (
     BASE,
     BASE_PARAMS,
+    _REPORT,
     _configure_left,
     _save_left_camera_params,
     _write_multires,
@@ -78,9 +83,11 @@ def test_metadata_names_the_active_calibration(app_model, tmp_path):
 
 
 def test_metadata_names_an_overridden_calibration_with_its_override(app_model, tmp_path):
-    folder = _write_multires(tmp_path / "Autotrainer-calib" / DEFAULT_3D_CALIB_DIR_NAME)
     override = {"by": "operator", "reason": "baseline warning expected after the remount"}
-    store.record_override(folder, override)
+    folder = tmp_path / "Autotrainer-calib" / DEFAULT_3D_CALIB_DIR_NAME
+    folder.parent.mkdir(parents=True)
+    store.write_calibration(folder, fit=FIT, presets=presets_from_base(BASE, (4, 2, 1)), board=BoardSpec(),
+                            report=dataclasses.replace(_REPORT, override=override), capture={})
     _configure_left(app_model, **BASE_PARAMS)
     app_model.reload_calib(folder)
     assert _saved_calibration3d(app_model, tmp_path)["override"] == override

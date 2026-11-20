@@ -39,7 +39,7 @@ from autotrainer.inference import InferenceStatus, PoseResponse
 from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME, make_cam_offsets_dict
 from autotrainer.inference.multires_calibration.report import QualityReport
-from autotrainer.inference.multires_calibration.store import CalibrationIndex, calibration_created, record_override
+from autotrainer.inference.multires_calibration.store import CalibrationIndex, calibration_created
 
 from autotrainer.behavior import SystemState
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus, BehaviorAlgoProps
@@ -997,13 +997,13 @@ class MainWindow(QMainWindow):
             return None
         if override:
             record = override_record(getpass.getuser(), datetime.now())
-            # Before the install, so the installed copy carries the record.
-            record_override(new_dir, record)
+            # The library keeps it as a decision about the calibration; the calibration is not edited.
             report = dataclasses.replace(report, override=record)
             logger.warning("3D calibration %s: override recorded (install pending): %s", index.id, record)
         try:
             installed, _ = install_calibration(
-                new_dir, Path(self._preferences.configuration_location), now=datetime.now())
+                new_dir, Path(self._preferences.configuration_location), now=datetime.now(),
+                by=getpass.getuser(), override=record if override else None)
         except Exception:
             logger.error("3D calibration %s: install failed", index.id)
             raise

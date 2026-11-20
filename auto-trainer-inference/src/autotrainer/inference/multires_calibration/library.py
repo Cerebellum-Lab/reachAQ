@@ -1,0 +1,381 @@
+"""The calibration library: every calibration kept as an immutable entry, one of them active.
+
+Under <config>/calibrations/ (library_root):
+
+    <id>/               one calibration, at format 3 (or a copy of a format-2 or legacy folder)
+    active.yaml         the one mutable pointer: {id, by, at}
+    decisions.jsonl     append-only: one JSON object per line, {event, id, at, ...}
+    settings.yaml       library-wide switches; this module only names the file (settings_path)
+    .derived/           the cache load_preset_set derives other geometries into, outside any entry
+
+A session names its calibration by id, so an entry never changes once it is in place: it is
+copied into <id>.partial and renamed to <id>, and nothing here writes inside it afterwards.
+What happens to an entry afterwards (made active, installed over a failed quality check)
+is a line in decisions.jsonl, not an edit of the entry. The pointer is replaced whole
+(temp file, then os.replace), and decisions are appended with one write per line.
+
+A reader never raises on the pointer: active_id returns None, and says why in the log, when
+active.yaml is missing, corrupt or names an entry that is not there.
+
+import_existing brings in the folders that predate the library: the active 4mm_6r_8c_4x
+folder and its dated backups. A legacy folder (no calibration.yaml) gets a generated
+calibration.yaml at format "legacy", with an id made from its name and its
+stereo_params.pickle time, and that time as `created`; the file is written before the entry
+is renamed into place. The old folders are only read.
+
+Times are local and naive, as in store.py.
+"""
+
+import json
+import os
+import shutil
+import uuid
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import yaml
+
+from autotrainer.core.logging import get_verbose_logger
+from autotrainer.inference.multires_calibration.store import (
+    INDEX_FILE,
+    CalibrationResolutionError,
+    calibration_candidates,
+    load_index,
+)
+
+logger = get_verbose_logger(__name__)
+
+LIBRARY_DIR_NAME = "calibrations"
+ACTIVE_FILE = "active.yaml"
+DECISIONS_FILE = "decisions.jsonl"
+SETTINGS_FILE = "settings.yaml"
+DERIVED_DIR_NAME = ".derived"
+LEGACY_FORMAT = "legacy"
+
+_PARTIAL_SUFFIX = ".partial"
+_LEGACY_PICKLE = Path("camera_matrix", "stereo_params.pickle")
+_LEGACY_NAMESPACE = uuid.UUID("6a1f3c52-8f0e-4c63-9a5d-2f3b7c1d9e40")
+
+
+@dataclass(frozen=True)
+class LibraryEntry:
+    id: str
+    created: datetime  # local, naive, to the second
+    cameras: List[str]  # every capture camera's name, in capture order
+    verdict: str
+    active: bool
+    uncalibrated: Dict[str, str]  # a 2D-only camera's name -> the reason
+    path: Path
+
+
+def library_root(config_dir: Path) -> Path:
+    return Path(config_dir) / LIBRARY_DIR_NAME
+
+
+def settings_path(root: Path) -> Path:
+    return Path(root) / SETTINGS_FILE
+
+
+def derived_root(root: Path) -> Path:
+    """Where load_preset_set derives geometries no stored set has; never inside an entry."""
+    return Path(root) / DERIVED_DIR_NAME
+
+
+def entry_path(root: Path, calibration_id: str) -> Path:
+    """The folder of entry `calibration_id`. Raises CalibrationResolutionError when there is none."""
+    root = Path(root)
+    if not _is_entry_name(calibration_id):
+        raise CalibrationResolutionError(f"{calibration_id!r} is not a calibration id")
+    path = root / calibration_id
+    if not (path / INDEX_FILE).is_file():
+        raise CalibrationResolutionError(f"the calibration library {root} has no calibration {calibration_id}")
+    return path
+
+
+def add_entry(root: Path, built_folder: Path) -> str:
+    """Copy the calibration in `built_folder` into the library and return its id.
+
+    `built_folder` is a calibration already written at format 2 or 3 (store.write_calibration).
+    It is copied to <id>.partial and renamed to <id>, so a power cut leaves no entry that
+    loads, and it is left as it is. Raises FileExistsError when the library already has that
+    id: an entry is never replaced.
+    """
+    root = Path(root)
+    calibration_id = load_index(built_folder).id
+    if not _is_entry_name(calibration_id):
+        raise ValueError(f"{built_folder} has an id that cannot name a folder: {calibration_id!r}")
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / calibration_id
+    if target.exists():
+        raise FileExistsError(f"the calibration library {root} already has calibration {calibration_id}")
+    partial = _fresh_partial(root, calibration_id)
+    try:
+        shutil.copytree(built_folder, partial)
+        os.replace(partial, target)
+    except BaseException:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise
+    logger.info("added calibration %s to the library %s", calibration_id, root)
+    return calibration_id
+
+
+def discard_entry(root: Path, calibration_id: str) -> None:
+    """Delete an entry that was just added and never became active, to undo a failed install.
+
+    Refuses the active entry. Not for entries a session may already name.
+    """
+    path = entry_path(root, calibration_id)
+    if active_id(root) == calibration_id:
+        raise ValueError(f"calibration {calibration_id} is the active one and is not discarded")
+    shutil.rmtree(path)
+    logger.warning("discarded calibration %s from the library %s", calibration_id, root)
+
+
+def set_active(root: Path, calibration_id: str, *, by: str) -> None:
+    """Make `calibration_id` the active calibration, and record who did it.
+
+    active.yaml is written to a temp file and renamed over the old one, so a failure leaves
+    the old pointer; the decision is appended only after the pointer is in place.
+    """
+    root = Path(root)
+    entry_path(root, calibration_id)
+    at = _now()
+    text = yaml.safe_dump({"id": calibration_id, "by": str(by), "at": at}, sort_keys=False)
+    _replace_text(root / ACTIVE_FILE, text)
+    _append_decision(root, {"event": "set_active", "id": calibration_id, "by": str(by), "at": at})
+    logger.info("calibration %s is now active in %s", calibration_id, root)
+
+
+def record_decision(root: Path, calibration_id: str, kind: str, detail: dict) -> None:
+    """Append {"event": kind, "id": calibration_id, "at": now, "detail": detail} to decisions.jsonl."""
+    root = Path(root)
+    entry_path(root, calibration_id)
+    _append_decision(root, {"event": str(kind), "id": calibration_id, "at": _now(), "detail": detail})
+
+
+def active_id(root: Path) -> Optional[str]:
+    """The active calibration's id, or None.
+
+    None when active.yaml is missing, is not a mapping with an id, or names an id that has no
+    entry; each logs a warning saying which. Never raises.
+    """
+    root = Path(root)
+    path = root / ACTIVE_FILE
+    try:
+        if not path.is_file():
+            logger.warning("no active calibration: %s does not exist", path)
+            return None
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        calibration_id = data.get("id") if isinstance(data, dict) else None
+        if not isinstance(calibration_id, str) or not calibration_id:
+            logger.warning("no active calibration: %s does not name a calibration id", path)
+            return None
+        entry_path(root, calibration_id)
+        return calibration_id
+    except CalibrationResolutionError as error:
+        logger.warning("no active calibration: %s names a calibration that is not in the library: %s", path, error)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+        logger.warning("no active calibration: %s cannot be read: %s", path, error)
+    return None
+
+
+def list_entries(root: Path) -> List[LibraryEntry]:
+    """Every entry in the library, newest first.
+
+    Skips .derived, any name starting with "." and any ending ".partial". An entry that
+    cannot be read is warned about and left out.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return []
+    active = active_id(root) if (root / ACTIVE_FILE).exists() else None
+    entries = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or not _is_entry_name(child.name):
+            continue
+        try:
+            entries.append(_read_entry(child, active))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            logger.warning("skipping %s in the calibration library: %s", child, error)
+    entries.sort(key=lambda e: (e.created, e.id), reverse=True)
+    return entries
+
+
+def is_legacy_entry(folder: Path) -> bool:
+    """True when `folder` holds the generated calibration.yaml of an imported legacy calibration."""
+    try:
+        data = yaml.safe_load((Path(folder) / INDEX_FILE).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return False
+    return isinstance(data, dict) and data.get("format") == LEGACY_FORMAT
+
+
+def active_at(root: Path, when: datetime) -> Optional[str]:
+    """The entry that was active at `when` (local, naive): the last set_active at or before it.
+
+    None when the log has no such line or the entry is gone. Unreadable lines are skipped.
+    """
+    root = Path(root)
+    try:
+        lines = (root / DECISIONS_FILE).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    best: Optional[Tuple[datetime, str]] = None
+    for line in lines:
+        try:
+            record = json.loads(line)
+            if record["event"] != "set_active":
+                continue
+            at = datetime.fromisoformat(record["at"])
+            calibration_id = str(record["id"])
+        except (ValueError, KeyError, TypeError):
+            continue
+        if at <= when and (best is None or at >= best[0]):
+            best = (at, calibration_id)
+    if best is None:
+        return None
+    try:
+        entry_path(root, best[1])
+    except CalibrationResolutionError:
+        return None
+    return best[1]
+
+
+def import_existing(config_dir: Path) -> List[str]:
+    """Copy the 4mm_6r_8c_4x folder and every dated backup under `config_dir` into the library.
+
+    Returns the ids this call added, oldest first; an id already in the library is skipped,
+    so a second call returns []. A folder with a format-2 index keeps its id; a legacy folder
+    gets an id made from its name and stereo_params.pickle time, so it is imported once, and
+    that time as `created`. A folder that cannot be imported is warned about and left out.
+    When the library has no readable active pointer, the active folder's entry becomes it.
+    The old folders are not changed.
+    """
+    config_dir = Path(config_dir)
+    root = library_root(config_dir)
+    added: List[str] = []
+    active_source: Optional[str] = None
+    for candidate in calibration_candidates(config_dir):
+        folder = candidate.path
+        try:
+            calibration_id, is_new = _import_folder(root, candidate.calibration_id, folder)
+            if is_new:
+                record_decision(root, calibration_id, "import", {"source": folder.name})
+        except (OSError, ValueError) as error:
+            logger.warning("not importing %s into the calibration library: %s", folder, error)
+            continue
+        if calibration_id is None:
+            continue
+        if candidate.active_until is None:
+            active_source = calibration_id
+        if is_new:
+            added.append(calibration_id)
+    if active_source is not None and active_id(root) is None:
+        set_active(root, active_source, by="import")
+    return added
+
+
+def _import_folder(root: Path, known_id: Optional[str], folder: Path) -> Tuple[Optional[str], bool]:
+    """(id, added) for one existing folder; (None, False) when it is not a calibration."""
+    if known_id is not None:
+        if (root / known_id).exists():
+            return known_id, False
+        return add_entry(root, folder), True
+    if (folder / INDEX_FILE).exists():
+        logger.warning("not importing %s: its %s is unreadable or at a format this version does not know",
+                       folder, INDEX_FILE)
+        return None, False
+    pickle_path = folder / _LEGACY_PICKLE
+    if not pickle_path.is_file():
+        logger.warning("not importing %s: it has no %s", folder, _LEGACY_PICKLE.as_posix())
+        return None, False
+    stat = pickle_path.stat()
+    calibration_id = uuid.uuid5(_LEGACY_NAMESPACE, f"{folder.name}|{stat.st_mtime_ns}").hex
+    if (root / calibration_id).exists():
+        return calibration_id, False
+    created = datetime.fromtimestamp(stat.st_mtime).replace(microsecond=0)
+    root.mkdir(parents=True, exist_ok=True)
+    partial = _fresh_partial(root, calibration_id)
+    shutil.copytree(folder, partial)
+    marker = {"format": LEGACY_FORMAT, "id": calibration_id, "created": created.isoformat(timespec="seconds"),
+              "source": folder.name}
+    _replace_text(partial / INDEX_FILE, yaml.safe_dump(marker, sort_keys=False))
+    os.replace(partial, root / calibration_id)
+    logger.info("imported the legacy calibration %s as %s", folder, calibration_id)
+    return calibration_id, True
+
+
+def _read_entry(path: Path, active: Optional[str]) -> LibraryEntry:
+    try:
+        index = load_index(path)
+    except ValueError:
+        if not is_legacy_entry(path):
+            raise
+        data = yaml.safe_load((path / INDEX_FILE).read_text(encoding="utf-8"))
+        created = data["created"]
+        created = created if isinstance(created, datetime) else datetime.fromisoformat(created)
+        calibration_id, cameras, verdict, uncalibrated = str(data["id"]), ["left", "right"], "unknown", {}
+    else:
+        calibration_id, created, verdict = index.id, index.created, index.verdict
+        cameras = [c["name"] for c in index.cameras]
+        uncalibrated = {c["name"]: c["reason"] for c in index.cameras if not c["calibrated"]}
+    if calibration_id != path.name:
+        raise ValueError(f"the folder is named {path.name} but its calibration id is {calibration_id}")
+    return LibraryEntry(
+        id=calibration_id, created=created, cameras=cameras, verdict=verdict,
+        active=calibration_id == active, uncalibrated=uncalibrated, path=path,
+    )
+
+
+def _is_entry_name(name) -> bool:
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and not name.startswith(".")
+        and not name.endswith(_PARTIAL_SUFFIX)
+        and not any(sep in name for sep in ("/", "\\"))
+    )
+
+
+def _fresh_partial(root: Path, calibration_id: str) -> Path:
+    partial = root / (calibration_id + _PARTIAL_SUFFIX)
+    if partial.exists():
+        logger.warning("removing %s, left by an interrupted write to the calibration library", partial)
+        shutil.rmtree(partial)
+    return partial
+
+
+def _now() -> str:
+    return datetime.now().replace(microsecond=0).isoformat()
+
+
+def _replace_text(path: Path, text: str) -> None:
+    """Replace `path` whole, so a crash leaves the old file or the new one, never a mix."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _append_decision(root: Path, record: dict) -> None:
+    """Append one JSON line. A last line a crash left without its newline is ended first."""
+    path = root / DECISIONS_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, default=str) + "\n"
+    with path.open("a+b") as fh:
+        if fh.seek(0, os.SEEK_END) > 0:
+            fh.seek(-1, os.SEEK_END)
+            if fh.read(1) != b"\n":
+                line = "\n" + line
+        fh.write(line.encode("utf-8"))
+        fh.flush()
+        os.fsync(fh.fileno())

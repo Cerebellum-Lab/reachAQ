@@ -16,6 +16,9 @@ from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR
 
 from autotrainer.inference.analysis.prepare_jetson_data import process_raw_data
 from autotrainer.inference.analysis.parse_pellet_presentations_jetson import segment_reaches
+from autotrainer.inference.multires_calibration.geometry import PresetGeometry
+from autotrainer.inference.multires_calibration.library import is_legacy_entry
+from autotrainer.inference.multires_calibration.products import stereo_pair_geometry
 from autotrainer.inference.multires_calibration.store import (
     INDEX_FILE,
     CalibrationGeometryError,
@@ -45,7 +48,8 @@ def resolve_session_calibration(project: ProjectInfo, calib_root: Path) -> Path:
     """The calibration folder under `calib_root` that the session was recorded with.
 
     A session whose metadata names a calibration (hardware.configured.calibration3d.id) uses
-    that calibration, wherever it now is: the active folder or a backup. Any other session
+    that calibration, wherever it now is: the library (<calib_root>/calibrations), the active
+    folder or a backup. Any other session
     uses the calibration that was active when it started (see _session_start for where that
     time comes from). When only the session's day is known, the calibration must not have
     changed that day. Raises CalibrationResolutionError, saying to pass --calib-dir, when the
@@ -151,7 +155,7 @@ def _warn_if_made_after(folder: Path, start: datetime, project: ProjectInfo) -> 
 
 
 def _session_preset(folder: Path, metadata: dict, project: ProjectInfo) -> LoadedPreset:
-    """The preset of the format-2 calibration in `folder` that the session's 2D points are in.
+    """The preset of the format-2 or 3 calibration in `folder` that the session's 2D points are in.
 
     That is the preset its live 3D used, named in its metadata. A session whose live 3D was
     off (calibration3d records a live3dDisabledReason, for example a camera geometry that
@@ -161,6 +165,12 @@ def _session_preset(folder: Path, metadata: dict, project: ProjectInfo) -> Loade
     files are in inference space, the base capture's pixels (spec, "Offline 3D input"). That
     is a session recorded before calibration3d existed, or one whose live 3D ran on a legacy
     calibration and reaches this format-2 folder; the latter is warned about.
+
+    A format-3 calibration may hold no left-right pair at all, and its presets are then empty.
+    Without a preset in the metadata such a session is read at the live preset set, the one
+    the cameras recorded at, when it holds left and right at one geometry; else at the base
+    preset, as above, when the calibration has any left-right preset; otherwise
+    CalibrationGeometryError says there is no preset to read.
     """
     index = load_index(folder)
     calibration3d = _calibration3d(metadata)
@@ -172,17 +182,32 @@ def _session_preset(folder: Path, metadata: dict, project: ProjectInfo) -> Loade
         )
     name = calibration3d.get("preset")
     if name is None:
-        geometry = max(index.presets, key=lambda g: g.binning)
-        if calibration3d:
-            logger.warning(
-                "session %s ran live 3D on a legacy calibration, not the multi-resolution one in %s;"
-                " reading it at the base preset %s", project.short_id, folder, geometry.name)
+        geometry = _live_pair_geometry(index) if index.format >= 3 else None
+        if geometry is not None:
+            logger.info("session %s names no preset; using the live preset set of %s (%s)",
+                        project.short_id, folder, geometry.name)
+        elif not index.presets:
+            raise CalibrationGeometryError(
+                f"the calibration in {folder} has no left-right preset, so session {project.short_id}"
+                f" has none to be read at; {_CALIB_DIR_HINT}"
+            )
         else:
-            logger.info("session %s has no calibration3d; using the base preset %s of %s",
-                        project.short_id, geometry.name, folder)
+            geometry = max(index.presets, key=lambda g: g.binning)
+            if calibration3d:
+                logger.warning(
+                    "session %s ran live 3D on a legacy calibration, not the multi-resolution one in %s;"
+                    " reading it at the base preset %s", project.short_id, folder, geometry.name)
+            else:
+                logger.info("session %s has no calibration3d; using the base preset %s of %s",
+                            project.short_id, geometry.name, folder)
     else:
         matches = [g for g in index.presets if g.name == name]
         if not matches:
+            if not index.presets:
+                raise CalibrationGeometryError(
+                    f"the calibration in {folder} has no left-right preset, so session {project.short_id}"
+                    f" (recorded at preset {name}) cannot be read from it; {_CALIB_DIR_HINT}"
+                )
             available = ", ".join(g.name for g in index.presets)
             raise CalibrationGeometryError(
                 f"session {project.short_id} was recorded at preset {name}, which the calibration in"
@@ -190,6 +215,17 @@ def _session_preset(folder: Path, metadata: dict, project: ProjectInfo) -> Loade
             )
         geometry, = matches
     return load_preset(folder, geometry)
+
+
+def _live_pair_geometry(index) -> Optional[PresetGeometry]:
+    """The geometry left and right share in the calibration's live preset set, or None when it has no such set or pair."""
+    for preset_set in index.preset_sets:
+        if preset_set["name"] == "live":
+            return stereo_pair_geometry({
+                cam: PresetGeometry(g["binning"], g["width"], g["height"], g["offset_x"], g["offset_y"])
+                for cam, g in preset_set["cameras"].items()
+            })
+    return None
 
 
 def intersession_process(
@@ -217,9 +253,10 @@ def intersession_process(
             project, DEFAULT_CONFIG_DIR.expanduser() if calib_root is None else Path(calib_root))
     else:
         calib_src_dir = Path(calib_dir).expanduser()
-    # A folder with a calibration.yaml is format 2, whether or not it reads: a legacy folder
-    # never has one, so it is never read the legacy way (which would also fail obscurely).
-    if calib_src_dir.joinpath(INDEX_FILE).exists():
+    # A folder with a calibration.yaml is format 2 or 3, whether or not it reads: a legacy folder
+    # never has one, so it is never read the legacy way (which would also fail obscurely). The
+    # library's copy of a legacy folder has a generated one, marked format "legacy".
+    if calib_src_dir.joinpath(INDEX_FILE).exists() and not is_legacy_entry(calib_src_dir):
         preset = _session_preset(calib_src_dir, _session_metadata(project), project)
     else:
         preset = None

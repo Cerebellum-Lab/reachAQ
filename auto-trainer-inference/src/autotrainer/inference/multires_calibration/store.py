@@ -30,6 +30,10 @@ left and right, both calibrated, with one preset set per preset.
 A calibration is never written to after it is in place. Every reader here only reads;
 load_preset_set derives a geometry no stored set has into a cache outside the folder.
 
+The calibration library (library.py) keeps calibrations as immutable entries under
+<config>/calibrations/; find_calibration and resolve_for_time look there first and fall back
+to the active folder and its dated backups, which library.import_existing copies in.
+
 A half-written folder never loads. The folder is written as <name>.partial and renamed into
 place only when complete, and calibration.yaml is the last file written into it. A folder
 without calibration.yaml at format 2 or 3 is a legacy, single-geometry calibration, which is
@@ -502,7 +506,17 @@ def calibration_candidates(root: Path, name: str = DEFAULT_3D_CALIB_DIR_NAME) ->
 
 
 def find_calibration(root: Path, calibration_id: str) -> Path:
-    """The folder under `root` whose calibration has id `calibration_id`."""
+    """The folder under `root` whose calibration has id `calibration_id`.
+
+    The library (<root>/calibrations) is searched first, then the active folder and its dated
+    backups, which hold calibrations the library has not imported (library.import_existing).
+    """
+    from autotrainer.inference.multires_calibration import library  # library imports this module
+
+    try:
+        return library.entry_path(library.library_root(root), calibration_id)
+    except CalibrationResolutionError:
+        pass
     matches = [c.path for c in calibration_candidates(root) if c.calibration_id == calibration_id]
     if not matches:
         raise CalibrationResolutionError(f"no calibration under {root} has id {calibration_id}")
@@ -523,11 +537,22 @@ def resolve_for_time(root: Path, when: datetime) -> Path:
     calibration, the one in force then is gone, and the oldest kept one is no stand-in for
     it (spec, Old sessions). A folder that cannot be dated is warned about and returned; it
     fails when it is loaded.
+
+    The library's own record comes first: when decisions.jsonl shows an entry made active at
+    or before `when`, that entry is the one in force. Earlier than its first set_active, the
+    folders above decide, as they did before the library.
     """
+    from autotrainer.inference.multires_calibration import library  # library imports this module
+
     root = Path(root)
     if when.tzinfo is not None:
         # The backup suffixes are local naive times; compare in the same terms.
         when = when.astimezone().replace(tzinfo=None)
+    library_id = library.active_at(library.library_root(root), when)
+    if library_id is not None:
+        folder = library.entry_path(library.library_root(root), library_id)
+        _check_made_by(folder, when)
+        return folder
     candidates = calibration_candidates(root)
     if not candidates:
         raise CalibrationResolutionError(f"no calibration folder under {root}")
@@ -569,26 +594,6 @@ def _check_made_by(folder: Path, when: datetime) -> None:
             f"no kept calibration under {folder.parent} was in force at {when}: {folder.name}, the one active"
             f" then by its end time, was made later, at {created}"
         )
-
-
-def record_override(folder: Path, override: dict) -> None:
-    """Record the operator's override in calibration.yaml and in the quality report.
-
-    Both new files are built before either is written, so an override JSON cannot hold
-    changes nothing. Each file is replaced whole, and the index last.
-    """
-    folder = Path(folder)
-    load_index(folder)  # refuses a folder that is not an intact calibration
-    index_data = _index_data(folder)
-    report = QualityReport.from_json((folder / _REPORT_JSON).read_text(encoding="utf-8"))
-    report.override = dict(override)
-    report_json = report.to_json()
-    index_data["override"] = _plain(dict(override))
-    index_text = _yaml_text(index_data)
-
-    _replace_text(folder / _REPORT_JSON, report_json)
-    _replace_text(folder / _REPORT_TEXT, report.to_text() + "\n")
-    _replace_text(folder / INDEX_FILE, index_text)
 
 
 def _write_preset(

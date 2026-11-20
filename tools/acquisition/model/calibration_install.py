@@ -1,10 +1,14 @@
 """Install a new 3D calibration into the configuration location, as its quality report allows.
 
 A pass or warn report installs at once; a warn only informs. A fail keeps the previous
-calibration unless the operator confirms an override, which is recorded in the new
-calibration before it is installed, so the installed copy carries it.
+calibration unless the operator confirms an override. The override is a decision in the
+library's decisions.jsonl, not an edit of the calibration: library entries never change.
 
-The install never leaves the location half-copied: the new folder is copied in beside the
+An install adds the calibration to the library (<location>/calibrations) and makes it the
+active entry. Until the readers use the library, it also keeps the 4mm_6r_8c_4x folder
+current, which the app still loads.
+
+That folder is never left half-copied: the new folder is copied in beside the
 active one as <name>.partial, the active one is renamed to its dated backup, and the copy
 is then renamed into place. A copy that fails leaves the previous calibration untouched,
 and a final rename that fails puts it back.
@@ -14,6 +18,7 @@ previous one: it is measured by DCS against a calibration, so the previous offse
 stale in the new frame, and DCS writes new ones once it is redone.
 """
 
+import getpass
 import os
 import shutil
 from datetime import datetime
@@ -24,6 +29,13 @@ from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.core.project.project_info import DATE_TIME_FORMAT
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
+from autotrainer.inference.multires_calibration.library import (
+    add_entry,
+    discard_entry,
+    library_root,
+    record_decision,
+    set_active,
+)
 
 logger = get_verbose_logger(__name__)
 
@@ -49,14 +61,29 @@ def override_record(user: str, now: datetime) -> dict:
     return {"confirmed": True, "by": user, "at": now.isoformat()}
 
 
-def install_calibration(new_dir: Path, configuration_location: Path, *, now: datetime) -> Tuple[Path, Optional[Path]]:
+def install_calibration(
+    new_dir: Path,
+    configuration_location: Path,
+    *,
+    now: datetime,
+    by: Optional[str] = None,
+    override: Optional[dict] = None,
+) -> Tuple[Path, Optional[Path]]:
     """Make `new_dir` the active calibration under `configuration_location`.
 
-    Returns (the installed folder, the previous one's dated backup or None). The previous
-    folder is renamed to <name>_<now in DATE_TIME_FORMAT>, the suffix the store reads as
-    the time it stopped being active. `new_dir` is copied, not moved, and stays as it is.
+    `new_dir` is added to the library as a new entry, which is made the active one by `by`
+    (the operating-system user when None); `override`, the operator's confirmation of a
+    failed report, is appended to the library's decisions then. Returns (the installed
+    4mm_6r_8c_4x folder, the previous one's dated backup or None). The previous folder is
+    renamed to <name>_<now in DATE_TIME_FORMAT>, the suffix the store reads as the time it
+    stopped being active. `new_dir` is copied, not moved, and stays as it is.
+
+    When the folder swap fails the new entry is removed again and the previous calibration
+    stays active, so the install can be retried. A decision that cannot be written after the
+    install is logged, not raised: the calibration is installed by then.
     """
     new_dir = Path(new_dir)
+    root = library_root(configuration_location)
     target = Path(configuration_location) / DEFAULT_3D_CALIB_DIR_NAME
     partial = target.with_name(target.name + _PARTIAL_SUFFIX)
     backup = target.with_name(f"{target.name}_{now.strftime(DATE_TIME_FORMAT)}") if target.exists() else None
@@ -68,17 +95,36 @@ def install_calibration(new_dir: Path, configuration_location: Path, *, now: dat
     if partial.exists():
         logger.warning("removing %s, left by an interrupted calibration install", partial)
         shutil.rmtree(partial)
-    shutil.copytree(new_dir, partial, ignore=_without_camera_offsets)
-    if backup is not None:
-        target.rename(backup)
-        logger.info("previous 3D calibration moved to %s", backup)
+    calibration_id = add_entry(root, new_dir)
     try:
-        os.replace(partial, target)
-    except BaseException:
+        shutil.copytree(new_dir, partial, ignore=_without_camera_offsets)
         if backup is not None:
-            backup.rename(target)
-            logger.warning("could not install %s; the previous calibration is back in place", new_dir)
+            target.rename(backup)
+            logger.info("previous 3D calibration moved to %s", backup)
+        try:
+            os.replace(partial, target)
+        except BaseException:
+            if backup is not None:
+                backup.rename(target)
+                logger.warning("could not install %s; the previous calibration is back in place", new_dir)
+            raise
+        try:
+            set_active(root, calibration_id, by=by or getpass.getuser())
+        except BaseException:
+            # The folder swap is done; undo it so the previous calibration stays the active one.
+            shutil.rmtree(target)
+            if backup is not None:
+                backup.rename(target)
+            raise
+    except BaseException:
+        discard_entry(root, calibration_id)
         raise
+    if override is not None:
+        try:
+            record_decision(root, calibration_id, "override", dict(override))
+        except OSError:
+            logger.exception("calibration %s is installed, but its override could not be recorded: %s",
+                             calibration_id, override)
     logger.success("installed the 3D calibration from %s into %s", new_dir, target)
     return target, backup
 
