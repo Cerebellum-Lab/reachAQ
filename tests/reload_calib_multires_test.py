@@ -545,6 +545,24 @@ def test_subset_is_only_a_passive_note(app_model, tmp_path):
     assert not difference.differs
 
 
+def test_an_independent_stim_camera_is_never_added(app_model, tmp_path):
+    # stimCam in stimulation mode is never 3D-posed, so recording it against a calibration
+    # without it needs no confirmation. It is still 2D only, and says so. The fixture
+    # configures left and right only, so right's body stands in for the stimCam.
+    _active_entry(app_model, tmp_path)
+    _configure_with_serials(app_model, {"left": SERIALS["left"], "right": "21000003"})
+    stim = app_model.right_camera
+    stim._name = "stimCam"
+    with mock.patch.object(app_model, "on_error"):
+        app_model.reload_calib(None)
+    selected = ["left", "stimCam"]
+    assert app_model.camera_setup_difference(selected).added == ["stimCam"]
+    with mock.patch.object(AppModel, "_is_independent_stim_camera", side_effect=lambda camera: camera is stim):
+        difference = app_model.camera_setup_difference(selected)
+    assert difference == SetupDifference(added=[], removed=["right"], swapped=[], uncalibrated_off=[])
+    assert app_model.uncalibrated_reasons["stimCam"] == "not in the active calibration"
+
+
 def test_a_calibrated_camera_no_longer_configured_is_removed(app_model, tmp_path):
     _active_entry(app_model, tmp_path)
     # right's body is replaced, and right is not selected: its calibrated body is gone.

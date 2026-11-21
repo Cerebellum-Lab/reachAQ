@@ -24,9 +24,9 @@ used, see
   acquisition".
 - The left camera is configured at binning 4, the live preset. A binning that
   is not a multiple of 4 stops the capture before the stage moves.
-- The capture records left and right for now (the calibration dialog's choice of
-  2 to 6 cameras comes later). Each camera's own configured geometry gives its
-  presets, and `waypoints.yaml` records each camera's name, serial and camera id.
+- The capture records the 2 to 6 cameras ticked in the calibration dialog
+  (below). Each camera's own configured geometry gives its presets, and
+  `waypoints.yaml` records each camera's name, serial and camera id.
 
 ## Steps
 
@@ -34,8 +34,10 @@ used, see
    corners. Mount it so it moves with the stage and both cameras see it at the
    start position. The board is only translated, never tilted, and its
    orientation on the stage does not need to be measured: the fit solves for it.
-2. Choose **Tools → Make 3D calibration**.
-3. Wait while the stage runs. Both cameras record the full sensor (1440 x 1080,
+2. Choose **Tools → Make 3D calibration**, tick the cameras to calibrate and
+   press **Start** (see
+   [Choosing cameras, the library, and the recording warning](#choosing-cameras-the-library-and-the-recording-warning)).
+3. Wait while the stage runs. The cameras record the full sensor (1440 x 1080,
    binning 1, gain 1.0 dB, gamma off, 4500 µs exposure, 40 fps) while the stage
    homes, goes to the start position, and then visits **37 positions**. Waypoint
    0 is the start and the other 36 are single-axis moves; one move repeats the
@@ -69,7 +71,11 @@ below the stage's lower limit is commanded at the limit and logged; see
 
 The report starts with every camera that could not be calibrated, then lists
 failures, warnings and passes, each with its value and limits, then notes. The
-thresholds are in [The quality report](#the-quality-report).
+thresholds are in [The quality report](#the-quality-report). On screen (the
+installed report, the failed-report dialog and **Show report** in the library),
+each camera that could not be calibrated is a red line at the top, for example
+**camera4 NOT CALIBRATED (2D only): too few board views: 4 of 12 needed**, then
+the verdict, then the rest of the report.
 
 ### A camera that saw too little: 2D only
 
@@ -131,6 +137,73 @@ and a session recorded meanwhile carries `live3dDisabledReason`, which offline
 3D refuses. The next configuration load or a restart loads the installed entry
 again. Any explicit reload that fails (the DCS run's too) leaves live 3D off the
 same way.
+
+## Choosing cameras, the library, and the recording warning
+
+### The calibration dialog
+
+**Tools → Make 3D calibration** first opens a dialog with one checkbox per
+configured camera, labelled `<name> (<serial>)`, all ticked; the stimCam is
+listed and ticked too when it is a real camera. A camera that is disabled, has
+no hardware (its scheme is not `spinnaker`, such as `random`) is unticked and cannot be ticked; the reason is shown beside it and as its
+tooltip. **Start** is available only with 2 to 6 cameras ticked; **Cancel**
+starts nothing. The cameras are captured in camera-list order with the
+configured primary first.
+
+- **Move list**: *hand-written* is the only choice for now; *automatic (scout)*
+  is shown but not available yet.
+- **Capture reference images** is shown but not available yet.
+
+### The calibration library
+
+**Tools → Calibration library…** lists every calibration in the library, newest
+first: its id (the first 8 characters; the full id is the tooltip), when it was
+made, its cameras, its verdict, which one is **active**, and the cameras it left
+**2D only**, each with its reason, in red.
+
+- **Set active** makes the selected calibration the active one and loads it at
+  once, as an install does. It is refused while a session records or a
+  calibration runs. It is recorded in `decisions.jsonl` like any other change
+  of the active calibration, and a DCS measured against another calibration is
+  then out of date (below).
+- **Show report** shows the selected calibration's report as the result page
+  does. A legacy calibration has no report.
+
+### 2D-only cameras while recording
+
+Each camera that the active calibration does not 3D-calibrate shows a red
+**2D only** tag beside its name on its camera panel, with the reason as the
+tooltip: "not in the active calibration", "swapped: calibrated serial X, now Y",
+the calibration's own reason (such as "too few board views: 4 of 12 needed"), or
+"no active 3D calibration". The tags follow every calibration and configuration
+load.
+
+### The recording warning
+
+When **Record** is pressed and the recording cameras differ from the active
+calibration's, the app asks first:
+
+> **Calibration looks needed**: Camera setup differs from the active
+> calibration; a calibration looks needed. Record anyway?
+
+followed by one line per difference:
+
+- `Added, not in the calibration: <cameras>`: recording cameras the calibration
+  does not have. The stimCam in stimulation mode never counts: it is never
+  3D-posed.
+- `Removed, calibrated but no longer configured: <cameras>`: calibrated cameras
+  whose body (serial) no configured camera has any more.
+- `Swapped for another camera body: <name>, calibrated serial X, now Y`: a
+  camera with the calibration's name but another serial.
+
+**No** (the default) records nothing. **Yes** records, and the session metadata
+says `mismatchAcknowledged: true`. The answer covers that one start: the next
+Record asks again. Headless and API starts never ask; they record the mismatch
+with `mismatchAcknowledged: false`.
+
+A calibrated camera that is only turned off for this recording is not a
+difference: Record does not ask, and the status bar notes it, for example
+**Calibrated cameras not recording: right**.
 
 ## After a new calibration: redo the coordinate system
 

@@ -704,7 +704,12 @@ both the session and the acquisition metadata:
   `[{name, calibratedSerial, recordedSerial}]`. A calibrated camera that is
   simply not recording is not a mismatch. Null without a calibration.
 - `mismatchAcknowledged`: true when the operator chose to record anyway with
-  exactly this difference (`AppModel.acknowledge_setup_difference`).
+  exactly these added, removed and swapped cameras
+  (`AppModel.acknowledge_setup_difference`, the GUI's "Record anyway?"). Calibrated
+  cameras turned off do not change it. An acknowledgement covers the one recording
+  start it was given for; headless and API starts never ask, so they record any
+  mismatch with false. The independent stimCam is never `added`: it is never
+  3D-posed.
 - `created`: when the calibration was made, local ISO time to the second. A
   legacy folder records no date, so its `camera_matrix/stereo_params.pickle`
   modification time stands in.

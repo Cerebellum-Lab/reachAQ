@@ -71,6 +71,8 @@ class CameraContent(ContentWidget):
         NotificationCenter.default_center().add_observer(TriggerNotification.CAPTURE_ID, self._trigger_received)
 
         capture_model.property_changed += self._on_model_property_changed
+        app_model.property_changed += self._on_app_model_property_changed
+        self._refresh_calibration_tag()
 
         # Swap because model shape is row x col == height x width
         capture_view.setShape(capture_model.shape[1], capture_model.shape[0])
@@ -85,6 +87,7 @@ class CameraContent(ContentWidget):
     def close(self):
         NotificationCenter.default_center().remove_observer(TriggerNotification.CAPTURE_ID, self._trigger_received)
         self._model.property_changed -= self._on_model_property_changed
+        self._app_model.property_changed -= self._on_app_model_property_changed
         # The panel holds a running timer and an observer on the telemetry
         # model, which outlives this view; leaving either attached keeps the
         # widget alive and ticking after it is gone.
@@ -139,6 +142,17 @@ class CameraContent(ContentWidget):
     def _trigger_received(self, notification: Notification):
         if self._model.is_enabled and self._model.record_mode == VideoRecordMode.TRIGGER:
             self._capture_view.recording_indicator_changed.emit(notification.context)
+
+    @invoke_method
+    def _on_app_model_property_changed(self, name, value, _):
+        if name == AppModel.Props.CAMERA_CALIBRATION:
+            self._refresh_calibration_tag()
+
+    def _refresh_calibration_tag(self) -> None:
+        """"2D only" beside the camera's name while the active calibration does not calibrate
+        it, with the reason as the tooltip."""
+        reason = self._app_model.uncalibrated_reasons.get(self._model.name)
+        self._capture_view.setTag("" if reason is None else "2D only", reason or "")
 
     @invoke_method
     def _on_model_property_changed(self, name, value, _):

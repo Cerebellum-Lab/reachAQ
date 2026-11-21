@@ -34,6 +34,7 @@ from tools.acquisition.model.app_model_status import AppModelStatus
 from tools.acquisition.model.calibration_install import decide_install, install_calibration, override_record
 from tools.acquisition.model.dcs_state import DcsState
 from tools.acquisition.view import main_window as main_window_module
+from tools.acquisition.view.calibration_dialog import CalibrationRequest
 from tools.acquisition.view.main_window import MainWindow
 
 
@@ -374,16 +375,19 @@ def test_on_3d_calibrate_hands_the_calibration_to_the_install_flow_still_held(tm
     window, seen = _window(location, monkeypatch, override_answer=False)
     window._app_model.status = AppModelStatus.IDLE
     window._finish_3d_calib = partial(MainWindow._finish_3d_calib, window)
+    left, right = SimpleNamespace(name="left"), SimpleNamespace(name="right")
+    window._app_model.cameras = (left, right)
+    window._ask_calibration_cameras = lambda: CalibrationRequest(["left", "right"], "handwritten", False)
     asked = []
     monkeypatch.setattr(main_window_module, "make_3d_calib",
-                        lambda app_model, cameras: asked.append(cameras) or produced)
+                        lambda app_model, cameras, move_list=None: asked.append(cameras) or produced)
     monkeypatch.setattr(main_window_module, "threading", SimpleNamespace(Thread=_InlineThread))
     # show_result runs where it is called, instead of being posted to a Qt event loop.
     monkeypatch.setattr(main_window_module, "invoke_method", lambda method: method)
 
     MainWindow.on_3d_calibrate(window, True)
 
-    assert asked == [["left", "right"]], "left and right until the dialog chooses"
+    assert asked == [[left, right]], "the cameras the dialog chose"
     assert seen.given_back == [("ask", False)]
     assert seen.events == [(ApiEventKind.calibration3dCompleted,)]
     assert _given_back(window)

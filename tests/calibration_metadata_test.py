@@ -281,9 +281,34 @@ def test_metadata_schema_3_fields(app_model, tmp_path):
         "serial": "21000002", "cameraId": 1, "inCalibration": True, "uncalibratedReason": None,
     }
 
-    # A different setup than the one acknowledged is not acknowledged.
+    # A calibrated camera turned off is only a passive note: the acknowledgement stands.
     app_model.right_camera.is_recording_enabled = False
+    assert _saved_calibration3d(app_model, tmp_path)["mismatchAcknowledged"] is True
+    # A different setup than the one acknowledged is not acknowledged.
+    app_model.right_camera.is_recording_enabled = True
+    _configure_with_serials(app_model, {"left": "21000099", "right": "21000098"})
     assert _saved_calibration3d(app_model, tmp_path)["mismatchAcknowledged"] is False
+
+
+def test_an_acknowledgement_covers_one_recording_start(app_model, tmp_path):
+    """The operator's "Record anyway" is for the start it was asked for. The next start that
+    is not asked again records the mismatch unacknowledged, as a headless start does."""
+    _active_entry(app_model, tmp_path)
+    _configure_with_serials(app_model, {"left": "21000099", "right": SERIALS["right"]})
+    app_model.left_camera.is_recording_enabled = True
+    app_model.right_camera.is_recording_enabled = True
+    with mock.patch.object(app_model, "on_error"):
+        app_model.reload_calib(None)
+    assert app_model.session_recording_status.value == "ready"
+    with mock.patch.object(app_model, "_start_recording_locked", return_value=True):
+        app_model.acknowledge_setup_difference()
+        assert app_model.start_recording()
+        # The start it was given for keeps it, for every save of that session's metadata.
+        assert _saved_calibration3d(app_model, tmp_path)["mismatchAcknowledged"] is True
+        assert app_model.start_recording()
+    calibration3d = _saved_calibration3d(app_model, tmp_path)
+    assert calibration3d["matchesRecording"] is False
+    assert calibration3d["mismatchAcknowledged"] is False
 
 
 def test_schema_2_session_still_resolves(app_model, user_pref, calib_dir, tmp_path):

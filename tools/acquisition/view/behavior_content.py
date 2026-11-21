@@ -18,6 +18,7 @@ from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import SessionRecordingStatus
 from tools.acquisition.model.inference_model import InferenceModel
 from tools.acquisition.model.behavior_model import BehaviorModel
+from tools.acquisition.view.calibration_dialog import confirm_camera_setup
 
 
 def inference_status_display(value) -> str:
@@ -243,13 +244,18 @@ class BehaviorContent(ContentWidget):
         self._update_recording_controls(self._app_model.session_recording_status)
 
     def _start_recording(self):
+        # Asked before the start: cameras that differ from the active calibration's need the
+        # operator's "Record anyway"; calibrated cameras only turned off are a passive note.
+        proceed, setup_note = confirm_camera_setup(self, self._app_model)
+        if not proceed:
+            return
         if not self._app_model.start_recording():
             return
         # Warnings do not hold Record back, so they are said as it starts.
-        notice = self._app_model.protocol_check_notice
+        notices = [text for text in (self._app_model.protocol_check_notice, setup_note) if text]
         window = self.window()
-        if notice and hasattr(window, "statusBar"):
-            window.statusBar().showMessage(notice, 15000)
+        if notices and hasattr(window, "statusBar"):
+            window.statusBar().showMessage(" | ".join(notices), 15000)
 
     def _update_recording_controls(self, status: SessionRecordingStatus):
         self._recording_status_label.setText(status.value.capitalize())

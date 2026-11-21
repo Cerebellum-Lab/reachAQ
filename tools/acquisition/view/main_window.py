@@ -10,7 +10,6 @@ import math
 import traceback
 import dataclasses
 import getpass
-import html
 from datetime import datetime
 from functools import partial
 from itertools import chain
@@ -38,6 +37,7 @@ from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.inference import InferenceStatus, PoseResponse
 from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.analysis.prepare_jetson_data import make_cam_offsets_dict
+from autotrainer.inference.multires_calibration import library
 from autotrainer.inference.multires_calibration.report import QualityReport
 from autotrainer.inference.multires_calibration.store import CalibrationIndex, calibration_created
 
@@ -64,6 +64,8 @@ from tools.acquisition.model.rfid_resolution import RfidResolutionKind
 from tools.acquisition.model.subsystem_status import SubsystemState
 from tools.acquisition.model.training_plan import get_plan_id
 from tools.acquisition.model.user_preferences import UserPreferences
+from tools.acquisition.view.calibration_dialog import CalibrationDialog, CalibrationRequest, result_page
+from tools.acquisition.view.calibration_library_view import CalibrationLibraryView
 from tools.acquisition.view.main_content import MainContent
 from tools.acquisition.view.multi_selection_menu import MultiSelectionMenu
 from tools.acquisition.view.ui_availability import calculate_ui_availability
@@ -111,11 +113,6 @@ def _allow_bidirectional_window_resizing(window: QMainWindow) -> None:
     window.setMinimumSize(_MINIMUM_RESIZABLE_WINDOW_SIZE)
     window.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
     window.layout().setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
-
-
-def _preformatted(text: str) -> str:
-    """`text` as rich text in a fixed-width font, so a message box keeps its columns."""
-    return f"<pre>{html.escape(text)}</pre>"
 
 
 class MainWindow(QMainWindow):
@@ -877,14 +874,22 @@ class MainWindow(QMainWindow):
         if not is_toggled:
             return
         app_model = self._app_model
+        request = self._ask_calibration_cameras()
+        if request is None:
+            # Cancelled: nothing started, so Run and the action are given back as they were.
+            self.run_action.setEnabled(True)
+            self.make_3d_calib_action.setChecked(False)
+            return
+        # The dialog's choice, in its order: the configured primary first, then camera-list order.
+        by_name = {camera.name: camera for camera in app_model.cameras}
+        cameras = [by_name[name] for name in request.cameras]
         prev_status, app_model.status = app_model.status, AppModelStatus.CALIBRATION_3D
         error = "Processing unfinished"
         result: Optional[Tuple[Path, Path, CalibrationIndex, QualityReport]] = None
         def handle_3d_calib():
             nonlocal error, result
             try:
-                # Left and right for now; the calibration dialog's choice of cameras replaces them.
-                result = make_3d_calib(self._app_model, [self._app_model.left_camera, self._app_model.right_camera])
+                result = make_3d_calib(self._app_model, cameras, move_list=request.move_list)
             except Exception as err:
                 logger.exception("3d-calib failed: %s", err)
                 error = err
@@ -906,6 +911,13 @@ class MainWindow(QMainWindow):
         waiter_thread = threading.Thread(target=wait_3d_calib_done, name="wait-3d-calibration",
                                          args=(executor_thread,), daemon=True)
         waiter_thread.start()
+
+    def _ask_calibration_cameras(self) -> Optional[CalibrationRequest]:
+        """Which cameras to calibrate, from the calibration dialog; None when cancelled."""
+        dialog = CalibrationDialog(self._app_model.cameras, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.request()
 
     def _finish_3d_calib(self, error, result, prev_status: AppModelStatus) -> None:
         """Install the calibration make_3d_calib produced, as its quality report allows, or show why it failed.
@@ -971,7 +983,7 @@ class MainWindow(QMainWindow):
                 "3D calibration not loaded",
                 f"3D calibration installed, but it could not be loaded: {reason}. Restart the app.",
                 QMessageBox.Icon.Warning)
-        self._show_msg_box("3D calibration installed", _preformatted(report.to_text()), QMessageBox.Icon.Information)
+        self._show_msg_box("3D calibration installed", result_page(report), QMessageBox.Icon.Information)
         # A DCS measured against the previous calibration is held off and blocks Record until
         # it is redone. With no DCS at all, the existing missing-DCS warning applies instead.
         if self._app_model.dcs_state is DcsState.STALE:
@@ -1021,7 +1033,7 @@ class MainWindow(QMainWindow):
         box = QMessageBox(self)
         box.setWindowTitle("3D calibration failed its quality checks")
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setText(_preformatted(report.to_text()))
+        box.setText(result_page(report))
         keep = box.addButton("Keep previous", QMessageBox.ButtonRole.RejectRole)
         install = box.addButton("Install anyway…", QMessageBox.ButtonRole.AcceptRole)
         box.setDefaultButton(keep)
@@ -1036,6 +1048,35 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         return rsp == QMessageBox.StandardButton.Yes
+
+    def _on_calibration_library(self) -> None:
+        view = CalibrationLibraryView(
+            self._app_model.calibration_library_root, set_active=self._set_active_calibration, parent=self)
+        view.exec()
+
+    def _set_active_calibration(self, calibration_id: str) -> Optional[str]:
+        """Make library entry `calibration_id` the active calibration and load it.
+
+        Refused while a session or a calibration runs: live 3D must not change under it.
+        Returns None, or why it was not set or not loaded.
+        """
+        app_model = self._app_model
+        if (app_model.status == AppModelStatus.CALIBRATION_3D
+                or app_model.session_recording_status != SessionRecordingStatus.READY):
+            return "Stop the recording or calibration first: the active calibration cannot change while one runs."
+        library.set_active(app_model.calibration_library_root, calibration_id, by=getpass.getuser())
+        try:
+            app_model.reload_calib(None)
+        except Exception as err:
+            logger.exception("3D calibration %s: set active, but could not be loaded", calibration_id)
+            return f"Set active, but it could not be loaded: {err or type(err).__name__}. Restart the app."
+        logger.success("3D calibration %s: set active", calibration_id)
+        if app_model.dcs_state is DcsState.STALE:
+            self._show_msg_box(
+                "Coordinate system out of date",
+                "Redo Tools → Calibrate Coordinate System before running sessions.",
+                QMessageBox.Icon.Warning)
+        return None
 
     @invoke_method
     def _show_msg_box(self, title, text, icon):
@@ -1373,6 +1414,10 @@ class MainWindow(QMainWindow):
         action.setCheckable(True)
         action.triggered.connect(self.on_3d_calibrate)
 
+        action = self.calibration_library_action = QAction("Calibration library…", self)
+        action.setToolTip("Every 3D calibration, which one is active, and which cameras each left 2D only")
+        action.triggered.connect(self._on_calibration_library)
+
         action = self.daq_monitor_action = QAction(
             _toolbar_icon("fa5s.wave-square"), "DAQ Monitor", self)
         action.setToolTip(
@@ -1452,6 +1497,7 @@ class MainWindow(QMainWindow):
         tools_menu.addSeparator()
         tools_menu.addAction(self.calib_diamond_triangle_action)
         tools_menu.addAction(self.make_3d_calib_action)
+        tools_menu.addAction(self.calibration_library_action)
         tools_menu.addSeparator()
         resolution_menu = tools_menu.addMenu("Camera resolution")
         for action in self.capture_binning_actions.values():

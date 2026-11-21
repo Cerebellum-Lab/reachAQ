@@ -588,6 +588,11 @@ class SetupDifference:
     def differs(self) -> bool:
         return bool(self.added or self.removed or self.swapped)
 
+    @property
+    def confirmable(self) -> Tuple[Tuple[str, ...], Tuple[str, ...], Tuple[str, ...]]:
+        """(added, removed, swapped): what the operator confirms, without the passive note."""
+        return tuple(self.added), tuple(self.removed), tuple(self.swapped)
+
 
 def _load_camera_offsets(calib_dir: Path, offsets_path: Optional[Path] = None) -> Dict[str, Any]:
     """The live 3D camera offsets for the calibration in `calib_dir`, or zero offsets when it has none.
@@ -822,6 +827,9 @@ class AppModel(ObservableObject):
         INTERNAL_ERROR_DIAGNOSTIC = "internal_error_diagnostic"
         TRIAL_PROTOCOL_STATE = "trial_protocol_state"
         SESSION_VALIDATION_STATE = "session_validation_state"
+        # Which configured cameras are 2D only (uncalibrated_reasons), after every calibration
+        # or configuration load.
+        CAMERA_CALIBRATION = "camera_calibration"
 
     def __init__(
             self,
@@ -1148,7 +1156,10 @@ class AppModel(ObservableObject):
         # the last resolution picked; the setup difference the operator said to record anyway.
         self._active_calibration_format: Optional[Union[int, str]] = None
         self._resolved_calibration_folder: Optional[Path] = None
-        self._acknowledged_difference: Optional[SetupDifference] = None
+        # What the operator confirmed (SetupDifference.confirmable), for one recording start:
+        # the start after acknowledge_setup_difference keeps it, any later start clears it.
+        self._acknowledged_difference: Optional[Tuple[Tuple[str, ...], ...]] = None
+        self._acknowledgement_pending = False
         # No DCS configuration is loaded before the first configuration load, which
         # recomputes this (refresh_dcs_state), as every later calibration or DCS load does.
         self._dcs_state = DcsState.MISSING
@@ -1617,6 +1628,12 @@ class AppModel(ObservableObject):
 
     def start_recording(self) -> bool:
         with self._session_lifecycle_command_lock:
+            if self._recording_session.status == SessionRecordingStatus.READY:
+                # An acknowledgement covers the one start it was given for: a start not asked
+                # again (the next one, or any headless or API start) records it unacknowledged.
+                if not self._acknowledgement_pending:
+                    self._acknowledged_difference = None
+                self._acknowledgement_pending = False
             return self._start_recording_locked()
 
     def _start_recording_locked(self) -> bool:
@@ -2788,13 +2805,18 @@ class AppModel(ObservableObject):
         if cameras is None:
             return SetupDifference([], [], [], [])
         match = match_cameras(cameras, self._configured_serials())
+        # The independent stimCam is never 3D-posed, so a calibration without it is no difference.
+        never_posed = {camera.name for camera in self._cameras if self._is_independent_stim_camera(camera)}
         swapped = [name for name in selected if name in match.swapped]
         removed = [
             c["name"] for c in cameras
             if c.get("calibrated", True) and c["name"] not in match.matched and c["name"] not in swapped
         ]
         return SetupDifference(
-            added=[name for name in selected if match.reasons.get(name) == NOT_IN_CALIBRATION],
+            added=[
+                name for name in selected
+                if match.reasons.get(name) == NOT_IN_CALIBRATION and name not in never_posed
+            ],
             removed=removed,
             swapped=swapped,
             uncalibrated_off=[name for name in match.calibrated if name not in selected],
@@ -2803,11 +2825,18 @@ class AppModel(ObservableObject):
     def _recording_camera_names(self) -> List[str]:
         return [camera.name for camera in self._cameras if camera.is_recording_enabled]
 
+    @property
+    def recording_camera_names(self) -> List[str]:
+        """The cameras a recording started now would record, in camera order."""
+        return self._recording_camera_names()
+
     def acknowledge_setup_difference(self) -> None:
         """The operator chose to record with the selected cameras although they differ from the
-        active calibration's. The session metadata records mismatchAcknowledged while the
-        difference stays the one acknowledged."""
-        self._acknowledged_difference = self.camera_setup_difference(self._recording_camera_names())
+        active calibration's. The session metadata records mismatchAcknowledged while the added,
+        removed and swapped cameras stay the ones acknowledged; calibrated cameras turned off
+        are only a passive note and do not matter. It covers the next recording start only."""
+        self._acknowledged_difference = self.camera_setup_difference(self._recording_camera_names()).confirmable
+        self._acknowledgement_pending = True
 
     @property
     def active_calibration_dir(self) -> Optional[Path]:
@@ -2842,6 +2871,9 @@ class AppModel(ObservableObject):
             # The hold announces only a changed configuration, so a None that stays None
             # (stale, then missing) would leave the hardware the old reason to refuse with.
             self._hand_dcs_to_hardware(algo.diamond_triangle_config)
+            # Every calibration and configuration load ends here, so the cameras' "2D only"
+            # tags follow them.
+            self.property_changed(self.Props.CAMERA_CALIBRATION, self.uncalibrated_reasons, None)
             if state is prev:
                 return state
             logger.info("coordinate system (DCS) %s -> %s", prev.value, state.value)
@@ -2921,7 +2953,8 @@ class AppModel(ObservableObject):
                 ],
             },
             "mismatchAcknowledged": bool(
-                difference is not None and difference.differs and difference == self._acknowledged_difference),
+                difference is not None and difference.differs
+                and difference.confirmable == self._acknowledged_difference),
         }
         if self._pose_algorithm is None or self._pose_algorithm.stereo_params is None:
             record["preset"] = None
