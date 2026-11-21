@@ -514,13 +514,24 @@ calibrations/
   the entry the log shows as active then, or, for a time before the log begins,
   the old folders' dated backups as before.
 - **The app loads the active entry.** At start, and whenever no calibration
-  folder is given, it reads `active.yaml`. When the library has no `active.yaml`
-  yet, the app first runs `import_existing`, so a rig keeps its calibration on
-  its first start with the library. A missing, corrupt or dangling pointer, or
-  an entry that cannot be read (a half-written file after a power cut), never
-  stops the app: it records 2D, and `live3dDisabledReason` says why, for example
-  "no active 3D calibration: …/calibrations/active.yaml does not exist" or
-  "could not load …/calibrations/<id>: …".
+  folder is given, it reads `active.yaml`. When the library has never been used
+  (no entry and no `decisions.jsonl`), the app first runs `import_existing`, so a
+  rig keeps its calibration on its first start with the library. A library that
+  has entries but no `active.yaml` is not imported into again, since that could
+  make an old folder's calibration active behind the operator's back: the app
+  records 2D with "no active calibration in …/calibrations: active.yaml is
+  missing" until a calibration is made active. A missing, corrupt or dangling
+  pointer, or an entry that cannot be read (a half-written file after a power
+  cut), never stops the app: it records 2D, and `live3dDisabledReason` says why,
+  for example "no active 3D calibration: …/calibrations/active.yaml does not
+  exist" or "could not load …/calibrations/<id>: …". While the active
+  calibration cannot be read, no camera is in it: every camera is recorded with
+  `inCalibration: false` and the reason "the active calibration <id> could not
+  be read: <error>", and `matchesRecording` is false.
+- **DCS needs an active calibration.** Without one, Calibrate Coordinate System
+  is refused with "Calibrate Coordinate System needs an active 3D calibration,
+  and there is none: make or activate a 3D calibration first", and nothing is
+  written; it no longer creates a stand-in `4mm_6r_8c_4x` folder.
 - **Cameras are matched by serial.** A configured camera is the calibration's
   camera with the same serial (`host` of a Spinnaker camera), so renaming a
   camera keeps its calibration. A camera with no serial on either side
@@ -540,8 +551,10 @@ calibrations/
   nothing changes unless you switch it off. It is stored as `live3d: true` or
   `false` in `calibrations/settings.yaml`; a missing, empty or corrupt file
   means on, and the file is replaced whole (temp file, then rename), keeping any
-  other key in it. Switching it reinstalls the pose algorithm at once, and only
-  while the session is Ready.
+  other key in it. It is read once per calibration load and when it is
+  switched, not on every use. Switching it reinstalls the pose algorithm at once,
+  and only while the session is Ready; outside Ready the switch goes back and
+  Preferences shows why.
   - **Off**, 2D pose keeps running. The drift monitor and the DCS are
     unavailable, with the reason "live 3D is off": the loaded DCS configuration
     is kept but not used (as when it is out of date), a move given in DCS is

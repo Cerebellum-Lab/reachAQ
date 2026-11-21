@@ -382,6 +382,44 @@ def test_the_dcs_calibration_against_a_legacy_folder_records_no_id(
     assert app_model.dcs_state is DcsState.VALID
 
 
+def test_a_dcs_run_without_an_active_calibration_writes_nothing(app_model, dcs_path, user_pref, monkeypatch):
+    # No calibration at all: the run used to write its offsets into a stand-in 4mm_6r_8c_4x.
+    with mock.patch.object(app_model, "on_error"):
+        app_model.reload_calib(None)
+    assert app_model.active_calibration_dir is None
+    warnings, events = [], []
+    monkeypatch.setattr(main_window_module, "QMessageBox", SimpleNamespace(
+        warning=lambda parent, title, text, *args: warnings.append((title, text)),
+        information=lambda *args, **kwargs: pytest.fail("saved"),
+        StandardButton=QMessageBox.StandardButton,
+    ))
+    dcs_path.unlink(missing_ok=True)
+    action = mock.Mock()
+    window = SimpleNamespace(_app_model=app_model, _preferences=user_pref, _diamond_triangle_calib_run=None,
+                             calib_diamond_triangle_action=action,
+                             _timer_calibrate_diamond_triangle=mock.Mock(),
+                             _post_api_event=lambda kind, *args: events.append((kind, args)))
+
+    MainWindow.on_calibrate_diamond_triangle(window, True)
+    assert window._diamond_triangle_calib_run is None, "the run never started"
+    action.setChecked.assert_called_once_with(False)
+
+    MainWindow._handle_diamond_triangle_calib_run(
+        window,
+        positions=[Offset3DTuple(7.0, 4.5, 6.5)] * 10,
+        offsets=[Offset3DTuple(4.0, -33.0, -8.0)] * 10,
+        diamond_locs3d=[Offset3DTuple(0.1, 0.2, 0.3)] * 10,
+        raw_diamond_3d=[Offset3DTuple(3.0, -19.0, 0.5)] * 10,
+    )
+
+    reason = app_model.dcs_refusal()
+    assert warnings == [("Calibrate Coordinate System", reason)] * 2
+    assert "needs an active 3D calibration" in reason
+    assert [kind.name for kind, _ in events] == ["calibrationDcsFailed"]
+    assert not dcs_path.exists()
+    assert not (Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME).exists()
+
+
 def _manual_move(app_model, monkeypatch, xyz) -> None:
     """Set the motors as the Hardware Control panel's Set does, with the device accepting each command."""
     hardware = app_model.hardware
@@ -422,7 +460,7 @@ def test_a_manual_move_while_valid_still_updates_the_animal(
 
 
 def test_a_failing_recompute_never_hides_the_calibration_load_error(app_model, monkeypatch):
-    def broken_load(calib_dir, *, report):
+    def broken_load(calib_dir, no_calibration, *, report):
         raise ValueError("the load failed")
 
     def broken_refresh():
@@ -439,7 +477,7 @@ def test_a_failing_recompute_after_a_good_load_still_raises(app_model, monkeypat
     def broken_refresh():
         raise RuntimeError("the recompute failed")
 
-    monkeypatch.setattr(app_model, "_load_calibration", lambda calib_dir, *, report: None)
+    monkeypatch.setattr(app_model, "_load_calibration", lambda calib_dir, no_calibration, *, report: None)
     monkeypatch.setattr(app_model, "refresh_dcs_state", broken_refresh)
     with pytest.raises(RuntimeError, match="the recompute failed"):
         app_model.reload_calib(None)

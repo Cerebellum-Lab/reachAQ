@@ -273,6 +273,12 @@ def active_id(root: Path) -> Optional[str]:
     return None
 
 
+def pointer_id(root: Path) -> Optional[str]:
+    """The id active.yaml names, whether or not that entry is usable; None when it names none
+    or cannot be read. Never raises, and logs nothing (active_id says why)."""
+    return _pointer_id(root)
+
+
 def _pointer_id(root: Path, *, quiet: bool = True) -> Optional[str]:
     """The id active.yaml names, unchecked; None when it names none. With `quiet` (the
     default) any read error is None too; otherwise it raises."""

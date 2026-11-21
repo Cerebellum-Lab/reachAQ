@@ -26,7 +26,6 @@ import qtawesome as qta
 from autotrainer.core import EventManager, Offset3DTuple, AnimalSubject, SystemConfiguration, CameraConfiguration, \
     calculate_std_dev_manual, ProjectInfo, get_perf_now
 from autotrainer.core.capture import CaptureProcessStatus
-from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.logging import get_console_handler, get_verbose_logger
 from autotrainer.core.multiproc import make_daemon_timer, no_op_timer
 from autotrainer.core.pose_elements import SceneElement
@@ -699,9 +698,17 @@ class MainWindow(QMainWindow):
                 "calibration with a longer, stable capture."
             )
             return
+        app_model = self._app_model
+        # The offsets are kept with the active calibration; without one (it went while DCS
+        # ran) nothing is written: a stand-in folder would be a legacy calibration that is not there.
+        refusal = app_model.dcs_refusal()
+        if refusal is not None:
+            self._post_api_event(ApiEventKind.calibrationDcsFailed, dict(reason="NoActiveCalibration"))
+            logger.error("%s", refusal)
+            QMessageBox.warning(self, "Calibrate Coordinate System", refusal)
+            return
         # success
         self._post_api_event(ApiEventKind.calibrationDcsCompleted)
-        app_model = self._app_model
         algo = app_model.behavior.algorithm
         save_path = algo.diamond_triangle_offset_config_path.expanduser()
         if save_path.exists():
@@ -736,11 +743,9 @@ class MainWindow(QMainWindow):
         # The calibration this was measured in, and its folder: the offsets are written
         # beside it and that folder is reloaded, so the DCS fits it at once. A later 3D
         # calibration has another id, which makes this DCS stale; a legacy calibration has
-        # no id to record. Without an active folder, the default one, as before.
+        # no id to record. There is an active folder: dcs_refusal said so above.
         calibration_index = app_model.active_calibration_index
         calib_dir = app_model.active_calibration_dir
-        if calib_dir is None:
-            calib_dir = Path(self._preferences.configuration_location).joinpath(DEFAULT_3D_CALIB_DIR_NAME)
         new_cfg = DiamondTriangleOffsetConfig(
             used_position=avg_pos,
             measured_offset=avg_offset,
@@ -875,6 +880,12 @@ class MainWindow(QMainWindow):
                 logger.verbose("AppModelStatus not idle, not starting acquisition", app_status)
 
     def on_calibrate_diamond_triangle(self, is_toggled):
+        refusal = self._app_model.dcs_refusal() if is_toggled and self._diamond_triangle_calib_run is None else None
+        if refusal is not None:
+            logger.error("%s", refusal)
+            self.calib_diamond_triangle_action.setChecked(False)
+            QMessageBox.warning(self, "Calibrate Coordinate System", refusal)
+            return
         if is_toggled and self._diamond_triangle_calib_run is None:
             self._diamond_triangle_calib_run = self._make_diamond_triangle_calib_run()
         calib_run = self._diamond_triangle_calib_run

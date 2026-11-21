@@ -9,6 +9,7 @@ DCS is redone, gives zero offsets instead of a crash.
 """
 
 import dataclasses
+import json
 import logging
 import pickle
 import shutil
@@ -601,3 +602,74 @@ def test_dcs_offsets_for_a_library_entry_go_beside_it(app_model, tmp_path):
     assert not (entry / DEFAULT_CAM_OFFSET_FILE_NAME).exists()
     # Not an entry, so never listed as one.
     assert [e.id for e in library.list_entries(root)] == [entry.name]
+
+
+def test_a_library_with_entries_and_no_pointer_is_not_imported_into_again(app_model, user_pref, tmp_path):
+    # A rig whose active.yaml went missing: an old folder is still there, and importing it
+    # again would make its calibration active behind the operator's back.
+    entry = _active_entry(app_model, tmp_path)
+    old = _write_multires(Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME)
+    root = entry.parent
+    (root / library.ACTIVE_FILE).unlink()
+    _configure_with_serials(app_model, SERIALS)
+
+    with mock.patch.object(app_model, "on_error"):
+        app_model.reload_calib(None)
+
+    assert app_model.active_calibration_dir is None
+    assert app_model._live_3d_disabled_reason == f"no active calibration in {root}: active.yaml is missing"
+    assert app_model._pose_algorithm.stereo_params is None, "2D only"
+    assert not (root / library.ACTIVE_FILE).exists()
+    assert [e.id for e in library.list_entries(root)] == [entry.name], "the old folder was not imported"
+    assert store.load_index(old).id not in [e.id for e in library.list_entries(root)]
+
+
+def test_a_calibration_that_fails_to_load_puts_no_camera_in_it(app_model, tmp_path):
+    from calibration_metadata_test import _saved_calibration3d
+
+    entry = _active_entry(app_model, tmp_path)
+    _configure_with_serials(app_model, SERIALS)
+    # Entries never change; this stands in for a disk error under one of its presets.
+    (entry / "presets" / BASE.name / "camera_matrix" / "stereo_params.pickle").unlink()
+    for camera in (app_model.left_camera, app_model.right_camera):
+        camera.is_recording_enabled = True
+
+    with pytest.raises(OSError):
+        app_model.reload_calib(None)
+
+    reason = app_model.uncalibrated_reasons["left"]
+    assert reason.startswith(f"the active calibration {entry.name} could not be read: FileNotFoundError")
+    assert app_model.uncalibrated_reasons == {name: reason for name in app_model.uncalibrated_reasons}
+    assert app_model.calibrated_cameras == {}
+    calibration3d = _saved_calibration3d(app_model, tmp_path)
+    assert calibration3d["id"] == entry.name and calibration3d["matchesRecording"] is False
+    saved = (tmp_path / "session003" / "metadata.json").read_text()
+    cameras = json.loads(saved)["hardware"]["configured"]["cameras"]
+    assert {name: (c["inCalibration"], c["uncalibratedReason"]) for name, c in cameras.items()
+            if name in ("left", "right")} == {"left": (False, reason), "right": (False, reason)}
+
+
+def test_an_unreadable_active_entry_says_so_for_every_camera(app_model, tmp_path):
+    entry = _active_entry(app_model, tmp_path)
+    _configure_with_serials(app_model, SERIALS)
+    (entry / store.INDEX_FILE).write_text("format: 3\nid: [half-written\n")
+
+    with mock.patch.object(app_model, "on_error"):
+        app_model.reload_calib(entry)
+
+    reason = app_model.uncalibrated_reasons["left"]
+    assert reason.startswith(f"the active calibration {entry.name} could not be read: ")
+    assert "not valid YAML" in reason
+    assert app_model.calibrated_cameras == {}
+
+
+def test_dcs_is_refused_without_an_active_calibration(app_model, user_pref):
+    root = library.library_root(Path(user_pref.configuration_location))
+    with mock.patch.object(app_model, "on_error"):
+        app_model.reload_calib(None)
+    assert app_model.active_calibration_dir is None
+    assert app_model.dcs_refusal() == (
+        "Calibrate Coordinate System needs an active 3D calibration, and there is none:"
+        " make or activate a 3D calibration first")
+    assert not (Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME).exists()
+    assert not root.joinpath(".offsets").exists()

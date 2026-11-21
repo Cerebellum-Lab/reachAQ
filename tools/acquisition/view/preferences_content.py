@@ -12,7 +12,7 @@ from PySide6 import QtCore
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QWidget, QFormLayout, QLineEdit, QComboBox, QLabel, QHBoxLayout, QPushButton,
                                QTabWidget, QVBoxLayout, QCheckBox, QDoubleSpinBox, QSpinBox, QGridLayout,
-                               QLayout, QSizePolicy, QGroupBox, QFileDialog, QDialog)
+                               QLayout, QSizePolicy, QGroupBox, QFileDialog, QDialog, QMessageBox)
 
 from autotrainer.behavior.pellet_trial import (
     AttemptAssignmentPolicy,
@@ -252,7 +252,15 @@ class PreferencesContent(QWidget):
         live_3d_note = self._live_3d_note = QLabel("Drift monitor and DCS need live 3D")
         live_3d_note.setVisible(not toggle.isChecked())
         def live_3d_state_changed(x: int):
-            app_model.live_3d_enabled = x != 0
+            try:
+                app_model.live_3d_enabled = x != 0
+            except RuntimeError as err:
+                # Refused outside Ready: the switch goes back to what is in force, and says why.
+                live_3d_toggle = self._live_3d_toggle
+                live_3d_toggle.blockSignals(True)
+                live_3d_toggle.setChecked(app_model.live_3d_enabled)
+                live_3d_toggle.blockSignals(False)
+                QMessageBox.warning(self, "Live 3D", str(err))
             live_3d_note.setVisible(not app_model.live_3d_enabled)
         toggle.stateChanged.connect(live_3d_state_changed)  # after setChecked
         live_3d_layout.addWidget(toggle)

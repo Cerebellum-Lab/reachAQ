@@ -102,19 +102,24 @@ from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSE
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry
 from autotrainer.inference.multires_calibration.library import (
     ACTIVE_FILE,
+    DECISIONS_FILE,
     active_id,
     derived_root,
+    entry_path,
+    has_entries,
     import_existing,
     is_legacy_entry,
     latest_decision,
     legacy_folder_name,
     library_root,
+    pointer_id,
     read_settings,
     update_settings,
 )
 from autotrainer.inference.multires_calibration.store import (
     INDEX_FILE,
     CalibrationGeometryError,
+    CalibrationResolutionError,
     CalibrationIndex,
     LoadedPreset,
     calibration_created,
@@ -554,6 +559,9 @@ def _camera_configured_metadata(camera) -> Dict[str, Any]:
 
 #: Why a camera is 2D only when there is no active 3D calibration at all.
 NO_ACTIVE_CALIBRATION = "no active 3D calibration"
+#: Why Calibrate Coordinate System is refused without an active 3D calibration.
+DCS_NEEDS_CALIBRATION = ("Calibrate Coordinate System needs an active 3D calibration, and there is none:"
+                         " make or activate a 3D calibration first")
 #: Beside the library's entries: DCS's camera offsets for each entry, which an entry, never
 #: written to once in place, cannot hold. <library>/.offsets/<id>/camera_offsets.pkl
 _LIBRARY_OFFSETS_DIR = ".offsets"
@@ -633,6 +641,26 @@ def _readable_index(folder: Path) -> Optional[CalibrationIndex]:
         return load_index(folder) if is_multires_calibration(folder) else None
     except (OSError, ValueError):
         return None
+
+
+def _index_error(folder: Path) -> str:
+    """Why the index of `folder` does not load, as load_index says it."""
+    try:
+        load_index(folder)
+    except Exception as err:
+        return str(err)
+    return "it loads now"
+
+
+def _unreadable_reason(folder: Optional[Path], error: str) -> Optional[str]:
+    """Each camera's 2D-only reason while the active calibration in `folder` cannot be read:
+    "the active calibration <id> could not be read: <error>", the id being the index's when
+    it still reads, else the folder's name (a library entry is named by its id)."""
+    if folder is None:
+        return None
+    index = _readable_index(folder)
+    name = index.id if index is not None else Path(folder).name
+    return f"the active calibration {name} could not be read: {error}"
 
 
 def _camera_exposure_seconds(cameras) -> Dict[str, Optional[float]]:
@@ -1153,10 +1181,13 @@ class AppModel(ObservableObject):
         # why live 3D is off when it is, as the operator was told.
         self._active_calibration_preset: Optional[PresetGeometry] = None
         self._live_3d_disabled_reason: Optional[str] = None
-        # The active calibration's format (2, 3, "legacy"), None when none loaded; the folder
-        # the last resolution picked; the setup difference the operator said to record anyway.
+        # The active calibration's format (2, 3, "legacy"), None when none loaded; each camera's
+        # reason when the active calibration could not be read (no camera is in it then); the
+        # live 3D setting as last read (live_3d_enabled); the setup difference the operator
+        # said to record anyway.
         self._active_calibration_format: Optional[Union[int, str]] = None
-        self._resolved_calibration_folder: Optional[Path] = None
+        self._calibration_unreadable: Optional[str] = None
+        self._live_3d_setting: Optional[bool] = None
         # What the operator confirmed (SetupDifference.confirmable), for one recording start:
         # the start after acknowledge_setup_difference keeps it, any later start clears it.
         self._acknowledged_difference: Optional[Tuple[Tuple[str, ...], ...]] = None
@@ -2419,11 +2450,20 @@ class AppModel(ObservableObject):
         """<configuration location>/calibrations, where the calibrations are kept."""
         return library_root(Path(self._preferences.configuration_location).expanduser())
 
-    @property
-    def live_3d_enabled(self) -> bool:
-        """Whether live 3D runs: <library>/settings.yaml `live3d`, True when it is missing or unreadable."""
+    def _read_live_3d_setting(self) -> bool:
         value = read_settings(self.calibration_library_root).get(_LIVE_3D_SETTING, True)
         return value if isinstance(value, bool) else True
+
+    @property
+    def live_3d_enabled(self) -> bool:
+        """Whether live 3D runs: <library>/settings.yaml `live3d`, True when it is missing or unreadable.
+
+        Read once per calibration load and by the setter, then cached: it is asked on every
+        DCS hold and hand-over, which must not read a file each time.
+        """
+        if self._live_3d_setting is None:
+            self._live_3d_setting = self._read_live_3d_setting()
+        return self._live_3d_setting
 
     @live_3d_enabled.setter
     @_serialized_session_configuration
@@ -2436,9 +2476,11 @@ class AppModel(ObservableObject):
         """
         self._require_session_ready_for_configuration("Changing live 3D")
         enabled = bool(enabled)
-        if enabled == self.live_3d_enabled:
+        self._live_3d_setting = self._read_live_3d_setting()
+        if enabled == self._live_3d_setting:
             return
         update_settings(self.calibration_library_root, **{_LIVE_3D_SETTING: enabled})
+        self._live_3d_setting = enabled
         logger.notice("live 3D is now %s", "on" if enabled else "off")
         self._reload_calib_guarded(self._active_calibration_dir, report=True)
         self.refresh_dcs_state()
@@ -2451,19 +2493,25 @@ class AppModel(ObservableObject):
     def _resolve_calibration(self, calib_dir: Optional[Path]) -> Tuple[Optional[Path], Optional[str]]:
         """(the folder reload_calib loads, None), or (None, why there is none).
 
-        `calib_dir` as given; else the library's active entry (active.yaml). A library with
-        no active.yaml first imports the folders that predate it (import_existing), so a rig
-        keeps its calibration on its first start with the library. The import is idempotent;
-        one that fails is logged, and the app starts without a calibration.
+        `calib_dir` as given; else the library's active entry (active.yaml). A library that
+        has never been used (no entry and no decisions.jsonl) first imports the folders that
+        predate it (import_existing), so a rig keeps its calibration on its first start with
+        the library. The import is idempotent; one that fails is logged, and the app starts
+        without a calibration. A library that has entries but no active.yaml is not imported
+        into again, which could make an old folder's calibration active behind the operator's
+        back: there is no active calibration, 2D only, with the reason
+        "no active calibration in <library>: active.yaml is missing".
         """
         if calib_dir is not None:
-            folder = Path(calib_dir).expanduser()
-            self._resolved_calibration_folder = folder
-            return folder, None
+            return Path(calib_dir).expanduser(), None
         config = Path(self._preferences.configuration_location).expanduser()
         root = library_root(config)
         pointer = root / ACTIVE_FILE
         if not pointer.exists():
+            if has_entries(root) or root.joinpath(DECISIONS_FILE).exists():
+                logger.warning("no active 3D calibration: the library %s has calibrations but no %s",
+                               root, ACTIVE_FILE)
+                return None, f"no active calibration in {root}: {ACTIVE_FILE} is missing"
             try:
                 added = import_existing(config)
                 if added:
@@ -2476,14 +2524,18 @@ class AppModel(ObservableObject):
             logger.exception("could not read the active 3D calibration in %s", root)
             calibration_id = None
         if calibration_id is None:
-            self._resolved_calibration_folder = None
+            named = pointer_id(root) if pointer.exists() else None
+            if named is not None:
+                try:
+                    entry_path(root, named)
+                except CalibrationResolutionError as err:
+                    # An entry that is gone or half-written (an empty calibration.yaml).
+                    return None, f"{NO_ACTIVE_CALIBRATION}: {pointer} names {named}, which is not usable: {err}"
             if pointer.exists():
                 return None, (f"{NO_ACTIVE_CALIBRATION}: {pointer} is unreadable or names a calibration"
                               " that is not in the library")
             return None, f"{NO_ACTIVE_CALIBRATION}: {pointer} does not exist"
-        folder = root / calibration_id
-        self._resolved_calibration_folder = folder
-        return folder, None
+        return root / calibration_id, None
 
     def _is_library_entry(self, folder: Optional[Path]) -> bool:
         if folder is None:
@@ -2515,8 +2567,11 @@ class AppModel(ObservableObject):
         a guarded load does (_live_3d_off_after_failed_load) and raises to the caller,
         which reports it. Either way dcs_state then follows the calibration now active.
         """
+        # This load's own folder, not instance state another load could change meanwhile.
+        folder = Path(calib_dir).expanduser() if calib_dir is not None else None
         try:
-            self._load_calibration(calib_dir, report=True)
+            folder, no_calibration = self._resolve_calibration(calib_dir)
+            self._load_calibration(folder, no_calibration, report=True)
         except BaseException as err:
             # Live 3D must not carry on with the parameters loaded before: after an install the
             # folder holds another calibration, and sessions recorded meanwhile would name it
@@ -2524,7 +2579,6 @@ class AppModel(ObservableObject):
             # fails too is only logged: the caller gets the load's error.
             if isinstance(err, Exception):
                 try:
-                    folder = Path(calib_dir).expanduser() if calib_dir is not None else self._resolved_calibration_folder
                     self._live_3d_off_after_failed_load(folder, err, report=False)
                 except Exception:
                     logger.exception("could not turn live 3D off after the failed load of %s", calib_dir)
@@ -2542,9 +2596,13 @@ class AppModel(ObservableObject):
         else:
             logger.warning("3D calibration, before the camera configuration is loaded: %s", message)
 
-    def _load_calibration(self, calib_dir: Optional[Path], *, report: bool):
-        calib_src_dir, no_calibration = self._resolve_calibration(calib_dir)
+    def _load_calibration(self, calib_src_dir: Optional[Path], no_calibration: Optional[str], *, report: bool):
+        """Load the calibration in `calib_src_dir`, as _resolve_calibration gave it with
+        `no_calibration`, the reason there is none when it is None."""
         logger.info("loading calib from %s", calib_src_dir)
+        # The live 3D setting is read once per load, then cached (live_3d_enabled).
+        self._live_3d_setting = self._read_live_3d_setting()
+        self._calibration_unreadable = None
         # The folder is committed before anything in it is read, so the next configuration
         # load retries it even when this load raises: after an install, the folder active
         # before may be a dated backup by now. The index, preset and disabled reason are
@@ -2578,6 +2636,7 @@ class AppModel(ObservableObject):
             cam_names = None
             cam_offsets = None
             disabled_reason = f"{INDEX_FILE} unreadable: {calib_src_dir}"
+            self._calibration_unreadable = _unreadable_reason(calib_src_dir, _index_error(calib_src_dir))
             self._calibration_problem(disabled_reason, report=report)
         elif calib_src_dir.exists() and is_multires_calibration(calib_src_dir):
             calibration_index = load_index(calib_src_dir)
@@ -2638,10 +2697,11 @@ class AppModel(ObservableObject):
         without it, the log only. Explicit reloads (DCS, the 3D calibration) turn live 3D
         off the same way, then raise.
         """
+        folder = Path(calib_dir).expanduser() if calib_dir is not None else None
         try:
-            self._load_calibration(calib_dir, report=report)
+            folder, no_calibration = self._resolve_calibration(calib_dir)
+            self._load_calibration(folder, no_calibration, report=report)
         except Exception as err:
-            folder = Path(calib_dir).expanduser() if calib_dir is not None else self._resolved_calibration_folder
             self._live_3d_off_after_failed_load(folder, err, report=report)
 
     def _live_3d_off_after_failed_load(self, folder: Optional[Path], err: Exception, *, report: bool) -> None:
@@ -2664,6 +2724,8 @@ class AppModel(ObservableObject):
         )
         self._active_calibration_preset = None
         self._live_3d_disabled_reason = f"could not load {folder}: {type(err).__name__}: {err}"
+        # No camera is in a calibration that did not load, whatever its index says.
+        self._calibration_unreadable = _unreadable_reason(folder, f"{type(err).__name__}: {err}")
         self._install_pose_algorithm()
         if report:
             self.on_error("3D calibration", self._live_3d_disabled_reason)
@@ -2784,6 +2846,9 @@ class AppModel(ObservableObject):
 
     def _camera_match(self) -> CameraMatch:
         configured = self._configured_serials()
+        if self._calibration_unreadable is not None:
+            # A calibration that did not load calibrates no camera, whatever its index lists.
+            return CameraMatch(reasons={name: self._calibration_unreadable for name in configured})
         cameras = self._calibration_cameras()
         if cameras is None:
             return CameraMatch(reasons={name: NO_ACTIVE_CALIBRATION for name in configured})
@@ -2799,7 +2864,8 @@ class AppModel(ObservableObject):
     def uncalibrated_reasons(self) -> Dict[str, str]:
         """Configured camera name -> why it is 2D only, for every other configured camera:
         "not in the active calibration", "swapped: calibrated serial X, now Y", the
-        calibration's own reason, or "no active 3D calibration"."""
+        calibration's own reason, "no active 3D calibration", or, when the active calibration
+        did not load, "the active calibration <id> could not be read: <error>"."""
         return dict(self._camera_match().reasons)
 
     def camera_setup_difference(self, selected: Sequence[str]) -> SetupDifference:
@@ -2904,6 +2970,16 @@ class AppModel(ObservableObject):
             logger.warning("possibly moved: %s", reference_image_check.moved_detail(verdicts[name]))
         return verdicts
 
+    def dcs_refusal(self) -> Optional[str]:
+        """Why Calibrate Coordinate System (DCS) cannot run now, or None when it can.
+
+        DCS is measured in the active 3D calibration's frame and its offsets are kept with
+        that calibration, so without one it is refused rather than writing offsets into a
+        stand-in folder."""
+        if self._active_calibration_dir is None:
+            return DCS_NEEDS_CALIBRATION
+        return None
+
     @property
     def active_calibration_dir(self) -> Optional[Path]:
         """The 3D calibration folder reload_calib loaded, or None when there was none."""
@@ -2998,6 +3074,8 @@ class AppModel(ObservableObject):
         cameras = self._calibration_cameras()
         difference = None if cameras is None else self.camera_setup_difference(self._recording_camera_names())
         match = None if cameras is None else match_cameras(cameras, self._configured_serials())
+        # A calibration that did not load matches no recording, though its index names cameras.
+        unreadable = self._calibration_unreadable is not None
         record = {
             "id": None if index is None else index.id,
             "created": None if created is None else created.isoformat(timespec="seconds"),
@@ -3009,7 +3087,7 @@ class AppModel(ObservableObject):
             "cameras": None if cameras is None else [
                 {"name": c["name"], "serial": c.get("serial"), "cameraId": c.get("camera_id")} for c in cameras
             ],
-            "matchesRecording": None if difference is None else not difference.differs,
+            "matchesRecording": False if unreadable else None if difference is None else not difference.differs,
             "mismatch": None if difference is None else {
                 "added": list(difference.added),
                 "removed": list(difference.removed),

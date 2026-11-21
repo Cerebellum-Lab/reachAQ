@@ -8,16 +8,21 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
+import importlib
+
 import yaml
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from autotrainer.core import Offset3DTuple
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.inference.multires_calibration import library
 from calibration_metadata_test import _saved_calibration3d  # noqa: E402
+from tools.acquisition.view import preferences_content as preferences_module  # noqa: E402
 from tools.acquisition.view.preferences_content import PreferencesContent  # noqa: E402
+
+app_model_module = importlib.import_module("tools.acquisition.model.app_model")
 
 LIVE_3D_OFF = "live 3D is off"
 
@@ -132,5 +137,55 @@ def test_preferences_toggle_switches_live_3d_and_shows_the_note_when_off(app_mod
 
         toggle.setChecked(True)
         assert app_model.live_3d_enabled is True and not note.isVisibleTo(note.parentWidget())
+    finally:
+        content.close()
+
+
+def test_the_setting_is_read_once_per_load_not_on_every_access(app_model, monkeypatch):
+    reads = []
+    real = app_model_module.read_settings
+
+    def counting(root):
+        reads.append(root)
+        return real(root)
+
+    monkeypatch.setattr(app_model_module, "read_settings", counting)
+    app_model.reload_calib(app_model.active_calibration_dir)
+    after_load = len(reads)
+    assert after_load >= 1
+    for _ in range(50):
+        assert app_model.live_3d_enabled is True
+    app_model.refresh_dcs_state()
+    assert len(reads) == after_load, "asking the setting reads no file"
+
+    app_model.live_3d_enabled = False
+    assert app_model.live_3d_enabled is False
+    # The setter reads the file once, and its reload once more.
+    assert len(reads) - after_load <= 2
+
+
+def test_the_preferences_toggle_reverts_and_says_why_when_refused(app_model, monkeypatch):
+    QApplication.instance() or QApplication([])
+    app_model._inference = SimpleNamespace(is_enabled=False, model_location="", pose_parts=[])
+    shown = []
+    monkeypatch.setattr(preferences_module, "QMessageBox", SimpleNamespace(
+        warning=lambda parent, title, text, *args: shown.append((title, text)),
+        StandardButton=QMessageBox.StandardButton))
+    content = PreferencesContent(app_model.preferences, app_model)
+    try:
+        reason = "Changing live 3D is unavailable while session state is recording"
+
+        def refuse(action):
+            raise RuntimeError(reason)
+
+        monkeypatch.setattr(app_model, "_require_session_ready_for_configuration", refuse)
+        toggle, note = content._live_3d_toggle, content._live_3d_note
+
+        toggle.setChecked(False)
+
+        assert app_model.live_3d_enabled is True
+        assert toggle.isChecked(), "the switch shows what is in force"
+        assert not note.isVisibleTo(note.parentWidget())
+        assert shown == [("Live 3D", reason)]
     finally:
         content.close()

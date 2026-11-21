@@ -381,7 +381,8 @@ def test_missing_active_entry_records_2d_with_reason(start_app, user_pref, tmp_p
     saved = json.loads(output.with_suffix(".json").read_text())
     calibration3d = saved["hardware"]["configured"]["calibration3d"]
     assert calibration3d["live3dDisabledReason"] == reason
-    if damage != "truncated preset":
-        # Nothing names the cameras' calibration; with a readable index they stay in it.
-        for camera in saved["hardware"]["configured"]["cameras"].values():
-            assert camera["inCalibration"] is False and camera["uncalibratedReason"]
+    # No camera is in a calibration that did not load, not even with a readable index.
+    for camera in saved["hardware"]["configured"]["cameras"].values():
+        assert camera["inCalibration"] is False and camera["uncalibratedReason"]
+    if damage == "truncated preset":
+        assert calibration3d["matchesRecording"] is False
