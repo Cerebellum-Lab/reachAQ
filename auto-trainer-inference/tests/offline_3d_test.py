@@ -52,7 +52,7 @@ from multires_offline_resolution_test import (
     _capture_process_raw_data,
     _metadata,
     _project,
-    _write_format2,
+    _write_format3_with_live_set,
     _write_metadata,
     _Stop,
 )
@@ -498,7 +498,7 @@ def _tree_hashes(folder: Path) -> dict:
 def test_intersession_live_3d_switched_off_is_not_refused(tmp_path, monkeypatch):
     root = tmp_path / "Autotrainer"
     folder = root / NAME
-    index = _write_format2(folder)
+    index = _write_format3_with_live_set(folder)
     project = _project(tmp_path)
     _write_metadata(project, _metadata(IN_SECOND_WINDOW, id=index.id, preset="512x512_bin2",
                                        live3dDisabledReason=LIVE_3D_OFF,
@@ -512,7 +512,7 @@ def test_intersession_live_3d_switched_off_is_not_refused(tmp_path, monkeypatch)
 def test_intersession_live_3d_off_without_a_preset_reads_the_recorded_geometry(tmp_path, monkeypatch):
     root = tmp_path / "Autotrainer"
     folder = root / NAME
-    index = _write_format2(folder)
+    index = _write_format3_with_live_set(folder)
     project = _project(tmp_path)
     data = _metadata(IN_SECOND_WINDOW, id=index.id, preset=None, live3dDisabledReason=LIVE_3D_OFF)
     data["configuration"] = {"cameras": [{"name": cam, "params": _params(PRESETS[1])} for cam in ("left", "right")]}
@@ -525,7 +525,7 @@ def test_intersession_live_3d_off_without_a_preset_reads_the_recorded_geometry(t
 
 def test_intersession_live_3d_off_with_a_swapped_left_is_refused(tmp_path, monkeypatch):
     root = tmp_path / "Autotrainer"
-    index = _write_format2(root / NAME)
+    index = _write_format3_with_live_set(root / NAME)
     project = _project(tmp_path)
     data = _metadata(IN_SECOND_WINDOW, id=index.id, preset=None, live3dDisabledReason=LIVE_3D_OFF)
     reason = "swapped: calibrated serial 21000001, now 21000099"
