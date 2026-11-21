@@ -20,6 +20,7 @@ import math
 import os
 import pickle
 import shutil
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,7 +31,7 @@ import pytest
 import yaml
 
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
-from autotrainer.inference.multires_calibration import pipeline, store
+from autotrainer.inference.multires_calibration import library, pipeline, store
 from autotrainer.inference.multires_calibration.fit import CaptureCamera
 from autotrainer.inference.multires_calibration.geometry import (
     PresetGeometry,
@@ -240,7 +241,7 @@ def test_a_write_that_fails_midway_leaves_no_calibration(tmp_path, report, monke
     written = []
 
     def failing_toml(fit, preset_set, **kwargs):
-        # As a crash would: after the sensor file and the first preset, partway through the second.
+        # After the sensor file and the first preset, partway through the second.
         if len(written) == 2:
             raise OSError("disk full")
         written.append(preset_set.name)
@@ -249,11 +250,14 @@ def test_a_write_that_fails_midway_leaves_no_calibration(tmp_path, report, monke
     monkeypatch.setattr(store, "anipose_toml", failing_toml)
     with pytest.raises(OSError, match="disk full"):
         write(folder, report)
-    assert not folder.exists()
-    assert (partial / "calibration.toml").is_file()
-    assert (partial / "presets" / written[1] / "calibration.toml").is_file()
+    # The failed write cleans up after itself.
+    assert not folder.exists() and not partial.exists()
+
+    # A crash cannot clean up: what it leaves is not a calibration, nor a candidate for an
+    # old session, and the next write clears it.
+    (partial / "presets" / written[1]).mkdir(parents=True)
+    (partial / "calibration.toml").write_text("[cam_0]\n")
     assert not is_multires_calibration(partial)
-    # Nor is the .partial folder a candidate for an old session.
     with pytest.raises(CalibrationResolutionError):
         resolve_for_time(tmp_path, datetime(2026, 5, 1))
 
@@ -261,6 +265,43 @@ def test_a_write_that_fails_midway_leaves_no_calibration(tmp_path, report, monke
     write(folder, report)
     assert is_multires_calibration(folder)
     assert not partial.exists()
+
+
+def test_a_non_finite_rms_is_refused_naming_the_camera_and_leaves_no_partial(tmp_path, report3):
+    # metadata.error pools the cameras' RMS, so the refusal must name the camera itself.
+    fit = dataclasses.replace(RIG3.truth, rms_px={**RIG3.truth.rms_px, "camera4": math.nan})
+    folder = tmp_path / NAME
+    with pytest.raises(ValueError, match="camera camera4: its fit RMS nan is not a finite calibration value"):
+        write3(folder, report3, fit=fit)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("replace_text", [store._replace_text, library._replace_text],
+                         ids=["store", "library"])
+def test_two_writers_of_one_file_at_once_both_succeed_and_leave_it_whole(tmp_path, replace_text):
+    # The derived cache is written by the live app and by offline processes at once. With
+    # one shared temporary name, one writer's rename would take the other's file away.
+    path = tmp_path / "calibration.toml"
+    texts = ["a" * 200_000 + "\n", "b" * 300_000 + "\n"]
+    start = threading.Barrier(len(texts))
+    errors = []
+
+    def writer(text):
+        start.wait()
+        try:
+            for _ in range(50):
+                replace_text(path, text)
+        except BaseException as error:  # reported below, from the main thread
+            errors.append(error)
+
+    threads = [threading.Thread(target=writer, args=(text,)) for text in texts]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert path.read_text(encoding="utf-8") in texts
+    assert [p.name for p in tmp_path.iterdir()] == [path.name]
 
 
 def test_write_never_overwrites_and_clears_a_stale_partial(tmp_path, report):
@@ -600,7 +641,12 @@ def _format2_copy(tmp_path: Path) -> Path:
 
     *.pickle files are in git LFS, which the rig's test clone does not fetch, so the fixture
     holds the text files only. The pickles are what that writer wrote: the stereo parameters
-    of the saved fit, through the same write_pickle."""
+    of the saved fit, through the same write_pickle.
+
+    So a test comparing a loaded pickle with preset_stereo_params of the loaded fit (the P2
+    check in test_format_2_index_reads_as_left_right) is circular: both come from the same
+    code. It shows the pickle loads and keeps its keys, not that today's code still writes
+    what the format-2 writer wrote."""
     from autotrainer.inference.calibration_FLIR import write_pickle
 
     folder = tmp_path / "format2" / NAME
@@ -716,6 +762,57 @@ def test_no_file_in_the_entry_changes_after_write(tmp_path, report3):
     pipeline._previous(folder, [])
 
     assert tree_hashes(folder) == before
+
+
+def _edit_index(folder: Path, edit) -> None:
+    data = yaml.safe_load((folder / INDEX_FILE).read_text(encoding="utf-8"))
+    edit(data)
+    (folder / INDEX_FILE).write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
+def _drop_camera4_from_live(data):
+    del data["preset_sets"][0]["cameras"]["camera4"]
+
+
+def _put_stimcam_in_live(data):
+    data["preset_sets"][0]["cameras"]["stimCam"] = dataclasses.asdict(LIVE3["stimCam"])
+
+
+def _uncalibrate_camera4(data):
+    camera4 = next(c for c in data["cameras"] if c["name"] == "camera4")
+    camera4["calibrated"], camera4["reason"] = False, "too few board views: 4 of 12 needed"
+    for preset_set in data["preset_sets"]:
+        del preset_set["cameras"]["camera4"]
+
+
+@pytest.mark.parametrize("edit, message", [
+    (_drop_camera4_from_live, "preset set live has no geometry for calibrated camera4"),
+    (_put_stimcam_in_live, "preset set live holds stimCam, which the index does not list as calibrated"),
+], ids=["set-lacks-a-calibrated-camera", "set-holds-an-uncalibrated-camera"])
+def test_a_format_3_index_whose_sets_disagree_with_its_cameras_is_corrupt(tmp_path, report3, edit, message):
+    folder = tmp_path / NAME
+    write3(folder, report3)
+    _edit_index(folder, edit)
+    with pytest.raises(ValueError, match="is corrupt") as raised:
+        load_index(folder)
+    assert message in str(raised.value)
+    assert not is_multires_calibration(folder)
+
+
+def test_an_index_whose_calibrated_cameras_are_not_the_fits_is_refused(tmp_path, report3):
+    folder = tmp_path / NAME
+    write3(folder, report3)
+    # Consistent within itself, but sensor/fit.yaml still holds camera4.
+    _edit_index(folder, _uncalibrate_camera4)
+    load_index(folder)
+    with pytest.raises(ValueError, match="the index calibrated left, right but sensor/fit.yaml holds camera4, left, right"):
+        load_sensor_fit(folder)
+
+
+def test_the_index_is_written_at_its_own_format(tmp_path, report3):
+    index = write3(tmp_path / NAME, report3)
+    assert store._index_to_plain(index)["format"] == index.format == 3
+    assert store._index_to_plain(dataclasses.replace(index, format=2))["format"] == 2
 
 
 def test_a_format_2_previous_is_compared_with_a_format_3_calibration_on_the_cameras_in_both(tmp_path):

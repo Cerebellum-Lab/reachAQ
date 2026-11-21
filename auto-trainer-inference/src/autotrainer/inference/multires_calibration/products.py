@@ -172,7 +172,14 @@ def anipose_toml(
             ]
         except ValueError as error:
             raise ValueError(f"anipose export of preset set {preset_set.name}, camera {cam}: {error}") from error
-        errors.append(fit.rms_px[cam] / g.binning)
+        rms = fit.rms_px[cam]
+        if not math.isfinite(rms):
+            # metadata.error pools every camera's, so its own refusal could not name the camera.
+            raise ValueError(
+                f"anipose export of preset set {preset_set.name}, camera {cam}: its fit RMS {float(rms)!r} is not a"
+                " finite calibration value"
+            )
+        errors.append(rms / g.binning)
     listed = ", ".join(_toml_inline({"name": c.name, "serial": c.serial}) for c in tables)
     lines += [
         "[metadata]",

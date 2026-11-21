@@ -35,7 +35,9 @@ The calibration library (library.py) keeps calibrations as immutable entries und
 to the active folder and its dated backups, which library.import_existing copies in.
 
 A half-written folder never loads. The folder is written as <name>.partial and renamed into
-place only when complete, and calibration.yaml is the last file written into it. A folder
+place only when complete, and calibration.yaml is the last file written into it. A write
+that raises removes its .partial folder; one a crash leaves is removed by the next write. A
+folder
 without calibration.yaml at format 2 or 3 is a legacy, single-geometry calibration, which is
 loaded the old way.
 
@@ -186,12 +188,16 @@ def write_calibration(
 
     `preset_sets` are the sets to write (geometry.presets_for_cameras); a camera in a set
     that the fit did not calibrate is dropped from it, a set that then repeats an earlier
-    one's geometries is left out, and every set must give each calibrated camera a geometry. Without them, each of `presets` is a set of its own,
-    named g.name, with every calibrated camera at g. `cameras` are the capture's cameras
+    one's geometries is left out, and every set must give each calibrated camera a geometry.
+    Without them, each of `presets` is a set of its own, named g.name, with every calibrated
+    camera at g. `cameras` are the capture's cameras
     in capture order, and must include every calibrated one; each one's verdict comes from
     report.cameras. Without them the cameras are the fit's, with no serial or camera_id.
     `extra_files` maps a file name in the folder to a file to copy there, for the coverage
     images and the waypoint log, so they too are in place before the index is written.
+
+    Any error while the files are written (a value the anipose export refuses, a full disk)
+    removes the .partial folder before it is raised, so a refused calibration leaves nothing.
     """
     folder = Path(folder)
     if folder.exists():
@@ -255,26 +261,31 @@ def write_calibration(
         shutil.rmtree(partial)
     partial.mkdir(parents=True)
 
-    _write_text(partial / _SENSOR_FIT_FILE, _yaml_text(_fit_to_plain(fit)))
-    toml_cameras = [c for c in cameras if c.name in fit.cameras]
-    _write_text(
-        partial / _ANIPOSE_FILE,
-        anipose_toml(fit, _sensor_set(fit, calibrated), calibration_id=index.id, cameras=toml_cameras),
-    )
-    signs = motor_to_inference_signs()
-    for s in sets:
-        _write_preset(partial / _PRESETS_DIR / s.name, fit, s, signs, calibration_id=index.id, cameras=toml_cameras)
-    _write_text(partial / _REPORT_JSON, report.to_json())
-    _write_text(partial / _REPORT_TEXT, report.to_text() + "\n")
-    for name, source in (extra_files or {}).items():
-        target = partial / name
-        if target.exists():
-            raise ValueError(f"extra file {name} would replace a calibration file")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)
-    # Last: until the index is in place the folder is not a calibration.
-    _write_text(partial / INDEX_FILE, index_text)
-    os.replace(partial, folder)
+    try:
+        _write_text(partial / _SENSOR_FIT_FILE, _yaml_text(_fit_to_plain(fit)))
+        toml_cameras = [c for c in cameras if c.name in fit.cameras]
+        _write_text(
+            partial / _ANIPOSE_FILE,
+            anipose_toml(fit, _sensor_set(fit, calibrated), calibration_id=index.id, cameras=toml_cameras),
+        )
+        signs = motor_to_inference_signs()
+        for s in sets:
+            _write_preset(partial / _PRESETS_DIR / s.name, fit, s, signs, calibration_id=index.id,
+                          cameras=toml_cameras)
+        _write_text(partial / _REPORT_JSON, report.to_json())
+        _write_text(partial / _REPORT_TEXT, report.to_text() + "\n")
+        for name, source in (extra_files or {}).items():
+            target = partial / name
+            if target.exists():
+                raise ValueError(f"extra file {name} would replace a calibration file")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+        # Last: until the index is in place the folder is not a calibration.
+        _write_text(partial / INDEX_FILE, index_text)
+        os.replace(partial, folder)
+    except BaseException:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise
     return index
 
 
@@ -330,6 +341,7 @@ def _index_from_data(data: dict) -> CalibrationIndex:
             PresetSet(str(s["name"]), {str(cam): _geometry_from_plain(g) for cam, g in s["cameras"].items()})
             for s in data["preset_sets"]
         ]
+        _check_preset_sets(cameras, sets)
         presets = _pair_geometries(sets)
     return CalibrationIndex(
         id=calibration_id,
@@ -346,10 +358,32 @@ def _index_from_data(data: dict) -> CalibrationIndex:
     )
 
 
+def _check_preset_sets(cameras: Sequence[dict], sets: Sequence[PresetSet]) -> None:
+    """Raise ValueError unless every preset set holds exactly the calibrated cameras."""
+    calibrated = [c["name"] for c in cameras if c["calibrated"]]
+    for s in sets:
+        lacking = [cam for cam in calibrated if cam not in s.cameras]
+        if lacking:
+            raise ValueError(f"preset set {s.name} has no geometry for calibrated {', '.join(lacking)}")
+        extra = [cam for cam in s.cameras if cam not in calibrated]
+        if extra:
+            raise ValueError(f"preset set {s.name} holds {', '.join(extra)}, which the index does not list as calibrated")
+
+
 def load_sensor_fit(folder: Path) -> MotorFrameFit:
+    """The motor-frame fit in sensor/fit.yaml. Raises ValueError when, at format 3, its cameras
+    are not the index's calibrated cameras: the two are written together, so one is damaged."""
     folder = Path(folder)
-    load_index(folder)
+    index = load_index(folder)
     data = _read_yaml(folder / _SENSOR_FIT_FILE)
+    if index.format >= 3:
+        calibrated = sorted(c["name"] for c in index.cameras if c["calibrated"])
+        fitted = sorted(str(cam) for cam in data["cameras"])
+        if calibrated != fitted:
+            raise ValueError(
+                f"{folder}: the index calibrated {', '.join(calibrated)} but {_SENSOR_FIT_FILE.as_posix()} holds"
+                f" {', '.join(fitted)}"
+            )
     return MotorFrameFit(
         cameras={
             cam: CameraModel(
@@ -694,7 +728,7 @@ def _is_within(path: Path, folder: Path) -> bool:
 
 def _index_to_plain(index: CalibrationIndex) -> dict:
     return {
-        "format": CALIBRATION_FORMAT,
+        "format": index.format,
         "id": index.id,
         # A string, so the file reads the same whatever YAML loader opens it.
         "created": index.created.isoformat(timespec="seconds"),
@@ -816,7 +850,18 @@ def _write_text(path: Path, text: str) -> None:
 
 
 def _replace_text(path: Path, text: str) -> None:
-    """Replace `path` whole, so a crash leaves the old file or the new one, never a mix."""
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    """Replace `path` whole, so a crash leaves the old file or the new one, never a mix.
+
+    The temporary file's name is unique (<file>.<uuid4 hex>.tmp): the derived cache is shared
+    by the live app and offline processes, which may write the same file at once.
+    """
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise

@@ -427,9 +427,13 @@ def _now() -> str:
 
 
 def _replace_text(path: Path, text: str) -> None:
-    """Replace `path` whole, so a crash leaves the old file or the new one, never a mix."""
+    """Replace `path` whole, so a crash leaves the old file or the new one, never a mix.
+
+    The temporary file's name is unique (<file>.<uuid4 hex>.tmp), so two processes writing
+    the same file at once do not write into each other's.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         tmp.write_text(text, encoding="utf-8")
         os.replace(tmp, path)
