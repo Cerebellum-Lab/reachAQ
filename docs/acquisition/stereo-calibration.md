@@ -261,9 +261,13 @@ made, its cameras, its verdict, which one is **active**, and the cameras it left
   Entries never change, so the images go into a **new entry** with the same fit:
   a copy under a new id, with `parent_id` naming the original and
   `references_captured` the time; its `created` stays the fit's, so the monthly
-  reminder is not reset. The app then offers to set it active. Setting it active
-  is a change of the active calibration like any other, so the coordinate system
-  must be redone afterwards (below).
+  reminder is not reset. The app then offers to set it active. Its
+  `sensor/fit.yaml` is byte-identical to its parent's, so it is the same
+  calibration geometrically: the coordinate system stays valid (a DCS measured
+  against any id of that `parent_id` chain with the same fit counts, and the
+  other way round), and setting it active copies the parent's current camera
+  offsets file into its empty `.offsets/<id>/`. A real recalibration, with
+  another fit, still makes the coordinate system out of date.
 
 ### 2D-only cameras while recording
 
@@ -292,10 +296,12 @@ followed by one line per difference:
 - `Swapped for another camera body: <name>, calibrated serial X, now Y`: a
   camera with the calibration's name but another serial.
 
-**No** (the default) records nothing. **Yes** records, and the session metadata
-says `mismatchAcknowledged: true`. The answer covers that one start: the next
-Record asks again. Headless and API starts never ask; they record the mismatch
-with `mismatchAcknowledged: false`.
+**No** (the default) records nothing, and drops the moved-camera check's result
+it was asked for. **Yes** records, and the session metadata says
+`mismatchAcknowledged: true`. The answer covers that one start call, whether or
+not it starts: the next Record asks again. Headless and API starts never ask;
+they record the mismatch with `mismatchAcknowledged: false` and no check
+result, even right after a declined Record.
 
 A calibrated camera that is only turned off for this recording is not a
 difference: Record does not ask, and the status bar notes it, for example
@@ -325,9 +331,11 @@ centre), a rotation about the optical axis and a scale. It takes about 8 ms per
 256×256 camera on christielab10.
 
 - **moved**: over any limit. Record asks, as above.
-- **can't tell**: no frame from the camera, a frame of another size than the
-  reference, or a match below the minimum quality (an animal or a hand in view
-  lowers it rather than faking a move). Shown in the status bar, for example
+- **can't tell**: no current frame from the camera (none shown, capture
+  stopped, or the one shown is more than 1 s old), a frame of another size than
+  the reference, a registration that did not converge (whatever `min_quality`
+  is), or a match below the minimum quality (an animal or a hand in view lowers
+  it rather than faking a move). Shown in the status bar, for example
   **Reference image check can't tell: right (match 0.62 below 0.80)**; it never
   asks.
 - **no reference**: the calibration has no reference image for that camera.

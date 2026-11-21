@@ -147,6 +147,28 @@ def test_occluded_frame_is_cant_tell(tmp_path):
     assert verdict.status == ric.CANT_TELL
 
 
+def test_a_non_finite_registration_is_cant_tell_whatever_the_minimum_quality():
+    nan = float("nan")
+    for registration in (ric.Registration(nan, nan, nan, 0.0), ric.Registration(1.0, 0.0, 0.0, nan),
+                         ric.Registration(float("inf"), 0.0, 0.0, 0.99)):
+        verdict = ric.judge("left", registration, ric.Limits(min_quality=0.0))
+        assert verdict.status == ric.CANT_TELL, registration
+        assert verdict.reason == "the registration did not converge"
+
+
+def test_an_ecc_that_does_not_converge_is_quality_0_and_cant_tell(tmp_path, monkeypatch):
+    def diverge(*args, **kwargs):
+        raise cv2.error("findTransformECC: the algorithm stopped before its convergence")
+
+    monkeypatch.setattr(ric.cv2, "findTransformECC", diverge)
+    registration = ric.register(REFERENCE, _view(seed=2))
+    assert registration.quality == 0.0
+
+    on_at_zero = {"checks": {"reference_image": {"enabled": True, "min_quality": 0.0}}}
+    verdict = ric.check_cameras(_entry(tmp_path), {"left": _view(seed=2)}, on_at_zero)["left"]
+    assert verdict.status == ric.CANT_TELL and verdict.registration.quality == 0.0
+
+
 def test_disabled_by_default(tmp_path):
     settings = ric.reference_check_settings({})
     assert settings.enabled is False
@@ -211,6 +233,9 @@ class _AppModel:
     def acknowledge_setup_difference(self):
         self.calls.append("acknowledge")
 
+    def discard_reference_check(self):
+        self.calls.append("discard")
+
     def start_recording(self):
         self.calls.append("start")
         return True
@@ -263,6 +288,7 @@ def test_a_moved_camera_answered_no_records_nothing(monkeypatch):
     BehaviorContent._start_recording(behavior)
 
     assert "start" not in app_model.calls and "acknowledge" not in app_model.calls
+    assert app_model.calls[-1] == "discard", "the declined start's check result is dropped"
 
 
 def test_cant_tell_is_shown_but_does_not_ask(monkeypatch):
@@ -314,6 +340,28 @@ def test_check_results_and_acknowledgement_reach_the_metadata(app_model, tmp_pat
     app_model.start_recording()
     record = _saved_calibration3d(app_model, tmp_path)["movedCameraChecks"]["referenceImage"]
     assert record["ran"] is False and record["cameras"] == {}
+
+
+def test_a_declined_start_leaves_no_result_for_a_later_headless_start(app_model, tmp_path, monkeypatch):
+    folder = _write_multires(tmp_path / "Autotrainer-calib" / DEFAULT_3D_CALIB_DIR_NAME)
+    (folder / "reference").mkdir()
+    for camera in ("left", "right"):
+        cv2.imwrite(str(folder / "reference" / f"{camera}.png"), REFERENCE)
+    _configure_live_pair(app_model, **BASE_PARAMS)
+    app_model.reload_calib(folder)
+    for camera in (app_model.left_camera, app_model.right_camera):
+        camera.is_recording_enabled = True
+    app_model.reference_image_check_enabled = True
+    frames = {"left": _view(shift=(12.0, 0.0), seed=2), "right": _view(seed=3)}
+    asked = _question(monkeypatch, QMessageBox.StandardButton.No)
+
+    assert dialog_module.confirm_camera_setup(None, app_model, frames) == (False, None)
+    assert len(asked) == 1, "the moved camera asked"
+
+    app_model.start_recording()  # a headless start, which runs no check of its own
+    record = _saved_calibration3d(app_model, tmp_path)["movedCameraChecks"]["referenceImage"]
+    assert record["ran"] is False and record["moved"] == [] and record["cameras"] == {}
+    assert record["acknowledged"] is False
 
 
 class _RecordingCamera(_CaptureCamera):

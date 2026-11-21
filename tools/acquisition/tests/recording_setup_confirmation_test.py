@@ -66,6 +66,9 @@ class _AppModel:
     def acknowledge_setup_difference(self):
         self.calls.append("acknowledge")
 
+    def discard_reference_check(self):
+        self.calls.append("discard")
+
     def start_recording(self):
         self.calls.append("start")
         return self._started
@@ -205,3 +208,31 @@ def test_2d_only_tag_in_recording_list(monkeypatch):
     for content in contents.values():
         content.close()
     assert app_model.property_changed.handlers == []
+
+
+def test_a_stale_or_stopped_frame_is_no_current_view(monkeypatch):
+    import numpy as np
+
+    monkeypatch.setattr(camera_content_module, "CaptureTelemetryPanel", _TelemetryPanel)
+    app_model = _AppModel(SetupDifference([], [], [], []))
+    app_model.property_changed = _Event()
+    app_model.session_telemetry = None
+    content = CameraContent(app_model, _CaptureModel("left"))
+    now = [100.0]
+    monkeypatch.setattr(camera_content_module.time, "monotonic", lambda: now[0])
+    try:
+        assert content.displayed_frame() is None, "nothing shown yet"
+        frame = np.zeros((1080, 1440), np.uint8)
+        content.refresh_image(frame, 40.0)
+        now[0] += 0.9
+        assert content.displayed_frame() is frame
+        now[0] += 0.2  # 1.1 s old: the camera stalled
+        assert content.displayed_frame() is None
+
+        content.refresh_image(frame, 40.0)
+        assert content.displayed_frame() is frame
+        content.set_is_capture_active(False)
+        QApplication.processEvents()
+        assert content.displayed_frame() is None, "cleared when capture stops"
+    finally:
+        content.close()

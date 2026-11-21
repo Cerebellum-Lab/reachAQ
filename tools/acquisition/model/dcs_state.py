@@ -7,10 +7,14 @@ which DCS records. A legacy calibration has none: a DCS without an id is taken t
 as before ids existed, but a DCS that records an id was measured in a format-2 motor frame,
 which is not the legacy frame, so it is stale under a legacy calibration (after a rollback
 to a legacy backup, for example).
+
+A calibration's id is not its only identity: a reference copy made by "Capture reference
+images now" has a new id but its parent's fit (library.fit_lineage), so a DCS measured
+against any id of that lineage fits it.
 """
 
 from enum import Enum
-from typing import Optional
+from typing import Iterable, Optional
 
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.inference.multires_calibration.store import CalibrationIndex
@@ -31,11 +35,19 @@ class DcsState(Enum):
     MISSING = "missing"  # none loaded, or not fully valid
 
 
-def dcs_state(cfg: Optional[DiamondTriangleOffsetConfig], active_index: Optional[CalibrationIndex]) -> DcsState:
-    """The state of `cfg` against the active calibration, whose index is None for a legacy one."""
+def dcs_state(
+    cfg: Optional[DiamondTriangleOffsetConfig],
+    active_index: Optional[CalibrationIndex],
+    same_fit_ids: Iterable[str] = (),
+) -> DcsState:
+    """The state of `cfg` against the active calibration, whose index is None for a legacy one.
+
+    `same_fit_ids` are other ids with the active calibration's fit (library.fit_lineage); a
+    DCS measured against any of them is as valid as one measured against the active id."""
     if cfg is None or not cfg.fully_valid:
         return DcsState.MISSING
     if active_index is None:
         # A recorded id means a format-2 frame, which a legacy calibration is not.
         return DcsState.STALE if cfg.calibration_id is not None else DcsState.VALID
-    return DcsState.VALID if cfg.calibration_id == active_index.id else DcsState.STALE
+    fits = cfg.calibration_id == active_index.id or cfg.calibration_id in set(same_fit_ids)
+    return DcsState.VALID if fits else DcsState.STALE

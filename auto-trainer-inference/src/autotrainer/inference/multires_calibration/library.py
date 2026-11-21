@@ -67,6 +67,7 @@ OFFSETS_DIR_NAME = ".offsets"
 OFFSETS_FILE_NAME = "camera_offsets.pkl"
 #: The UTC time in a DCS run's own offsets file, camera_offsets-<time>.pkl; it sorts by name.
 OFFSETS_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+_SENSOR_FIT = Path("sensor", "fit.yaml")
 
 _PARTIAL_SUFFIX = ".partial"
 _LEGACY_PICKLE = Path("camera_matrix", "stereo_params.pickle")
@@ -267,6 +268,12 @@ def set_active(root: Path, calibration_id: str, *, by: str) -> None:
     append fails, the previous active.yaml is put back whole (or the new one removed when
     there was none) and the append's error raised, so the pointer never names an entry
     whose activation is not recorded.
+
+    An entry that is a reference copy of another (parent_id, the same sensor/fit.yaml) is the
+    same calibration geometrically, so the DCS measured against its parent still fits it
+    (fit_lineage): when its .offsets folder is empty, the nearest such ancestor's current
+    offsets file is copied there under its own name. A copy that fails is logged; the entry
+    is active by then.
     """
     root = Path(root)
     entry_path(root, calibration_id)
@@ -291,6 +298,65 @@ def set_active(root: Path, calibration_id: str, *, by: str) -> None:
                              pointer, calibration_id)
         raise
     logger.info("calibration %s is now active in %s", calibration_id, root)
+    try:
+        _inherit_offsets(root, calibration_id)
+    except Exception:
+        logger.exception("calibration %s is active, but its parent's camera offsets could not be copied to it",
+                         calibration_id)
+
+
+def fit_lineage(root: Path, calibration_id: str) -> Tuple[str, ...]:
+    """`calibration_id`, then each ancestor (parent_id in its calibration.yaml) while that
+    ancestor is in the library with a byte-identical sensor/fit.yaml: the ids that are this
+    calibration geometrically. A reference copy ("Capture reference images now") is one such
+    child. Stops at the first ancestor that is missing, unreadable or fitted differently.
+    Never raises; an entry it cannot read gives just (calibration_id,)."""
+    root = Path(root)
+    lineage = [calibration_id]
+    try:
+        fit = (root / calibration_id / _SENSOR_FIT).read_bytes()
+    except OSError:
+        return tuple(lineage)
+    current = calibration_id
+    while True:
+        parent = _parent_id(root / current)
+        if parent is None or parent in lineage:
+            break
+        try:
+            entry_path(root, parent)
+            if (root / parent / _SENSOR_FIT).read_bytes() != fit:
+                break
+        except (OSError, CalibrationResolutionError):
+            break
+        lineage.append(parent)
+        current = parent
+    return tuple(lineage)
+
+
+def _parent_id(folder: Path) -> Optional[str]:
+    try:
+        data = yaml.safe_load((folder / INDEX_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    parent = data.get("parent_id") if isinstance(data, dict) else None
+    return parent if isinstance(parent, str) and _is_entry_name(parent) else None
+
+
+def _inherit_offsets(root: Path, calibration_id: str) -> Optional[Path]:
+    """Copy the nearest same-fit ancestor's current offsets file into an empty .offsets/<id>/."""
+    target = offsets_dir(root, calibration_id)
+    if target.is_dir() and any(target.iterdir()):
+        return None
+    for ancestor in fit_lineage(root, calibration_id)[1:]:
+        source = current_offsets_path(root, ancestor)
+        if source is None:
+            continue
+        copy = target / source.name
+        _replace_bytes(copy, source.read_bytes())
+        logger.info("calibration %s has the fit of %s; its camera offsets %s are carried over to %s",
+                    calibration_id, ancestor, source.name, target)
+        return copy
+    return None
 
 
 def record_decision(root: Path, calibration_id: str, kind: str, detail: dict) -> None:

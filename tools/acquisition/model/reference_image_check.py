@@ -198,7 +198,15 @@ def register(reference: np.ndarray, current: np.ndarray) -> Registration:
 
 
 def judge(camera: str, registration: Registration, limits: Limits) -> ReferenceVerdict:
-    """MOVED over any limit, CANT_TELL below the minimum quality, else OK."""
+    """MOVED over any limit, CANT_TELL below the minimum quality, else OK.
+
+    A registration with a value that is not finite (ECC did not converge) is always
+    CANT_TELL, whatever min_quality is: NaN compares false against every limit, so it would
+    otherwise pass as OK with a min_quality of 0.
+    """
+    values = (registration.shift_px, registration.rotation_deg, registration.scale_pct, registration.quality)
+    if not all(math.isfinite(v) for v in values):
+        return ReferenceVerdict(camera, CANT_TELL, registration, limits, "the registration did not converge")
     if not registration.quality >= limits.min_quality:
         return ReferenceVerdict(camera, CANT_TELL, registration, limits,
                                 f"match {registration.quality:.2f} below {limits.min_quality:.2f}")

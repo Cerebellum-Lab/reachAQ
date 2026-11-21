@@ -27,12 +27,15 @@ from autotrainer.core import AnimalSubject, Offset3DTuple, ProjectInfo
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
-from autotrainer.inference.multires_calibration import store
+from autotrainer.inference.multires_calibration import library, store
 from autotrainer.inference.multires_calibration.fit import BoardSpec
 from autotrainer.inference.multires_calibration.store import CalibrationIndex, CalibrationResolutionError
 from reload_calib_multires_test import (
     BASE,
     BASE_PARAMS,
+    SERIALS,
+    _active_entry,
+    _configure_with_serials,
     _legacy_copy_without_offsets,
     _save_live_pair_params,
     _write_multires,
@@ -513,3 +516,77 @@ def test_capture_start_holds_a_dcs_file_gone_stale_before_positioning_the_animal
     assert app_model.dcs_state is DcsState.STALE
     assert _titled(on_error, "Coordinate system") == [STALE_NOTICE]
     assert (animal.pellet_x, animal.pellet_y, animal.pellet_z, animal.is_pellet_dcs) == (1.0, 2.0, 3.0, True)
+
+
+def _reference_copy(app_model, source: Path, tmp_path: Path, *, other_fit: bool = False) -> str:
+    """A copy of library entry `source` as "Capture reference images now" makes it, added to the
+    library; with `other_fit`, its sensor/fit.yaml differs (a real recalibration)."""
+    import cv2
+    import numpy as np
+
+    from tools.acquisition.model import handle_3d_calibration as h3d
+
+    png = tmp_path / "left.png"
+    cv2.imwrite(str(png), np.full((256, 256), 128, np.uint8))
+    built = tmp_path / f"copy-{other_fit}"
+    new_id = h3d.copy_with_references(source, {"left": png}, built, now=datetime(2026, 11, 20, 9, 30))
+    if other_fit:
+        fit = built / "sensor" / "fit.yaml"
+        fit.write_text(fit.read_text() + "# refitted\n")
+    root = library.library_root(Path(app_model._preferences.configuration_location))
+    assert library.add_entry(root, built) == new_id
+    return new_id
+
+
+def test_making_a_reference_copy_active_keeps_the_dcs_and_its_offsets(app_model, tmp_path):
+    parent = _active_entry(app_model, tmp_path)
+    _configure_with_serials(app_model, SERIALS)
+    root = parent.parent
+    offsets = {"x_off": 3.0, "y_off": -19.0, "z_off": 0.5}
+    measured = app_model.write_camera_offsets(parent, offsets)
+    app_model.reload_calib(None)
+    app_model.behavior.algorithm.diamond_triangle_config = _config(parent.name)
+    assert app_model.refresh_dcs_state() is DcsState.VALID
+
+    copy_id = _reference_copy(app_model, parent, tmp_path)
+    library.set_active(root, copy_id, by="ben")
+    with mock.patch.object(app_model, "on_error") as on_error:
+        app_model.reload_calib(None)
+
+    assert app_model.active_calibration_index.id == copy_id
+    assert library.fit_lineage(root, copy_id) == (copy_id, parent.name)
+    assert app_model.dcs_state is DcsState.VALID
+    assert _titled(on_error, "Coordinate system") == []
+    carried = root / ".offsets" / copy_id / measured.name
+    assert carried.read_bytes() == measured.read_bytes()
+    assert app_model._pose_algorithm.cam_offsets == offsets
+    # Made active again later, the parent fits a DCS redone on its copy too.
+    app_model.behavior.algorithm.diamond_triangle_config = _config(copy_id)
+    library.set_active(root, parent.name, by="ben")
+    app_model.reload_calib(None)
+    assert app_model.dcs_state is DcsState.VALID
+
+
+def test_a_recalibration_with_another_fit_still_makes_the_dcs_stale(app_model, tmp_path):
+    parent = _active_entry(app_model, tmp_path)
+    _configure_with_serials(app_model, SERIALS)
+    root = parent.parent
+    app_model.write_camera_offsets(parent, {"x_off": 3.0, "y_off": -19.0, "z_off": 0.5})
+    app_model.reload_calib(None)
+    app_model.behavior.algorithm.diamond_triangle_config = _config(parent.name)
+    assert app_model.refresh_dcs_state() is DcsState.VALID
+
+    other = _reference_copy(app_model, parent, tmp_path, other_fit=True)
+    library.set_active(root, other, by="ben")
+    with mock.patch.object(app_model, "on_error"):
+        app_model.reload_calib(None)
+
+    assert library.fit_lineage(root, other) == (other,)
+    assert app_model.dcs_state is DcsState.STALE
+    assert not (root / ".offsets" / other).exists(), "another fit's offsets are not carried over"
+
+
+def test_dcs_state_takes_any_id_of_the_same_fit():
+    assert dcs_state(_config("parent"), _index("copy"), ("copy", "parent")) is DcsState.VALID
+    assert dcs_state(_config("other"), _index("copy"), ("copy", "parent")) is DcsState.STALE
+    assert dcs_state(_config(None), _index("copy"), ("copy",)) is DcsState.STALE

@@ -249,6 +249,8 @@ def confirm_camera_setup(parent, app_model, frames: Optional[Mapping] = None) ->
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if rsp != QMessageBox.StandardButton.Yes:
+            # Declined: the check's result was for this start, which is not made.
+            app_model.discard_reference_check()
             return False, None
         app_model.acknowledge_setup_difference()
     notes = [note for note in (uncalibrated_off_note(difference), cant_tell_note(verdicts)) if note]

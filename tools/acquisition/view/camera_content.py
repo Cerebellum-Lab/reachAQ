@@ -1,3 +1,4 @@
+import time
 from typing import Dict, Optional
 
 from numpy import ndarray
@@ -20,6 +21,10 @@ from tools.acquisition.view.capture_telemetry_panel import CaptureTelemetryPanel
 
 logger = get_verbose_logger(__name__)
 
+#: A displayed frame older than this (seconds) is no current view of the camera: the
+#: reference-image check then can't tell, rather than judge a frozen picture.
+DISPLAYED_FRAME_MAX_AGE = 1.0
+
 
 class CameraContent(ContentWidget):
     def __init__(self, app_model: AppModel, capture_model: VideoCaptureModel):
@@ -30,8 +35,10 @@ class CameraContent(ContentWidget):
 
         self._text_overlay: Optional[str] = None
         self._text_overlay_color = Qt.GlobalColor.yellow
-        # The newest frame shown (refresh_image), which Record's reference-image check registers.
+        # The newest frame shown (refresh_image), which Record's reference-image check registers,
+        # and when it was shown (time.monotonic()).
         self._displayed_frame: Optional[ndarray] = None
+        self._displayed_at: Optional[float] = None
 
         layout = QGridLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -98,14 +105,18 @@ class CameraContent(ContentWidget):
 
     @Slot(ndarray, float)
     def refresh_image(self, data: ndarray, fps: float, frame_id: int = -1):
-        self._displayed_frame = data
+        self._displayed_frame, self._displayed_at = data, time.monotonic()
         row, col = data.shape
         self._capture_view.refresh_image(
             ImageData(data, col, row, frame_id), fps)
 
     def displayed_frame(self) -> Optional[ndarray]:
         """The newest frame this view was given, at the camera's capture geometry; None before
-        the first. The queue hands each frame over as its own copy, so it is not overwritten."""
+        the first, after capture stopped, and when it is older than DISPLAYED_FRAME_MAX_AGE
+        (the camera stalled), so the reference-image check can't tell instead of judging an
+        old picture. The queue hands each frame over as its own copy, so it is not overwritten."""
+        if self._displayed_at is None or time.monotonic() - self._displayed_at > DISPLAYED_FRAME_MAX_AGE:
+            return None
         return self._displayed_frame
 
     @invoke_method
@@ -114,6 +125,9 @@ class CameraContent(ContentWidget):
 
     @invoke_method
     def set_is_capture_active(self, is_active: bool):
+        if not is_active:
+            # A stopped camera has no current view; its last frame is not one.
+            self._displayed_frame = self._displayed_at = None
         self._capture_view.set_is_capture_active(is_active)
 
     @invoke_method

@@ -107,6 +107,7 @@ from autotrainer.inference.multires_calibration.library import (
     current_offsets_path,
     derived_root,
     entry_path,
+    fit_lineage,
     has_entries,
     import_existing,
     is_legacy_entry,
@@ -1670,15 +1671,16 @@ class AppModel(ObservableObject):
 
     def start_recording(self) -> bool:
         with self._session_lifecycle_command_lock:
-            if self._recording_session.status == SessionRecordingStatus.READY:
-                # An acknowledgement covers the one start it was given for: a start not asked
-                # again (the next one, or any headless or API start) records it unacknowledged.
-                if not self._acknowledgement_pending:
-                    self._acknowledged_difference = None
-                self._acknowledgement_pending = False
-                if not self._reference_check_pending:
-                    self._reference_check = None
-                self._reference_check_pending = False
+            # An acknowledgement and a reference-image check cover the one start call they were
+            # given for, whether or not it starts: a start not asked again (the next one, or any
+            # headless or API start) records neither. A start refused here (not Ready) uses
+            # them up too, so a later start never records a stale answer.
+            if not self._acknowledgement_pending:
+                self._acknowledged_difference = None
+            self._acknowledgement_pending = False
+            if not self._reference_check_pending:
+                self._reference_check = None
+            self._reference_check_pending = False
             return self._start_recording_locked()
 
     def _start_recording_locked(self) -> bool:
@@ -2943,6 +2945,12 @@ class AppModel(ObservableObject):
             # The moved cameras were in the same confirmation, so its Yes covers them too.
             self._reference_check["acknowledged"] = bool(self._reference_check["moved"])
 
+    def discard_reference_check(self) -> None:
+        """The operator answered No to the "Record anyway?" confirmation: the reference-image
+        check run for it, and any acknowledgement, cover no start, so none is recorded later."""
+        self._reference_check, self._reference_check_pending = None, False
+        self._acknowledged_difference, self._acknowledgement_pending = None, False
+
     @property
     def reference_image_check_enabled(self) -> bool:
         """Whether Record checks each camera against its reference image: <library>/settings.yaml
@@ -3034,7 +3042,8 @@ class AppModel(ObservableObject):
         """
         with self._dcs_state_lock:
             algo = self._behavior.algorithm
-            state = dcs_state(algo.loaded_diamond_triangle_config, self._active_calibration_index)
+            loaded = algo.loaded_diamond_triangle_config
+            state = dcs_state(loaded, self._active_calibration_index, self._same_fit_ids(loaded))
             prev, self._dcs_state = self._dcs_state, state
             # Held off while stale, and with live 3D off: there are no 3D offsets to measure against.
             algo.set_dcs_suppressed(state is DcsState.STALE or not self.live_3d_enabled)
@@ -3051,6 +3060,21 @@ class AppModel(ObservableObject):
                 self.on_error("Coordinate system", STALE_NOTICE)
             self.property_changed(self.Props.RECORDING_BLOCKERS, self.recording_blockers, None)
             return state
+
+    def _same_fit_ids(self, cfg: Optional[DiamondTriangleOffsetConfig]) -> Tuple[str, ...]:
+        """The ids with the active calibration's fit (library.fit_lineage): its own ancestors
+        with the same sensor/fit.yaml, and the DCS's calibration when the active one is among
+        that one's ancestors (a DCS redone on a reference copy, its parent made active again).
+        Empty outside the library."""
+        index, folder = self._active_calibration_index, self._active_calibration_dir
+        if index is None or folder is None or not self._is_library_entry(folder):
+            return ()
+        root = self.calibration_library_root
+        ids = fit_lineage(root, index.id)
+        measured = None if cfg is None else cfg.calibration_id
+        if measured and measured not in ids and index.id in fit_lineage(root, measured):
+            ids += (measured,)
+        return ids
 
     def _hand_dcs_to_hardware(self, cfg: Optional[DiamondTriangleOffsetConfig]) -> None:
         """Give the hardware the DCS configuration its consumers use: None while a stale one is
