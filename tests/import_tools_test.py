@@ -121,7 +121,7 @@ def test_the_daq_monitor_is_offered_only_while_idle():
         "make_3d_calib_action", "refresh_hardware_action",
         "_animal_dropdown_combo", "_rfid_entry", "animal_metadata_action",
         "_training_plan_combo", "_notes", "calib_diamond_triangle_action",
-        "daq_monitor_action",
+        "daq_monitor_action", "calibration_library_action",
     )
     offered = {}
     run_offered = {}
