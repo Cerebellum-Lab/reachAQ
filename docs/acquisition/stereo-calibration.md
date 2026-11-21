@@ -276,6 +276,24 @@ calibrations/
   `load_preset_set(...).stereo`. Otherwise live 3D is off with the reason, for
   example "live 3D needs left and right calibrated as left and right: left:
   swapped: calibrated serial 21000001, now 21000099". 2D pose is unaffected.
+- **Live 3D is a setting** (**Preferences → Behavior → Live 3D**), on by default, so
+  nothing changes unless you switch it off. It is stored as `live3d: true` or
+  `false` in `calibrations/settings.yaml`; a missing, empty or corrupt file
+  means on, and the file is replaced whole (temp file, then rename), keeping any
+  other key in it. Switching it reinstalls the pose algorithm at once, and only
+  while the session is Ready.
+  - **Off**, 2D pose keeps running. The drift monitor and the DCS are
+    unavailable, with the reason "live 3D is off": the loaded DCS configuration
+    is kept but not used (as when it is out of date), a move given in DCS is
+    refused with that reason, and animals' saved pellet positions in DCS are
+    kept, not zeroed. Preferences shows "Drift monitor and DCS need live 3D"
+    beside the switch.
+  - Nothing switches it on by itself: not a calibration, not an install.
+  - The session metadata records it as `calibration3d.live3d`:
+    `{enabled, disabledReason}`. With live 3D off, `live3dDisabledReason` is
+    "live 3D is off" too. Offline 3D refuses a session with a
+    `live3dDisabledReason` (its 2D points' preset is not recorded), so a session
+    recorded with live 3D off cannot be triangulated offline for now.
 
 A format-3 folder, for any 2 to 6 cameras:
 

@@ -270,6 +270,7 @@ def test_metadata_schema_3_fields(app_model, tmp_path):
         },
         "mismatchAcknowledged": True,
         "live3dDisabledReason": app_model._live_3d_disabled_reason,
+        "live3d": {"enabled": True, "disabledReason": app_model._live_3d_disabled_reason},
     }
     cameras = saved["hardware"]["configured"]["cameras"]
     assert {k: cameras["left"][k] for k in _CAMERA_KEYS} == {

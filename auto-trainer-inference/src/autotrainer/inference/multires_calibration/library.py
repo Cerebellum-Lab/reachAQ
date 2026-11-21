@@ -78,6 +78,31 @@ def settings_path(root: Path) -> Path:
     return Path(root) / SETTINGS_FILE
 
 
+def read_settings(root: Path) -> dict:
+    """The library's settings.yaml as a dict; {} when it is missing, empty or corrupt. Never raises."""
+    path = settings_path(root)
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as err:
+        logger.warning("ignoring the unreadable library settings %s: %s", path, err)
+        return {}
+    return dict(data) if isinstance(data, dict) else {}
+
+
+def update_settings(root: Path, **changes) -> dict:
+    """Set `changes` in settings.yaml, keeping every other key, and return the settings now stored.
+
+    The file is replaced whole (temp file, then os.replace). A corrupt file is replaced by
+    the changes alone.
+    """
+    settings = read_settings(root)
+    settings.update(changes)
+    _replace_text(settings_path(root), yaml.safe_dump(settings, sort_keys=False))
+    return settings
+
+
 def derived_root(root: Path) -> Path:
     """Where load_preset_set derives geometries no stored set has; never inside an entry."""
     return Path(root) / DERIVED_DIR_NAME

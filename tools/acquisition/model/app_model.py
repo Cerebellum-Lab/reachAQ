@@ -109,6 +109,8 @@ from autotrainer.inference.multires_calibration.library import (
     latest_decision,
     legacy_folder_name,
     library_root,
+    read_settings,
+    update_settings,
 )
 from autotrainer.inference.multires_calibration.store import (
     INDEX_FILE,
@@ -556,6 +558,9 @@ NO_ACTIVE_CALIBRATION = "no active 3D calibration"
 _LIBRARY_OFFSETS_DIR = ".offsets"
 #: The two cameras today's live 3D triangulates, by their calibration names.
 _LIVE_PAIR = ("left", "right")
+#: The key in <library>/settings.yaml, and the reason live 3D gives while it is switched off.
+_LIVE_3D_SETTING = "live3d"
+LIVE_3D_OFF = "live 3D is off"
 #: The cameras of a legacy calibration, which records no list: left and right, no serials.
 _LEGACY_CAMERAS = (
     {"name": "left", "serial": None, "camera_id": 0, "calibrated": True, "reason": ""},
@@ -2389,6 +2394,35 @@ class AppModel(ObservableObject):
         """<configuration location>/calibrations, where the calibrations are kept."""
         return library_root(Path(self._preferences.configuration_location).expanduser())
 
+    @property
+    def live_3d_enabled(self) -> bool:
+        """Whether live 3D runs: <library>/settings.yaml `live3d`, True when it is missing or unreadable."""
+        value = read_settings(self.calibration_library_root).get(_LIVE_3D_SETTING, True)
+        return value if isinstance(value, bool) else True
+
+    @live_3d_enabled.setter
+    @_serialized_session_configuration
+    def live_3d_enabled(self, enabled: bool) -> None:
+        """Switch live 3D on or off, store it, and reinstall the pose algorithm.
+
+        Off, 2D pose keeps running; the drift monitor and the DCS are unavailable with the
+        reason "live 3D is off" (_install_pose_algorithm, refresh_dcs_state). Nothing switches
+        it on again by itself.
+        """
+        self._require_session_ready_for_configuration("Changing live 3D")
+        enabled = bool(enabled)
+        if enabled == self.live_3d_enabled:
+            return
+        update_settings(self.calibration_library_root, **{_LIVE_3D_SETTING: enabled})
+        logger.notice("live 3D is now %s", "on" if enabled else "off")
+        self._reload_calib_guarded(self._active_calibration_dir, report=True)
+        self.refresh_dcs_state()
+
+    @property
+    def _dcs_held_off(self) -> bool:
+        """The loaded DCS configuration is kept but not used: stale, or live 3D is off."""
+        return self._dcs_state is DcsState.STALE or not self.live_3d_enabled
+
     def _resolve_calibration(self, calib_dir: Optional[Path]) -> Tuple[Optional[Path], Optional[str]]:
         """(the folder reload_calib loads, None), or (None, why there is none).
 
@@ -2621,8 +2655,12 @@ class AppModel(ObservableObject):
     ) -> None:
         """Build the PoseAlgorithm for these calibration inputs and hand it to inference.
 
-        With no stereo parameters, live 3D is off and 2D pose runs as usual.
+        With no stereo parameters, live 3D is off and 2D pose runs as usual. So it is with
+        the live 3D setting off, whatever the calibration holds.
         """
+        if not self.live_3d_enabled:
+            stereo_params = calib_metadata = cam_names = square_size = cam_offsets = frame_transform = None
+            self._live_3d_disabled_reason = LIVE_3D_OFF
         inference = self._inference
         model_location = inference.model_location if inference is not None else None
         pose_algo = PoseAlgorithm(
@@ -2799,7 +2837,8 @@ class AppModel(ObservableObject):
             algo = self._behavior.algorithm
             state = dcs_state(algo.loaded_diamond_triangle_config, self._active_calibration_index)
             prev, self._dcs_state = self._dcs_state, state
-            algo.set_dcs_suppressed(state is DcsState.STALE)
+            # Held off while stale, and with live 3D off: there are no 3D offsets to measure against.
+            algo.set_dcs_suppressed(state is DcsState.STALE or not self.live_3d_enabled)
             # The hold announces only a changed configuration, so a None that stays None
             # (stale, then missing) would leave the hardware the old reason to refuse with.
             self._hand_dcs_to_hardware(algo.diamond_triangle_config)
@@ -2814,9 +2853,12 @@ class AppModel(ObservableObject):
     def _hand_dcs_to_hardware(self, cfg: Optional[DiamondTriangleOffsetConfig]) -> None:
         """Give the hardware the DCS configuration its consumers use: None while a stale one is
         held off (refresh_dcs_state), so moves given in DCS refuse meanwhile, and say why."""
-        stale = cfg is None and self._dcs_state is DcsState.STALE
-        self._hardware.set_diamond_triangle_config(
-            cfg, unavailable_reason=STALE_RECORDING_BLOCKER if stale else None)
+        reason = None
+        if cfg is None and not self.live_3d_enabled:
+            reason = LIVE_3D_OFF
+        elif cfg is None and self._dcs_state is DcsState.STALE:
+            reason = STALE_RECORDING_BLOCKER
+        self._hardware.set_diamond_triangle_config(cfg, unavailable_reason=reason)
 
     def _calibration3d_metadata(self) -> Dict[str, Any]:
         """hardware.configured.calibration3d: the active 3D calibration, and why live 3D used none.
@@ -2884,6 +2926,7 @@ class AppModel(ObservableObject):
         if self._pose_algorithm is None or self._pose_algorithm.stereo_params is None:
             record["preset"] = None
             record["live3dDisabledReason"] = self._live_3d_disabled_reason or "no stereo params"
+        record["live3d"] = {"enabled": self.live_3d_enabled, "disabledReason": record.get("live3dDisabledReason")}
         return record
 
     def _identify_primary_main_cam_idx(self):
@@ -5143,7 +5186,7 @@ class AppModel(ObservableObject):
             diamond_cfg = algo.diamond_triangle_config
             # A stale DCS is held off (None) but not gone: the position is kept for when
             # DCS is redone, and _set_animal_base_positions does not send it meanwhile.
-            if self._dcs_state is not DcsState.STALE and (diamond_cfg is None or not diamond_cfg.fully_valid):
+            if not self._dcs_held_off and (diamond_cfg is None or not diamond_cfg.fully_valid):
                 self.on_error("Notice", "Animal Send Pos reset to 0 due to not fully valid diamond-triangle config")
                 animal.is_pellet_dcs = False
                 animal.pellet_x = animal.pellet_y = animal.pellet_z = 0
@@ -10630,10 +10673,11 @@ class AppModel(ObservableObject):
                        xyz.humanize(n_digits=1), animal.is_pellet_dcs)
         algo = self._behavior.algorithm
         diamond_cfg = algo.diamond_triangle_config
-        if diamond_cfg is None and animal.is_pellet_dcs and self._dcs_state is DcsState.STALE:
-            # Kept, not zeroed: it means the same place again once DCS is redone.
+        if diamond_cfg is None and animal.is_pellet_dcs and self._dcs_held_off:
+            # Kept, not zeroed: it means the same place again once DCS is redone (stale) or
+            # live 3D is on again.
             logger.warning("Not sending %s's pellet position: it is in the coordinate system, "
-                           "which is out of date until DCS is redone", animal.name)
+                           "which is unavailable (out of date, or live 3D is off)", animal.name)
             return
         if diamond_cfg is None and animal.is_pellet_dcs:
             logger.warning("loaded animal with pellet DCS, but no diamond-triangle config, forcing to 0")
@@ -11600,11 +11644,11 @@ class AppModel(ObservableObject):
             # the animal's manually configured base position.
             if self._attached_plan is not None or self._protocol_positioning_active:
                 return
-            if animal.is_pellet_dcs and self._dcs_state is DcsState.STALE:
-                # A stale DCS is held off (None), which would rewrite the saved DCS
-                # position as a motor one below; it is kept for when DCS is redone.
+            if animal.is_pellet_dcs and self._dcs_held_off:
+                # A DCS held off (None: stale, or live 3D off) would rewrite the saved DCS
+                # position as a motor one below; it is kept for when DCS is usable again.
                 logger.warning("Not saving %s's pellet position from a motor move: the coordinate "
-                               "system is out of date until DCS is redone", animal.name)
+                               "system is unavailable (out of date, or live 3D is off)", animal.name)
                 return
             coord = name[-1]
             coord_idx = "xyz".index(coord)

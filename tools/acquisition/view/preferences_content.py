@@ -241,6 +241,25 @@ class PreferencesContent(QWidget):
         analysis_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
         top_layout.addLayout(analysis_layout)
         #
+        live_3d_layout = QHBoxLayout()
+        live_3d_layout.addWidget(QLabel("Live 3D:"))
+        toggle = self._live_3d_toggle = QSwitch()
+        toggle.setToolTip(
+            "Triangulates the left and right pose into 3D during live preview and recording sessions. "
+            "On by default. Off, 2D pose keeps running, and the drift monitor and DCS are unavailable."
+        )
+        toggle.setChecked(app_model.live_3d_enabled)
+        live_3d_note = self._live_3d_note = QLabel("Drift monitor and DCS need live 3D")
+        live_3d_note.setVisible(not toggle.isChecked())
+        def live_3d_state_changed(x: int):
+            app_model.live_3d_enabled = x != 0
+            live_3d_note.setVisible(not app_model.live_3d_enabled)
+        toggle.stateChanged.connect(live_3d_state_changed)  # after setChecked
+        live_3d_layout.addWidget(toggle)
+        live_3d_layout.addWidget(live_3d_note)
+        live_3d_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        top_layout.addLayout(live_3d_layout)
+        #
         inference_model_layout = QHBoxLayout()
         inference_model_layout.addWidget(QLabel("Inference model:"))
 
