@@ -282,9 +282,11 @@ made, its cameras, its verdict, which one is **active**, and the cameras it left
   `sensor/fit.yaml` is byte-identical to its parent's, so it is the same
   calibration geometrically: the coordinate system stays valid (a DCS measured
   against any id of that `parent_id` chain with the same fit counts, and the
-  other way round), and setting it active copies the parent's current camera
-  offsets file into its empty `.offsets/<id>/`. A real recalibration, with
-  another fit, still makes the coordinate system out of date.
+  other way round), and it reads the same camera offsets as its parent: the
+  offsets of a fit are kept under one key, the oldest id with that fit, so a DCS
+  redone on the copy or on the parent is in force for both. A real
+  recalibration, with another fit, still makes the coordinate system out of
+  date, and has offsets of its own.
 
 ### 2D-only cameras while recording
 
@@ -439,7 +441,7 @@ delivery position with the Set and Send buttons, and choose **Tools → Calibrat
 Coordinate System**. DCS records the id of the calibration it was measured
 against in `diamond_triangle_offset.yaml` and writes fresh camera offsets
 for the active calibration: beside a library entry, as a new
-`calibrations/.offsets/<id>/camera_offsets-<UTC %Y%m%dT%H%M%SZ>.pkl`, because
+`calibrations/.offsets/<key>/camera_offsets-<UTC %Y%m%dT%H%M%SZ>.pkl`, because
 an entry is never written to; inside the folder, as `camera_offsets.pkl`, for a
 calibration folder given explicitly (the simulator's). Each run is its own file
 and none is overwritten; the newest by name is the one live 3D and offline
@@ -515,7 +517,7 @@ calibrations/
   settings.yaml       library-wide switches (only the file is named here)
   scout_move_list.yaml  the automatic move list saved for a camera set (mutable)
   .derived/           anipose files derived on demand; never inside an entry
-  .offsets/<id>/      DCS's camera offsets for entry <id>, one file per DCS run
+  .offsets/<key>/     DCS's camera offsets for one fit, one file per DCS run
 ```
 
 - **An entry never changes.** A session records the calibration's id, so the
@@ -646,9 +648,12 @@ A format-3 folder, for any 2 to 6 cameras:
 ```
 
 DCS's camera offsets for a library entry are kept beside it, in
-`calibrations/.offsets/<id>/`, one `camera_offsets-<UTC time>.pkl` per DCS run;
-the newest by name is in force. A plain `camera_offsets.pkl` there, from before
-the files were versioned, is read when there is no versioned one. An entry
+`calibrations/.offsets/<key>/`, one `camera_offsets-<UTC time>.pkl` per DCS run;
+the newest by name is in force. `<key>` is the oldest id with the entry's fit
+(`library.offsets_key`): an entry and its reference copies share it, since DCS
+is measured in a fit's frame. A plain `camera_offsets.pkl` there, from before
+the files were versioned, is read when there is no versioned one; when the
+key's folder has neither, the entry's own `.offsets/<id>/` is read. An entry
 imported from an older folder carries that folder's own `camera_offsets.pkl`,
 which is read when `.offsets` has none.
 

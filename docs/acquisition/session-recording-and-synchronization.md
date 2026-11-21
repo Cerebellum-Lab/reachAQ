@@ -701,7 +701,7 @@ both the session and the acquisition metadata:
   without a calibration.
 - `offsetsFile`: `{name, sha256}` of the DCS camera offsets file live 3D loaded
   with the calibration (for a library entry, the newest
-  `calibrations/.offsets/<id>/camera_offsets-<UTC time>.pkl`), or null while it
+  `calibrations/.offsets/<key>/camera_offsets-<UTC time>.pkl`), or null while it
   has none and live 3D uses zero offsets.
 - `mismatch`: `{added, removed, swapped}`: recording cameras the calibration
   does not have, calibrated cameras no configured camera is any more, and
@@ -755,7 +755,8 @@ session's `preset`, else at its live preset set, and a session that names no
 preset under a format-3 calibration without a live set is refused: the largest
 binning would be a guess at the pixels. Offline 3D never writes
 `camera_offsets.pkl` into a format-2 calibration folder: only DCS does, and for
-a library entry it writes beside it, in `calibrations/.offsets/<id>/`.
+a library entry it writes beside it, in `calibrations/.offsets/<key>/`, keyed by
+the entry's fit.
 
 How the calibration is made, stored and graded: [Multi-resolution stereo calibration](stereo-calibration.md).
 

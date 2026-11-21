@@ -538,33 +538,85 @@ def _reference_copy(app_model, source: Path, tmp_path: Path, *, other_fit: bool 
     return new_id
 
 
-def test_making_a_reference_copy_active_keeps_the_dcs_and_its_offsets(app_model, tmp_path):
+O1 = {"x_off": 3.0, "y_off": -19.0, "z_off": 0.5}
+O2 = {"x_off": 4.0, "y_off": -18.0, "z_off": 1.5}
+
+
+def _parent_and_copy(app_model, tmp_path):
+    """A parent entry P, active, with DCS O1 measured on it, and its reference copy C."""
     parent = _active_entry(app_model, tmp_path)
     _configure_with_serials(app_model, SERIALS)
     root = parent.parent
-    offsets = {"x_off": 3.0, "y_off": -19.0, "z_off": 0.5}
-    measured = app_model.write_camera_offsets(parent, offsets)
+    app_model.write_camera_offsets(parent, O1)
     app_model.reload_calib(None)
     app_model.behavior.algorithm.diamond_triangle_config = _config(parent.name)
     assert app_model.refresh_dcs_state() is DcsState.VALID
+    return root, parent.name, _reference_copy(app_model, parent, tmp_path)
 
-    copy_id = _reference_copy(app_model, parent, tmp_path)
-    library.set_active(root, copy_id, by="ben")
+
+def _activate(app_model, root, calibration_id):
+    library.set_active(root, calibration_id, by="ben")
     with mock.patch.object(app_model, "on_error") as on_error:
         app_model.reload_calib(None)
+    assert app_model.active_calibration_index.id == calibration_id
+    return on_error
 
-    assert app_model.active_calibration_index.id == copy_id
-    assert library.fit_lineage(root, copy_id) == (copy_id, parent.name)
+
+def test_a_reference_copy_reads_its_parents_offsets_and_keeps_the_dcs(app_model, tmp_path):
+    root, parent, copy_id = _parent_and_copy(app_model, tmp_path)
+
+    on_error = _activate(app_model, root, copy_id)
+
+    assert library.fit_lineage(root, copy_id) == (copy_id, parent)
+    assert library.offsets_key(root, copy_id) == library.offsets_key(root, parent) == parent
     assert app_model.dcs_state is DcsState.VALID
     assert _titled(on_error, "Coordinate system") == []
-    carried = root / ".offsets" / copy_id / measured.name
-    assert carried.read_bytes() == measured.read_bytes()
-    assert app_model._pose_algorithm.cam_offsets == offsets
-    # Made active again later, the parent fits a DCS redone on its copy too.
+    assert app_model._pose_algorithm.cam_offsets == O1
+    assert not (root / ".offsets" / copy_id).exists(), "nothing is copied: one folder per fit"
+
+
+def test_dcs_redone_on_the_copy_is_what_the_parent_loads(app_model, tmp_path):
+    root, parent, copy_id = _parent_and_copy(app_model, tmp_path)
+    copy_entry = root / copy_id
+    _activate(app_model, root, copy_id)
+    written = app_model.write_camera_offsets(copy_entry, O2)  # DCS redone on C
     app_model.behavior.algorithm.diamond_triangle_config = _config(copy_id)
-    library.set_active(root, parent.name, by="ben")
-    app_model.reload_calib(None)
+    assert written.parent == root / ".offsets" / parent
+
+    _activate(app_model, root, parent)
+
     assert app_model.dcs_state is DcsState.VALID
+    assert app_model._pose_algorithm.cam_offsets == O2
+
+
+def test_dcs_redone_on_the_parent_is_what_the_copy_loads(app_model, tmp_path):
+    root, parent, copy_id = _parent_and_copy(app_model, tmp_path)
+    _activate(app_model, root, copy_id)
+    assert app_model._pose_algorithm.cam_offsets == O1
+    _activate(app_model, root, parent)
+    app_model.write_camera_offsets(root / parent, O2)  # DCS redone on P
+
+    _activate(app_model, root, copy_id)
+
+    assert app_model.dcs_state is DcsState.VALID
+    assert app_model._pose_algorithm.cam_offsets == O2
+
+
+def test_offsets_left_under_a_copys_own_id_are_still_read(app_model, tmp_path):
+    # Written before offsets were keyed by fit: .offsets/<copy id>/ with the parent's empty.
+    import pickle as _pickle
+
+    root, parent, copy_id = _parent_and_copy(app_model, tmp_path)
+    for f in (root / ".offsets" / parent).iterdir():
+        f.unlink()
+    own = root / ".offsets" / copy_id / "camera_offsets-20261120T093000Z.pkl"
+    own.parent.mkdir(parents=True)
+    own.write_bytes(_pickle.dumps(O2))
+
+    _activate(app_model, root, copy_id)
+
+    assert app_model.camera_offsets_path() == own
+    assert app_model._pose_algorithm.cam_offsets == O2
 
 
 def test_a_recalibration_with_another_fit_still_makes_the_dcs_stale(app_model, tmp_path):
@@ -582,8 +634,10 @@ def test_a_recalibration_with_another_fit_still_makes_the_dcs_stale(app_model, t
         app_model.reload_calib(None)
 
     assert library.fit_lineage(root, other) == (other,)
+    assert library.offsets_key(root, other) == other != parent.name, "another fit has its own key"
     assert app_model.dcs_state is DcsState.STALE
     assert not (root / ".offsets" / other).exists(), "another fit's offsets are not carried over"
+    assert app_model._pose_algorithm.cam_offsets == {"x_off": 0.0, "y_off": 0.0, "z_off": 0.0}
 
 
 def test_dcs_state_takes_any_id_of_the_same_fit():

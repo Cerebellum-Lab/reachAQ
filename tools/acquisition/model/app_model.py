@@ -2597,7 +2597,7 @@ class AppModel(ObservableObject):
         """The camera offsets file in force for the calibration in `folder` (the active one by default).
 
         For a library entry, the one library.current_offsets_path picks in
-        <library>/.offsets/<id>/ (the newest DCS run's), as offline does; None when DCS has
+        <library>/.offsets/<offsets_key>/ (the newest DCS run's), as offline does; None when DCS has
         written none there yet. In any other folder (a legacy folder or one given explicitly),
         <folder>/camera_offsets.pkl, as before. None when there is no calibration.
         """
@@ -2611,7 +2611,7 @@ class AppModel(ObservableObject):
     def write_camera_offsets(self, folder: Path, cam_offsets: Mapping[str, Any]) -> Path:
         """Keep DCS's `cam_offsets` for the calibration in `folder`, and return the file.
 
-        For a library entry, a new <library>/.offsets/<id>/camera_offsets-<UTC time>.pkl, never
+        For a library entry, a new <library>/.offsets/<offsets_key>/camera_offsets-<UTC time>.pkl, never
         overwriting an earlier run's (library.write_offsets). In any other folder,
         <folder>/camera_offsets.pkl, the previous one first copied to a dated backup, as before.
         """

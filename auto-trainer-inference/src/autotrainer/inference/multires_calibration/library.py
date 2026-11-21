@@ -7,9 +7,11 @@ Under <config>/calibrations/ (library_root):
     decisions.jsonl     append-only: one JSON object per line, {event, id, at, ...}
     settings.yaml       library-wide switches; this module only names the file (settings_path)
     .derived/           the cache load_preset_set derives other geometries into, outside any entry
-    .offsets/<id>/      the camera offsets DCS measured against entry <id> (offsets_dir): one
+    .offsets/<key>/     the camera offsets DCS measured against a fit (offsets_dir): one
                         camera_offsets-<UTC %Y%m%dT%H%M%SZ>.pkl per DCS run, never overwritten;
-                        the newest by name is the current one (current_offsets_path)
+                        the newest by name is the current one (current_offsets_path). <key> is
+                        offsets_key: the oldest id with that fit, so a reference copy and its
+                        parent share one folder
 
 A session names its calibration by id, so an entry never changes once it is in place: it is
 copied into <id>.partial, its files and folders are flushed to disk, and it is renamed to
@@ -123,21 +125,22 @@ def derived_root(root: Path) -> Path:
     return Path(root) / DERIVED_DIR_NAME
 
 
-def offsets_dir(root: Path, calibration_id: str) -> Path:
-    """Where the camera offsets DCS measured against entry `calibration_id` are kept, beside it."""
-    return Path(root) / OFFSETS_DIR_NAME / calibration_id
+def offsets_dir(root: Path, key: str) -> Path:
+    """The .offsets folder named `key`; for an entry's offsets, `key` is offsets_key(root, id)."""
+    return Path(root) / OFFSETS_DIR_NAME / key
 
 
-def current_offsets_path(root: Path, calibration_id: str) -> Optional[Path]:
-    """The camera offsets in force for entry `calibration_id`: the newest
-    camera_offsets-<UTC time>.pkl in its .offsets folder by name, else a plain
-    camera_offsets.pkl there (written before the files were versioned), else None.
+def offsets_key(root: Path, calibration_id: str) -> str:
+    """The folder name under .offsets that entry `calibration_id`'s camera offsets are kept
+    under: the oldest id of its fit_lineage, the root ancestor with the same sensor/fit.yaml.
 
-    Live 3D (AppModel.camera_offsets_path) and offline (prepare_jetson_data) both pick the
-    file here, so they read the same one. An entry's own camera_offsets.pkl, which an
-    imported legacy folder may have, is the callers' fallback after this.
-    """
-    folder = offsets_dir(root, calibration_id)
+    DCS is measured in a fit's frame and its configuration is global, so every entry of one
+    fit (a parent and its reference copies) reads and writes the same offsets: a DCS redone
+    on any of them is in force for all of them. Another fit has another key."""
+    return fit_lineage(root, calibration_id)[-1]
+
+
+def _newest_offsets(folder: Path) -> Optional[Path]:
     stem, suffix = os.path.splitext(OFFSETS_FILE_NAME)
     try:
         stamped = sorted(p for p in folder.glob(f"{stem}-*{suffix}") if p.is_file())
@@ -149,16 +152,34 @@ def current_offsets_path(root: Path, calibration_id: str) -> Optional[Path]:
     return plain if plain.is_file() else None
 
 
+def current_offsets_path(root: Path, calibration_id: str) -> Optional[Path]:
+    """The camera offsets in force for entry `calibration_id`: in .offsets/<offsets_key>/, the
+    newest camera_offsets-<UTC time>.pkl by name, else a plain camera_offsets.pkl there
+    (written before the files were versioned). When that folder has neither, the entry's own
+    .offsets/<id>/ is read the same way (written before offsets were keyed by fit); else None.
+
+    Live 3D (AppModel.camera_offsets_path) and offline (prepare_jetson_data) both pick the
+    file here, so they read the same one. An entry's own camera_offsets.pkl, which an
+    imported legacy folder may have, is the callers' fallback after this.
+    """
+    key = offsets_key(root, calibration_id)
+    found = _newest_offsets(offsets_dir(root, key))
+    if found is None and key != calibration_id:
+        found = _newest_offsets(offsets_dir(root, calibration_id))
+    return found
+
+
 def write_offsets(root: Path, calibration_id: str, data: bytes, *, now: Optional[datetime] = None) -> Path:
     """Keep `data` (a pickled offsets dict) as a new camera_offsets-<UTC time>.pkl of entry
-    `calibration_id`, and return it; it becomes current_offsets_path. No file is ever
-    overwritten: a name already taken (two runs in one second) takes the next second, so the
-    name order stays the time order. The file is written whole (temp file, then rename)."""
-    folder = offsets_dir(root, calibration_id)
+    `calibration_id`, in .offsets/<offsets_key>/, and return it; it becomes current_offsets_path
+    for every entry of that fit. No file is ever overwritten: a name already taken (two runs
+    in one second) takes the next second, so the name order stays the time order. The file is
+    written whole (temp file, then rename)."""
+    folder = offsets_dir(root, offsets_key(root, calibration_id))
     folder.mkdir(parents=True, exist_ok=True)
     when = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0)
     stem, suffix = os.path.splitext(OFFSETS_FILE_NAME)
-    current = current_offsets_path(root, calibration_id)
+    current = _newest_offsets(folder)
     if current is not None and current.name != OFFSETS_FILE_NAME:
         # Never before the current file in name order (a clock set back), which would hide the new one.
         try:
@@ -267,13 +288,8 @@ def set_active(root: Path, calibration_id: str, *, by: str) -> None:
     the old pointer; the decision is appended only after the pointer is in place. When the
     append fails, the previous active.yaml is put back whole (or the new one removed when
     there was none) and the append's error raised, so the pointer never names an entry
-    whose activation is not recorded.
-
-    An entry that is a reference copy of another (parent_id, the same sensor/fit.yaml) is the
-    same calibration geometrically, so the DCS measured against its parent still fits it
-    (fit_lineage): when its .offsets folder is empty, the nearest such ancestor's current
-    offsets file is copied there under its own name. A copy that fails is logged; the entry
-    is active by then.
+    whose activation is not recorded. Nothing is copied: an entry of the same fit as
+    another reads the same offsets (offsets_key).
     """
     root = Path(root)
     entry_path(root, calibration_id)
@@ -298,11 +314,6 @@ def set_active(root: Path, calibration_id: str, *, by: str) -> None:
                              pointer, calibration_id)
         raise
     logger.info("calibration %s is now active in %s", calibration_id, root)
-    try:
-        _inherit_offsets(root, calibration_id)
-    except Exception:
-        logger.exception("calibration %s is active, but its parent's camera offsets could not be copied to it",
-                         calibration_id)
 
 
 def fit_lineage(root: Path, calibration_id: str) -> Tuple[str, ...]:
@@ -340,23 +351,6 @@ def _parent_id(folder: Path) -> Optional[str]:
         return None
     parent = data.get("parent_id") if isinstance(data, dict) else None
     return parent if isinstance(parent, str) and _is_entry_name(parent) else None
-
-
-def _inherit_offsets(root: Path, calibration_id: str) -> Optional[Path]:
-    """Copy the nearest same-fit ancestor's current offsets file into an empty .offsets/<id>/."""
-    target = offsets_dir(root, calibration_id)
-    if target.is_dir() and any(target.iterdir()):
-        return None
-    for ancestor in fit_lineage(root, calibration_id)[1:]:
-        source = current_offsets_path(root, ancestor)
-        if source is None:
-            continue
-        copy = target / source.name
-        _replace_bytes(copy, source.read_bytes())
-        logger.info("calibration %s has the fit of %s; its camera offsets %s are carried over to %s",
-                    calibration_id, ancestor, source.name, target)
-        return copy
-    return None
 
 
 def record_decision(root: Path, calibration_id: str, kind: str, detail: dict) -> None:
