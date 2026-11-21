@@ -324,3 +324,50 @@ def test_configured_bounds_come_from_the_library_setting():
     assert scout.configured_bounds({"scoutBounds": {"lo": [0, 1, 2], "hi": [3, 4, 5]}}) == Bounds((0, 1, 2), (3, 4, 5))
     assert scout.configured_bounds({"scoutBounds": {"lo": [0, 1], "hi": [3, 4, 5]}}) is None
     assert scout.configured_bounds({"scoutBounds": "wide"}) is None
+    assert scout.configured_bounds({"scoutBounds": {"lo": "012", "hi": "345"}}) is None
+
+
+def _seen(camera, corners=None):
+    return ScoutView(camera, True, np.zeros((48, 2)) if corners is None else corners, None, 0.78, True)
+
+
+def _unseen(camera):
+    return ScoutView(camera, False, None, None, None, False)
+
+
+def test_a_camera_detected_at_too_few_points_is_told_so_not_never_in_view():
+    views = {i: {"few": _seen("few") if i < 5 else _unseen("few")} for i in range(18)}
+    assert diagnose(views, ["few"]) == {
+        "few": "board seen at only 5 of 18 points, 12 needed: aim the camera at the middle of the board's travel"}
+
+
+def test_disjoint_camera_groups_leave_the_selection_short():
+    grid = scout_grid(BOX, counts=(4, 4, 2))  # 32 points
+    views = {i: ({"a": _seen("a"), "b": _seen("b"), "c": _unseen("c"), "d": _unseen("d")} if i < 16 else
+                 {"a": _unseen("a"), "b": _unseen("b"), "c": _seen("c"), "d": _seen("d")})
+             for i in range(len(grid))}
+    selection = select_waypoints(grid, views, ["a", "b", "c", "d"])
+    assert not selection.connected and selection.groups == (("a", "b"), ("c", "d"))
+    assert all(n >= 12 for n in selection.per_camera.values())
+    assert scout.selection_shortfalls(selection, ["a", "b", "c", "d"]) == {
+        "c": "not joined to a, b through shared views in the chosen move list",
+        "d": "not joined to a, b through shared views in the chosen move list"}
+
+
+def test_a_cap_that_shrinks_the_list_below_12_views_is_named():
+    grid = scout_grid(BOX)
+    rng = np.random.default_rng(2)
+    views = {i: {c: _seen(c, rng.uniform(0, 1000, (48, 2))) for c in ("a", "b")} for i in range(len(grid))}
+    selection, path = scout.choose_move_list(grid, views, ["a", "b"], max_path=10)
+    assert len(path) <= 10
+    n = selection.per_camera["a"]
+    assert n < 12
+    assert scout.selection_shortfalls(selection, ["a", "b"]) == {
+        "a": f"only {n} of 12 views in the chosen move list", "b": f"only {n} of 12 views in the chosen move list"}
+    # The uncapped list passes.
+    full, _ = scout.choose_move_list(grid, views, ["a", "b"])
+    assert scout.selection_shortfalls(full, ["a", "b"]) == {}
+
+
+def test_advice_for_one_camera_is_merged():
+    assert scout.merge_advice({"a": "x"}, {"a": "y", "b": "z"}, {"a": "x"}) == {"a": "x; y", "b": "z"}

@@ -75,6 +75,12 @@ ADVICE_FOCUS = "board in frame but never detected: check focus at the board dist
 ADVICE_GRAZING = ("board seen at a grazing angle (aspect {aspect:.2f} vs 0.78):"
                   " aim the camera more face-on; the stage cannot tilt the board")
 ADVICE_NEVER = "board never in view: the camera points elsewhere or the scout bounds miss its view"
+ADVICE_FEW = ("board seen at only {k} of {m} points, {need} needed:"
+              " aim the camera at the middle of the board's travel")
+# The chosen move list itself falls short of the rule for a camera.
+SHORT_VIEWS = "only {n} of {need} views in the chosen move list"
+SHORT_COVISIBLE = "only {n} of {need} views shared with another camera in the chosen move list"
+SHORT_JOINED = "not joined to {others} through shared views in the chosen move list"
 
 
 class ScoutAborted(RuntimeError):
@@ -117,12 +123,16 @@ class ScoutView:
 
 @dataclass(frozen=True)
 class Selection:
-    """The chosen points in the order they were chosen; each camera's views among them; and
-    whether shared views join every ticked camera."""
+    """The chosen points in the order they were chosen; each camera's views among them;
+    whether shared views join every ticked camera; each camera's views shared with another
+    camera (`covisible`, as per_camera when not given); and the groups of cameras shared
+    views join (`groups`; when not given, one group of all if connected, else one each)."""
 
     points: List[Point]
     per_camera: Dict[str, int]
     connected: bool
+    covisible: Optional[Dict[str, int]] = None
+    groups: Optional[Tuple[Tuple[str, ...], ...]] = None
 
 
 @dataclass
@@ -295,7 +305,53 @@ def select_waypoints(
                 axis_values[c][k].add(grid[best][k])
             covered[c] |= cells[best][c]
     connected = groups.count() == 1 and all(count[c] > 0 for c in cameras)
-    return Selection(points=[tuple(grid[i]) for i in chosen], per_camera=count, connected=connected)
+    return Selection(points=[tuple(grid[i]) for i in chosen], per_camera=count, connected=connected,
+                     covisible=dict(covisible), groups=groups.groups())
+
+
+def selection_shortfalls(
+    selection: Selection,
+    cameras: Sequence[str],
+    *,
+    min_views: int = MIN_VIEWS,
+    min_covisible: int = MIN_COVISIBLE,
+) -> Dict[str, str]:
+    """Plain-words advice for each camera the chosen move list itself leaves short of the rule.
+
+    Fewer than `min_views` views, fewer than `min_covisible` of them shared with another
+    camera, or not joined through shared views to the largest group of cameras (of equal
+    groups, the one with the earliest camera in `cameras`). A camera's reasons are joined
+    with "; ".
+    """
+    cameras = list(cameras)
+    covisible = selection.per_camera if selection.covisible is None else selection.covisible
+    groups = selection.groups
+    if groups is None:
+        groups = (tuple(cameras),) if selection.connected else tuple((c,) for c in cameras)
+    rank = {c: k for k, c in enumerate(cameras)}
+    main = max(groups, key=lambda g: (len(g), -min(rank.get(c, len(rank)) for c in g))) if groups else ()
+    reasons: Dict[str, List[str]] = {}
+    for camera in cameras:
+        n = selection.per_camera.get(camera, 0)
+        if n < min_views:
+            reasons.setdefault(camera, []).append(SHORT_VIEWS.format(n=n, need=min_views))
+        k = covisible.get(camera, 0)
+        if k < min_covisible and k < n:
+            reasons.setdefault(camera, []).append(SHORT_COVISIBLE.format(n=k, need=min_covisible))
+        if camera not in main:
+            others = ", ".join(c for c in cameras if c in main) or "the other cameras"
+            reasons.setdefault(camera, []).append(SHORT_JOINED.format(others=others))
+    return {camera: "; ".join(text) for camera, text in reasons.items()}
+
+
+def merge_advice(*advice: Mapping[str, str]) -> Dict[str, str]:
+    """Per camera, every distinct advice given for it, in order, joined with "; "."""
+    merged: Dict[str, List[str]] = {}
+    for one in advice:
+        for camera, text in one.items():
+            if text not in merged.setdefault(camera, []):
+                merged[camera].append(text)
+    return {camera: "; ".join(texts) for camera, texts in merged.items()}
 
 
 def _cells(corners, camera, views, image_sizes) -> set:
@@ -334,6 +390,13 @@ class _Groups:
 
     def join(self, cameras):
         self._join(self._parent, cameras)
+
+    def groups(self) -> Tuple[Tuple[str, ...], ...]:
+        """The groups, each in camera order, in the order of their first camera."""
+        by_root: Dict[str, List[str]] = {}
+        for c in self._parent:
+            by_root.setdefault(self._root(c), []).append(c)
+        return tuple(tuple(g) for g in by_root.values())
 
     def _join(self, parent, cameras):
         cameras = list(cameras)
@@ -467,6 +530,8 @@ def configured_bounds(settings: Mapping) -> Optional[Bounds]:
     if value is None:
         return None
     try:
+        if not isinstance(value, Mapping) or not all(isinstance(value.get(k), (list, tuple)) for k in ("lo", "hi")):
+            raise TypeError("it must be {lo: [x, y, z], hi: [x, y, z]}")
         lo = tuple(float(v) for v in value["lo"])
         hi = tuple(float(v) for v in value["hi"])
         if len(lo) != 3 or len(hi) != 3 or not all(math.isfinite(v) for v in lo + hi):
@@ -490,13 +555,13 @@ def diagnose(
     views' median foreshortening is below GRAZING_FORESHORTENING. Its advice is the first
     that fits:
 
-    - no board pixels at any point: never in view;
+    - no board pixels and no detection at any point: never in view;
     - found, but at a grazing angle: aim more face-on;
-    - at half or more of the points with board pixels but no detection, the board reaches
-      one image edge (or, for a detection, its corners come within 10 px of it, given
-      `image_sizes`): cut off at that edge, with how many of the scouted points;
+    - at half or more of the points with the board in view (board pixels, detected or
+      not), it reaches one image edge (for a detection, its corners come within 10 px of
+      it, given `image_sizes`): cut off at that edge, with how many of the scouted points;
     - board pixels without a detection: focus, then lighting and exposure;
-    - otherwise: never in view.
+    - otherwise, detected at too few points: seen at only k of m points.
     """
     advice = {}
     m = len(views)
@@ -509,20 +574,23 @@ def diagnose(
         if len(detected) >= min_views and not grazing:
             continue
         size = None if image_sizes is None else image_sizes.get(camera)
-        edges = [_view_edge(v, size) for v in seen]
-        undetected = [v for v in seen if v.board_pixels and not v.found]
+        # Like with like: the edge count and what it is compared with are both over the
+        # points where the board was in view, detected or not.
+        in_view = [v for v in seen if v.board_pixels or v.found]
+        undetected = [v for v in in_view if not v.found]
+        edges = [_view_edge(v, size) for v in in_view]
         tally = {e: edges.count(e) for e in _EDGES}
         edge = max(_EDGES, key=lambda e: tally[e])
-        if not any(v.board_pixels or v.found for v in seen):
+        if not in_view:
             advice[camera] = ADVICE_NEVER
         elif grazing:
             advice[camera] = ADVICE_GRAZING.format(aspect=median_aspect)
-        elif undetected and tally[edge] > 0 and tally[edge] * 2 >= len(undetected):
+        elif tally[edge] > 0 and tally[edge] * 2 >= len(in_view):
             advice[camera] = ADVICE_EDGE.format(edge=edge, n=tally[edge], m=m)
         elif undetected:
             advice[camera] = ADVICE_FOCUS
         else:
-            advice[camera] = ADVICE_NEVER
+            advice[camera] = ADVICE_FEW.format(k=len(detected), m=m, need=min_views)
     return advice
 
 

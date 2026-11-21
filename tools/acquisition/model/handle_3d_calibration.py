@@ -41,8 +41,10 @@ from autotrainer.inference.multires_calibration.scout import (
     configured_bounds,
     diagnose,
     load_move_list,
+    merge_advice,
     save_move_list,
     scout_grid,
+    selection_shortfalls,
     scout_views_from_capture,
     video_sizes,
 )
@@ -374,6 +376,8 @@ def run_waypoints(
     origin = _reported_position(hard)  # where prepare() left the stage, if the motor said
     for i, (axis, value, motor) in enumerate(plan):
         moved = AXES if i == 0 else (axis,)
+        if strict:
+            _abort_on_fault(hard, f"waypoint {i}")  # a fault latched since the last check: no command
         for move_axis in moved:
             if not strict:
                 _command(hard, move_axis, motor[AXES.index(move_axis)])
@@ -383,7 +387,7 @@ def run_waypoints(
             except Exception as err:
                 raise ScoutAborted(f"waypoint {i}: the move of {move_axis} to {motor[AXES.index(move_axis)]:.3f}"
                                    f" failed: {err}") from err
-            _abort_on_fault(hard, i)
+            _abort_on_fault(hard, f"waypoint {i}")
         wait = _move_settle(limits, moved, motor, origin) if settle is None else settle
         logger.debug("waypoint %d: %s to %s, settle %.3f s", i, "".join(moved), motor, wait)
         sleep(wait)
@@ -394,7 +398,7 @@ def run_waypoints(
         if strict:
             if not arrived:
                 raise ScoutAborted(f"waypoint {i}: the motor reported {reported}, not the commanded {motor}")
-            _abort_on_fault(hard, i)
+            _abort_on_fault(hard, f"waypoint {i}")
         if not arrived:
             logger.warning("waypoint %d: the motor reported %s, not within %s of the commanded %s",
                            i, reported, tolerance, motor)
@@ -421,10 +425,11 @@ class ScoutCancelled(RuntimeError):
     """The operator chose Cancel at the scout's advice; nothing was captured."""
 
 
-def _abort_on_fault(hard, waypoint: int) -> None:
+def _abort_on_fault(hard, where: str) -> None:
+    """Raise ScoutAborted when the motor reports a driver fault on any axis."""
     faulted = tuple(getattr(hard, "pellet_axes_with_driver_fault", ()) or ())
     if faulted:
-        raise ScoutAborted(f"waypoint {waypoint}: motor driver fault on {', '.join(faulted)}")
+        raise ScoutAborted(f"{where}: motor driver fault on {', '.join(faulted)}")
 
 
 def scout_plan(
@@ -533,22 +538,33 @@ def calibrate_waypoint_capture(
     return output_dir, index, report
 
 
-def _prepare_capture(app_model, hard, cameras, cams_before_cfg, cam_params, record_mode, project, start_xyz) -> None:
+def _prepare_capture(app_model, hard, cameras, cams_before_cfg, cam_params, record_mode, project, start_xyz,
+                     *, strict: bool = False) -> None:
     """Connect and home the stage, go to `start_xyz`, give the cameras the capture's
     configuration and start them recording: the one camera lifecycle the capture and the
-    scout share (_record_plan)."""
+    scout share (_record_plan).
+
+    `strict` (the scout) checks for a motor driver fault before homing, after it, and after
+    each start-position command, raising ScoutAborted before the next command.
+    """
     logger.notice("Preparing ..")
     #
     logger.info("Connecting to HW ..")
     hard.connect(app_model.message_handler.input_queue)
+    if strict:
+        _abort_on_fault(hard, "before homing")
     token = hard.send_home()
     hard.wait_pending_command_acked(token)
+    if strict:
+        _abort_on_fault(hard, "homing")
     #
     # Waypoint 0 is reached before recording starts, so the video opens on it rather
     # than on the move from home, which would add a stationary segment no waypoint has.
     logger.verbose("Setting start position")
     for axis, motor_value in zip(AXES, start_xyz):
         _command(hard, axis, motor_value)
+        if strict:
+            _abort_on_fault(hard, f"the start move of {axis}")
     #
     for cam, cfg in zip(cameras, cams_before_cfg):
         params = cam_params.copy()
@@ -666,7 +682,8 @@ def _record_plan(
     failed = None
     log = None
     try:
-        _prepare_capture(app_model, hard, cameras, cams_before_cfg, cam_params, record_mode, project, plan[0][2])
+        _prepare_capture(app_model, hard, cameras, cams_before_cfg, cam_params, record_mode, project, plan[0][2],
+                         strict=bool(waypoint_options.get("strict", False)))
         logger.notice("Running %s ..", label)
         logger.info("Now executing the moves, pausing at each waypoint ..")
         log = run_waypoints(hard, plan, capture_settings=capture_settings_of(cam_params), cameras=capture_list,
@@ -744,12 +761,16 @@ def run_scout(
 
 def saved_scout_list(root: Optional[Path], identities: Sequence[str], bounds: Bounds):
     """The scout list saved in the library `root` for these cameras, or None when there is
-    none, or a point lies outside `bounds` (today's hand-written box: the DCS may have moved
-    it) or two in a row differ in other than one axis."""
+    none, it has fewer than MIN_SCOUT_POINTS points, a point lies outside `bounds` (today's
+    hand-written box: the DCS may have moved it) or two in a row differ in other than one axis."""
     if root is None:
         return None
     points = load_move_list(Path(root, SCOUT_MOVE_LIST_FILE), identities)
     if points is None:
+        return None
+    if len(points) < MIN_SCOUT_POINTS:
+        logger.warning("the saved scout move list has %d points, fewer than %d; scouting again",
+                       len(points), MIN_SCOUT_POINTS)
         return None
     if not all(lo <= v <= hi for p in points for v, lo, hi in zip(p, bounds.lo, bounds.hi)):
         logger.warning("the saved scout move list leaves the hand-written list's box %s - %s; scouting again",
@@ -778,11 +799,13 @@ def make_3d_calib(
     `move_list` is "handwritten" (the default, `moves`) or "scout". With "scout", the list
     saved in the calibration library for the same cameras (by serial, by name without one)
     is used when it lies inside the hand-written list's box; otherwise the scout runs
-    (run_scout). When a camera fails the rule, `confirm_scout(advice by camera)` is asked
-    first: False raises ScoutCancelled and nothing is captured; True goes on, and that
-    camera ends up 2D only. Then choose_plan: the scout's list with 12 or more chosen
-    points, else the hand-written list. A scout list every camera passed is saved for next
-    time.
+    (run_scout), then choose_plan: the scout's list with 12 or more chosen points, else the
+    hand-written list. When a camera fails the rule over the scout's grid (diagnose) or in
+    the scout list to be used (selection_shortfalls: fewer than 12 views, fewer than 8
+    shared, or not joined to the others), `confirm_scout(advice by camera)` is asked first:
+    False raises ScoutCancelled and nothing is captured; True goes on, and that camera may
+    end up 2D only. A scout list is saved for next time only when no camera has advice and
+    the list joins every camera.
 
     The cameras record in TRIGGER mode, as a session's do. On christielab10 (2026-11-19)
     START_CONTINUOUS never reached RECORDING ("left: no RECORDING within 5 s", three runs),
@@ -845,10 +868,17 @@ def make_3d_calib(
             scout = run_scout(app_model, cameras, targets, project=project, session_dir=Path(sess_path.location),
                               cams_before_cfg=cams_before_cfg, capture_list=capture_list, cam_params=cam_params,
                               record_mode=record_mode, configured=configured)
-            if scout.diagnosis and confirm_scout is not None and not confirm_scout(dict(scout.diagnosis)):
-                raise ScoutCancelled("cancelled at the scout's advice; nothing was captured")
             plan, used = choose_plan(SCOUT, diamond_triangle_cfg, scout)
-            if used == SCOUT and root is not None and not scout.diagnosis:
+            # The rule is checked on the list that will be used, too: the 60-waypoint cap can
+            # leave a camera short, and shared views can join the cameras in separate groups.
+            shortfalls = {} if used != SCOUT else selection_shortfalls(
+                scout.selection, [camera.name for camera in cameras])
+            advice = merge_advice(scout.diagnosis, shortfalls)
+            for camera, text in shortfalls.items():
+                logger.warning("%s: %s", camera, text)
+            if advice and confirm_scout is not None and not confirm_scout(advice):
+                raise ScoutCancelled("cancelled at the scout's advice; nothing was captured")
+            if used == SCOUT and root is not None and not advice and scout.selection.connected:
                 save_move_list(Path(root, SCOUT_MOVE_LIST_FILE), scout.points, identities, datetime.now())
 
     log = _record_plan(app_model, cameras, cams_before_cfg, cam_params, record_mode, project, plan, capture_list,

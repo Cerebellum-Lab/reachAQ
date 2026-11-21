@@ -1109,6 +1109,7 @@ class _ScoutRigMotor(_Motor):
         self._calls.append(("motor", "connect"))
 
     def send_home(self):
+        self._calls.append(("motor", "home"))
         return uuid.uuid4()
 
     def disconnect(self):
@@ -1188,10 +1189,12 @@ def test_an_aborted_scout_stops_the_cameras_and_moves_no_video(tmp_path, monkeyp
     assert not (tmp_path / "session" / "scout").exists()
 
 
-def _scout_result(n_selected, diagnosis=None):
+def _scout_result(n_selected, diagnosis=None, *, per_camera=None, groups=None):
     # inside the hand-written list's box on _dcs(): motor x 0.6-20, y 5-30, z 52-65
     points = [(1.0 + i, 20.0, 60.0) for i in range(n_selected)]
-    selection = Selection(points=points, per_camera={"left": n_selected, "right": n_selected}, connected=True)
+    per_camera = {"left": n_selected, "right": n_selected} if per_camera is None else per_camera
+    selection = Selection(points=points, per_camera=per_camera, connected=groups is None or len(groups) == 1,
+                          groups=groups)
     return ScoutResult(points=order_path(points), selection=selection, diagnosis=diagnosis or {}, views={})
 
 
@@ -1294,7 +1297,112 @@ def test_a_scout_with_too_few_points_captures_the_handwritten_list(tmp_path, mon
 
 def test_a_saved_list_outside_todays_box_is_scouted_again(tmp_path, monkeypatch):
     app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(14)])
-    save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", [(500.0, 40.0, 30.0)], ["left", "right"],
+    # 14 points, one-axis moves, the last outside today's box (motor x 0.6-20).
+    points = [(1.0 + i, 20.0, 60.0) for i in range(13)] + [(500.0, 20.0, 60.0)]
+    save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
                    datetime(2026, 11, 20))
+    run()
+    assert seen["scouts"] == 1
+
+
+def test_a_fault_before_waypoint_0_sends_no_waypoint_command():
+    # A fault latched during homing, the start move or the cameras' start-up is still set
+    # when the waypoints begin: the scout sends nothing.
+    clock = _Clock()
+    motor = _scout_motor(clock)
+    motor.pellet_axes_with_driver_fault = ("X",)
+    with pytest.raises(ScoutAborted, match="waypoint 0: motor driver fault on X"):
+        run_waypoints(motor, _scout_grid_plan(), strict=True, sleep=clock.sleep, now=clock.now, clock=clock.now)
+    assert motor.commands == []
+
+    # The capture, not strict, behaves as before.
+    log = run_waypoints(motor, _scout_grid_plan(), sleep=clock.sleep, now=clock.now, clock=clock.now)
+    assert len(log.motor) == 8
+
+
+def test_a_fault_before_the_scout_sends_no_command_not_even_home(tmp_path):
+    calls, clock = [], _Clock()
+    app_model = _scout_app_model(tmp_path, calls, clock)
+    app_model.hardware.pellet_axes_with_driver_fault = ("Z",)
+    cameras = [app_model.left_camera, app_model.right_camera]
+    with pytest.raises(ScoutAborted, match="before homing"):
+        h3d.run_scout(app_model, cameras, [(10.0, 20.0, 30.0), (14.0, 26.0, 34.0)],
+                      **_scout_kwargs(app_model, tmp_path, clock, cameras))
+    assert app_model.hardware.commands == [] and ("motor", "home") not in calls
+    _assert_cameras_stopped_and_restored_or_untouched(app_model, calls)
+
+
+def _assert_cameras_stopped_and_restored_or_untouched(app_model, calls):
+    for camera in (app_model.left_camera, app_model.right_camera):
+        mine = [call[1:] for call in calls if call[0] == camera.name]
+        assert ("on_capture_stop",) in mine and mine[-1] == ("load_configuration", camera.saved)
+    assert ("motor", "disconnect") in calls
+
+
+@pytest.mark.parametrize("when", ["start move", "camera start-up"])
+def test_a_fault_latched_before_the_waypoints_sends_no_waypoint_command(tmp_path, when):
+    calls, clock = [], _Clock()
+    app_model = _scout_app_model(tmp_path, calls, clock)
+    motor = app_model.hardware
+    motor.pellet_axes_with_driver_fault = ()
+    if when == "start move":
+        real_move_y = motor.move_y
+
+        def faulting_move_y(value, *, absolute=True):
+            motor.pellet_axes_with_driver_fault = ("Y",)
+            return real_move_y(value, absolute=absolute)
+
+        motor.move_y = faulting_move_y
+        expected = ["x", "y"]  # the start move's x and y; z and every waypoint never sent
+        match = "the start move of y"
+    else:
+        camera = app_model.left_camera
+        real_start = camera.on_capture_start
+
+        def faulting_start():
+            motor.pellet_axes_with_driver_fault = ("X",)
+            real_start()
+
+        camera.on_capture_start = faulting_start
+        expected = ["x", "y", "z"]  # the whole start move, then nothing
+        match = "waypoint 0"
+    cameras = [app_model.left_camera, app_model.right_camera]
+    with pytest.raises(ScoutAborted, match=match):
+        h3d.run_scout(app_model, cameras, [(10.0, 20.0, 30.0), (14.0, 26.0, 34.0)],
+                      **_scout_kwargs(app_model, tmp_path, clock, cameras))
+    assert [axis for axis, _ in motor.commands] == expected
+    # Stopped and given their own configuration back; a fault in the start move comes before
+    # the cameras were configured at all.
+    _assert_cameras_stopped_and_restored_or_untouched(app_model, calls)
+
+
+def test_disjoint_camera_groups_get_advice_and_are_not_saved(tmp_path, monkeypatch):
+    asked = []
+    result = _scout_result(14, groups=(("left",), ("right",)))
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [result],
+                                          confirm=lambda a: asked.append(a) or True)
+    run()
+    assert asked == [{"right": "not joined to left through shared views in the chosen move list"}]
+    assert len(seen["plans"]) == 1
+    assert not (tmp_path / "calibrations" / "scout_move_list.yaml").exists()
+
+
+def test_a_camera_the_chosen_list_leaves_short_gets_advice(tmp_path, monkeypatch):
+    # As the 60-waypoint cap can leave it: the grid gave right enough views, the list does not.
+    asked = []
+    result = _scout_result(14, per_camera={"left": 14, "right": 11})
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [result],
+                                          confirm=lambda a: asked.append(a) or False)
+    with pytest.raises(h3d.ScoutCancelled):
+        run()
+    assert asked == [{"right": "only 11 of 12 views in the chosen move list"}]
+    assert seen["plans"] == []
+    assert not (tmp_path / "calibrations" / "scout_move_list.yaml").exists()
+
+
+def test_a_saved_list_with_fewer_than_12_points_is_not_used(tmp_path, monkeypatch):
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(14)])
+    save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml",
+                   [(1.0 + i, 20.0, 60.0) for i in range(11)], ["left", "right"], datetime(2026, 11, 20))
     run()
     assert seen["scouts"] == 1

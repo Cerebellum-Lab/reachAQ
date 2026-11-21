@@ -23,7 +23,7 @@ SCOUT_TOOLTIP = ("the stage first visits a coarse grid and every camera looks fo
                  " chosen from what they saw, or the hand-written list when fewer than 12 suit")
 HANDWRITTEN_TOOLTIP = "the fixed list of 37 waypoints"
 SCOUT_ADVICE_TITLE = "Some cameras saw too little of the board"
-SCOUT_ADVICE_CONTINUE = "Continue: the cameras named are calibrated 2D only"
+SCOUT_ADVICE_CONTINUE = "Continue: the cameras named may end up 2D only"
 #: The red of every "2D only" mark.
 UNCALIBRATED_COLOR = "#c62828"
 

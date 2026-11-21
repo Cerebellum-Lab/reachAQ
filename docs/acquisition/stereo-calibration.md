@@ -173,13 +173,15 @@ only re-aiming the camera helps.
    list already travels (its commanded motor positions, after the lower-limit
    clamp; about x 0-17.7, y 0.1-25.1, z 19.8-32.8 mm on christielab10). The box
    is never widened. An optional `scoutBounds` entry in the library's
-   `settings.yaml`, `{lo: [x, y, z], hi: [x, y, z]}` in motor mm, can narrow it.
+   `settings.yaml`, `{lo: [x, y, z], hi: [x, y, z]}` in motor mm, can narrow it;
+   any other form is ignored with a warning.
    The points are visited in serpentine order, so every move is one axis.
 2. **Short capture.** The scout records like the capture itself (same camera
    settings, TRIGGER mode, home first), pausing 0.3 s at each point after the
    usual settle at the configured speed. Nothing changes a speed, a limit or the
    firmware. The scout **stops at once**, with the stage where it stopped, on a
-   motor driver fault, a command that is not acknowledged (as on a CAN error),
+   motor driver fault (checked before homing, after homing, after each start-position
+   command, and before and after every waypoint's commands), a command that is not acknowledged (as on a CAN error),
    or a point the motor does not report reaching; the calibration then fails
    with that reason. Its videos and timestamps are kept in the session as
    `scout/source_videos/`.
@@ -199,9 +201,12 @@ only re-aiming the camera helps.
    hand-written list, and the log says so.
 
 **Advice before the capture.** When a camera found the board at fewer than 12
-points, or sees it at a grazing angle, a window lists each such camera with what
-to fix, and offers **Continue** or **Cancel**. Cancel captures nothing. Continue
-captures, and that camera ends up 2D only (see
+points, or sees it at a grazing angle, or the chosen list itself leaves it short
+(fewer than 12 views, fewer than 8 shared with another camera, or not joined to
+the other cameras through shared views, which the 60-waypoint cap or separate
+groups of cameras can cause), a window lists each such camera with what to fix,
+and offers **Continue** or **Cancel**. Cancel captures nothing. Continue
+captures, and that camera may end up 2D only (see
 [A camera that saw too little: 2D only](#a-camera-that-saw-too-little-2d-only)).
 The messages are:
 
@@ -211,15 +216,17 @@ The messages are:
 | `board in frame but never detected: check focus at the board distance, then lighting and exposure` | the board pattern is in view but the detector cannot read it: blur, low contrast or darkness |
 | `board seen at a grazing angle (aspect <a> vs 0.78): aim the camera more face-on; the stage cannot tilt the board` | the board is detected, but its median aspect (short side over long side of the whole 9 x 7-square board) is far from 7:9; the board foreshortened by more than about a 45-50 degree view |
 | `board never in view: the camera points elsewhere or the scout bounds miss its view` | no board pattern at any point |
+| `board seen at only <k> of <m> points, 12 needed: aim the camera at the middle of the board's travel` | detected at some points, and at the rest nothing in view |
+| `only <n> of 12 views in the chosen move list` (also `... views shared with another camera ...`, and `not joined to <cameras> through shared views in the chosen move list`) | the list to be used leaves the camera short |
 
 "Board pattern" is a local-contrast test, not a detection: other high-contrast
 texture in view can count as board, and a very dark image can count as none.
 
-**Saved list.** When every camera passed, the chosen list is saved as
+**Saved list.** When every camera passed, on the grid and in the chosen list, the list is saved as
 `calibrations/scout_move_list.yaml` with the date and the cameras' serials (a
 camera without one by name). The next automatic calibration with exactly the
-same cameras uses it without scouting, as long as every point is still inside
-today's hand-written box (a redone DCS can move it). Ticking a different set of
+same cameras uses it without scouting, as long as it has 12 or more points and
+every point is still inside today's hand-written box (a redone DCS can move it). Ticking a different set of
 cameras, or deleting the file, scouts again. If a camera was re-aimed without
 being swapped, delete the file or the saved list is reused.
 

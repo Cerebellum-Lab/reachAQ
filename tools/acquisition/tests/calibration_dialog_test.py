@@ -122,7 +122,7 @@ def test_scout_advice_names_each_camera_and_what_continue_does():
     text = scout_advice_text({"camera4": "board never in view: the camera points elsewhere or the scout bounds miss its view"})
     assert text.splitlines()[0] == (
         "camera4: board never in view: the camera points elsewhere or the scout bounds miss its view")
-    assert text.splitlines()[-1] == "Continue: the cameras named are calibrated 2D only."
+    assert text.splitlines()[-1] == "Continue: the cameras named may end up 2D only."
 
 
 def test_uncalibrated_banner_names_camera_and_reason():
