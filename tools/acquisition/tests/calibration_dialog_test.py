@@ -20,6 +20,7 @@ from tools.acquisition.model.app_model_status import AppModelStatus  # noqa: E40
 from tools.acquisition.view import calibration_library_view as library_view_module  # noqa: E402
 from tools.acquisition.view import main_window as main_window_module  # noqa: E402
 from tools.acquisition.view.calibration_dialog import (  # noqa: E402
+    REFERENCES_TOOLTIP,
     CalibrationDialog,
     CalibrationRequest,
     result_page,
@@ -114,7 +115,7 @@ def test_the_scout_is_the_default_move_list_and_references_wait_for_later():
     assert "hand-written list when fewer than 12" in dialog.scout_button.toolTip()
     dialog.handwritten_button.setChecked(True)
     assert dialog.request().move_list == "handwritten"
-    assert not dialog.references_box.isEnabled() and dialog.references_box.toolTip() == "not available yet"
+    assert dialog.references_box.isEnabled() and dialog.references_box.toolTip() == REFERENCES_TOOLTIP
     assert not dialog.references_box.isChecked()
 
 
@@ -263,6 +264,24 @@ def test_library_view_refusal_is_shown_and_changes_nothing(tmp_path, monkeypatch
     view.set_active_button.click()
     assert warnings == [("Calibration not set active", "Stop the recording first.")]
     assert view.table.item(0, 4).text() == "active"
+
+
+def test_library_view_captures_references_for_the_selected_entry(tmp_path, monkeypatch):
+    monkeypatch.setattr(library_view_module, "list_entries", lambda root: _entries(tmp_path))
+    warnings = []
+    monkeypatch.setattr(library_view_module, "QMessageBox", SimpleNamespace(
+        warning=lambda parent, title, text: warnings.append((title, text))))
+    asked = []
+    view = CalibrationLibraryView(tmp_path, set_active=lambda calibration_id: None,
+                                  capture_references=lambda calibration_id: asked.append(calibration_id) or "busy")
+    button = view.capture_references_button
+    assert button.text() == "Capture reference images now" and not button.isEnabled()
+    view.table.selectRow(1)
+    button.click()
+    assert asked == ["a" * 32] and warnings == [("Reference images not captured", "busy")]
+    # Without the callback the button is not offered.
+    plain = CalibrationLibraryView(tmp_path, set_active=lambda calibration_id: None)
+    assert not plain.capture_references_button.isVisibleTo(plain)
 
 
 def test_library_report_page_leads_with_the_banner(tmp_path):

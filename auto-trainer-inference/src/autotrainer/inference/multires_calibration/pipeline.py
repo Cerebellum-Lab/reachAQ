@@ -43,8 +43,9 @@ calibrate_capture turns it into a calibration folder (store.py):
    format 2 or 3, on the cameras both calibrated; a legacy folder has no motor-frame fit to
    compare with.
 7. The calibration is written with the coverage images (one per capture camera, calibrated
-   or not) and waypoints.yaml, both before its index (store.write_calibration's
-   extra_files). The source videos are not copied: the
+   or not) and waypoints.yaml, and the capture's reference/<camera>.png when it has them,
+   all before its index (store.write_calibration's extra_files). The source videos are not
+   copied: the
    index's capture.capture_folder names the capture folder, absolute, where they stay.
 
 Errors are not caught here: WaypointAlignmentError from extraction, CalibrationRefused
@@ -118,6 +119,9 @@ SOURCE_VIDEOS = "source_videos"
 # time.time() at the first frame plus frame-id steps at the configured fps, the clock
 # WaypointLog.times uses.
 TIMESTAMPS_SUFFIX = "_timestamps.txt"
+# <capture>/reference/<camera>.png: a still frame per camera at its live geometry, with the
+# board removed, for the reference-image check. Copied into the calibration when present.
+REFERENCE_DIR = "reference"
 
 # The capture settings recorded when waypoints.yaml has none: the settings the capture sets
 # (gain 1.0 dB, camera gamma off, 4500 us exposure, 40 fps).
@@ -487,6 +491,10 @@ def calibrate_capture(
         coverage = write_coverage_images(extraction.observations, image_size, base.sensor_roi(), Path(tmp), cameras)
         extra_files = {path.name: path for path in coverage}
         extra_files[WAYPOINT_LOG] = capture_dir / WAYPOINT_LOG
+        for camera in cameras:
+            reference = capture_dir / REFERENCE_DIR / f"{camera}.png"
+            if reference.is_file():
+                extra_files[f"{REFERENCE_DIR}/{camera}.png"] = reference
         index = write_calibration(
             output_dir,
             fit=fit,

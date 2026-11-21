@@ -244,9 +244,14 @@ class BehaviorContent(ContentWidget):
         self._update_recording_controls(self._app_model.session_recording_status)
 
     def _start_recording(self):
-        # Asked before the start: cameras that differ from the active calibration's need the
-        # operator's "Record anyway"; calibrated cameras only turned off are a passive note.
-        proceed, setup_note = confirm_camera_setup(self, self._app_model)
+        # Asked before the start: cameras that differ from the active calibration's, or that
+        # the reference-image check finds moved, need the operator's "Record anyway";
+        # calibrated cameras only turned off are a passive note. The check registers the frames
+        # the camera views show now (frame_source, set by MainContent): the GUI is the only
+        # holder of a current frame. A camera without one is "can't tell".
+        frame_source = getattr(self, "frame_source", None)
+        frames = frame_source() if frame_source is not None else {}
+        proceed, setup_note = confirm_camera_setup(self, self._app_model, frames)
         if not proceed:
             return
         if not self._app_model.start_recording():

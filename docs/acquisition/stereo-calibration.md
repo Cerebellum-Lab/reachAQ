@@ -153,7 +153,11 @@ configured primary first.
 - **Move list**: *automatic (scout)*, the default, chooses the waypoints from a
   scout pass before the capture (see [Automatic move list](#automatic-move-list));
   *hand-written* is the fixed list of 37 waypoints described under Steps.
-- **Capture reference images** is shown but not available yet.
+- **Capture reference images**, unticked by default: after the capture the app
+  asks you to remove the board and keep hands and animals out of view, then each
+  camera records 1 s at its recording settings and keeps the middle frame as its
+  reference image (**Skip** goes on without). See
+  [Moved-camera check](#moved-camera-check-reference-images).
 
 ### Automatic move list
 
@@ -244,6 +248,16 @@ made, its cameras, its verdict, which one is **active**, and the cameras it left
   then out of date (below).
 - **Show report** shows the selected calibration's report as the result page
   does. A legacy calibration has no report.
+- **Capture reference images now** takes reference images for the selected
+  calibration later, with the cameras the calibration calibrated that are
+  configured now (by serial). It asks you to clear the view first, and is
+  refused while the acquisition runs, a session records or a calibration runs.
+  Entries never change, so the images go into a **new entry** with the same fit:
+  a copy under a new id, with `parent_id` naming the original and
+  `references_captured` the time; its `created` stays the fit's, so the monthly
+  reminder is not reset. The app then offers to set it active. Setting it active
+  is a change of the active calibration like any other, so the coordinate system
+  must be redone afterwards (below).
 
 ### 2D-only cameras while recording
 
@@ -280,6 +294,76 @@ with `mismatchAcknowledged: false`.
 A calibrated camera that is only turned off for this recording is not a
 difference: Record does not ask, and the status bar notes it, for example
 **Calibrated cameras not recording: right**.
+
+With the moved-camera check on, a camera that looks moved joins the same
+question, under `Moved since the calibration's reference images:`, one line per
+camera with its measured values, for example
+`left: shifted 6.3 px (limit 4.0), rotated 0.2° (limit 1.5), scale 0.1% (limit 2.0), match 0.93`.
+The same **Yes** covers it.
+
+### Moved-camera check: reference images
+
+Optional and **off by default**: recalibrating by hand stays the normal way to
+deal with a moved camera. Switch it on in **Preferences → Behavior →
+Moved-camera check**. It needs a calibration with reference images (the
+dialog's **Capture reference images**, or **Capture reference images now** in
+the library).
+
+At **Record**, each recording camera that the active calibration calibrated is
+compared with its reference image, `reference/<camera>.png` in the calibration.
+The frame compared is the one its camera panel shows at that moment, at the
+camera's live geometry, the same as the reference. OpenCV's ECC registration
+(`findTransformECC`, affine) runs on the gradient magnitude of both images, so
+the fixed rig structure dominates; it is reduced to a shift (of the image
+centre), a rotation about the optical axis and a scale. It takes about 8 ms per
+256×256 camera on christielab10.
+
+- **moved**: over any limit. Record asks, as above.
+- **can't tell**: no frame from the camera, a frame of another size than the
+  reference, or a match below the minimum quality (an animal or a hand in view
+  lowers it rather than faking a move). Shown in the status bar, for example
+  **Reference image check can't tell: right (match 0.62 below 0.80)**; it never
+  asks.
+- **no reference**: the calibration has no reference image for that camera.
+- **ok**: within every limit.
+
+The settings live in `calibrations/settings.yaml`, global, with an optional
+override per camera (by its configured name) for a camera with a busy view:
+
+```yaml
+checks:
+  reference_image:
+    enabled: false
+    max_shift_px: 4.0
+    max_rotation_deg: 1.5
+    max_scale_pct: 2.0
+    min_quality: 0.80
+    per_camera:
+      left: {max_shift_px: 6.0}
+```
+
+| setting | default | why |
+|---|---|---|
+| `enabled` | false | manual recalibration is the default; the check is an aid |
+| `max_shift_px` | 4.0 px (live geometry) | a 1° pan or tilt moves the image by fx·tan 1° ≈ 12 px (fx ≈ 677 px at bin 4), 0.5° by ≈ 6 px, so 4 px catches a knock of a third of a degree or more; ECC jitter between frames of an unchanged view is sub-pixel and the pose model's error is 0.88 px, so it never warns on noise |
+| `max_rotation_deg` | 1.5° | moves a point at the edge of a 256 px view (r = 128 px) by 128·sin 1.5° ≈ 3.4 px, the same budget as the shift |
+| `max_scale_pct` | 2.0 % | 128 px × 0.02 ≈ 2.6 px at the edge: a camera pushed about 2 % closer or further along its axis |
+| `min_quality` | 0.80 | the ECC correlation below which the result is "can't tell", never a pass; still to be tuned from repeated session starts on the rig |
+| `per_camera` | none | one setting covers the normal case; a camera can be loosened alone |
+
+A value that is not a number of 0 or more is ignored, with a warning, and the
+default used. The switch writes only `checks.reference_image.enabled`, keeping
+every other key.
+
+The session metadata records the result as
+`calibration3d.movedCameraChecks.referenceImage`, only while the check is on:
+`{enabled, ran, moved, acknowledged, cameras}`, with each camera's `status`,
+`shiftPx`, `rotationDeg`, `scalePct`, `quality`, `reason` and `limits`.
+`acknowledged` is true when a moved camera was answered **Yes**. Headless and API
+starts have no camera panels, so they do not run it: `ran: false`.
+
+The other moved-camera check, pose consistency, runs in offline 3D; see
+[Offline 3D](offline-3d.md#pose-consistency-check).
 
 ## After a new calibration: redo the coordinate system
 
@@ -472,6 +556,8 @@ A format-3 folder, for any 2 to 6 cameras:
   quality_report.txt        the operator's summary
   coverage_<camera>.png     one per capture camera, calibrated or not
   waypoints.yaml            copied from the capture
+  reference/<camera>.png    the moved-camera check's still frame, at the camera's live
+                            geometry; only when reference images were captured
 ```
 
 DCS's `camera_offsets.pkl` for a library entry is kept beside it, in

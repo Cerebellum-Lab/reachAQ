@@ -39,7 +39,8 @@ from autotrainer.inference.analysis import IntersessionResponse
 from autotrainer.inference.analysis.prepare_jetson_data import make_cam_offsets_dict
 from autotrainer.inference.multires_calibration import library
 from autotrainer.inference.multires_calibration.report import QualityReport
-from autotrainer.inference.multires_calibration.store import CalibrationIndex, calibration_created
+from autotrainer.inference.multires_calibration.store import (CalibrationIndex, CalibrationResolutionError,
+                                                             calibration_created, load_index)
 
 from autotrainer.behavior import SystemState
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus, BehaviorAlgoProps
@@ -58,14 +59,15 @@ from tools.acquisition.model.calibration_install import decide_install, install_
 from tools.acquisition.model.calibration_reminder import (
     MAKE_CALIBRATION_MENU_PATH, calibration_due, due_label_text, reminder_text)
 from tools.acquisition.model.dcs_state import DcsState
-from tools.acquisition.model.handle_3d_calibration import make_3d_calib
+from tools.acquisition.model.calibration_geometry import camera_serial, match_cameras
+from tools.acquisition.model.handle_3d_calibration import capture_reference_entry, make_3d_calib
 from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
 from tools.acquisition.model.rfid_resolution import RfidResolutionKind
 from tools.acquisition.model.subsystem_status import SubsystemState
 from tools.acquisition.model.training_plan import get_plan_id
 from tools.acquisition.model.user_preferences import UserPreferences
-from tools.acquisition.view.calibration_dialog import (CalibrationDialog, CalibrationRequest, confirm_scout_advice,
-                                                  result_page)
+from tools.acquisition.view.calibration_dialog import (CalibrationDialog, CalibrationRequest, camera_unavailable_reason,
+                                                  confirm_reference_capture, confirm_scout_advice, result_page)
 from tools.acquisition.view.calibration_library_view import CalibrationLibraryView
 from tools.acquisition.view.main_content import MainContent
 from tools.acquisition.view.multi_selection_menu import MultiSelectionMenu
@@ -184,6 +186,8 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(icon)
 
         self._open_dialogs = []
+        # The open calibration library view, refreshed when a reference capture ends.
+        self._library_view: Optional[CalibrationLibraryView] = None
         self._debug_view: Optional[DebugView] = None
         self._training_plan_index_by_plan_id: Dict[Optional[str], int] = {}
         self._diamond_triangle_calib_run = None
@@ -908,7 +912,10 @@ class MainWindow(QMainWindow):
             try:
                 result = make_3d_calib(self._app_model, cameras, move_list=request.move_list,
                                        confirm_scout=lambda advice: _ask_on_gui_thread(
-                                           confirm_scout_advice, self, advice))
+                                           confirm_scout_advice, self, advice),
+                                       capture_references=request.capture_references,
+                                       confirm_references=lambda: _ask_on_gui_thread(
+                                           confirm_reference_capture, self))
             except Exception as err:
                 logger.exception("3d-calib failed: %s", err)
                 error = err
@@ -1069,9 +1076,87 @@ class MainWindow(QMainWindow):
         return rsp == QMessageBox.StandardButton.Yes
 
     def _on_calibration_library(self) -> None:
-        view = CalibrationLibraryView(
-            self._app_model.calibration_library_root, set_active=self._set_active_calibration, parent=self)
-        view.exec()
+        view = self._library_view = CalibrationLibraryView(
+            self._app_model.calibration_library_root, set_active=self._set_active_calibration,
+            capture_references=self._capture_reference_images, parent=self)
+        try:
+            view.exec()
+        finally:
+            self._library_view = None
+
+    def _capture_reference_images(self, calibration_id: str) -> Optional[str]:
+        """Start capturing reference images for library entry `calibration_id`, into a new entry.
+
+        The configured cameras that entry calibrated (by serial, by name without one) record
+        a short still clip (capture_reference_entry) on a worker thread, with the app held in
+        CALIBRATION_3D as for a calibration. Returns None when it started or the operator
+        cancelled, or why it cannot run. Once done, the operator is offered to set the new
+        entry active.
+        """
+        app_model = self._app_model
+        if (app_model.status == AppModelStatus.CALIBRATION_3D or not self.make_3d_calib_action.isEnabled()
+                or app_model.session_recording_status != SessionRecordingStatus.READY):
+            return ("Reference images are captured as a calibration is: stop the acquisition, the recording or"
+                    " the calibration first.")
+        root = app_model.calibration_library_root
+        try:
+            index = load_index(library.entry_path(root, calibration_id))
+        except (ValueError, CalibrationResolutionError) as err:
+            return f"This calibration cannot take reference images: {err}. Make a new calibration instead."
+        match = match_cameras(index.cameras, {c.name: camera_serial(c.active_config) for c in app_model.cameras})
+        cameras = [c for c in app_model.cameras if c.name in match.calibrated and camera_unavailable_reason(c) is None]
+        if not cameras:
+            return "None of the configured cameras is one this calibration calibrated."
+        if not confirm_reference_capture(self, skip_label="Cancel"):
+            return None
+        names = {camera.name: match.calibrated[camera.name] for camera in cameras}
+        prev_status, app_model.status = app_model.status, AppModelStatus.CALIBRATION_3D
+        self.run_action.setEnabled(False)
+        self.make_3d_calib_action.setEnabled(False)
+        outcome = {}
+
+        @invoke_method
+        def finish():
+            try:
+                self._end_3d_calib(prev_status)
+            finally:
+                self._finish_reference_capture(calibration_id, outcome)
+
+        def run():
+            try:
+                outcome["id"] = capture_reference_entry(app_model, root, calibration_id, cameras, names=names)
+            except Exception as err:
+                logger.exception("reference images for %s not captured: %s", calibration_id, err)
+                outcome["error"] = err
+            finally:
+                finish()
+
+        threading.Thread(target=run, name="reference-images", daemon=True).start()
+        return None
+
+    def _finish_reference_capture(self, source_id: str, outcome: dict) -> None:
+        """Say how the reference capture ended and offer to set the new entry active."""
+        if self._library_view is not None:
+            self._library_view.refresh()
+        error = outcome.get("error")
+        if error is not None or "id" not in outcome:
+            QMessageBox.critical(self, "Reference images not captured", str(error or "the capture did not finish"))
+            return
+        new_id = outcome["id"]
+        rsp = QMessageBox.question(
+            self,
+            "Reference images captured",
+            f"The reference images are in a new calibration, {new_id[:8]}, with the fit of {source_id[:8]}. "
+            "Set it active now? The coordinate system must then be redone "
+            "(Tools → Calibrate Coordinate System), as after any change of the active calibration.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if rsp == QMessageBox.StandardButton.Yes:
+            refusal = self._set_active_calibration(new_id)
+            if refusal:
+                QMessageBox.warning(self, "Calibration not set active", refusal)
+        if self._library_view is not None:
+            self._library_view.refresh()
 
     def _set_active_calibration(self, calibration_id: str) -> Optional[str]:
         """Make library entry `calibration_id` the active calibration and load it.

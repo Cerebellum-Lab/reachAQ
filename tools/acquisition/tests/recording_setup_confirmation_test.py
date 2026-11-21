@@ -60,6 +60,9 @@ class _AppModel:
         self.calls.append(("difference", list(selected)))
         return self.difference
 
+    def check_reference_images(self, frames):
+        return {}  # the reference-image check is off
+
     def acknowledge_setup_difference(self):
         self.calls.append("acknowledge")
 

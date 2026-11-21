@@ -30,6 +30,8 @@ class CameraContent(ContentWidget):
 
         self._text_overlay: Optional[str] = None
         self._text_overlay_color = Qt.GlobalColor.yellow
+        # The newest frame shown (refresh_image), which Record's reference-image check registers.
+        self._displayed_frame: Optional[ndarray] = None
 
         layout = QGridLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -96,9 +98,15 @@ class CameraContent(ContentWidget):
 
     @Slot(ndarray, float)
     def refresh_image(self, data: ndarray, fps: float, frame_id: int = -1):
+        self._displayed_frame = data
         row, col = data.shape
         self._capture_view.refresh_image(
             ImageData(data, col, row, frame_id), fps)
+
+    def displayed_frame(self) -> Optional[ndarray]:
+        """The newest frame this view was given, at the camera's capture geometry; None before
+        the first. The queue hands each frame over as its own copy, so it is not overwritten."""
+        return self._displayed_frame
 
     @invoke_method
     def set_is_editable(self, is_editable: bool):

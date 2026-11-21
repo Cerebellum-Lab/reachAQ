@@ -1,10 +1,14 @@
 import math
 import shutil
 import time
+import uuid
 import dataclasses
 from datetime import datetime
 from typing import Callable, Dict, Any, Optional, List, Mapping, Sequence, Tuple
 from pathlib import Path
+
+import cv2
+import yaml
 
 from autotrainer.core import Offset3DTuple, get_verbose_logger, ProjectInterval
 from autotrainer.inference import calibration_FLIR
@@ -15,10 +19,11 @@ from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.inference.multires_calibration.fit import BoardSpec, CaptureCamera
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
-from autotrainer.inference.multires_calibration.library import read_settings
+from autotrainer.inference.multires_calibration.library import add_entry, entry_path, read_settings
 from autotrainer.inference.multires_calibration.pipeline import (
     MAX_CAMERAS,
     MIN_CAMERAS,
+    REFERENCE_DIR,
     SOURCE_VIDEOS,
     TIMESTAMPS_SUFFIX,
     WAYPOINT_LOG,
@@ -48,7 +53,7 @@ from autotrainer.inference.multires_calibration.scout import (
     scout_views_from_capture,
     video_sizes,
 )
-from autotrainer.inference.multires_calibration.store import CalibrationIndex
+from autotrainer.inference.multires_calibration.store import INDEX_FILE, CalibrationIndex, load_index
 
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.calibration_geometry import camera_serial, live_inference_geometry
@@ -566,8 +571,15 @@ def _prepare_capture(app_model, hard, cameras, cams_before_cfg, cam_params, reco
         if strict:
             _abort_on_fault(hard, f"the start move of {axis}")
     #
-    for cam, cfg in zip(cameras, cams_before_cfg):
-        params = cam_params.copy()
+    _start_cameras(cameras, cams_before_cfg, [cam_params] * len(cameras), record_mode, project)
+
+
+def _start_cameras(cameras, cams_before_cfg, params_per_camera, record_mode, project) -> None:
+    """Give each camera its params in `params_per_camera` (its own primary role kept) and
+    start them all recording, primary first: the camera half of _prepare_capture, which the
+    reference capture uses alone, with no stage."""
+    for cam, cfg, cam_params in zip(cameras, cams_before_cfg, params_per_camera):
+        params = dict(cam_params)
         params["primary"] = cfg.params.get("primary", "off")
         logger.info("Preparing cam %s with params=%s", cam.name, params)
         new_cfg = dataclasses.replace(
@@ -625,15 +637,17 @@ def _stop_recording(cameras, record_mode) -> None:
 
 
 def _teardown_capture(cameras, hard, cams_before_cfg, failed: Optional[BaseException]) -> Optional[BaseException]:
-    """Stop the cameras, disconnect the stage and restore the cameras' configurations, on
-    every path; returns `failed`, or the cameras' failure to stop when nothing failed before."""
+    """Stop the cameras, disconnect the stage (none to disconnect when `hard` is None) and
+    restore the cameras' configurations, on every path; returns `failed`, or the cameras'
+    failure to stop when nothing failed before."""
     for camera in reversed(cameras):
         logger.info("%s: notify end cam", camera.name)
         camera.on_capture_notify_end()
     for camera in reversed(cameras):
         logger.info("%s: stopping cam", camera.name)
         camera.on_capture_stop()
-    hard.disconnect()
+    if hard is not None:
+        hard.disconnect()
     try:
         wait_cams_capture_status(cameras, CaptureProcessStatus.TERMINATED, 5)
     except RuntimeError as err:
@@ -782,6 +796,163 @@ def saved_scout_list(root: Optional[Path], identities: Sequence[str], bounds: Bo
     return points
 
 
+# The reference clip: long enough for every camera to record frames after RECORDING, short
+# enough that nothing in view changes. Its middle frame is the reference.
+REFERENCE_CLIP_S = 1.0
+# Where capture_reference_entry builds the copy before the library takes it in.
+REFERENCE_ENTRY_DIR_NAME = "reference_entry"
+
+
+def middle_frame(video: Path):
+    """The middle frame of `video` as a grayscale array, or None when it has no frame."""
+    capture = cv2.VideoCapture(str(video))
+    frames = []
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            frames.append(frame)
+    finally:
+        capture.release()
+    if not frames:
+        return None
+    frame = frames[len(frames) // 2]
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+
+
+def fit_to_live_geometry(frame, params: Mapping[str, Any]):
+    """`frame` area-averaged to the live geometry of a camera configured with `params`, as the
+    display and inference queues receive it (frame_fit.QueueFit), when the camera recorded at a
+    capture-binning preset k times larger; otherwise as it is."""
+    try:
+        geometry = live_inference_geometry(params)
+    except ValueError:
+        return frame
+    rows, cols = frame.shape[:2]
+    target = (geometry.height, geometry.width)
+    if (rows, cols) == target or rows % target[0] or cols % target[1] or rows // target[0] != cols // target[1]:
+        return frame
+    return cv2.resize(frame, (target[1], target[0]), interpolation=cv2.INTER_AREA)
+
+
+def capture_reference_images(
+    cameras: Sequence[VideoCaptureModel],
+    cams_before_cfg,
+    project,
+    dest_dir: Path,
+    *,
+    names: Optional[Mapping[str, str]] = None,
+    record_mode: VideoRecordMode = VideoRecordMode.TRIGGER,
+    duration: Optional[float] = None,
+    sleep=time.sleep,
+) -> Dict[str, Path]:
+    """Record a short clip with `cameras` at each one's live geometry and keep its middle frame.
+
+    Each camera records with its own configuration in `cams_before_cfg` (the one a session
+    records with), in `record_mode`, for `duration` seconds (REFERENCE_CLIP_S unless given). Nothing moves: the stage is
+    neither connected nor commanded. The camera lifecycle is the capture's (_start_cameras,
+    _stop_recording, _teardown_capture on every path). The clips go to
+    <dest_dir>/reference/source_videos, and each middle frame to
+    <dest_dir>/reference/<name>.png, named by `names` (camera -> its calibration name) or
+    the camera's own name, at the live geometry the camera panel shows at Record
+    (fit_to_live_geometry). Returns camera name -> that file. Raises the first error after
+    the teardown, and RuntimeError for a clip with no frame.
+    """
+    clip_dir = Path(dest_dir, REFERENCE_DIR)
+    duration = REFERENCE_CLIP_S if duration is None else duration
+    params = [dict(cfg.params) for cfg in cams_before_cfg]
+    failed = None
+    try:
+        logger.notice("Recording the reference images of %s ..", ", ".join(camera.name for camera in cameras))
+        _start_cameras(cameras, cams_before_cfg, params, record_mode, project)
+        sleep(duration)
+        _stop_recording(cameras, record_mode)
+    except Exception as err:
+        logger.exception("Could not record the reference images: %s", err)
+        failed = err
+    finally:
+        failed = _teardown_capture(cameras, None, cams_before_cfg, failed)
+    if failed is not None:
+        raise failed
+    _collect_videos(project, cameras, record_mode, clip_dir)
+    written = {}
+    for camera, cfg in zip(cameras, cams_before_cfg):
+        frame = middle_frame(Path(clip_dir, SOURCE_VIDEOS, f"{camera.name}.mp4"))
+        if frame is None:
+            raise RuntimeError(f"{camera.name}: the reference clip has no frame")
+        frame = fit_to_live_geometry(frame, cfg.params)
+        path = Path(clip_dir, f"{(names or {}).get(camera.name, camera.name)}.png")
+        if not cv2.imwrite(str(path), frame):
+            raise RuntimeError(f"{camera.name}: the reference image could not be written to {path}")
+        logger.info("%s: reference image %dx%d written to %s", camera.name, frame.shape[1], frame.shape[0], path)
+        written[camera.name] = path
+    return written
+
+
+def copy_with_references(source: Path, references: Mapping[str, Path], built: Path, *, now: datetime) -> str:
+    """Build in `built` a copy of the calibration in `source` that holds `references`
+    (calibration camera name -> PNG) as reference/<name>.png, under a new id, and return it.
+
+    The fit and every file but the old references are copied as they are. The index gets
+    the new id, parent_id (the source's id) and references_captured (`now`); its created
+    stays the fit's, so the calibration is as old as its fit. The anipose TOMLs name the
+    calibration by id in their metadata, so the old id is replaced by the new one there.
+    Raises ValueError for a source that is not at format 2 or 3 (a legacy import).
+    """
+    source, built = Path(source), Path(built)
+    source_id = load_index(source).id
+    new_id = uuid.uuid4().hex
+    shutil.copytree(source, built, ignore=lambda folder, names: [REFERENCE_DIR] if Path(folder) == source else [])
+    data = yaml.safe_load(Path(built, INDEX_FILE).read_text(encoding="utf-8"))
+    data["id"] = new_id
+    data["parent_id"] = source_id
+    data["references_captured"] = now.replace(microsecond=0).isoformat()
+    for toml in built.rglob("*.toml"):
+        toml.write_text(toml.read_text(encoding="utf-8").replace(source_id, new_id), encoding="utf-8")
+    Path(built, REFERENCE_DIR).mkdir()
+    for name, png in references.items():
+        shutil.copyfile(png, Path(built, REFERENCE_DIR, f"{name}.png"))
+    # Last, as store.write_calibration does: the index is what makes the folder a calibration.
+    Path(built, INDEX_FILE).write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return new_id
+
+
+def capture_reference_entry(
+    app_model,
+    root: Path,
+    source_id: str,
+    cameras: Sequence[VideoCaptureModel],
+    *,
+    names: Optional[Mapping[str, str]] = None,
+    now: Optional[datetime] = None,
+    **capture_options,
+) -> str:
+    """Capture reference images now for library entry `source_id` and add them as a new entry.
+
+    Entries never change, so the references go into a copy of the entry that inherits its
+    fit (copy_with_references), added to the library `root`, which is not made active.
+    `cameras` are the configured cameras matched to the entry's; `names` maps each to its
+    name in the entry. The clip and the copy are built in a new session folder. Returns the
+    new entry's id. Raises ValueError for a legacy entry, before any camera starts.
+    """
+    source = entry_path(root, source_id)
+    load_index(source)
+    cameras = [camera for camera in cameras if camera.is_primary] + [c for c in cameras if not c.is_primary]
+    cams_before_cfg = tuple(camera.save_configuration() for camera in cameras)
+    project = app_model.make_project_info()
+    project.calculate_next_session_index()
+    session = Path(project.get_session_path().location)
+    written = capture_reference_images(cameras, cams_before_cfg, project, session, names=names, **capture_options)
+    references = {(names or {}).get(camera, camera): path for camera, path in written.items()}
+    built = Path(session, REFERENCE_ENTRY_DIR_NAME)
+    copy_with_references(source, references, built, now=now or datetime.now())
+    calibration_id = add_entry(root, built)
+    logger.success("reference images of %s added as calibration %s, from %s",
+                   ", ".join(references), calibration_id, source_id)
+    return calibration_id
+
+
 def make_3d_calib(
     app_model: AppModel,
     cameras: Sequence[VideoCaptureModel],
@@ -789,6 +960,8 @@ def make_3d_calib(
     record_mode: VideoRecordMode = VideoRecordMode.TRIGGER,
     move_list: Optional[str] = None,
     confirm_scout: Optional[Callable[[Mapping[str, str]], bool]] = None,
+    capture_references: bool = False,
+    confirm_references: Optional[Callable[[], bool]] = None,
 ) -> Tuple[Path, Path, CalibrationIndex, QualityReport]:
     """Capture the board paused at every waypoint with `cameras`, then calibrate them from it.
 
@@ -806,6 +979,12 @@ def make_3d_calib(
     False raises ScoutCancelled and nothing is captured; True goes on, and that camera may
     end up 2D only. A scout list is saved for next time only when no camera has advice and
     the list joins every camera.
+
+    With `capture_references`, after the capture the operator is asked to remove the board
+    (`confirm_references()`; False skips it) and each camera records a short still clip at
+    its live geometry (capture_reference_images), whose middle frame goes into the capture's
+    reference/ folder and from there into the calibration. A reference capture that fails
+    is logged and the calibration goes on without references.
 
     The cameras record in TRIGGER mode, as a session's do. On christielab10 (2026-11-19)
     START_CONTINUOUS never reached RECORDING ("left: no RECORDING within 5 s", three runs),
@@ -883,6 +1062,15 @@ def make_3d_calib(
 
     log = _record_plan(app_model, cameras, cams_before_cfg, cam_params, record_mode, project, plan, capture_list,
                        src_dir)
+
+    if capture_references:
+        if confirm_references is None or confirm_references():
+            try:
+                capture_reference_images(cameras, cams_before_cfg, project, src_dir, record_mode=record_mode)
+            except Exception as err:
+                logger.error("No reference images: %s. The calibration goes on without them.", err)
+        else:
+            logger.notice("Reference images skipped")
 
     logger.notice("Calibrating every preset from the capture in %s", src_dir)
     output_dir, index, report = calibrate_waypoint_capture(

@@ -179,6 +179,7 @@ from tools.acquisition.model.calibration_geometry import (
     live_inference_geometry,
     match_cameras,
 )
+from tools.acquisition.model import reference_image_check
 from tools.acquisition.model.camera_timing_alignment import (
     CameraTimestampInput,
     align_camera_timestamp_files,
@@ -1160,6 +1161,10 @@ class AppModel(ObservableObject):
         # the start after acknowledge_setup_difference keeps it, any later start clears it.
         self._acknowledged_difference: Optional[Tuple[Tuple[str, ...], ...]] = None
         self._acknowledgement_pending = False
+        # The reference-image check of the next recording start (check_reference_images), as
+        # the session metadata records it; it covers that one start, as the acknowledgement does.
+        self._reference_check: Optional[Dict[str, Any]] = None
+        self._reference_check_pending = False
         # No DCS configuration is loaded before the first configuration load, which
         # recomputes this (refresh_dcs_state), as every later calibration or DCS load does.
         self._dcs_state = DcsState.MISSING
@@ -1634,6 +1639,9 @@ class AppModel(ObservableObject):
                 if not self._acknowledgement_pending:
                     self._acknowledged_difference = None
                 self._acknowledgement_pending = False
+                if not self._reference_check_pending:
+                    self._reference_check = None
+                self._reference_check_pending = False
             return self._start_recording_locked()
 
     def _start_recording_locked(self) -> bool:
@@ -2837,6 +2845,64 @@ class AppModel(ObservableObject):
         are only a passive note and do not matter. It covers the next recording start only."""
         self._acknowledged_difference = self.camera_setup_difference(self._recording_camera_names()).confirmable
         self._acknowledgement_pending = True
+        if self._reference_check is not None:
+            # The moved cameras were in the same confirmation, so its Yes covers them too.
+            self._reference_check["acknowledged"] = bool(self._reference_check["moved"])
+
+    @property
+    def reference_image_check_enabled(self) -> bool:
+        """Whether Record checks each camera against its reference image: <library>/settings.yaml
+        checks.reference_image.enabled, False when it is missing or unreadable."""
+        return reference_image_check.reference_check_settings(read_settings(self.calibration_library_root)).enabled
+
+    @reference_image_check_enabled.setter
+    def reference_image_check_enabled(self, enabled: bool) -> None:
+        """Switch the reference-image check on or off, keeping its limits and every other setting."""
+        root = self.calibration_library_root
+        update_settings(root, **{reference_image_check.CHECKS_KEY: reference_image_check.with_enabled(
+            read_settings(root), enabled)})
+        logger.notice("the reference-image check is now %s", "on" if enabled else "off")
+
+    def check_reference_images(
+        self, frames: Mapping[str, Optional[np.ndarray]]
+    ) -> Dict[str, "reference_image_check.ReferenceVerdict"]:
+        """Each recording camera that the active calibration calibrated, against its reference image.
+
+        `frames` are the cameras' current frames by configured name (None or absent when the
+        GUI has none). {} when the check is off or there is no active calibration. The result
+        is kept for the next recording start's metadata (movedCameraChecks.referenceImage),
+        unacknowledged until acknowledge_setup_difference. Never raises: a check that fails
+        is logged and leaves every camera "can't tell".
+        """
+        self._reference_check, self._reference_check_pending = None, False
+        settings = reference_image_check.reference_check_settings(read_settings(self.calibration_library_root))
+        folder = self._active_calibration_dir
+        if not settings.enabled or folder is None:
+            return {}
+        calibrated = self.calibrated_cameras
+        cameras = [name for name in self._recording_camera_names() if name in calibrated]
+        current = {name: frames.get(name) for name in cameras}
+        try:
+            verdicts = reference_image_check.check_cameras(folder, current, settings, names=calibrated)
+        except Exception as err:
+            logger.exception("the reference-image check failed: %s", err)
+            verdicts = {
+                name: reference_image_check.ReferenceVerdict(
+                    name, reference_image_check.CANT_TELL, None, settings.limits_for(name), f"the check failed: {err}")
+                for name in cameras
+            }
+        moved = [name for name, verdict in verdicts.items() if verdict.status == reference_image_check.MOVED]
+        self._reference_check = {
+            "enabled": True,
+            "ran": True,
+            "moved": moved,
+            "acknowledged": False,
+            "cameras": {name: reference_image_check.verdict_metadata(v) for name, v in verdicts.items()},
+        }
+        self._reference_check_pending = True
+        for name in moved:
+            logger.warning("possibly moved: %s", reference_image_check.moved_detail(verdicts[name]))
+        return verdicts
 
     @property
     def active_calibration_dir(self) -> Optional[Path]:
@@ -2960,6 +3026,12 @@ class AppModel(ObservableObject):
             record["preset"] = None
             record["live3dDisabledReason"] = self._live_3d_disabled_reason or "no stereo params"
         record["live3d"] = {"enabled": self.live_3d_enabled, "disabledReason": record.get("live3dDisabledReason")}
+        if self._reference_check is not None:
+            record["movedCameraChecks"] = {"referenceImage": dict(self._reference_check)}
+        elif self.reference_image_check_enabled:
+            # On, but this start did not run it: a headless or API start has no GUI frames.
+            record["movedCameraChecks"] = {"referenceImage": {
+                "enabled": True, "ran": False, "moved": [], "acknowledged": False, "cameras": {}}}
         return record
 
     def _identify_primary_main_cam_idx(self):

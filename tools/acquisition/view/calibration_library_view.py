@@ -1,5 +1,6 @@
 """Tools → Calibration library…: every calibration in the library, which one is active, and
-which cameras each left 2D only. The operator sets another entry active or reads its report.
+which cameras each left 2D only. The operator sets another entry active, reads its report, or
+captures reference images for it, which become a new entry with the same fit.
 """
 
 import html
@@ -46,13 +47,18 @@ class CalibrationLibraryView(QDialog):
     """The library's entries, newest first.
 
     `set_active(id)` makes an entry active and loads it; it returns None, or why it did not.
+    `capture_references(id)` starts capturing reference images for an entry; it returns
+    None, or why it cannot. Without it the button is not shown.
     """
 
-    def __init__(self, root: Path, *, set_active: Callable[[str], Optional[str]], parent: Optional[QWidget] = None):
+    def __init__(self, root: Path, *, set_active: Callable[[str], Optional[str]],
+                 capture_references: Optional[Callable[[str], Optional[str]]] = None,
+                 parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setWindowTitle("Calibration library")
         self._root = Path(root)
         self._set_active = set_active
+        self._capture_references = capture_references
         self._entries: List[LibraryEntry] = []
 
         layout = QVBoxLayout(self)
@@ -72,10 +78,16 @@ class CalibrationLibraryView(QDialog):
         self.set_active_button.clicked.connect(self._on_set_active)
         self.show_report_button = QPushButton("Show report")
         self.show_report_button.clicked.connect(self._on_show_report)
+        self.capture_references_button = QPushButton("Capture reference images now")
+        self.capture_references_button.setToolTip(
+            "Each camera records a moment with nothing in view; the frames go into a new entry with this fit")
+        self.capture_references_button.clicked.connect(self._on_capture_references)
+        self.capture_references_button.setVisible(capture_references is not None)
         close = QPushButton("Close")
         close.clicked.connect(self.accept)
         buttons.addWidget(self.set_active_button)
         buttons.addWidget(self.show_report_button)
+        buttons.addWidget(self.capture_references_button)
         buttons.addStretch(1)
         buttons.addWidget(close)
         layout.addLayout(buttons)
@@ -128,6 +140,7 @@ class CalibrationLibraryView(QDialog):
         entry = self._selected()
         self.set_active_button.setEnabled(entry is not None and not entry.active)
         self.show_report_button.setEnabled(entry is not None)
+        self.capture_references_button.setEnabled(entry is not None and self._capture_references is not None)
 
     def _on_set_active(self) -> None:
         entry = self._selected()
@@ -137,6 +150,14 @@ class CalibrationLibraryView(QDialog):
         if refusal:
             QMessageBox.warning(self, "Calibration not set active", refusal)
         self.refresh()
+
+    def _on_capture_references(self) -> None:
+        entry = self._selected()
+        if entry is None or self._capture_references is None:
+            return
+        refusal = self._capture_references(entry.id)
+        if refusal:
+            QMessageBox.warning(self, "Reference images not captured", refusal)
 
     def _on_show_report(self) -> None:
         entry = self._selected()

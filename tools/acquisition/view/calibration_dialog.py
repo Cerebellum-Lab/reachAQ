@@ -1,5 +1,6 @@
 """The 3D calibration's operator pages: which cameras to calibrate, the result, and the
-confirmation Record asks for when the cameras differ from the active calibration's.
+confirmation Record asks for when the cameras differ from the active calibration's or a
+camera looks moved against its reference image.
 
 A camera a calibration left 2D only is named, with its reason, wherever the operator looks:
 first and in red on the result page, and in the confirmation's details.
@@ -7,7 +8,7 @@ first and in red on the result page, and in the confirmation's details.
 
 import html
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QDialogButtonBox, QGridLayout, QGroupBox,
                                QHBoxLayout, QLabel, QMessageBox, QRadioButton, QVBoxLayout, QWidget)
@@ -15,10 +16,16 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QDialogButtonBo
 from autotrainer.inference.multires_calibration.extract import MAX_CAMERAS, MIN_CAMERAS
 from autotrainer.inference.multires_calibration.report import NOT_CALIBRATED, QualityReport
 from tools.acquisition.model.calibration_geometry import camera_serial
+from tools.acquisition.model.reference_image_check import CANT_TELL, MOVED, moved_detail
 
 SCOUT = "scout"
 HANDWRITTEN = "handwritten"
-NOT_AVAILABLE_YET = "not available yet"
+REFERENCES_TOOLTIP = ("after the capture, remove the board: each camera then keeps one frame at its recording"
+                      " settings, which Record compares it with when the moved-camera check is on")
+REFERENCE_PROMPT_TITLE = "Reference images"
+REFERENCE_PROMPT_TEXT = ("Remove the calibration board and keep hands and animals out of view. Each camera then"
+                         " records 1 s at its recording settings and keeps the middle frame as its reference image.")
+MOVED_HEADER = "Moved since the calibration's reference images:"
 SCOUT_TOOLTIP = ("the stage first visits a coarse grid and every camera looks for the board; the waypoints are"
                  " chosen from what they saw, or the hand-written list when fewer than 12 suit")
 HANDWRITTEN_TOOLTIP = "the fixed list of 37 waypoints"
@@ -107,8 +114,8 @@ class CalibrationDialog(QDialog):
         layout.addWidget(moves)
 
         self.references_box = QCheckBox("Capture reference images")
-        self.references_box.setEnabled(False)
-        self.references_box.setToolTip(NOT_AVAILABLE_YET)
+        self.references_box.setChecked(False)
+        self.references_box.setToolTip(REFERENCES_TOOLTIP)
         layout.addWidget(self.references_box)
 
         self._count_label = QLabel("")
@@ -162,6 +169,16 @@ def confirm_scout_advice(parent, diagnosis: Dict[str, str]) -> bool:
     return box.clickedButton() is go_on
 
 
+def confirm_reference_capture(parent, *, skip_label: str = "Skip") -> bool:
+    """Ask the operator to clear the cameras' view before the reference clip; True for Capture."""
+    box = QMessageBox(QMessageBox.Icon.Information, REFERENCE_PROMPT_TITLE, REFERENCE_PROMPT_TEXT, parent=parent)
+    capture = box.addButton("Capture", QMessageBox.ButtonRole.AcceptRole)
+    box.addButton(skip_label, QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(capture)
+    box.exec()
+    return box.clickedButton() is capture
+
+
 def uncalibrated_lines(report: QualityReport) -> List[str]:
     """"<camera> NOT CALIBRATED (2D only): <reason>", one per camera the report left 2D only."""
     return [f"{v.name} {NOT_CALIBRATED}: {v.reason}" for v in report.cameras.values() if not v.calibrated]
@@ -199,17 +216,32 @@ def uncalibrated_off_note(difference) -> Optional[str]:
     return f"Calibrated cameras not recording: {', '.join(difference.uncalibrated_off)}"
 
 
-def confirm_camera_setup(parent, app_model) -> Tuple[bool, Optional[str]]:
-    """Ask before Record when the recording's cameras differ from the active calibration's.
+def cant_tell_note(verdicts: Mapping) -> Optional[str]:
+    """The passive note for cameras the reference-image check could not judge; None when there are none."""
+    lines = [f"{v.camera} ({v.reason})" for v in verdicts.values() if v.status == CANT_TELL]
+    return f"Reference image check can't tell: {', '.join(lines)}" if lines else None
+
+
+def confirm_camera_setup(parent, app_model, frames: Optional[Mapping] = None) -> Tuple[bool, Optional[str]]:
+    """Ask before Record when the recording's cameras differ from the active calibration's,
+    or a camera looks moved against its reference image.
 
     Returns (whether to record, the passive note for the status bar). Added, removed or
-    swapped cameras ask; Yes acknowledges the difference (acknowledge_setup_difference) for
-    this start. Calibrated cameras that are only not recording are the note, without asking.
-    Only the GUI's Record asks: headless and API starts record the mismatch unacknowledged.
+    swapped cameras ask, and so does a camera the reference-image check finds moved
+    (app_model.check_reference_images over `frames`, the cameras' current frames by name;
+    it does nothing while the check is off), with its measured values in the details. Yes
+    acknowledges both (acknowledge_setup_difference) for this start. Calibrated cameras
+    that are only not recording, and cameras the check cannot judge, are the note, without
+    asking. Only the GUI's Record asks: headless and API starts record the mismatch
+    unacknowledged and run no reference-image check.
     """
     difference = app_model.camera_setup_difference(app_model.recording_camera_names)
-    if difference.differs:
+    verdicts = app_model.check_reference_images(dict(frames or {}))
+    moved = [verdict for verdict in verdicts.values() if verdict.status == MOVED]
+    if difference.differs or moved:
         details = setup_difference_details(difference, app_model.uncalibrated_reasons)
+        if moved:
+            details += [MOVED_HEADER, *(moved_detail(verdict) for verdict in moved)]
         rsp = QMessageBox.question(
             parent,
             SETUP_DIFFERS_TITLE,
@@ -219,4 +251,5 @@ def confirm_camera_setup(parent, app_model) -> Tuple[bool, Optional[str]]:
         if rsp != QMessageBox.StandardButton.Yes:
             return False, None
         app_model.acknowledge_setup_difference()
-    return True, uncalibrated_off_note(difference)
+    notes = [note for note in (uncalibrated_off_note(difference), cant_tell_note(verdicts)) if note]
+    return True, " | ".join(notes) or None
