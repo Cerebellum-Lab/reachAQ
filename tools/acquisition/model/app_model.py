@@ -4,6 +4,7 @@ import ctypes
 import dataclasses
 import enum
 import functools
+import getpass
 import hashlib
 import json
 import logging
@@ -116,6 +117,7 @@ from autotrainer.inference.multires_calibration.library import (
     library_root,
     pointer_id,
     read_settings,
+    set_active,
     update_settings,
     write_offsets,
 )
@@ -505,6 +507,13 @@ class _BoundedClose:
 # A Preferences edit arrives per keystroke or spin-box step; its save waits
 # this long after the last one, so a run of edits writes the file once.
 _PREFERENCES_SAVE_DELAY_SECONDS = 0.5
+
+
+# The app states in which the active calibration must not change, as set active names them.
+_SET_ACTIVE_REFUSED_STATUSES = {
+    AppModelStatus.CALIBRATION_3D: "a 3D calibration runs",
+    AppModelStatus.CALIBRATION_DCS: "the coordinate system is calibrated",
+}
 
 
 def _serialized_session_configuration(method):
@@ -2492,6 +2501,37 @@ class AppModel(ObservableObject):
         logger.notice("live 3D is now %s", "on" if enabled else "off")
         self._reload_calib_guarded(self._active_calibration_dir, report=True)
         self.refresh_dcs_state()
+
+    @_serialized_session_configuration
+    def set_active_calibration(self, calibration_id: str, *, by: Optional[str] = None) -> Optional[str]:
+        """Make library entry `calibration_id` the active calibration and load it.
+
+        Under the session lock, as every configuration change is: refused while a session
+        is not Ready (it arms, records or finalizes; _require_session_ready_for_configuration's
+        rule, in its own words) and while a 3D or coordinate-system calibration runs, with "set active is not possible while <state>"; live 3D must not
+        change under any of them. The pointer is written through library.set_active (who
+        did it, `by`, defaults to the login name), then the calibration reloads. Returns
+        None, or why it was not set (an unknown or unreadable entry, a write that failed)
+        or not loaded. Never raises for those.
+        """
+        state = _SET_ACTIVE_REFUSED_STATUSES.get(self._status)
+        if state is None and self._recording_session.status is not SessionRecordingStatus.READY:
+            state = self._recording_session.status.value
+        if state is not None:
+            return f"set active is not possible while {state}"
+        root = self.calibration_library_root
+        try:
+            set_active(root, calibration_id, by=by if by is not None else getpass.getuser())
+        except Exception as err:
+            logger.exception("3D calibration %s: not set active", calibration_id)
+            return f"{calibration_id[:8]} was not set active: {err or type(err).__name__}"
+        try:
+            self.reload_calib(None)
+        except Exception as err:
+            logger.exception("3D calibration %s: set active, but could not be loaded", calibration_id)
+            return f"Set active, but it could not be loaded: {err or type(err).__name__}. Restart the app."
+        logger.success("3D calibration %s: set active", calibration_id)
+        return None
 
     @property
     def _dcs_held_off(self) -> bool:

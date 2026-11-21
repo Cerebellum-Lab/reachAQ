@@ -290,3 +290,20 @@ def test_library_report_page_leads_with_the_banner(tmp_path):
     page = library_view_module.report_page(entry)
     assert BANNER in page and page.index(BANNER) < page.index("3D calibration quality: WARN")
     assert "no quality report" in library_view_module.report_page(legacy)
+
+
+def test_set_active_from_the_library_goes_through_the_app_model_and_resets_the_due_label(tmp_path, monkeypatch):
+    answers = {"a" * 32: None, "c" * 32: "set active is not possible while recording"}
+    labels, calls = [], []
+    app_model = SimpleNamespace(
+        calibration_library_root=tmp_path, dcs_state=None,
+        set_active_calibration=lambda calibration_id: calls.append(calibration_id) or answers[calibration_id])
+    window = SimpleNamespace(_app_model=app_model, _set_calibration_due_label=labels.append)
+    monkeypatch.setattr(main_window_module.library, "pointer_id", lambda root: "b" * 32)
+
+    assert MainWindow._set_active_calibration(window, "a" * 32) is None
+    assert labels == [None], "the monthly reminder's label is reset, as after an install"
+
+    assert MainWindow._set_active_calibration(window, "c" * 32) == "set active is not possible while recording"
+    assert labels == [None], "a refusal leaves the label of the calibration still active"
+    assert calls == ["a" * 32, "c" * 32]

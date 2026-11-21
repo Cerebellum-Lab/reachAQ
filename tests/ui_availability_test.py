@@ -88,6 +88,16 @@ def test_background_operation_temporarily_disables_conflicting_controls():
     assert state.notes
 
 
+def test_the_calibration_library_follows_set_actives_rule():
+    # Its Set active is refused while a session is not Ready or a calibration runs.
+    assert _state().calibration_library
+    assert _state(status=AppModelStatus.IDLE, acquisition_started=False).calibration_library
+    assert not _state(recording_status=SessionRecordingStatus.RECORDING).calibration_library
+    assert not _state(status=AppModelStatus.CALIBRATION_3D).calibration_library
+    assert not _state(status=AppModelStatus.CALIBRATION_DCS).calibration_library
+    assert not _state(hardware_refreshing=True).calibration_library
+
+
 class _Widget:
     def __init__(self):
         self.enabled = None
@@ -113,7 +123,7 @@ _WIDGETS = (
     "_app_model_status_combo", "run_action", "preferences_action", "edit_camera_settings_action",
     "edit_daq_ports_action", "make_3d_calib_action", "daq_monitor_action", "refresh_hardware_action",
     "_animal_dropdown_combo", "_rfid_entry", "animal_metadata_action", "_training_plan_combo", "_notes",
-    "calib_diamond_triangle_action",
+    "calib_diamond_triangle_action", "calibration_library_action",
 )
 
 
@@ -167,3 +177,4 @@ def test_dcs_action_needs_a_loaded_dcs(algo):
     MainWindow._refresh_ui_availability(window)
 
     assert window.calib_diamond_triangle_action.enabled is False
+    assert window.calibration_library_action.enabled is True

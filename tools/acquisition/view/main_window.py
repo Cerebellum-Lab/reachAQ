@@ -379,6 +379,7 @@ class MainWindow(QMainWindow):
         self.edit_camera_settings_action.setEnabled(state.idle_configuration)
         self.edit_daq_ports_action.setEnabled(state.idle_configuration)
         self.make_3d_calib_action.setEnabled(state.idle_configuration)
+        self.calibration_library_action.setEnabled(state.calibration_library)
         # It pauses the NI-DAQ input stream, which in System Mode is the
         # acquisition's; AppModel refuses the pause then as well.
         self.daq_monitor_action.setEnabled(state.idle_configuration)
@@ -1161,22 +1162,18 @@ class MainWindow(QMainWindow):
             self._library_view.refresh()
 
     def _set_active_calibration(self, calibration_id: str) -> Optional[str]:
-        """Make library entry `calibration_id` the active calibration and load it.
+        """Make library entry `calibration_id` the active calibration and load it
+        (AppModel.set_active_calibration, under the session lock).
 
-        Refused while a session or a calibration runs: live 3D must not change under it.
-        Returns None, or why it was not set or not loaded.
+        Returns None, or why it was not set or not loaded. Once the pointer names it, the
+        monthly reminder's label is reset, as after an install.
         """
         app_model = self._app_model
-        if (app_model.status == AppModelStatus.CALIBRATION_3D
-                or app_model.session_recording_status != SessionRecordingStatus.READY):
-            return "Stop the recording or calibration first: the active calibration cannot change while one runs."
-        library.set_active(app_model.calibration_library_root, calibration_id, by=getpass.getuser())
-        try:
-            app_model.reload_calib(None)
-        except Exception as err:
-            logger.exception("3D calibration %s: set active, but could not be loaded", calibration_id)
-            return f"Set active, but it could not be loaded: {err or type(err).__name__}. Restart the app."
-        logger.success("3D calibration %s: set active", calibration_id)
+        refusal = app_model.set_active_calibration(calibration_id)
+        if refusal is None or library.pointer_id(app_model.calibration_library_root) == calibration_id:
+            self._set_calibration_due_label(None)
+        if refusal is not None:
+            return refusal
         if app_model.dcs_state is DcsState.STALE:
             self._show_msg_box(
                 "Coordinate system out of date",
