@@ -49,9 +49,17 @@ Switching live 3D off does not change the cameras or their pixels.
    frame.
 3. A point seen by fewer than 2 cameras is NaN.
 
+The session is read and processed 20 000 frames at a time, so memory does not
+grow with the session's length. A 400 000-frame session of 6 cameras and 16
+keypoints peaked at 691 MiB resident on christielab10, against 661 MiB for
+100 000 frames; about 180 MiB of that is the libraries loaded before it starts.
+
 ## Outputs
 
-These files are written into the session folder.
+These files are written into the session folder. Each is written under a
+temporary name and renamed into place when it is complete, so a failed run
+leaves no partial file and an earlier result as it was. The datasets are
+chunked and gzip-compressed.
 
 `points3d.h5`:
 
@@ -103,6 +111,9 @@ way to deal with a moved camera.
   inconsistent", because the check cannot tell which camera moved.
 - A camera with too few frames or observations is reported as "not enough
   data".
+- The residuals are kept as histograms, 400 bins per decade, so the median and
+  p95 are read to within 0.6 % of their value. The confidence cutoff applies to
+  the hundredth.
 
 The verdicts are logged and written to `poseConsistency` in
 `offline3d_report.json`.

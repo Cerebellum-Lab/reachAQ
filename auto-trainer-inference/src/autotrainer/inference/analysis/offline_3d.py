@@ -2,24 +2,30 @@
 
 session_offline_3d is what intersession processing calls once the session's calibration has
 resolved. It matches the cameras the session recorded to the calibration's by serial
-(select_session_cameras): a camera whose body was swapped, one the calibration left 2D only,
-and one it does not hold are excluded, each with its reason. The 2D pose of the rest, each
-camera's *_<camera>_raw2D_live.h5 in the pixels inference saw, is triangulated with the
+(select_session_cameras): a camera whose body was swapped, one the calibration left 2D
+only, and one it does not hold are excluded, each with its reason. The 2D pose of the rest,
+each camera's *_<camera>_raw2D_live.h5 in the pixels inference saw, is triangulated with the
 calibration's anipose TOML at each camera's recorded geometry (store.load_preset_set):
 
+- the session is read and processed in blocks of BLOCK_FRAMES frames, so memory does not
+  grow with its length;
 - every point is undistorted to normalised coordinates with its camera's K and distortion,
   then triangulated by N-view DLT with P = [R|t] (triangulate_dlt), from the views whose
   likelihood reaches the confidence cutoff; fewer than 2 such views give NaN;
 - points3d.h5 holds the points in the calibration's motor frame, in mm; reprojections.h5
   holds each camera's projection of them and its distance from that camera's own point.
+  Both are chunked and compressed, and written under a temporary name and renamed into
+  place, so a failed run leaves no partial file and an earlier result as it was.
 
 The pose-consistency check (pose_consistency, spec section 8(b)) measures each camera
 against the point triangulated from the other cameras (leave-one-out), which needs 3 or
 more cameras. A camera whose median residual is over the limit is "possibly moved". With
 exactly 2 cameras the residual is shared, the sum of the two cameras' reprojection errors,
 which is about how far the pair is from agreeing; it cannot say which camera moved, so it
-reports "pair inconsistent". The settings are in <library>/settings.yaml under
-checks.pose_consistency, global with an optional per_camera override, and are only read here.
+reports "pair inconsistent". The residuals are kept as histograms (ResidualStats), so the
+median and p95 are read to within 0.6 % of their value.
+The settings are in <library>/settings.yaml under checks.pose_consistency, global with an
+optional per_camera override, and are only read here.
 
 Nothing is written inside the calibration entry: a geometry no stored file has is derived
 into the library's .derived cache.
@@ -28,9 +34,10 @@ into the library's .derived cache.
 import json
 import math
 import os
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import h5py
@@ -67,8 +74,18 @@ STATUS_TOO_LITTLE = "not enough data"
 # import the app, so tests/offline_3d_test.py checks the two agree where both are importable.
 SPINCAM_DEFAULT_GEOMETRY = dict(hbin=4, width=256, height=256, offsetx=52, offsety=6)
 
+# Frames read and processed at a time: 20 000 frames of 6 cameras and 16 keypoints hold about
+# 30 MB of 2D points, whatever the session's length.
+BLOCK_FRAMES = 20_000
+# Frames per HDF5 chunk of the outputs.
+_H5_CHUNK_FRAMES = 1_000
 # Points triangulated per batch: the DLT matrices of a batch take 64 * cameras bytes each.
 _CHUNK = 50_000
+
+# The residual histograms: confidence in hundredths (rows) by residual (columns). The residual
+# bins are [0, 1e-4) px, 400 per decade from 1e-4 to 1e4 px, and [1e4, inf).
+_CONFIDENCE_STEPS = 100
+_RESIDUAL_EDGES = np.concatenate([[0.0], np.logspace(-4.0, 4.0, 8 * 400 + 1), [np.inf]])
 
 
 # --- the anipose TOML ---------------------------------------------------------------------
@@ -174,74 +191,210 @@ def project(points3d: np.ndarray, camera: TomlCamera) -> np.ndarray:
 
 # --- the 2D pose files --------------------------------------------------------------------
 
+class PoseFile:
+    """A DLC-style pose file, read in row blocks: (bodypart, x / y / likelihood) columns, and
+    frame_idx when live pose wrote it.
+
+    Opening it reads the whole file once, a block at a time, for its frame indices and body
+    parts; raises when it cannot be read as a pose file.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        with pd.HDFStore(self.path, mode="r") as store:
+            keys = store.keys()
+            if len(keys) != 1:
+                raise ValueError(f"{self.path}: expected one table, found {len(keys)}")
+            self._key = keys[0]
+            self.node_names: Optional[List[str]] = None
+            has_frame_idx, frame_idx, self.n_rows = False, [], 0
+            while True:
+                df = store.select(self._key, start=self.n_rows, stop=self.n_rows + BLOCK_FRAMES)
+                if self.node_names is None:
+                    self.node_names, has_frame_idx = self._columns(df)
+                if has_frame_idx and len(df):
+                    frame_idx.append(np.asarray(df["frame_idx"]).reshape(len(df), -1)[:, 0].astype(np.int64))
+                self.n_rows += len(df)
+                if len(df) < BLOCK_FRAMES:
+                    break
+        # (n_rows,) recording-relative frame index, None without the column.
+        self.frame_idx = np.concatenate(frame_idx + [np.zeros(0, np.int64)]) if has_frame_idx else None
+
+    def _columns(self, df: pd.DataFrame) -> Tuple[List[str], bool]:
+        if not isinstance(df.columns, pd.MultiIndex):
+            raise ValueError(f"{self.path}: expected (bodypart, coordinate) columns")
+        parts = [p for p in dict.fromkeys(df.columns.get_level_values(0)) if p != "frame_idx"]
+        if not parts:
+            raise ValueError(f"{self.path}: no body parts")
+        return parts, "frame_idx" in df.columns.get_level_values(0)
+
+    def read(self, start: int, stop: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Rows [start, stop): (xy (n, parts, 2), likelihood (n, parts)), parts in node_names' order."""
+        with pd.HDFStore(self.path, mode="r") as store:
+            df = store.select(self._key, start=start, stop=stop)
+
+        def column(coordinate: str) -> np.ndarray:
+            return np.stack([df[(p, coordinate)].to_numpy(float) for p in self.node_names], axis=1)
+
+        return np.stack([column("x"), column("y")], axis=-1), column("likelihood")
+
+
 @dataclass(frozen=True)
-class PoseTrack:
-    frame_idx: Optional[np.ndarray]  # (n,) recording-relative frame index, None without the column
-    node_names: List[str]
-    xy: np.ndarray  # (n, kp, 2)
-    likelihood: np.ndarray  # (n, kp)
+class _Block:
+    frames: np.ndarray  # (n,) frame index of each row
+    xy: np.ndarray  # (cams, n, kp, 2) pixels, NaN where the camera has no point
+    likelihood: np.ndarray  # (cams, n, kp)
+    mask: np.ndarray  # (cams, n, kp) the views used: likelihood at the cutoff and a finite point
+    normalised: np.ndarray  # (cams, n, kp, 2) undistorted normalised coordinates
 
 
-def read_pose_file(path: Path) -> PoseTrack:
-    """A DLC-style pose file: (bodypart, x / y / likelihood) columns, and frame_idx when live pose wrote it."""
-    df = pd.read_hdf(path)
-    if not isinstance(df.columns, pd.MultiIndex):
-        raise ValueError(f"{path}: expected (bodypart, coordinate) columns")
-    parts = [p for p in dict.fromkeys(df.columns.get_level_values(0)) if p != "frame_idx"]
-    if not parts:
-        raise ValueError(f"{path}: no body parts")
-
-    def column(coordinate: str) -> np.ndarray:
-        return np.stack([df[(p, coordinate)].to_numpy(float) for p in parts], axis=1)
-
-    frame_idx = None
-    if "frame_idx" in df.columns.get_level_values(0):
-        frame_idx = np.asarray(df["frame_idx"]).reshape(len(df), -1)[:, 0].astype(np.int64)
-    return PoseTrack(frame_idx, parts, np.stack([column("x"), column("y")], axis=-1), column("likelihood"))
-
-
-def _aligned(tracks: Mapping[str, PoseTrack]) -> Tuple[np.ndarray, List[str], np.ndarray, np.ndarray]:
-    """(frame_idx, node_names, xy (cams, frames, kp, 2), likelihood (cams, frames, kp)) over all cameras.
+class _SessionPoses:
+    """The cameras' pose files aligned frame by frame, read a block of frames at a time.
 
     Frames are matched by frame_idx when every file has it, over the union of indices: a frame
     a camera did not pose is NaN there. Without it, by row. The parts are those every camera
     has, in the first camera's order.
     """
-    first = next(iter(tracks.values()))
-    names = [p for p in first.node_names if all(p in t.node_names for t in tracks.values())]
-    if not names:
-        raise ValueError("the cameras' pose files have no body part in common")
-    if all(t.frame_idx is not None for t in tracks.values()):
-        frames = np.unique(np.concatenate([t.frame_idx for t in tracks.values()]))
-        rows = {cam: np.searchsorted(frames, t.frame_idx) for cam, t in tracks.items()}
-    else:
-        frames = np.arange(max(len(t.xy) for t in tracks.values()))
-        rows = {cam: np.arange(len(t.xy)) for cam, t in tracks.items()}
-    xy = np.full((len(tracks), len(frames), len(names), 2), np.nan)
-    likelihood = np.zeros((len(tracks), len(frames), len(names)))
-    for c, (cam, track) in enumerate(tracks.items()):
-        columns = [track.node_names.index(p) for p in names]
-        xy[c, rows[cam]] = track.xy[:, columns]
-        likelihood[c, rows[cam]] = np.nan_to_num(track.likelihood[:, columns], nan=0.0)
-    return frames, names, xy, likelihood
+
+    def __init__(self, cameras: Sequence[TomlCamera], sources: Sequence[PoseFile], min_confidence: float):
+        self.cameras = list(cameras)
+        self.min_confidence = min_confidence
+        self.sources = list(sources)
+        first = self.sources[0]
+        self.node_names = [p for p in first.node_names if all(p in s.node_names for s in self.sources)]
+        if not self.node_names:
+            raise ValueError("the cameras' pose files have no body part in common")
+        self._columns = [[s.node_names.index(p) for p in self.node_names] for s in self.sources]
+        if all(s.frame_idx is not None for s in self.sources):
+            self.frames = np.unique(np.concatenate([s.frame_idx for s in self.sources]))
+            self._rows = [np.searchsorted(self.frames, s.frame_idx) for s in self.sources]
+        else:
+            self.frames = np.arange(max(s.n_rows for s in self.sources), dtype=np.int64)
+            self._rows = [np.arange(s.n_rows) for s in self.sources]
+
+    def blocks(self) -> Iterator[_Block]:
+        n_cams, n_kp, size = len(self.sources), len(self.node_names), BLOCK_FRAMES
+        for start in range(0, len(self.frames), size):
+            stop = min(start + size, len(self.frames))
+            xy = np.full((n_cams, stop - start, n_kp, 2), np.nan)
+            likelihood = np.zeros((n_cams, stop - start, n_kp))
+            for c, (source, rows, columns) in enumerate(zip(self.sources, self._rows, self._columns)):
+                # The file rows whose frames fall in this block: one contiguous read when the
+                # file's frame indices rise, as live pose writes them.
+                selected = np.flatnonzero((rows >= start) & (rows < stop))
+                if not selected.size:
+                    continue
+                first = int(selected.min())
+                block_xy, block_likelihood = source.read(first, int(selected.max()) + 1)
+                at = rows[selected] - start
+                xy[c, at] = block_xy[selected - first][:, columns]
+                likelihood[c, at] = np.nan_to_num(block_likelihood[selected - first][:, columns], nan=0.0)
+            mask = (likelihood >= self.min_confidence) & np.isfinite(xy).all(axis=-1)
+            normalised = np.stack([undistort_normalised(xy[i], c) for i, c in enumerate(self.cameras)])
+            yield _Block(self.frames[start:stop], xy, likelihood, mask, normalised)
 
 
-# --- export -------------------------------------------------------------------------------
+# --- residuals ----------------------------------------------------------------------------
 
-@dataclass(frozen=True)
+def _confidence_bin(confidence: np.ndarray) -> np.ndarray:
+    return np.clip(np.floor(np.asarray(confidence, float) * _CONFIDENCE_STEPS + 1e-9), 0, _CONFIDENCE_STEPS).astype(
+        np.int64)
+
+
+@dataclass
 class ResidualStats:
-    """One camera's judged observations: the residual in px, the confidence and the frame of each.
+    """One camera's judged observations, as histograms, so their size does not grow with the session.
 
-    leave_one_out is True when the residual is against the point the other cameras give; False
-    with exactly 2 cameras, where it is the pair's shared residual.
+    counts holds the observations by confidence (in hundredths) and residual bin
+    (_RESIDUAL_EDGES); frame_counts the frames with a judged observation, by the highest
+    confidence among them. leave_one_out is True when the residual is against the point the
+    other cameras give; False with exactly 2 cameras, where it is the pair's shared residual.
     """
 
     camera: str
-    residual_px: np.ndarray
-    confidence: np.ndarray
-    frame: np.ndarray
     leave_one_out: bool
+    counts: np.ndarray = None
+    frame_counts: np.ndarray = None
 
+    def __post_init__(self):
+        if self.counts is None:
+            self.counts = np.zeros((_CONFIDENCE_STEPS + 1, _RESIDUAL_EDGES.size - 1), np.int64)
+        if self.frame_counts is None:
+            self.frame_counts = np.zeros(_CONFIDENCE_STEPS + 1, np.int64)
+
+    def add(self, residual: np.ndarray, confidence: np.ndarray, judged: np.ndarray) -> None:
+        """Add a block of (frames, kp) residuals in px, their confidences, and which are judged."""
+        n_bins = _RESIDUAL_EDGES.size - 1
+        rows = _confidence_bin(confidence[judged])
+        columns = np.clip(np.searchsorted(_RESIDUAL_EDGES, residual[judged], side="right") - 1, 0, n_bins - 1)
+        self.counts += np.bincount(rows * n_bins + columns, minlength=self.counts.size).reshape(self.counts.shape)
+        seen = judged.any(axis=1)
+        best = np.where(judged, confidence, -np.inf).max(axis=1)[seen]
+        self.frame_counts += np.bincount(_confidence_bin(best), minlength=self.frame_counts.size)
+
+    @staticmethod
+    def _from(min_confidence: float) -> int:
+        return max(0, int(math.ceil(min_confidence * _CONFIDENCE_STEPS - 1e-9)))
+
+    def n_obs(self, min_confidence: float = 0.0) -> int:
+        """Observations at or above `min_confidence` (to the hundredth)."""
+        return int(self.counts[self._from(min_confidence):].sum())
+
+    def n_frames(self, min_confidence: float = 0.0) -> int:
+        """Frames with an observation at or above `min_confidence` (to the hundredth)."""
+        return int(self.frame_counts[self._from(min_confidence):].sum())
+
+    def quantile(self, q: float, min_confidence: float = 0.0) -> Optional[float]:
+        """The q-th quantile (0 to 1) of the residuals at or above `min_confidence`, within
+        its histogram bin; None without any."""
+        hist = self.counts[self._from(min_confidence):].sum(axis=0)
+        total = int(hist.sum())
+        if not total:
+            return None
+        cumulative = np.cumsum(hist)
+        target = q * total
+        i = min(int(np.searchsorted(cumulative, target, side="left")), hist.size - 1)
+        low, high = _RESIDUAL_EDGES[i], _RESIDUAL_EDGES[i + 1]
+        if not np.isfinite(high):
+            return float(low)
+        below = cumulative[i] - hist[i]
+        return float(low + (target - below) / hist[i] * (high - low)) if hist[i] else float(low)
+
+
+def _residuals(block: _Block, cameras: Sequence[TomlCamera], projections: np.ndarray,
+               use: Sequence[int]) -> Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """{camera index: (residual, confidence, judged)} of the cameras `use` on one block.
+
+    Only the cameras in `use` take part. With 2 of them, the residual is their shared one:
+    the sum of their reprojection errors from the point they give together. With more, each
+    camera's leave-one-out residual against the point the others give.
+    """
+    in_use = np.zeros(len(cameras), bool)
+    in_use[list(use)] = True
+    mask = block.mask & in_use[:, None, None]
+    out = {}
+    if len(use) == MIN_VIEWS:
+        points3d = triangulate_dlt(block.normalised, projections, mask)
+        errors = []
+        for i in use:
+            error = np.linalg.norm(project(points3d, cameras[i]) - block.xy[i], axis=-1)
+            error[~mask[i]] = np.nan
+            errors.append(error)
+        shared = errors[0] + errors[1]
+        confidence = np.minimum(*(block.likelihood[i] for i in use))
+        for i in use:
+            out[i] = (shared, confidence, np.isfinite(shared))
+        return out
+    for i in use:
+        others = mask.copy()
+        others[i] = False
+        point = triangulate_dlt(block.normalised, projections, others)
+        residual = np.linalg.norm(project(point, cameras[i]) - block.xy[i], axis=-1)
+        out[i] = (residual, block.likelihood[i], mask[i] & np.isfinite(residual))
+    return out
+
+
+# --- export -------------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class ConsistencyVerdict:
@@ -296,73 +449,93 @@ def export_session_3d(
     (points3d (frames, kp, 3) in mm, node_names, camera_names, frame_idx; attrs
     calibration_id and units "mm") and reprojections.h5 (reprojections (cams, frames, kp, 2),
     reprojection_error (cams, frames, kp), NaN where the camera's own point was not used,
-    node_names, camera_names, frame_idx). Cameras are in the TOML's order.
+    node_names, camera_names, frame_idx). Cameras are in the TOML's order. The session is
+    processed BLOCK_FRAMES frames at a time, into chunked, gzip-compressed datasets that grow
+    along the frame axis; both files are written under a temporary name, then renamed.
     """
+    return _export(session_dir, calibration_toml, {name: PoseFile(Path(p)) for name, p in camera_files.items()},
+                   min_confidence=min_confidence)
+
+
+def _export(session_dir: Path, calibration_toml: Path, sources: Mapping[str, PoseFile], *,
+            min_confidence: float) -> Offline3DResult:
     session_dir = Path(session_dir)
     calibration_id, toml_cameras = load_anipose_toml(calibration_toml)
     in_toml = {c.name for c in toml_cameras}
-    unknown = [name for name in camera_files if name not in in_toml]
+    unknown = [name for name in sources if name not in in_toml]
     if unknown:
         raise ValueError(f"{calibration_toml} has no camera {', '.join(unknown)}")
-    cameras = [c for c in toml_cameras if c.name in camera_files]
+    cameras = [c for c in toml_cameras if c.name in sources]
     if len(cameras) < MIN_VIEWS:
         raise ValueError(f"offline 3D needs at least {MIN_VIEWS} cameras, got {len(cameras)}")
-    tracks = {c.name: read_pose_file(Path(camera_files[c.name])) for c in cameras}
-    frames, node_names, xy, likelihood = _aligned(tracks)
-    mask = (likelihood >= min_confidence) & np.isfinite(xy).all(axis=-1)
-    normalised = np.stack([undistort_normalised(xy[i], c) for i, c in enumerate(cameras)])
+    poses = _SessionPoses(cameras, [sources[c.name] for c in cameras], min_confidence)
     projections = np.stack([c.projection for c in cameras])
-
-    points3d = triangulate_dlt(normalised, projections, mask)
-    reprojections = np.stack([project(points3d, c) for c in cameras])
-    error = np.linalg.norm(reprojections - xy, axis=-1)
-    error[~mask] = np.nan
-
-    residuals = {}
-    if len(cameras) == MIN_VIEWS:
-        shared = error[0] + error[1]
-        judged = np.isfinite(shared)
-        confidence = np.minimum(likelihood[0], likelihood[1])
-        for c in cameras:
-            residuals[c.name] = _stats(c.name, shared, confidence, frames, judged, leave_one_out=False)
-    else:
-        for i, c in enumerate(cameras):
-            others = mask.copy()
-            others[i] = False
-            residual = np.linalg.norm(project(triangulate_dlt(normalised, projections, others), c) - xy[i], axis=-1)
-            judged = mask[i] & np.isfinite(residual)
-            residuals[c.name] = _stats(c.name, residual, likelihood[i], frames, judged, leave_one_out=True)
-
     names = [c.name for c in cameras]
+    n_cams, n_kp = len(cameras), len(poses.node_names)
+    use = range(n_cams)
+    residuals = {c.name: ResidualStats(c.name, leave_one_out=n_cams > MIN_VIEWS) for c in cameras}
+
     points3d_path = session_dir / POINTS3D_FILE
     reprojections_path = session_dir / REPROJECTIONS_FILE
-    with h5py.File(points3d_path, "w") as fh:
-        fh.create_dataset("points3d", data=points3d)
-        _write_names(fh, node_names, names, frames)
-        fh.attrs["calibration_id"] = calibration_id or ""
-        fh.attrs["units"] = "mm"
-    with h5py.File(reprojections_path, "w") as fh:
-        fh.create_dataset("reprojections", data=reprojections)
-        fh.create_dataset("reprojection_error", data=error)
-        _write_names(fh, node_names, names, frames)
-        fh.attrs["calibration_id"] = calibration_id or ""
-        fh.attrs["units"] = "px"
-    used = int(np.isfinite(points3d).all(axis=-1).sum())
+    temps = [path.with_name(f"{path.name}.{os.getpid()}.tmp") for path in (points3d_path, reprojections_path)]
+    used = total = 0
+    try:
+        with h5py.File(temps[0], "w") as points_fh, h5py.File(temps[1], "w") as reprojections_fh:
+            points_ds = _growing(points_fh, "points3d", (0, n_kp, 3), axis=0)
+            reprojections_ds = _growing(reprojections_fh, "reprojections", (n_cams, 0, n_kp, 2), axis=1)
+            error_ds = _growing(reprojections_fh, "reprojection_error", (n_cams, 0, n_kp), axis=1)
+            frame_ds = [_growing(fh, "frame_idx", (0,), axis=0, dtype=np.int64)
+                        for fh in (points_fh, reprojections_fh)]
+            for fh, units in ((points_fh, "mm"), (reprojections_fh, "px")):
+                _write_names(fh, poses.node_names, names)
+                fh.attrs["calibration_id"] = calibration_id or ""
+                fh.attrs["units"] = units
+            for block in poses.blocks():
+                points3d = triangulate_dlt(block.normalised, projections, block.mask)
+                reprojections = np.stack([project(points3d, c) for c in cameras])
+                error = np.linalg.norm(reprojections - block.xy, axis=-1)
+                error[~block.mask] = np.nan
+                _append(points_ds, points3d, axis=0)
+                _append(reprojections_ds, reprojections, axis=1)
+                _append(error_ds, error, axis=1)
+                for ds in frame_ds:
+                    _append(ds, np.asarray(block.frames, np.int64), axis=0)
+                for i, (residual, confidence, judged) in _residuals(block, cameras, projections, use).items():
+                    residuals[cameras[i].name].add(residual, confidence, judged)
+                used += int(np.isfinite(points3d).all(axis=-1).sum())
+                total += points3d.shape[0] * points3d.shape[1]
+        os.replace(temps[0], points3d_path)
+        os.replace(temps[1], reprojections_path)
+    except BaseException:
+        for temp in temps:
+            with suppress(OSError):
+                temp.unlink()
+        raise
     logger.info("offline 3D of %s from %s: %d of %d points triangulated, into %s",
-                session_dir, ", ".join(names), used, points3d.shape[0] * points3d.shape[1], points3d_path)
+                session_dir, ", ".join(names), used, total, points3d_path)
     return Offline3DResult(points3d_path, reprojections_path, residuals)
 
 
-def _stats(camera, residual, confidence, frames, judged, *, leave_one_out) -> ResidualStats:
-    frame_of = np.broadcast_to(frames[:, None], judged.shape)
-    return ResidualStats(camera, residual[judged], confidence[judged], frame_of[judged], leave_one_out)
+def _growing(fh: h5py.File, name: str, shape: Tuple[int, ...], *, axis: int, dtype=float) -> h5py.Dataset:
+    """A chunked, gzip-compressed dataset that `_append` grows along `axis`, the frame axis."""
+    maxshape = tuple(None if i == axis else n for i, n in enumerate(shape))
+    chunks = tuple(_H5_CHUNK_FRAMES if i == axis else (1 if i < axis else n) for i, n in enumerate(shape))
+    return fh.create_dataset(name, shape=shape, maxshape=maxshape, chunks=chunks, dtype=dtype,
+                             compression="gzip", shuffle=True)
 
 
-def _write_names(fh: h5py.File, node_names: Sequence[str], camera_names: Sequence[str], frames: np.ndarray) -> None:
+def _append(ds: h5py.Dataset, data: np.ndarray, *, axis: int) -> None:
+    n = ds.shape[axis]
+    ds.resize(n + data.shape[axis], axis=axis)
+    index = [slice(None)] * ds.ndim
+    index[axis] = slice(n, n + data.shape[axis])
+    ds[tuple(index)] = data
+
+
+def _write_names(fh: h5py.File, node_names: Sequence[str], camera_names: Sequence[str]) -> None:
     text = h5py.string_dtype()
     fh.create_dataset("node_names", data=np.array(list(node_names), dtype=object), dtype=text)
     fh.create_dataset("camera_names", data=np.array(list(camera_names), dtype=object), dtype=text)
-    fh.create_dataset("frame_idx", data=np.asarray(frames, np.int64))
 
 
 # --- the pose-consistency check -----------------------------------------------------------
@@ -459,12 +632,10 @@ def pose_consistency(
     verdicts = {}
     for name, stats in residuals.items():
         limits = settings.for_camera(name)
-        keep = stats.confidence >= limits.min_confidence
-        values = stats.residual_px[keep]
-        n_obs = int(values.size)
-        n_frames = int(np.unique(stats.frame[keep]).size)
-        median = float(np.median(values)) if n_obs else None
-        p95 = float(np.percentile(values, 95)) if n_obs else None
+        n_obs = stats.n_obs(limits.min_confidence)
+        n_frames = stats.n_frames(limits.min_confidence)
+        median = stats.quantile(0.5, limits.min_confidence)
+        p95 = stats.quantile(0.95, limits.min_confidence)
         if n_obs < limits.min_observations or n_frames < limits.min_frames:
             status = STATUS_TOO_LITTLE
         elif median > limits.median_px or (limits.p95_px is not None and p95 > limits.p95_px):

@@ -264,6 +264,67 @@ def test_frames_are_matched_by_frame_index(tmp_path):
         assert np.isnan(fh["reprojection_error"][2, 3]).all()
 
 
+def _outputs(result) -> dict:
+    with h5py.File(result.points3d_path, "r") as points, h5py.File(result.reprojections_path, "r") as reprojections:
+        return {"points3d": points["points3d"][()], "frame_idx": points["frame_idx"][()],
+                "reprojections": reprojections["reprojections"][()],
+                "reprojection_error": reprojections["reprojection_error"][()],
+                "reprojection_frame_idx": reprojections["frame_idx"][()]}
+
+
+def test_a_session_streamed_in_blocks_equals_one_block(tmp_path, monkeypatch):
+    cameras = _ring(3)
+    n = 50_000
+    X = _points(n, seed=5)
+    likelihood = np.ones((n, len(PARTS)))
+    likelihood[::7, 1] = 0.2
+    session, toml, files = _session(tmp_path, cameras, X, likelihood={"cam1": likelihood})
+    # cam2 dropped frames across a block edge: frames still pair by frame_idx from block to block.
+    keep = np.setdiff1d(np.arange(n), np.arange(6_990, 7_010))
+    _write_pose(files["cam2"], _pixels(cameras[2], X)[keep], frame_idx=keep + 1)
+
+    monkeypatch.setattr(offline_3d, "BLOCK_FRAMES", 10 ** 9)
+    whole = export_session_3d(session, toml, files)
+    expected = _outputs(whole)
+    monkeypatch.setattr(offline_3d, "BLOCK_FRAMES", 7_000)
+    blocked = export_session_3d(session, toml, files)
+    got = _outputs(blocked)
+    assert expected["points3d"].shape == (n, len(PARTS), 3)
+    for key, value in expected.items():
+        np.testing.assert_allclose(got[key], value, rtol=0, atol=1e-9, err_msg=key)
+    for name in whole.residuals:
+        np.testing.assert_array_equal(blocked.residuals[name].counts, whole.residuals[name].counts)
+        np.testing.assert_array_equal(blocked.residuals[name].frame_counts, whole.residuals[name].frame_counts)
+    # Chunked and compressed, and grown along the frame axis.
+    with h5py.File(blocked.points3d_path, "r") as fh:
+        for key, axis in (("points3d", 0), ("frame_idx", 0)):
+            assert fh[key].chunks is not None and fh[key].compression == "gzip" and fh[key].maxshape[axis] is None
+    with h5py.File(blocked.reprojections_path, "r") as fh:
+        for key in ("reprojections", "reprojection_error"):
+            assert fh[key].chunks is not None and fh[key].compression == "gzip" and fh[key].maxshape[1] is None
+
+
+def test_a_failed_export_leaves_no_partial_file_and_the_old_one_as_it_was(tmp_path, monkeypatch):
+    cameras = _ring(3)
+    session, toml, files = _session(tmp_path, cameras, _points(30))
+    export_session_3d(session, toml, files)
+    before = {p.name: p.read_bytes() for p in session.iterdir()}
+    assert {"points3d.h5", "reprojections.h5"} <= set(before)
+    monkeypatch.setattr(offline_3d, "BLOCK_FRAMES", 10)
+    calls, real = [], offline_3d.project
+
+    def failing(points3d, camera):
+        calls.append(camera.name)
+        if len(calls) > 4:  # in the first block, once its points are written
+            raise RuntimeError("disk full")
+        return real(points3d, camera)
+
+    monkeypatch.setattr(offline_3d, "project", failing)
+    with pytest.raises(RuntimeError, match="disk full"):
+        export_session_3d(session, toml, files)
+    assert {p.name: p.read_bytes() for p in session.iterdir()} == before
+
+
 # --- the pose-consistency check -----------------------------------------------------------
 
 def test_moved_camera_is_flagged(tmp_path):
