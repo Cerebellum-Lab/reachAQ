@@ -26,17 +26,29 @@ session's 2D processing and reach segmentation carry on.
   - the calibration left it 2D only, giving the calibration's reason, for
     example "too few board views: 4 of 12 needed";
   - the session recorded it as not in the calibration (`inCalibration` false);
-  - the calibration does not hold it: "not in the session's calibration".
-- **The 2D pose.** Each camera's `*_<camera>_raw2D_live.h5` in the session
-  folder, as live pose writes it. Frames from different cameras are paired by
-  the files' `frame_idx`. A frame that a camera did not pose counts as not seen
-  by that camera.
+  - the calibration does not hold it: "not in the session's calibration";
+  - it has no 2D pose file: "no 2D pose file";
+  - its 2D pose file cannot be read: "2D pose file unreadable: <error>";
+  - it recorded at another frame rate than the others: "different frame rate
+    (900 Hz vs 150 Hz)". The rate is the camera's `frameRateHz` or `fps` in
+    `hardware.configured.cameras`, else `fps` in its configuration params; the
+    rate most cameras share is kept. A camera whose rate is not recorded is not
+    left out for it.
+- **The 2D pose.** Each camera's `<session prefix>_<camera>_raw2D_live.h5` in
+  the session folder, at exactly the path live pose writes it
+  (`ProjectInfo.get_intersession_pose_path(camera, suffix="_live")`), so a
+  camera named `left` never takes `far_left`'s file. Frames from different
+  cameras are paired by the files' `frame_idx`. A frame that a camera did not
+  pose counts as not seen by that camera.
 - **The pixel space.** Each camera's 2D points are in the pixels of its
   configured base capture: binning, width, height and ROI offset from the
   session metadata's `configuration.cameras`. This is read the same way as the
   app reads it for live 3D. The calibration's anipose TOML for exactly those
   geometries is used. When no stored file has them, the TOML is derived into the
-  library's `.derived` cache. Nothing is written inside the calibration entry.
+  library's `.derived` cache. For a calibration outside the library
+  (`--calib-dir`), it is derived into `.offline3d_derived` in the session
+  folder instead, never into the operator's library. Nothing is written inside
+  the calibration entry.
 
 With live 3D switched off ("live 3D is off"), a session is processed as usual.
 Switching live 3D off does not change the cameras or their pixels.

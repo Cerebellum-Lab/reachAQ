@@ -48,6 +48,9 @@ _CALIB_DIR_HINT = "pass --calib-dir to choose the calibration folder"
 # about whether the calibration fits the session, so offline 3D does not refuse it.
 LIVE_3D_OFF = "live 3D is off"
 _LIVE_PAIR = ("left", "right")
+# Where offline 3D derives the TOMLs of a calibration outside the library (--calib-dir), in
+# the session folder: never in the operator's library.
+OFFLINE_DERIVED_DIR = ".offline3d_derived"
 
 
 def resolve_session_calibration(project: ProjectInfo, calib_root: Path) -> Path:
@@ -282,15 +285,20 @@ def _recorded_pair_geometry(metadata: dict) -> Optional[PresetGeometry]:
 def _offline_3d(project: ProjectInfo, location: str, folder: Path, calib_root: Optional[Path]) -> None:
     """Offline 3D from every calibrated camera of the session (offline_3d.session_offline_3d), for a format-3 calibration.
 
-    It is an extra product: a failure is logged and the session's processing goes on.
+    It is an extra product: a failure is logged and the session's processing goes on. A
+    calibration outside the library
+    (--calib-dir) has its derived TOMLs put in the session folder's OFFLINE_DERIVED_DIR,
+    never in the operator's library; the check's settings are still the library's.
     """
     try:
         if not folder.joinpath(INDEX_FILE).exists() or is_legacy_entry(folder) or load_index(folder).format < 3:
             return
-        library_dir = entry_library(folder)
+        library_dir, derived_dir = entry_library(folder), None
         if library_dir is None:
             library_dir = library_root(DEFAULT_CONFIG_DIR.expanduser() if calib_root is None else Path(calib_root))
-        session_offline_3d(Path(location), folder, _session_metadata(project), library_dir=library_dir)
+            derived_dir = Path(location) / OFFLINE_DERIVED_DIR
+        session_offline_3d(project, folder, _session_metadata(project), library_dir=library_dir,
+                           derived_dir=derived_dir)
     except Exception:
         logger.exception("offline 3D of session %s with the calibration in %s failed; its 2D processing goes on",
                          project.short_id, folder)

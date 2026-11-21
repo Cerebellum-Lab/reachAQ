@@ -3,9 +3,12 @@
 session_offline_3d is what intersession processing calls once the session's calibration has
 resolved. It matches the cameras the session recorded to the calibration's by serial
 (select_session_cameras): a camera whose body was swapped, one the calibration left 2D
-only, and one it does not hold are excluded, each with its reason. The 2D pose of the rest,
-each camera's *_<camera>_raw2D_live.h5 in the pixels inference saw, is triangulated with the
-calibration's anipose TOML at each camera's recorded geometry (store.load_preset_set):
+only, and one it does not hold are excluded, each with its reason. So are a calibrated
+camera with no 2D pose file or one that cannot be read, and one recorded at a frame rate
+the others were not. The 2D pose of the rest, each camera's
+<session prefix>_<camera>_raw2D_live.h5 (ProjectInfo.get_intersession_pose_path) in the
+pixels inference saw, is triangulated with the calibration's anipose TOML at each camera's
+recorded geometry (store.load_preset_set):
 
 - the session is read and processed in blocks of BLOCK_FRAMES frames, so memory does not
   grow with its length;
@@ -28,12 +31,13 @@ The settings are in <library>/settings.yaml under checks.pose_consistency, globa
 optional per_camera override, and are only read here.
 
 Nothing is written inside the calibration entry: a geometry no stored file has is derived
-into the library's .derived cache.
+into the library's .derived cache, or into the scratch folder the caller gives.
 """
 
 import json
 import math
 import os
+from collections import Counter
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -49,6 +53,7 @@ try:
 except ImportError:  # Python 3.10, as on the rigs: the backport, which the installer puts in the environment
     import tomli as tomllib
 
+from autotrainer.core import ProjectInfo
 from autotrainer.core.logging import get_verbose_logger
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry
 from autotrainer.inference.multires_calibration.library import derived_root, read_settings
@@ -59,9 +64,9 @@ logger = get_verbose_logger(__name__)
 POINTS3D_FILE = "points3d.h5"
 REPROJECTIONS_FILE = "reprojections.h5"
 REPORT_FILE = "offline3d_report.json"
-POSE_FILE_SUFFIX = "_raw2D_live.h5"
 MIN_VIEWS = 2
 NOT_IN_CALIBRATION = "not in the session's calibration"
+NO_POSE_FILE = "no 2D pose file"
 
 STATUS_OK = "ok"
 STATUS_MOVED = "possibly moved"
@@ -729,40 +734,75 @@ def configured_params(metadata: Mapping) -> Dict[str, Mapping]:
     return {str(c["name"]): (c.get("params") or {}) for c in cameras if isinstance(c, Mapping) and "name" in c}
 
 
-def find_pose_file(session_dir: Path, camera: str) -> Optional[Path]:
-    """The camera's *_<camera>_raw2D_live.h5 in `session_dir`, None when there is none or more than one."""
-    found = sorted(Path(session_dir).glob(f"*_{camera}{POSE_FILE_SUFFIX}"))
-    if len(found) > 1:
-        logger.warning("more than one pose file for %s in %s: %s", camera, session_dir, ", ".join(map(str, found)))
-        return None
-    return found[0] if found else None
+def recorded_frame_rate(entry: Any, params: Any) -> Optional[float]:
+    """The frame rate a camera recorded at, in Hz: its hardware.configured.cameras entry's
+    frameRateHz or fps, else its configuration params' fps; None when neither gives one."""
+    for source, keys in ((entry, ("frameRateHz", "fps")), (params, ("fps",))):
+        if not isinstance(source, Mapping):
+            continue
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, bool):
+                continue
+            try:
+                rate = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(rate) and rate > 0:
+                return rate
+    return None
 
 
 def session_offline_3d(
-    session_dir: Path, folder: Path, metadata: Mapping, *, library_dir: Path
+    project: ProjectInfo, folder: Path, metadata: Mapping, *, library_dir: Path,
+    derived_dir: Optional[Path] = None,
 ) -> Optional[Offline3DResult]:
-    """Offline 3D of the session in `session_dir` with the format-3 calibration in `folder`.
+    """Offline 3D of the session of `project` with the format-3 calibration in `folder`.
 
     `metadata` is the session's; `library_dir` is the library whose settings.yaml holds the
-    check's settings and whose .derived cache takes any geometry the entry has no file for.
-    Writes points3d.h5, reprojections.h5 and offline3d_report.json, which names the cameras
-    used, those excluded and why, and the check's verdicts (null when it is off). With
-    fewer than 2 cameras to triangulate the session is 2D only: the report says why, and
-    None is returned.
+    check's settings. A geometry the entry has no file for is derived into `derived_dir`,
+    else the library's .derived cache. Each camera's 2D pose is its
+    project.get_intersession_pose_path(camera, suffix="_live"). Writes points3d.h5,
+    reprojections.h5 and offline3d_report.json into the session folder; the report names
+    the cameras used, those excluded and why, and the check's verdicts (null when it is
+    off). With fewer than 2 cameras to triangulate the session is 2D only: the report says
+    why, and None is returned.
     """
-    session_dir, folder = Path(session_dir), Path(folder)
+    session_dir, folder = Path(project.get_session_path()[0]), Path(folder)
     index = load_index(folder)
     configured = ((metadata.get("hardware") or {}).get("configured") or {}).get("cameras")
     if not isinstance(configured, Mapping):
         # Recorded before the metadata listed its cameras: the calibration's, matched by name.
         configured = {c["name"]: {} for c in index.cameras}
-    recorded = {name: entry for name, entry in configured.items() if find_pose_file(session_dir, name) is not None}
-    selected = select_session_cameras(index.cameras, recorded)
+    selected = select_session_cameras(index.cameras, configured)
     excluded = dict(selected.excluded)
     params = configured_params(metadata)
+
+    sources = {}
+    for name in selected.used:
+        path = Path(project.get_intersession_pose_path(name, suffix="_live"))
+        if not path.is_file():
+            excluded[name] = NO_POSE_FILE
+            continue
+        try:
+            sources[name] = PoseFile(path)
+        except Exception as error:
+            excluded[name] = f"2D pose file unreadable: {str(error) or type(error).__name__}"
+
+    # One frame rate: frames of cameras recorded at different rates do not pair by index.
+    rates = {name: recorded_frame_rate(configured.get(name), params.get(name)) for name in sources}
+    known = [rate for rate in rates.values() if rate is not None]
+    if known:
+        common = Counter(known).most_common(1)[0][0]
+        for name, rate in rates.items():
+            if rate is not None and rate != common:
+                excluded[name] = f"different frame rate ({rate:g} Hz vs {common:g} Hz)"
+                del sources[name]
+
     live = next((s["cameras"] for s in index.preset_sets if s["name"] == "live"), {})
     geometries = {}
-    for name, calibration_name in selected.used.items():
+    for name in sources:
+        calibration_name = selected.used[name]
         try:
             if name in params:
                 geometries[name] = recorded_geometry(params[name])
@@ -789,12 +829,10 @@ def session_offline_3d(
         _write_report(session_dir, report)
         return None
     loaded = load_preset_set(folder, {used[name]: g for name, g in geometries.items()},
-                             derived_root=derived_root(library_dir))
+                             derived_root=derived_root(library_dir) if derived_dir is None else Path(derived_dir))
     settings = read_pose_consistency_settings(library_dir)
-    result = export_session_3d(
-        session_dir, loaded.toml_path, {used[name]: find_pose_file(session_dir, name) for name in used},
-        min_confidence=settings.limits.min_confidence,
-    )
+    result = _export(session_dir, loaded.toml_path, {used[name]: sources[name] for name in used},
+                     min_confidence=settings.limits.min_confidence)
     verdicts = {}
     if settings.enabled:
         verdicts = pose_consistency(result.residuals, settings)

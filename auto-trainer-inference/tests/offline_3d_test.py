@@ -10,6 +10,7 @@ import hashlib
 import importlib
 import json
 import pickle
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Sequence
@@ -451,12 +452,12 @@ CAPTURE3 = [CaptureCamera("left", "21000001", 0), CaptureCamera("right", "210000
 LIVE3 = {"left": BASE, "right": BASE, "camera4": PresetGeometry(2, 300, 200, 10, 40)}
 
 
-def _entry(config: Path) -> Path:
-    """A format-3 library entry for left, right and camera4."""
+def _entry(config: Path, rig=RIG3, capture=CAPTURE3, live=LIVE3) -> Path:
+    """A format-3 library entry, for left, right and camera4 by default."""
     root = library.library_root(config)
     built = config / "built"
-    store.write_calibration(built, fit=RIG3.truth, preset_sets=presets_for_cameras(LIVE3), board=RIG3.board,
-                            report=_REPORT, capture={}, cameras=CAPTURE3)
+    store.write_calibration(built, fit=rig.truth, preset_sets=presets_for_cameras(live), board=rig.board,
+                            report=_REPORT, capture={}, cameras=capture)
     return library.entry_path(root, library.add_entry(root, built))
 
 
@@ -465,32 +466,43 @@ def _params(g: PresetGeometry) -> dict:
             "offsetx": g.offset_x, "offsety": g.offset_y}
 
 
-def _motor_points(frames: int) -> np.ndarray:
+def _motor_points(frames: int, rig=RIG3) -> np.ndarray:
     """Points every camera sees: around the middle of the board's travel."""
-    centre = RIG3.world_corners((0.0, 22.0, -28.0)).mean(axis=0)
+    centre = rig.world_corners((0.0, 22.0, -28.0)).mean(axis=0)
     return centre + np.random.default_rng(3).uniform(-4.0, 4.0, (frames, len(PARTS), 3))
 
 
-def _session_pixels(cam: str, X: np.ndarray, g: PresetGeometry) -> np.ndarray:
-    m = RIG3.truth.cameras[cam]
+def _session_pixels(cam: str, X: np.ndarray, g: PresetGeometry, rig=RIG3) -> np.ndarray:
+    m = rig.truth.cameras[cam]
     sensor = cv2.projectPoints(X.reshape(-1, 3), m.rvec, m.tvec, m.K, m.dist)[0].reshape(-1, 2)
     return sensor_to_preset_points(sensor, g).reshape(*X.shape[:-1], 2)
 
 
+def _pose_path(project: ProjectInfo, cam: str) -> Path:
+    return Path(project.get_intersession_pose_path(cam, suffix="_live"))
+
+
 def _recorded_session(tmp_path: Path, entry: Path, serials: Dict[str, str], X: np.ndarray, *,
-                      live3d_reason=None) -> (Path, dict):
-    session = tmp_path / "session003"
-    session.mkdir(exist_ok=True)
+                      live3d_reason=None, rig=RIG3, live=LIVE3, geometries=None, fps=None):
+    """(project, session folder, metadata) of a session recorded with `serials`, each pose file
+    where live pose writes it. `geometries` overrides a camera's recorded window, and `fps`
+    records a camera's frame rate in its configuration."""
+    project = _project(tmp_path)
+    session = Path(project.get_session_path()[0])
+    session.mkdir(parents=True, exist_ok=True)
     index = store.load_index(entry)
     calibration_serials = {c["name"]: c["serial"] for c in index.cameras}
     cameras, configuration = {}, []
     for cam, serial in serials.items():
-        g = LIVE3[cam]
-        _write_pose(session / f"20261120_rig_session003_{cam}_raw2D_live.h5", _session_pixels(cam, X, g))
+        g = (geometries or {}).get(cam, live[cam])
+        _write_pose(_pose_path(project, cam), _session_pixels(cam, X, g, rig))
         swapped = serial != calibration_serials[cam]
         cameras[cam] = {"serial": serial, "inCalibration": not swapped, "uncalibratedReason": (
             f"swapped: calibrated serial {calibration_serials[cam]}, now {serial}" if swapped else None)}
-        configuration.append({"name": cam, "scheme": "spinnaker", "host": serial, "params": _params(g)})
+        params = _params(g)
+        if fps and cam in fps:
+            params["fps"] = fps[cam]
+        configuration.append({"name": cam, "scheme": "spinnaker", "host": serial, "params": params})
     calibration3d = {"id": index.id, "path": f"calibrations/{index.id}", "format": 3, "preset": None}
     if live3d_reason is not None:
         calibration3d.update(live3dDisabledReason=live3d_reason, live3d={"enabled": False,
@@ -498,7 +510,7 @@ def _recorded_session(tmp_path: Path, entry: Path, serials: Dict[str, str], X: n
     metadata = {"metadataSchemaVersion": 3, "scope": "session",
                 "hardware": {"configured": {"cameras": cameras, "calibration3d": calibration3d}},
                 "configuration": {"cameras": configuration}}
-    return session, metadata
+    return project, session, metadata
 
 
 def test_session_offline_3d_uses_every_calibrated_camera_but_the_swapped_one(tmp_path):
@@ -506,9 +518,9 @@ def test_session_offline_3d_uses_every_calibrated_camera_but_the_swapped_one(tmp
     entry = _entry(config)
     before = _tree_hashes(entry)
     X = _motor_points(60)
-    session, metadata = _recorded_session(
+    project, session, metadata = _recorded_session(
         tmp_path, entry, {"left": "21000001", "right": "21000099", "camera4": "21000004"}, X)
-    result = session_offline_3d(session, entry, metadata, library_dir=entry.parent)
+    result = session_offline_3d(project, entry, metadata, library_dir=entry.parent)
     assert result.excluded == {"right": "swapped: calibrated serial 21000002, now 21000099"}
     with h5py.File(result.points3d_path, "r") as fh:
         assert [n.decode() for n in fh["camera_names"][()]] == ["left", "camera4"]
@@ -526,9 +538,9 @@ def test_session_offline_3d_uses_every_calibrated_camera_but_the_swapped_one(tmp
 def test_session_offline_3d_with_fewer_than_two_cameras_is_2d_only(tmp_path):
     config = tmp_path / "Autotrainer"
     entry = _entry(config)
-    session, metadata = _recorded_session(tmp_path, entry, {"left": "21000001", "right": "21000099"},
-                                          _motor_points(10))
-    assert session_offline_3d(session, entry, metadata, library_dir=entry.parent) is None
+    project, session, metadata = _recorded_session(tmp_path, entry, {"left": "21000001", "right": "21000099"},
+                                                   _motor_points(10))
+    assert session_offline_3d(project, entry, metadata, library_dir=entry.parent) is None
     assert not (session / "points3d.h5").exists()
     report = json.loads((session / "offline3d_report.json").read_text(encoding="utf-8"))
     assert report["twoDOnlyReason"] == "fewer than 2 calibrated cameras: left (right: swapped: calibrated serial" \
@@ -540,13 +552,55 @@ def test_session_offline_3d_runs_the_check_when_enabled(tmp_path):
     entry = _entry(config)
     library.update_settings(entry.parent, checks={"pose_consistency": {
         "enabled": True, "min_frames": 10, "min_observations": 10}})
-    session, metadata = _recorded_session(
+    project, session, metadata = _recorded_session(
         tmp_path, entry, {"left": "21000001", "right": "21000002", "camera4": "21000004"}, _motor_points(40))
-    result = session_offline_3d(session, entry, metadata, library_dir=entry.parent)
+    result = session_offline_3d(project, entry, metadata, library_dir=entry.parent)
     assert {v.status for v in result.consistency.values()} == {"ok"}
     report = json.loads((session / "offline3d_report.json").read_text(encoding="utf-8"))
     assert set(report["poseConsistency"]) == {"left", "right", "camera4"}
     assert report["poseConsistency"]["camera4"]["status"] == "ok"
+
+
+THREE = {"left": "21000001", "right": "21000002", "camera4": "21000004"}
+
+
+def test_a_calibrated_camera_without_a_readable_pose_file_is_named(tmp_path):
+    entry = _entry(tmp_path / "Autotrainer")
+    project, session, metadata = _recorded_session(tmp_path, entry, THREE, _motor_points(20))
+    _pose_path(project, "camera4").unlink()
+    result = session_offline_3d(project, entry, metadata, library_dir=entry.parent)
+    assert result.excluded == {"camera4": "no 2D pose file"}
+    with h5py.File(result.points3d_path, "r") as fh:
+        assert [n.decode() for n in fh["camera_names"][()]] == ["left", "right"]
+    # A file that cannot be read is named with the error.
+    _pose_path(project, "right").write_bytes(b"not an HDF5 file")
+    assert session_offline_3d(project, entry, metadata, library_dir=entry.parent) is None
+    report = json.loads((session / "offline3d_report.json").read_text(encoding="utf-8"))
+    assert report["excluded"]["camera4"] == "no 2D pose file"
+    assert report["excluded"]["right"].startswith("2D pose file unreadable: ")
+
+
+def test_a_camera_named_left_does_not_take_far_left_s_pose_file(tmp_path):
+    entry = _entry(tmp_path / "Autotrainer")
+    project, session, metadata = _recorded_session(tmp_path, entry, THREE, _motor_points(20))
+    _pose_path(project, "left").rename(_pose_path(project, "far_left"))
+    result = session_offline_3d(project, entry, metadata, library_dir=entry.parent)
+    assert result.excluded == {"left": "no 2D pose file"}
+    with h5py.File(result.points3d_path, "r") as fh:
+        assert [n.decode() for n in fh["camera_names"][()]] == ["right", "camera4"]
+
+
+def test_a_camera_recorded_at_another_frame_rate_is_not_paired(tmp_path):
+    entry = _entry(tmp_path / "Autotrainer")
+    project, session, metadata = _recorded_session(tmp_path, entry, THREE, _motor_points(20),
+                                                   fps={"left": 150, "right": 150.0, "camera4": 900})
+    result = session_offline_3d(project, entry, metadata, library_dir=entry.parent)
+    assert result.excluded == {"camera4": "different frame rate (900 Hz vs 150 Hz)"}
+    # The session metadata's camera entry, when it gives a rate, is read first; the rate most
+    # cameras share is the one kept.
+    metadata["hardware"]["configured"]["cameras"]["right"]["frameRateHz"] = 900
+    result = session_offline_3d(project, entry, metadata, library_dir=entry.parent)
+    assert result.excluded == {"left": "different frame rate (150 Hz vs 900 Hz)"}
 
 
 def _tree_hashes(folder: Path) -> dict:
@@ -601,12 +655,37 @@ def test_intersession_live_3d_off_with_a_swapped_left_is_refused(tmp_path, monke
     assert seen == {}
 
 
+def test_offline_3d_of_a_calibration_outside_the_library_derives_into_the_session(tmp_path, monkeypatch):
+    config = tmp_path / "Autotrainer"
+    entry = _entry(config)
+    outside = tmp_path / "elsewhere" / entry.name
+    shutil.copytree(entry, outside)
+    home = tmp_path / "home" / "Autotrainer"
+    monkeypatch.setattr(intersession_module, "DEFAULT_CONFIG_DIR", home)
+    # camera4 at a window no stored preset set has, so its TOML is derived.
+    project, session, metadata = _recorded_session(tmp_path, entry, THREE, _motor_points(20),
+                                                   geometries={"camera4": PresetGeometry(2, 300, 200, 12, 40)})
+    metadata["hardware"]["configured"]["calibration3d"]["preset"] = BASE.name
+    _write_metadata(project, metadata)
+    monkeypatch.setattr(intersession_module, "process_raw_data", lambda *args, **kwargs: (None, None))
+
+    def stop(**kwargs):
+        raise _Stop
+
+    monkeypatch.setattr(intersession_module, "segment_reaches", stop)
+    with pytest.raises(_Stop):
+        intersession_process(project, calib_dir=outside)
+    assert (session / "points3d.h5").is_file()
+    assert list((session / intersession_module.OFFLINE_DERIVED_DIR).rglob("calibration.toml"))
+    assert not library.derived_root(library.library_root(home)).exists()
+    assert not library.derived_root(entry.parent).exists()
+
+
 def test_intersession_runs_offline_3d_after_2d_processing(tmp_path, monkeypatch):
     config = tmp_path / "Autotrainer"
     entry = _entry(config)
     library.set_active(entry.parent, entry.name, by="test")
-    project = _project(tmp_path)
-    session, metadata = _recorded_session(
+    project, session, metadata = _recorded_session(
         tmp_path, entry, {"left": "21000001", "right": "21000002", "camera4": "21000004"}, _motor_points(5),
         live3d_reason=LIVE_3D_OFF)
     metadata["hardware"]["configured"]["calibration3d"]["preset"] = BASE.name
@@ -616,9 +695,9 @@ def test_intersession_runs_offline_3d_after_2d_processing(tmp_path, monkeypatch)
     monkeypatch.setattr(intersession_module, "process_raw_data",
                         lambda *args, **kwargs: calls.append("2d") or (None, None))
     monkeypatch.setattr(intersession_module, "session_offline_3d",
-                        lambda session_dir, folder, data, *, library_dir: calls.append(
-                            ("3d", Path(session_dir), folder, data["hardware"]["configured"]["calibration3d"]["id"],
-                             library_dir)))
+                        lambda project, folder, data, *, library_dir, derived_dir: calls.append(
+                            ("3d", Path(project.get_session_path()[0]), folder,
+                             data["hardware"]["configured"]["calibration3d"]["id"], library_dir, derived_dir)))
 
     def stop(**kwargs):
         raise _Stop
@@ -627,7 +706,7 @@ def test_intersession_runs_offline_3d_after_2d_processing(tmp_path, monkeypatch)
     with pytest.raises(_Stop):
         intersession_process(project, calib_root=config)
     location = Path(project.get_session_path()[0])
-    assert calls == ["2d", ("3d", location, entry, entry.name, entry.parent)]
+    assert calls == ["2d", ("3d", location, entry, entry.name, entry.parent, None)]
 
 
 def test_intersession_offline_3d_failure_does_not_stop_the_session(tmp_path, monkeypatch, caplog):
