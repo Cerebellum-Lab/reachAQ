@@ -168,4 +168,6 @@ class CalibrationLibraryView(QDialog):
         box.setTextFormat(Qt.TextFormat.RichText)
         box.setText(report_page(entry))
         box.setIcon(QMessageBox.Icon.Information)
+        # Freed once closed; the view frees any still open when it goes.
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         box.show()

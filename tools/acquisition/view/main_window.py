@@ -12,7 +12,7 @@ from datetime import datetime
 from functools import partial
 from itertools import chain
 from pathlib import Path
-from typing import List, Optional, Dict, Tuple, Callable, Union, Literal
+from typing import List, Optional, Dict, Tuple, Callable, Union, Literal, Mapping, Sequence
 
 from PySide6.QtCore import Qt, QCoreApplication, QRect, QTimer, Signal, QSize, QKeyCombination
 from PySide6.QtGui import QAction, QIcon
@@ -115,19 +115,45 @@ def _allow_bidirectional_window_resizing(window: QMainWindow) -> None:
 
 
 def _ask_on_gui_thread(ask, *args) -> bool:
-    """Run `ask(*args)` on the GUI thread and wait for its answer; from the GUI thread it runs at once."""
+    """Run `ask(*args)` on the GUI thread and wait for its answer; from the GUI thread it runs at once.
+    An `ask` that raises is logged and answers False (Cancel)."""
     answer = []
     done = threading.Event()
 
     def run():
         try:
             answer.append(bool(ask(*args)))
+        except Exception:
+            # A box that fails reads as Cancel, and never escapes the slot.
+            logger.exception("the question %s failed; taken as Cancel", getattr(ask, "__name__", ask))
         finally:
             done.set()
 
     InvokeMethod(run)
     done.wait()
     return bool(answer and answer[0])
+
+
+def reference_capture_cameras(configured: Sequence, calibrated: Mapping[str, str]):
+    """The cameras "Capture reference images now" records: (cameras, names of those that only
+    record), or why it cannot run.
+
+    The configured cameras the entry calibrated (`calibrated`: configured name -> its name in
+    the entry) that can record. The configured primary triggers the others, so when the
+    entry did not calibrate it, it records with them and keeps no reference; a primary that
+    cannot record refuses the capture.
+    """
+    cameras = [c for c in configured if c.name in calibrated and camera_unavailable_reason(c) is None]
+    if not cameras:
+        return "None of the configured cameras is one this calibration calibrated."
+    primary = next((c for c in configured if c.is_primary), None)
+    if primary is None or primary in cameras:
+        return cameras, []
+    reason = camera_unavailable_reason(primary)
+    if reason is not None:
+        return (f"The primary camera {primary.name} triggers the others but cannot record ({reason}):"
+                " enable it, or make a new calibration with the cameras that can.")
+    return [primary, *cameras], [primary.name]
 
 
 class MainWindow(QMainWindow):
@@ -918,7 +944,8 @@ class MainWindow(QMainWindow):
                                            confirm_scout_advice, self, advice),
                                        capture_references=request.capture_references,
                                        confirm_references=lambda: _ask_on_gui_thread(
-                                           confirm_reference_capture, self))
+                                           confirm_reference_capture, self),
+                                       rescout=request.rescout)
             except Exception as err:
                 logger.exception("3d-calib failed: %s", err)
                 error = err
@@ -944,9 +971,12 @@ class MainWindow(QMainWindow):
     def _ask_calibration_cameras(self) -> Optional[CalibrationRequest]:
         """Which cameras to calibrate, from the calibration dialog; None when cancelled."""
         dialog = CalibrationDialog(self._app_model.cameras, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return None
-        return dialog.request()
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return None
+            return dialog.request()
+        finally:
+            dialog.deleteLater()
 
     def _finish_3d_calib(self, error, result, prev_status: AppModelStatus) -> None:
         """Install the calibration make_3d_calib produced, as its quality report allows, or show why it failed.
@@ -1086,6 +1116,7 @@ class MainWindow(QMainWindow):
             view.exec()
         finally:
             self._library_view = None
+            view.deleteLater()
 
     def _capture_reference_images(self, calibration_id: str) -> Optional[str]:
         """Start capturing reference images for library entry `calibration_id`, into a new entry.
@@ -1107,12 +1138,13 @@ class MainWindow(QMainWindow):
         except (ValueError, CalibrationResolutionError) as err:
             return f"This calibration cannot take reference images: {err}. Make a new calibration instead."
         match = match_cameras(index.cameras, {c.name: camera_serial(c.active_config) for c in app_model.cameras})
-        cameras = [c for c in app_model.cameras if c.name in match.calibrated and camera_unavailable_reason(c) is None]
-        if not cameras:
-            return "None of the configured cameras is one this calibration calibrated."
+        chosen = reference_capture_cameras(app_model.cameras, match.calibrated)
+        if isinstance(chosen, str):
+            return chosen
+        cameras, record_only = chosen
         if not confirm_reference_capture(self, skip_label="Cancel"):
             return None
-        names = {camera.name: match.calibrated[camera.name] for camera in cameras}
+        names = {camera.name: match.calibrated[camera.name] for camera in cameras if camera.name in match.calibrated}
         prev_status, app_model.status = app_model.status, AppModelStatus.CALIBRATION_3D
         self.run_action.setEnabled(False)
         self.make_3d_calib_action.setEnabled(False)
@@ -1127,7 +1159,8 @@ class MainWindow(QMainWindow):
 
         def run():
             try:
-                outcome["id"] = capture_reference_entry(app_model, root, calibration_id, cameras, names=names)
+                outcome["id"] = capture_reference_entry(app_model, root, calibration_id, cameras, names=names,
+                                                        record_only=record_only)
             except Exception as err:
                 logger.exception("reference images for %s not captured: %s", calibration_id, err)
                 outcome["error"] = err

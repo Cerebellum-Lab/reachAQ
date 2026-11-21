@@ -159,6 +159,9 @@ configured primary first.
 - **Move list**: *automatic (scout)*, the default, chooses the waypoints from a
   scout pass before the capture (see [Automatic move list](#automatic-move-list));
   *hand-written* is the fixed list of 37 waypoints described under Steps.
+  **Scout again**, unticked by default and offered only with the scout, ignores
+  the list saved for these cameras this time and scouts (see *Saved list*
+  below); the saved list is not deleted.
 - **Capture reference images**, unticked by default: after the capture the app
   asks you to remove the board and keep hands and animals out of view, then each
   camera records 1 s at its recording settings and keeps the middle frame as its
@@ -237,8 +240,10 @@ texture in view can count as board, and a very dark image can count as none.
 camera without one by name). The next automatic calibration with exactly the
 same cameras uses it without scouting, as long as it has 12 or more points and
 every point is still inside today's hand-written box (a redone DCS can move it). Ticking a different set of
-cameras, or deleting the file, scouts again. If a camera was re-aimed without
-being swapped, delete the file or the saved list is reused.
+cameras, ticking **Scout again**, or deleting the file, scouts again. If a camera was re-aimed without
+being swapped, tick **Scout again** or the saved list is reused. A scout run
+with **Scout again** replaces the saved list only when it passes for every
+camera, as any scout does; otherwise the old list stays.
 
 ### The calibration library
 
@@ -263,8 +268,13 @@ made, its cameras, its verdict, which one is **active**, and the cameras it left
   does. A legacy calibration has no report.
 - **Capture reference images now** takes reference images for the selected
   calibration later, with the cameras the calibration calibrated that are
-  configured now (by serial). It asks you to clear the view first, and is
+  configured now (by serial). The configured primary camera triggers the
+  others, so when the calibration did not calibrate it, it records with them
+  and keeps no reference; when it cannot record (disabled, or no hardware) the
+  capture is refused with the reason. It asks you to clear the view first, and is
   refused while the acquisition runs, a session records or a calibration runs.
+  The new entry holds only the references just captured: any the calibration
+  had are replaced, and a camera not captured this time has none.
   Entries never change, so the images go into a **new entry** with the same fit:
   a copy under a new id, with `parent_id` naming the original and
   `references_captured` the time; its `created` stays the fit's, so the monthly

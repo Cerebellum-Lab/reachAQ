@@ -1241,10 +1241,10 @@ def _scout_capture(tmp_path, monkeypatch, results, *, confirm=None):
                         lambda *a, **k: (session / "new", SimpleNamespace(id="abc"), SimpleNamespace(verdict="pass")))
     cameras = [app_model.left_camera, app_model.right_camera]
 
-    def run():
+    def run(rescout=False):
         for name in ("left", "right"):
             (session / f"{name}_recording.mp4").touch()
-        return make_3d_calib(app_model, cameras, move_list="scout", confirm_scout=confirm)
+        return make_3d_calib(app_model, cameras, move_list="scout", confirm_scout=confirm, rescout=rescout)
 
     return app_model, seen, run
 
@@ -1264,6 +1264,20 @@ def test_scout_capture_uses_the_scout_list_and_saves_it_for_the_same_cameras(tmp
     run()
     assert seen["scouts"] == 1
     assert [motor for *_, motor in seen["plans"][-1]] == result.points
+
+
+def test_scout_again_ignores_the_saved_list_without_deleting_it(tmp_path, monkeypatch):
+    first, second = _scout_result(14), _scout_result(16)
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [first, second])
+    run()
+    saved = tmp_path / "calibrations" / "scout_move_list.yaml"
+    assert seen["scouts"] == 1 and saved.exists()
+
+    run(rescout=True)
+
+    assert seen["scouts"] == 2, "the scout runs although a list is saved for these cameras"
+    assert [motor for *_, motor in seen["plans"][-1]] == second.points
+    assert saved.exists()
 
 
 def test_scout_advice_asks_before_the_capture(tmp_path, monkeypatch):

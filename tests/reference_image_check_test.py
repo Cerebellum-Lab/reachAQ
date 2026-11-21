@@ -475,6 +475,38 @@ def test_capture_now_copy_inherits_the_fit_under_a_new_id(tmp_path):
     assert {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()} == before
 
 
+def test_capture_now_records_the_primary_but_keeps_no_reference_for_it(tmp_path, monkeypatch):
+    root = library.library_root(tmp_path / "config")
+    built = _write_multires(tmp_path / "built" / DEFAULT_3D_CALIB_DIR_NAME)
+    source_id = library.add_entry(root, built)
+    session = tmp_path / "session"
+    project = SimpleNamespace(calculate_next_session_index=lambda: None,
+                              get_session_path=lambda: SimpleNamespace(location=str(session)))
+    app_model = SimpleNamespace(make_project_info=lambda: project)
+    cameras = [SimpleNamespace(name=name, is_primary=name == "stage", save_configuration=lambda: None)
+               for name in ("left", "stage")]
+    recorded = []
+
+    def capture(cameras_, cfgs, project_, dest, *, names=None, **kwargs):
+        recorded.append([camera.name for camera in cameras_])
+        written = {}
+        for camera in cameras_:
+            path = dest / "reference" / f"{(names or {}).get(camera.name, camera.name)}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(path), REFERENCE)
+            written[camera.name] = path
+        return written
+
+    monkeypatch.setattr(h3d, "capture_reference_images", capture)
+
+    new_id = h3d.capture_reference_entry(app_model, root, source_id, cameras, names={"left": "left"},
+                                         record_only=["stage"])
+
+    assert recorded == [["stage", "left"]], "the primary records first, for the trigger"
+    entry = library.entry_path(root, new_id)
+    assert sorted(p.name for p in (entry / "reference").iterdir()) == ["left.png"]
+
+
 # Preferences: each check's limits beside its switch.
 
 def _checks_ui(app_model):

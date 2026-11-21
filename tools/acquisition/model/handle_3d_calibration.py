@@ -926,14 +926,18 @@ def capture_reference_entry(
     *,
     names: Optional[Mapping[str, str]] = None,
     now: Optional[datetime] = None,
+    record_only: Sequence[str] = (),
     **capture_options,
 ) -> str:
     """Capture reference images now for library entry `source_id` and add them as a new entry.
 
     Entries never change, so the references go into a copy of the entry that inherits its
-    fit (copy_with_references), added to the library `root`, which is not made active.
+    fit (copy_with_references), added to the library `root`, which is not made active; the
+    copy holds the references just captured and none of the entry's old ones.
     `cameras` are the configured cameras matched to the entry's; `names` maps each to its
-    name in the entry. The clip and the copy are built in a new session folder. Returns the
+    name in the entry. The cameras named in `record_only` record with the others but keep
+    no reference: the configured primary, which triggers them, when the entry did not
+    calibrate it. The clip and the copy are built in a new session folder. Returns the
     new entry's id. Raises ValueError for a legacy entry, before any camera starts.
     """
     source = entry_path(root, source_id)
@@ -944,7 +948,8 @@ def capture_reference_entry(
     project.calculate_next_session_index()
     session = Path(project.get_session_path().location)
     written = capture_reference_images(cameras, cams_before_cfg, project, session, names=names, **capture_options)
-    references = {(names or {}).get(camera, camera): path for camera, path in written.items()}
+    references = {(names or {}).get(camera, camera): path for camera, path in written.items()
+                  if camera not in record_only}
     built = Path(session, REFERENCE_ENTRY_DIR_NAME)
     copy_with_references(source, references, built, now=now or datetime.now())
     calibration_id = add_entry(root, built)
@@ -962,6 +967,7 @@ def make_3d_calib(
     confirm_scout: Optional[Callable[[Mapping[str, str]], bool]] = None,
     capture_references: bool = False,
     confirm_references: Optional[Callable[[], bool]] = None,
+    rescout: bool = False,
 ) -> Tuple[Path, Path, CalibrationIndex, QualityReport]:
     """Capture the board paused at every waypoint with `cameras`, then calibrate them from it.
 
@@ -978,7 +984,8 @@ def make_3d_calib(
     shared, or not joined to the others), `confirm_scout(advice by camera)` is asked first:
     False raises ScoutCancelled and nothing is captured; True goes on, and that camera may
     end up 2D only. A scout list is saved for next time only when no camera has advice and
-    the list joins every camera.
+    the list joins every camera. With `rescout` the saved list is ignored for this run (not
+    deleted) and the scout runs.
 
     With `capture_references`, after the capture the operator is asked to remove the board
     (`confirm_references()`; False skips it) and each camera records a short still clip at
@@ -1039,7 +1046,9 @@ def make_3d_calib(
         identities = [camera.serial or camera.name for camera in capture_list]
         configured = None if root is None else configured_bounds(read_settings(root))
         targets = [motor for *_, motor in plan]
-        saved = saved_scout_list(root, identities, bounds_from_plan(targets, configured))
+        saved = None if rescout else saved_scout_list(root, identities, bounds_from_plan(targets, configured))
+        if rescout:
+            logger.notice("Scouting again, as asked: any saved scout move list is not used this time")
         if saved is not None:
             logger.notice("Using the scout move list saved for these cameras: %d waypoints", len(saved))
             plan = scout_plan(saved, diamond_triangle_cfg)

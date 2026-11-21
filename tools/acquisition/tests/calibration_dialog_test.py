@@ -12,7 +12,8 @@ from types import SimpleNamespace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import QEvent  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget  # noqa: E402
 
 from autotrainer.inference.multires_calibration.library import LibraryEntry  # noqa: E402
 from autotrainer.inference.multires_calibration.report import CameraVerdict, QualityReport  # noqa: E402
@@ -307,3 +308,136 @@ def test_set_active_from_the_library_goes_through_the_app_model_and_resets_the_d
     assert MainWindow._set_active_calibration(window, "c" * 32) == "set active is not possible while recording"
     assert labels == [None], "a refusal leaves the label of the calibration still active"
     assert calls == ["a" * 32, "c" * 32]
+
+
+def test_the_count_uses_the_right_plural():
+    dialog = CalibrationDialog(_rig())
+    assert dialog.count_text() == "3 cameras ticked"
+    dialog.checkbox("right").setChecked(False)
+    dialog.checkbox("stimCam").setChecked(False)
+    assert dialog.count_text() == "1 camera ticked; a calibration takes 2 to 6"
+    dialog.checkbox("right").setChecked(True)
+    assert dialog.count_text() == "2 cameras ticked"
+
+
+def test_scout_again_is_offered_only_with_the_scout():
+    dialog = CalibrationDialog(_rig())
+    box = dialog.rescout_box
+    assert box.text() == "Scout again" and not box.isChecked() and box.isEnabled()
+    assert dialog.request().rescout is False
+    box.setChecked(True)
+    assert dialog.request() == CalibrationRequest(
+        cameras=["left", "right", "stimCam"], move_list="scout", capture_references=False, rescout=True)
+    dialog.handwritten_button.setChecked(True)
+    assert not box.isEnabled()
+    assert dialog.request().rescout is False, "the hand-written list never scouts"
+    dialog.scout_button.setChecked(True)
+    assert box.isEnabled() and dialog.request().rescout is True
+
+
+def _flush_deletes():
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    QApplication.processEvents()
+
+
+class _Host(QWidget):
+    """A stand-in MainWindow: what the dialog methods use, as a real parent widget."""
+
+    def __init__(self, app_model):
+        super().__init__()
+        self._app_model = app_model
+        self._library_view = None
+
+
+def test_the_calibration_dialogs_are_freed_after_use(tmp_path, monkeypatch):
+    monkeypatch.setattr(library_view_module, "list_entries", lambda root: _entries(tmp_path))
+    host = _Host(SimpleNamespace(cameras=tuple(_rig()), calibration_library_root=tmp_path))
+    try:
+        monkeypatch.setattr(CalibrationDialog, "exec", lambda self: QDialog.DialogCode.Accepted)
+        assert MainWindow._ask_calibration_cameras(host).cameras == ["left", "right", "stimCam"]
+        monkeypatch.setattr(CalibrationDialog, "exec", lambda self: QDialog.DialogCode.Rejected)
+        assert MainWindow._ask_calibration_cameras(host) is None
+
+        def use(view):
+            view.table.selectRow(0)
+            view.show_report_button.click()  # one report left open
+            view.table.selectRow(1)
+            view.show_report_button.click()
+            reports = view.findChildren(QMessageBox)
+            assert len(reports) == 2
+            reports[0].close()
+            return QDialog.DialogCode.Accepted
+
+        monkeypatch.setattr(CalibrationLibraryView, "exec", use)
+        host._set_active_calibration = lambda calibration_id: None
+        host._capture_reference_images = lambda calibration_id: None
+        MainWindow._on_calibration_library(host)
+        _flush_deletes()
+
+        assert host.findChildren(CalibrationDialog) == []
+        assert host.findChildren(CalibrationLibraryView) == []
+        assert host.findChildren(QMessageBox) == []
+        assert host._library_view is None
+    finally:
+        host.deleteLater()
+        _flush_deletes()
+
+
+def test_a_question_asked_from_a_worker_returns_the_buttons_answer():
+    import threading
+
+    answers = []
+
+    def worker(ask):
+        answers.append(main_window_module._ask_on_gui_thread(ask, "advice"))
+
+    for ask, expected in ((lambda advice: True, True), (lambda advice: False, False)):
+        thread = threading.Thread(target=worker, args=(ask,))
+        thread.start()
+        while thread.is_alive():
+            QApplication.processEvents()
+            thread.join(0.01)
+        assert answers.pop() is expected
+    # On the GUI thread it runs at once.
+    assert main_window_module._ask_on_gui_thread(lambda advice: advice == "advice", "advice") is True
+
+
+def test_a_question_that_raises_reads_as_cancel():
+    import threading
+
+    def broken(*args):
+        raise RuntimeError("the box could not be shown")
+
+    assert main_window_module._ask_on_gui_thread(broken, "advice") is False
+    answers = []
+    thread = threading.Thread(target=lambda: answers.append(main_window_module._ask_on_gui_thread(broken)))
+    thread.start()
+    while thread.is_alive():
+        QApplication.processEvents()
+        thread.join(0.01)
+    assert answers == [False]
+
+
+def _capture_camera(name, *, primary=False, enabled=True):
+    return _camera(name, "", enabled=enabled, primary=primary)
+
+
+def test_capture_now_records_the_primary_the_entry_did_not_calibrate():
+    primary, right, stim = _capture_camera("left", primary=True), _capture_camera("right"), _capture_camera("stimCam")
+
+    # The entry calibrated right and stimCam only: the primary records too, for their trigger.
+    cameras, record_only = main_window_module.reference_capture_cameras(
+        [primary, right, stim], {"right": "camera2", "stimCam": "camera3"})
+    assert cameras == [primary, right, stim] and record_only == ["left"]
+
+    # With the primary calibrated, nothing is added.
+    assert main_window_module.reference_capture_cameras(
+        [primary, right], {"left": "camera1", "right": "camera2"}) == ([primary, right], [])
+
+    # A primary that cannot record refuses the capture.
+    off = _capture_camera("left", primary=True, enabled=False)
+    refusal = main_window_module.reference_capture_cameras([off, right], {"right": "camera2"})
+    assert refusal == ("The primary camera left triggers the others but cannot record (disabled):"
+                       " enable it, or make a new calibration with the cameras that can.")
+    assert main_window_module.reference_capture_cameras([primary], {}) == (
+        "None of the configured cameras is one this calibration calibrated.")

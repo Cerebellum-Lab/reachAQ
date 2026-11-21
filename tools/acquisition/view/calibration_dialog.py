@@ -29,6 +29,8 @@ MOVED_HEADER = "Moved since the calibration's reference images:"
 SCOUT_TOOLTIP = ("the stage first visits a coarse grid and every camera looks for the board; the waypoints are"
                  " chosen from what they saw, or the hand-written list when fewer than 12 suit")
 HANDWRITTEN_TOOLTIP = "the fixed list of 37 waypoints"
+RESCOUT_TOOLTIP = ("ignore the scout list saved for these cameras and scout again this time; the saved"
+                   " list is kept, and replaced only when the new scout passes for every camera")
 SCOUT_ADVICE_TITLE = "Some cameras saw too little of the board"
 SCOUT_ADVICE_CONTINUE = "Continue: the cameras named may end up 2D only"
 #: The red of every "2D only" mark.
@@ -42,11 +44,13 @@ _SWAPPED_PREFIX = "swapped: "
 @dataclass(frozen=True)
 class CalibrationRequest:
     """What the operator chose: the cameras in camera-list order, primary first; the move list,
-    "scout" or "handwritten"; and whether to capture reference images."""
+    "scout" or "handwritten"; whether to capture reference images; and, with the scout,
+    whether to scout again rather than use the list saved for these cameras."""
 
     cameras: List[str]
     move_list: str
     capture_references: bool
+    rescout: bool = False
 
 
 def camera_unavailable_reason(camera) -> Optional[str]:
@@ -111,6 +115,11 @@ class CalibrationDialog(QDialog):
         group.addButton(self.handwritten_button)
         moves_layout.addWidget(self.scout_button)
         moves_layout.addWidget(self.handwritten_button)
+        self.rescout_box = QCheckBox("Scout again")
+        self.rescout_box.setChecked(False)
+        self.rescout_box.setToolTip(RESCOUT_TOOLTIP)
+        self.scout_button.toggled.connect(self.rescout_box.setEnabled)
+        moves_layout.addWidget(self.rescout_box)
         layout.addWidget(moves)
 
         self.references_box = QCheckBox("Capture reference images")
@@ -143,13 +152,19 @@ class CalibrationDialog(QDialog):
         fits = MIN_CAMERAS <= count <= MAX_CAMERAS
         self.start_button.setEnabled(fits)
         self._count_label.setText(
-            f"{count} cameras ticked" + ("" if fits else f"; a calibration takes {MIN_CAMERAS} to {MAX_CAMERAS}"))
+            f"{count} camera{'' if count == 1 else 's'} ticked"
+            + ("" if fits else f"; a calibration takes {MIN_CAMERAS} to {MAX_CAMERAS}"))
+
+    def count_text(self) -> str:
+        return self._count_label.text()
 
     def request(self) -> CalibrationRequest:
+        scout = self.scout_button.isChecked()
         return CalibrationRequest(
             cameras=self._ticked(),
-            move_list=SCOUT if self.scout_button.isChecked() else HANDWRITTEN,
+            move_list=SCOUT if scout else HANDWRITTEN,
             capture_references=self.references_box.isChecked(),
+            rescout=scout and self.rescout_box.isChecked(),
         )
 
 
