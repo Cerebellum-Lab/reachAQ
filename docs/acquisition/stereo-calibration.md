@@ -307,6 +307,14 @@ A calibrated camera that is only turned off for this recording is not a
 difference: Record does not ask, and the status bar notes it, for example
 **Calibrated cameras not recording: right**.
 
+Every recording camera that will be 2D only is named as Record starts, in the
+status bar, one note per camera with its reason (the 2D-only tag's), for example
+**2D only: camera4 (too few board views: 4 of 12 needed)**. That covers a
+camera the calibration left 2D only, one it does not have (such as the stimCam),
+a swapped one, and every camera when there is no active calibration
+(**2D only: left (no active 3D calibration)**). When Record asks, the same
+lines are in the question's details too.
+
 With the moved-camera check on, a camera that looks moved joins the same
 question, under `Moved since the calibration's reference images:`, one line per
 camera with its measured values, for example

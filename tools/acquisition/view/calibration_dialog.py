@@ -210,6 +210,14 @@ def setup_difference_details(difference, reasons: Dict[str, str]) -> List[str]:
     return lines
 
 
+def two_d_only_lines(app_model) -> List[str]:
+    """"2D only: <camera> (<reason>)", one per recording camera that will not be 3D-posed:
+    one the active calibration left 2D only or does not have (the stimCam among them), a
+    swapped one, or every camera when there is no active calibration."""
+    reasons = app_model.uncalibrated_reasons
+    return [f"2D only: {name} ({reasons[name]})" for name in app_model.recording_camera_names if name in reasons]
+
+
 def uncalibrated_off_note(difference) -> Optional[str]:
     if not difference.uncalibrated_off:
         return None
@@ -234,14 +242,20 @@ def confirm_camera_setup(parent, app_model, frames: Optional[Mapping] = None) ->
     that are only not recording, and cameras the check cannot judge, are the note, without
     asking. Only the GUI's Record asks: headless and API starts record the mismatch
     unacknowledged and run no reference-image check.
+
+    Every recording camera that will be 2D only is named in the note, one
+    "2D only: <camera> (<reason>)" each (two_d_only_lines), and in the details when the
+    confirmation shows.
     """
     difference = app_model.camera_setup_difference(app_model.recording_camera_names)
     verdicts = app_model.check_reference_images(dict(frames or {}))
     moved = [verdict for verdict in verdicts.values() if verdict.status == MOVED]
+    two_d_only = two_d_only_lines(app_model)
     if difference.differs or moved:
         details = setup_difference_details(difference, app_model.uncalibrated_reasons)
         if moved:
             details += [MOVED_HEADER, *(moved_detail(verdict) for verdict in moved)]
+        details += two_d_only
         rsp = QMessageBox.question(
             parent,
             SETUP_DIFFERS_TITLE,
@@ -253,5 +267,5 @@ def confirm_camera_setup(parent, app_model, frames: Optional[Mapping] = None) ->
             app_model.discard_reference_check()
             return False, None
         app_model.acknowledge_setup_difference()
-    notes = [note for note in (uncalibrated_off_note(difference), cant_tell_note(verdicts)) if note]
+    notes = [*two_d_only, *(note for note in (uncalibrated_off_note(difference), cant_tell_note(verdicts)) if note)]
     return True, " | ".join(notes) or None

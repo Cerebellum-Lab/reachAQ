@@ -166,6 +166,47 @@ def test_a_matching_setup_asks_nothing(monkeypatch):
     assert asked == [] and app_model.calls[1:] == ["start"] and status_bar.messages == []
 
 
+TWO_D_REASON = "too few board views: 4 of 12 needed"
+
+
+def test_start_summary_names_a_2d_only_camera(monkeypatch):
+    # Recording cameras the calibration left 2D only, or does not have (the stimCam), each get
+    # a note; a configured camera that is not recording does not.
+    _question(monkeypatch, QMessageBox.StandardButton.No)
+    app_model = _AppModel(SetupDifference([], [], [], []),
+                          {"camera4": TWO_D_REASON, "stimCam": "not in the active calibration",
+                           "spare": "not in the active calibration"})
+    app_model.recording_camera_names = ["left", "camera4", "stimCam"]
+    behavior, status_bar = _behavior(app_model)
+
+    BehaviorContent._start_recording(behavior)
+
+    assert app_model.calls[1:] == ["start"]
+    assert status_bar.messages == [
+        f"2D only: camera4 ({TWO_D_REASON}) | 2D only: stimCam (not in the active calibration)"]
+
+    # With the confirmation, the same lines are in its details, and in the note after Yes.
+    asked = _question(monkeypatch, QMessageBox.StandardButton.Yes)
+    app_model.difference = SetupDifference(added=["camera9"], removed=[], swapped=[], uncalibrated_off=[])
+    BehaviorContent._start_recording(behavior)
+    (_, text), = asked
+    assert f"2D only: camera4 ({TWO_D_REASON})" in text.splitlines()
+    assert "2D only: stimCam (not in the active calibration)" in text.splitlines()
+    assert status_bar.messages[-1] == status_bar.messages[0]
+
+
+def test_start_summary_names_cameras_without_any_calibration(monkeypatch):
+    asked = _question(monkeypatch, QMessageBox.StandardButton.No)
+    reason = "no active 3D calibration"
+    app_model = _AppModel(SetupDifference([], [], [], []), {"left": reason, "right": reason})
+    behavior, status_bar = _behavior(app_model)
+
+    BehaviorContent._start_recording(behavior)
+
+    assert asked == [] and app_model.calls[1:] == ["start"]
+    assert status_bar.messages == [f"2D only: left ({reason}) | 2D only: right ({reason})"]
+
+
 class _CaptureModel:
     def __init__(self, name):
         self.name = name
