@@ -3005,6 +3005,23 @@ class AppModel(ObservableObject):
             read_settings(root), enabled)})
         logger.notice("the reference-image check is now %s", "on" if enabled else "off")
 
+    def library_settings(self) -> Dict[str, Any]:
+        """<library>/settings.yaml as it is now ({} when missing or unreadable), read afresh."""
+        return read_settings(self.calibration_library_root)
+
+    def update_moved_camera_check(self, check: str, **values) -> None:
+        """Store `values` under checks.<check> in settings.yaml (`check` is "reference_image" or
+        "pose_consistency"), keeping every other key there and elsewhere, per_camera included."""
+        root = self.calibration_library_root
+        checks = read_settings(root).get(reference_image_check.CHECKS_KEY)
+        checks = dict(checks) if isinstance(checks, Mapping) else {}
+        section = checks.get(check)
+        section = dict(section) if isinstance(section, Mapping) else {}
+        section.update(values)
+        checks[check] = section
+        update_settings(root, **{reference_image_check.CHECKS_KEY: checks})
+        logger.notice("checks.%s: %s", check, ", ".join(f"{key} = {value!r}" for key, value in values.items()))
+
     def check_reference_images(
         self, frames: Mapping[str, Optional[np.ndarray]]
     ) -> Dict[str, "reference_image_check.ReferenceVerdict"]:

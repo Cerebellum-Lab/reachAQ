@@ -126,7 +126,15 @@ camera over the limit. The moved camera then has the largest median.
 
 The settings are in `calibrations/settings.yaml`, under
 `checks.pose_consistency`. Offline analysis reads this file and never writes
-to it.
+to it. The acquisition app sets them in **Preferences → Behavior → Moved-camera
+checks → Pose consistency**: a switch (`enabled`) and a field per limit, median
+limit (px, 0.5 to 100), p95 limit (px, 1 to 200, empty for off, saved as
+`null`), minimum frames (1 to 1000000), minimum observations (1 to 10000000)
+and confidence cutoff (0.0 to 1.0). Each field shows the stored value, or the
+default where it is unset or invalid, and Preferences reads the file each time
+it opens. An edit saves that one key and keeps every other; an entry outside
+its range is refused beside the fields and not saved. Per-camera overrides:
+edit checks.pose_consistency.per_camera in calibrations/settings.yaml.
 
 ```yaml
 checks:

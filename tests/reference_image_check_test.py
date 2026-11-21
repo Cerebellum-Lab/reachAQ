@@ -473,3 +473,130 @@ def test_capture_now_copy_inherits_the_fit_under_a_new_id(tmp_path):
     assert (entry / "reference" / "left.png").read_bytes() == png.read_bytes()
     # The source entry is untouched.
     assert {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()} == before
+
+
+# Preferences: each check's limits beside its switch.
+
+def _checks_ui(app_model):
+    from tools.acquisition.view.moved_camera_checks import MovedCameraChecks
+
+    return MovedCameraChecks(app_model)
+
+
+def _stored(app_model):
+    return yaml.safe_load(library.settings_path(app_model.calibration_library_root).read_text(encoding="utf-8"))
+
+
+def _edit(ui, check, key, text):
+    edit = ui.fields[(check, key)]
+    edit.setText(text)
+    edit.editingFinished.emit()
+    return edit
+
+
+def test_thresholds_shown_with_defaults(app_model):
+    ui = _checks_ui(app_model)
+    shown = {key: (edit.text(), edit.placeholderText()) for key, edit in ui.fields.items()}
+    assert shown == {
+        ("reference_image", "max_shift_px"): ("4", "4"),
+        ("reference_image", "max_rotation_deg"): ("1.5", "1.5"),
+        ("reference_image", "max_scale_pct"): ("2", "2"),
+        ("reference_image", "min_quality"): ("0.8", "0.8"),
+        ("pose_consistency", "median_px"): ("6", "6"),
+        ("pose_consistency", "p95_px"): ("", "off"),
+        ("pose_consistency", "min_frames"): ("300", "300"),
+        ("pose_consistency", "min_observations"): ("1000", "1000"),
+        ("pose_consistency", "min_confidence"): ("0.5", "0.5"),
+    }
+    assert "default 4" in ui.fields[("reference_image", "max_shift_px")].toolTip()
+    assert "0.5 to 50" in ui.fields[("reference_image", "max_shift_px")].toolTip()
+    assert ("Per-camera overrides: edit checks.pose_consistency.per_camera in calibrations/settings.yaml"
+            in ui.switches["pose_consistency"].toolTip())
+    assert not ui.switches["reference_image"].isChecked() and not ui.switches["pose_consistency"].isChecked()
+
+    # Values in settings.yaml are shown, and re-read each time Preferences opens.
+    library.update_settings(app_model.calibration_library_root, checks={
+        "reference_image": {"enabled": True, "max_shift_px": 6.5},
+        "pose_consistency": {"enabled": True, "p95_px": 12.0, "min_frames": 450}})
+    again = _checks_ui(app_model)
+    assert again.fields[("reference_image", "max_shift_px")].text() == "6.5"
+    assert again.fields[("pose_consistency", "p95_px")].text() == "12"
+    assert again.fields[("pose_consistency", "min_frames")].text() == "450"
+    assert again.switches["reference_image"].isChecked() and again.switches["pose_consistency"].isChecked()
+
+
+def test_editing_a_threshold_saves_only_that_key(app_model):
+    library.update_settings(app_model.calibration_library_root, live3d=True, checks={
+        "reference_image": {"enabled": True, "per_camera": {"left": {"max_shift_px": 6.0}}},
+        "pose_consistency": {"per_camera": {"camera4": {"median_px": 8.0}}}})
+    ui = _checks_ui(app_model)
+
+    _edit(ui, "reference_image", "max_rotation_deg", "2.5")
+    _edit(ui, "pose_consistency", "min_observations", "2000")
+    # Leaving a field unchanged saves nothing.
+    ui.fields[("reference_image", "max_shift_px")].editingFinished.emit()
+
+    assert _stored(app_model) == {"live3d": True, "checks": {
+        "reference_image": {"enabled": True, "per_camera": {"left": {"max_shift_px": 6.0}}, "max_rotation_deg": 2.5},
+        "pose_consistency": {"per_camera": {"camera4": {"median_px": 8.0}}, "min_observations": 2000}}}
+    assert ric.reference_check_settings(_stored(app_model)).limits.max_rotation_deg == 2.5
+
+
+def test_pose_check_switch_saves_enabled(app_model):
+    from autotrainer.inference.analysis.offline_3d import read_pose_consistency_settings
+
+    ui = _checks_ui(app_model)
+    ui.switches["pose_consistency"].setChecked(True)
+    assert _stored(app_model) == {"checks": {"pose_consistency": {"enabled": True}}}
+    assert read_pose_consistency_settings(app_model.calibration_library_root).enabled is True
+    ui.switches["pose_consistency"].setChecked(False)
+    assert _stored(app_model)["checks"]["pose_consistency"] == {"enabled": False}
+    # The reference switch writes its own enabled only.
+    ui.switches["reference_image"].setChecked(True)
+    assert _stored(app_model)["checks"] == {"pose_consistency": {"enabled": False},
+                                            "reference_image": {"enabled": True}}
+
+
+def test_empty_p95_saves_null(app_model):
+    library.update_settings(app_model.calibration_library_root, checks={"pose_consistency": {"p95_px": 12.0}})
+    ui = _checks_ui(app_model)
+    _edit(ui, "pose_consistency", "p95_px", "")
+    assert _stored(app_model)["checks"]["pose_consistency"] == {"p95_px": None}
+    assert not ui.errors["pose_consistency"].isVisibleTo(ui)
+
+
+@pytest.mark.parametrize("check, key, text", [
+    ("reference_image", "max_shift_px", "60"),
+    ("reference_image", "max_shift_px", "0.2"),
+    ("reference_image", "min_quality", "1.5"),
+    ("reference_image", "max_scale_pct", "two"),
+    ("reference_image", "max_rotation_deg", ""),
+    ("pose_consistency", "min_frames", "300.5"),
+    ("pose_consistency", "p95_px", "0.5"),
+    ("pose_consistency", "min_observations", "0"),
+])
+def test_invalid_value_not_saved(app_model, check, key, text):
+    ui = _checks_ui(app_model)
+    edit = _edit(ui, check, key, text)
+    assert not library.settings_path(app_model.calibration_library_root).exists(), "nothing saved"
+    error = ui.errors[check]
+    assert error.isVisibleTo(ui) and "not saved" in error.text()
+    assert edit.styleSheet()
+    # A valid value then saves, and clears the refusal.
+    _edit(ui, check, key, "3" if key not in ("min_quality",) else "0.7")
+    assert key in _stored(app_model)["checks"][check]
+    assert not error.isVisibleTo(ui) and not edit.styleSheet()
+
+
+def test_preferences_shows_the_checks_beside_their_switches(app_model):
+    from tools.acquisition.view.preferences_content import PreferencesContent
+
+    app_model._inference = SimpleNamespace(is_enabled=False, model_location="", pose_parts=[])
+    content = PreferencesContent(app_model.preferences, app_model)
+    try:
+        checks = content._moved_camera_checks
+        assert content._reference_check_toggle is checks.switches["reference_image"]
+        content._reference_check_toggle.setChecked(True)
+        assert app_model.reference_image_check_enabled is True
+    finally:
+        content.close()

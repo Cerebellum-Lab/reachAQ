@@ -34,6 +34,7 @@ from tools.acquisition.model.animal_sources.config import (
     load_source_configuration,
 )
 from tools.acquisition.view.animal_source_setup_dialog import AnimalSourceSetupDialog
+from tools.acquisition.view.moved_camera_checks import REFERENCE_CHECK, MovedCameraChecks
 
 logger = get_verbose_logger(__name__)
 
@@ -268,21 +269,11 @@ class PreferencesContent(QWidget):
         live_3d_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
         top_layout.addLayout(live_3d_layout)
         #
-        moved_check_layout = QHBoxLayout()
-        moved_check_layout.addWidget(QLabel("Moved-camera check:"))
-        toggle = self._reference_check_toggle = QSwitch()
-        toggle.setToolTip(
-            "At Record, compares each camera's view with its calibration's reference image and asks before"
-            " recording when a camera looks shifted, rotated or rescaled. Off by default. Needs a calibration"
-            " with reference images; the limits are in calibrations/settings.yaml."
-        )
-        toggle.setChecked(app_model.reference_image_check_enabled)
-        def reference_check_state_changed(x: int):
-            app_model.reference_image_check_enabled = x != 0
-        toggle.stateChanged.connect(reference_check_state_changed)  # after setChecked
-        moved_check_layout.addWidget(toggle)
-        moved_check_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
-        top_layout.addLayout(moved_check_layout)
+        # Each moved-camera check's switch with its limits beside it, read afresh each time
+        # Preferences opens.
+        moved_checks = self._moved_camera_checks = MovedCameraChecks(app_model)
+        self._reference_check_toggle = moved_checks.switches[REFERENCE_CHECK]
+        top_layout.addWidget(moved_checks)
         #
         inference_model_layout = QHBoxLayout()
         inference_model_layout.addWidget(QLabel("Inference model:"))

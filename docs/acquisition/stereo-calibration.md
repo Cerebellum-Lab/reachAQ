@@ -332,7 +332,7 @@ The same **Yes** covers it.
 
 Optional and **off by default**: recalibrating by hand stays the normal way to
 deal with a moved camera. Switch it on in **Preferences → Behavior →
-Moved-camera check**. It needs a calibration with reference images (the
+Moved-camera checks → Reference image**, where its limits are too. It needs a calibration with reference images (the
 dialog's **Capture reference images**, or **Capture reference images now** in
 the library).
 
@@ -381,8 +381,18 @@ checks:
 | `per_camera` | none | one setting covers the normal case; a camera can be loosened alone |
 
 A value that is not a number of 0 or more is ignored, with a warning, and the
-default used. The switch writes only `checks.reference_image.enabled`, keeping
-every other key.
+default used.
+
+**In Preferences.** Each limit has a field beside the switch: max shift (px,
+0.5 to 50), max rotation (°, 0.1 to 20), max scale change (%, 0.1 to 20) and
+min match quality (0.0 to 1.0). A field shows the value in `settings.yaml`, or
+the default where it is unset or invalid; its tooltip gives the range and the
+default. Preferences reads the file each time it opens. An edit is saved when
+you leave the field or press Enter, as that one key alone; the switch writes
+only `checks.reference_image.enabled`. Every other key is kept. An entry
+outside the range, or not a number, is refused in red beside the fields and not
+saved. Per-camera overrides: edit checks.reference_image.per_camera in
+calibrations/settings.yaml; Preferences does not show them.
 
 The session metadata records the result as
 `calibration3d.movedCameraChecks.referenceImage`, only while the check is on:
@@ -391,7 +401,8 @@ The session metadata records the result as
 `acknowledged` is true when a moved camera was answered **Yes**. Headless and API
 starts have no camera panels, so they do not run it: `ran: false`.
 
-The other moved-camera check, pose consistency, runs in offline 3D; see
+The other moved-camera check, pose consistency, runs in offline 3D; its switch
+and limits are on the same Preferences group (**Pose consistency**); see
 [Offline 3D](offline-3d.md#pose-consistency-check).
 
 ## After a new calibration: redo the coordinate system
