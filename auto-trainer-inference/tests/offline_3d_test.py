@@ -6,9 +6,11 @@ knocked camera's would be, is the one the check flags. The session-level tests w
 format-3 calibration entry and the per-camera *_raw2D_live.h5 files live pose writes.
 """
 
+import functools
 import hashlib
 import importlib
 import json
+import logging
 import pickle
 import shutil
 from datetime import datetime
@@ -28,6 +30,8 @@ from autotrainer.inference.analysis.intersession_process import intersession_pro
 from autotrainer.inference.analysis.offline_3d import (
     ConsistencyVerdict,
     PoseConsistencySettings,
+    ResidualStats,
+    attribute_moved_cameras,
     export_session_3d,
     pose_consistency,
     read_pose_consistency_settings,
@@ -44,7 +48,7 @@ from autotrainer.inference.multires_calibration.geometry import (
     sensor_to_preset_points,
 )
 from autotrainer.inference.multires_calibration.report import QualityReport
-from autotrainer.inference.multires_calibration.store import CalibrationResolutionError
+from autotrainer.inference.multires_calibration.store import CalibrationGeometryError, CalibrationResolutionError
 from multires_offline_resolution_test import (
     BASE,
     IN_SECOND_WINDOW,
@@ -383,6 +387,35 @@ def test_not_enough_data(tmp_path):
     assert all(v.n_obs == 400 * len(PARTS) for v in verdicts.values())
 
 
+def test_no_observations_is_not_enough_data_whatever_the_minimums():
+    verdict = pose_consistency({"cam0": ResidualStats("cam0", leave_one_out=True)},
+                               _enabled(min_observations=0, min_frames=0))["cam0"]
+    assert verdict.status == "not enough data" and verdict.n_obs == 0 and verdict.median_px is None
+
+
+def test_three_cameras_one_knocked_flags_only_it(tmp_path):
+    cameras = _ring(3)
+    session, toml, files = _session(tmp_path, cameras, _points(400), shift={"cam0": (12.0, 0.0)})
+    result = export_session_3d(session, toml, files)
+    # In one round each camera is measured against a point cam0 helped to place, so all are over.
+    assert {v.status for v in pose_consistency(result.residuals, _enabled()).values()} == {"possibly moved"}
+    verdicts = attribute_moved_cameras(result, _enabled())
+    assert verdicts["cam0"].status == "possibly moved" and verdicts["cam0"].median_px > 6.0
+    # Without cam0, the other two agree as a pair.
+    assert verdicts["cam1"].status == "ok" and verdicts["cam2"].status == "ok"
+    assert verdicts["cam1"].median_px < 1.0
+
+
+def test_six_cameras_two_knocked_flags_both(tmp_path):
+    cameras = _ring(6)
+    session, toml, files = _session(tmp_path, cameras, _points(400),
+                                    shift={"cam1": (12.0, 0.0), "cam4": (0.0, 12.0)})
+    verdicts = attribute_moved_cameras(export_session_3d(session, toml, files), _enabled())
+    assert {name for name, v in verdicts.items() if v.status == "possibly moved"} == {"cam1", "cam4"}
+    for name in ("cam0", "cam2", "cam3", "cam5"):
+        assert verdicts[name].status == "ok", verdicts[name]
+
+
 def test_settings_are_read_from_settings_yaml_and_never_written(tmp_path):
     root = tmp_path / "calibrations"
     assert read_pose_consistency_settings(root) == PoseConsistencySettings()
@@ -459,6 +492,17 @@ def _entry(config: Path, rig=RIG3, capture=CAPTURE3, live=LIVE3) -> Path:
     store.write_calibration(built, fit=rig.truth, preset_sets=presets_for_cameras(live), board=rig.board,
                             report=_REPORT, capture={}, cameras=capture)
     return library.entry_path(root, library.add_entry(root, built))
+
+
+@functools.lru_cache(maxsize=None)
+def _rig_abc():
+    """Three cameras named a, b and c: no left-right pair."""
+    return synthetic_rig(noise_px=0.0, frame_rotation_deg=35.0, cameras=("a", "b", "c"))
+
+
+CAPTURE_ABC = [CaptureCamera("a", "31000001", 0), CaptureCamera("b", "31000002", 1),
+               CaptureCamera("c", "31000003", 2)]
+LIVE_ABC = {"a": BASE, "b": BASE, "c": BASE}
 
 
 def _params(g: PresetGeometry) -> dict:
@@ -653,6 +697,38 @@ def test_intersession_live_3d_off_with_a_swapped_left_is_refused(tmp_path, monke
     with pytest.raises(CalibrationResolutionError, match="left: swapped"):
         intersession_process(project, calib_root=root)
     assert seen == {}
+
+
+def test_intersession_live_3d_off_with_unreadable_recorded_params_is_refused(tmp_path, monkeypatch):
+    root = tmp_path / "Autotrainer"
+    index = _write_format3_with_live_set(root / NAME)
+    project = _project(tmp_path)
+    data = _metadata(IN_SECOND_WINDOW, id=index.id, preset=None, live3dDisabledReason=LIVE_3D_OFF)
+    data["configuration"] = {"cameras": [{"name": "left", "params": {"hbin": 2, "vbin": 4}},
+                                         {"name": "right", "params": _params(PRESETS[1])}]}
+    _write_metadata(project, data)
+    seen = _capture_process_raw_data(monkeypatch)
+    # Never read at the live set or the base preset as a guess.
+    with pytest.raises(CalibrationGeometryError, match="recorded geometry of left and right is unknown"):
+        intersession_process(project, calib_root=root)
+    assert seen == {}
+
+
+def test_offline_3d_runs_for_a_session_without_a_left_right_pair(tmp_path, caplog):
+    config = tmp_path / "Autotrainer"
+    rig = _rig_abc()
+    entry = _entry(config, rig=rig, capture=CAPTURE_ABC, live=LIVE_ABC)
+    X = _motor_points(30, rig)
+    project, session, metadata = _recorded_session(
+        tmp_path, entry, {"a": "31000001", "b": "31000002", "c": "31000003"}, X, rig=rig, live=LIVE_ABC)
+    _write_metadata(project, metadata)
+    # The left-right step has no pair to read: it is refused, and offline 3D runs regardless.
+    with caplog.at_level(logging.WARNING), pytest.raises(CalibrationGeometryError, match="left and right"):
+        intersession_process(project, calib_root=config)
+    assert "the left-right 3D of session" in caplog.text and "runs regardless" in caplog.text
+    with h5py.File(session / "points3d.h5", "r") as fh:
+        assert [n.decode() for n in fh["camera_names"][()]] == ["a", "b", "c"]
+        np.testing.assert_allclose(fh["points3d"][()], X, atol=1e-3)
 
 
 def test_offline_3d_of_a_calibration_outside_the_library_derives_into_the_session(tmp_path, monkeypatch):

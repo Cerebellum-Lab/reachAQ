@@ -11,6 +11,13 @@ in the stereo calibration guide.
 Offline 3D is an extra product. If it fails, the error is logged and the
 session's 2D processing and reach segmentation carry on.
 
+It does not depend on the left-right step. A session whose calibration has no
+left and right camera, or whose left or right is swapped, still triangulates
+the cameras that match. When the left-right step fails or is refused, its
+reason is logged ("the left-right 3D of session ... failed: ...; offline 3D
+from every calibrated camera runs regardless"), offline 3D runs, and the
+left-right failure then stands as before.
+
 ## Inputs
 
 - **The calibration.** It is resolved from the session's
@@ -117,12 +124,21 @@ way to deal with a moved camera.
   the limit is reported as "possibly moved". Its report entry and the log show
   the residual and the limit, for example "possibly moved: camera4, median
   residual 12.0 px over 5000 observations (limit 6.0)".
+- **A moved camera is told apart from the cameras it misleads.** Each camera's
+  leave-one-out point is placed partly by the moved camera, so one moved camera
+  can push the others over the limit too. While any camera is over its limit,
+  the one with the highest median is flagged "possibly moved", and the other
+  cameras are measured again with points triangulated without every flagged
+  camera. This repeats until no camera left is over its limit, or only 2 are
+  left; those 2 are then judged as a pair, below.
 - **With exactly 2 cameras**, the residual is the same for both cameras. It is
   the sum of the two cameras' reprojection errors, which is about how far apart
-  the two cameras' views are. A pair over the limit is reported as "pair
-  inconsistent", because the check cannot tell which camera moved.
-- A camera with too few frames or observations is reported as "not enough
-  data".
+  the two cameras' views are. The `median_px` limit is compared with that sum,
+  so with 2 cameras it is a limit on both cameras' errors together, not on one
+  camera's. A pair over the limit is reported as "pair inconsistent", because
+  the check cannot tell which camera moved.
+- A camera with too few frames or observations, or none at all, is reported as
+  "not enough data", whatever the minimums are set to.
 - The residuals are kept as histograms, 400 bins per decade, so the median and
   p95 are read to within 0.6 % of their value. The confidence cutoff applies to
   the hundredth.
@@ -135,15 +151,17 @@ The verdicts are logged and written to `poseConsistency` in
 In synthetic sessions with no noise, one camera's 2D points were shifted by
 12 px. The table gives the median residuals.
 
-| cameras | shifted camera | the others |
-|---|---|---|
-| 6 | 12.0 px, possibly moved | 2.9 to 3.8 px, ok |
-| 3 | 12.0 px, possibly moved | 8.6 and 8.9 px, also possibly moved |
-| 2 | 12.6 px for the pair, pair inconsistent | |
+| cameras | shifted camera | the others, first round | the others, verdict |
+|---|---|---|---|
+| 6 | 12.0 px, possibly moved | 2.9 to 3.8 px | ok |
+| 3 | 12.0 px, possibly moved | 8.6 and 8.9 px, over the limit | ok, as a pair without the shifted camera |
+| 2 | 12.6 px for the pair, pair inconsistent | | |
 
-With 3 cameras, each of the other cameras is checked against a point that the
-moved camera helped to place. A single moved camera can therefore push every
-camera over the limit. The moved camera then has the largest median.
+With 3 cameras, each of the other cameras is first checked against a point that
+the moved camera helped to place, so every camera is over the limit. The moved
+camera has the largest median and is flagged; the other two, measured again
+without it, agree. With 6 cameras and two of them shifted by 12 px, both are
+flagged and the other four are ok.
 
 ### Settings
 

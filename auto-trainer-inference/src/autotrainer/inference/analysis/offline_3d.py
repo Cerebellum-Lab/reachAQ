@@ -1,14 +1,14 @@
 """Offline 3D from every recorded camera a session's calibration holds, and the pose-consistency check.
 
 session_offline_3d is what intersession processing calls once the session's calibration has
-resolved. It matches the cameras the session recorded to the calibration's by serial
-(select_session_cameras): a camera whose body was swapped, one the calibration left 2D
-only, and one it does not hold are excluded, each with its reason. So are a calibrated
-camera with no 2D pose file or one that cannot be read, and one recorded at a frame rate
-the others were not. The 2D pose of the rest, each camera's
-<session prefix>_<camera>_raw2D_live.h5 (ProjectInfo.get_intersession_pose_path) in the
-pixels inference saw, is triangulated with the calibration's anipose TOML at each camera's
-recorded geometry (store.load_preset_set):
+resolved, whether or not the session's left-right 3D could be read. It matches the cameras
+the session recorded to the calibration's by serial (select_session_cameras): a camera whose
+body was swapped, one the calibration left 2D only, and one it does not hold are excluded,
+each with its reason. So are a calibrated camera with no 2D pose file or one that cannot be
+read, and one recorded at a frame rate the others were not. The 2D pose of the rest, each
+camera's <session prefix>_<camera>_raw2D_live.h5 (ProjectInfo.get_intersession_pose_path) in
+the pixels inference saw, is triangulated with the calibration's anipose TOML at each
+camera's recorded geometry (store.load_preset_set):
 
 - the session is read and processed in blocks of BLOCK_FRAMES frames, so memory does not
   grow with its length;
@@ -22,11 +22,13 @@ recorded geometry (store.load_preset_set):
 
 The pose-consistency check (pose_consistency, spec section 8(b)) measures each camera
 against the point triangulated from the other cameras (leave-one-out), which needs 3 or
-more cameras. A camera whose median residual is over the limit is "possibly moved". With
-exactly 2 cameras the residual is shared, the sum of the two cameras' reprojection errors,
-which is about how far the pair is from agreeing; it cannot say which camera moved, so it
-reports "pair inconsistent". The residuals are kept as histograms (ResidualStats), so the
-median and p95 are read to within 0.6 % of their value.
+more cameras. A camera whose median residual is over the limit is "possibly moved". A moved
+camera also pulls the points the others are measured against, so attribute_moved_cameras
+flags the one with the highest median and measures the rest again without it, until none
+is over its limit. With exactly 2 cameras the residual is shared, the sum of the two
+cameras' reprojection errors, which is about how far the pair is from agreeing; it cannot
+say which camera moved, so it reports "pair inconsistent". The residuals are kept as
+histograms (ResidualStats), so the median and p95 are read to within 0.6 % of their value.
 The settings are in <library>/settings.yaml under checks.pose_consistency, global with an
 optional per_camera override, and are only read here.
 
@@ -41,7 +43,7 @@ from collections import Counter
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import h5py
@@ -399,6 +401,16 @@ def _residuals(block: _Block, cameras: Sequence[TomlCamera], projections: np.nda
     return out
 
 
+def _measure(poses: _SessionPoses, projections: np.ndarray, use: Sequence[int]) -> Dict[str, ResidualStats]:
+    """The residuals of the cameras `use`, triangulated from them alone, over the whole session."""
+    cameras = poses.cameras
+    stats = {cameras[i].name: ResidualStats(cameras[i].name, leave_one_out=len(use) > MIN_VIEWS) for i in use}
+    for block in poses.blocks():
+        for i, (residual, confidence, judged) in _residuals(block, cameras, projections, use).items():
+            stats[cameras[i].name].add(residual, confidence, judged)
+    return stats
+
+
 # --- export -------------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -436,6 +448,10 @@ class Offline3DResult:
     # Filled by session_offline_3d: recorded name -> why it was not triangulated, and the check.
     excluded: Dict[str, str] = field(default_factory=dict)
     consistency: Dict[str, ConsistencyVerdict] = field(default_factory=dict)
+    # The residuals of the cameras left when those named are taken out, measured again from
+    # the pose files (attribute_moved_cameras).
+    recompute: Optional[Callable[[Sequence[str]], Dict[str, ResidualStats]]] = field(
+        default=None, repr=False, compare=False)
 
 
 DEFAULT_MIN_CONFIDENCE = 0.5
@@ -518,7 +534,11 @@ def _export(session_dir: Path, calibration_toml: Path, sources: Mapping[str, Pos
         raise
     logger.info("offline 3D of %s from %s: %d of %d points triangulated, into %s",
                 session_dir, ", ".join(names), used, total, points3d_path)
-    return Offline3DResult(points3d_path, reprojections_path, residuals)
+
+    def recompute(left_out: Sequence[str]) -> Dict[str, ResidualStats]:
+        return _measure(poses, projections, [i for i, c in enumerate(cameras) if c.name not in set(left_out)])
+
+    return Offline3DResult(points3d_path, reprojections_path, residuals, recompute=recompute)
 
 
 def _growing(fh: h5py.File, name: str, shape: Tuple[int, ...], *, axis: int, dtype=float) -> h5py.Dataset:
@@ -623,14 +643,15 @@ def read_pose_consistency_settings(library_dir: Path) -> PoseConsistencySettings
 def pose_consistency(
     residuals: Mapping[str, ResidualStats], settings: Any
 ) -> Dict[str, ConsistencyVerdict]:
-    """Each camera's verdict on its residuals, with its limits from `settings`.
+    """Each camera's verdict on its residuals, with its limits from `settings`, in one round.
 
     `settings` is a PoseConsistencySettings or the raw checks.pose_consistency mapping. Only
-    observations at or above the camera's min_confidence count. Too few of them, or too few
-    frames, is "not enough data"; otherwise a median (or, when set, p95) residual over its
-    limit is "possibly moved" for a leave-one-out residual and "pair inconsistent" for the
-    shared residual of 2 cameras, and "ok" otherwise. The verdict is computed whether or not
-    the check is enabled; the caller decides whether to run it.
+    observations at or above the camera's min_confidence count. None of them, too few of
+    them, or too few frames is "not enough data"; otherwise a median (or, when set, p95)
+    residual over its limit is "possibly moved" for a leave-one-out residual and "pair
+    inconsistent" for the shared residual of 2 cameras, and "ok" otherwise. The verdict is
+    computed whether or not the check is enabled; the caller decides whether to run it.
+    attribute_moved_cameras repeats it without a camera found moved.
     """
     if not isinstance(settings, PoseConsistencySettings):
         settings = pose_consistency_settings(settings)
@@ -641,13 +662,41 @@ def pose_consistency(
         n_frames = stats.n_frames(limits.min_confidence)
         median = stats.quantile(0.5, limits.min_confidence)
         p95 = stats.quantile(0.95, limits.min_confidence)
-        if n_obs < limits.min_observations or n_frames < limits.min_frames:
+        if n_obs == 0 or n_obs < limits.min_observations or n_frames < limits.min_frames:
             status = STATUS_TOO_LITTLE
         elif median > limits.median_px or (limits.p95_px is not None and p95 > limits.p95_px):
             status = STATUS_MOVED if stats.leave_one_out else STATUS_PAIR
         else:
             status = STATUS_OK
         verdicts[name] = ConsistencyVerdict(name, status, median, p95, n_obs, limits.median_px, limits.p95_px)
+    return verdicts
+
+
+def attribute_moved_cameras(result: Offline3DResult, settings: Any) -> Dict[str, ConsistencyVerdict]:
+    """The check's verdicts, with a moved camera told apart from the cameras it misleads.
+
+    With 3 or more cameras, each camera's leave-one-out residual is judged (pose_consistency).
+    While any camera still measured is over its limit, the one with the highest median is
+    flagged "possibly moved" and the others are measured again, triangulated without every
+    flagged camera (result.recompute). That stops when none is over, or when fewer than 3
+    cameras are left: those 2 are then judged on their shared residual, "pair inconsistent"
+    when it is over the limit, else "ok". Without result.recompute, or with 2 cameras, this
+    is pose_consistency.
+    """
+    if not isinstance(settings, PoseConsistencySettings):
+        settings = pose_consistency_settings(settings)
+    verdicts = pose_consistency(result.residuals, settings)
+    remaining = list(verdicts)
+    while result.recompute is not None and len(remaining) > MIN_VIEWS:
+        over = [verdicts[name] for name in remaining if verdicts[name].status == STATUS_MOVED]
+        if not over:
+            break
+        worst = max(over, key=lambda v: v.median_px)
+        remaining.remove(worst.camera)
+        flagged = [name for name in verdicts if name not in remaining]
+        logger.info("pose consistency: %s has the highest median of the cameras over their limit; measuring %s"
+                    " again without %s", worst.camera, ", ".join(remaining), ", ".join(flagged))
+        verdicts.update(pose_consistency(result.recompute(flagged), settings))
     return verdicts
 
 
@@ -835,7 +884,7 @@ def session_offline_3d(
                      min_confidence=settings.limits.min_confidence)
     verdicts = {}
     if settings.enabled:
-        verdicts = pose_consistency(result.residuals, settings)
+        verdicts = attribute_moved_cameras(result, settings)
         for verdict in verdicts.values():
             (logger.info if verdict.status in (STATUS_OK, STATUS_TOO_LITTLE) else logger.warning)(
                 "session %s: %s", session_dir, verdict.describe())

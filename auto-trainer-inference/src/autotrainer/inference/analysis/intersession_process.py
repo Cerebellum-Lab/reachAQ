@@ -173,7 +173,8 @@ def _session_preset(folder: Path, metadata: dict, project: ProjectInfo) -> Loade
     R35). A session recorded with live 3D switched off (LIVE_3D_OFF) is read like any other,
     unless its left or right camera was recorded as not in the calibration (a swapped body,
     say), which is refused; without a preset in its metadata it is read at the geometry
-    left and right recorded at, from its configuration, when that is known. Any other
+    left and right recorded at, from its configuration, when that is known, and refused
+    with CalibrationGeometryError when that configuration cannot be read. Any other
     session without a preset takes the base preset, the largest binning, since its 2D pose
     files are in inference space, the base capture's pixels (spec, "Offline 3D input"). That
     is a session recorded before calibration3d existed, or one whose live 3D ran on a legacy
@@ -196,7 +197,7 @@ def _session_preset(folder: Path, metadata: dict, project: ProjectInfo) -> Loade
     if switched_off:
         _refuse_uncalibrated_pair(metadata, folder, project)
     name = calibration3d.get("preset")
-    recorded = _recorded_pair_geometry(metadata) if switched_off and name is None else None
+    recorded = _recorded_pair_geometry(metadata, project) if switched_off and name is None else None
     if recorded is not None:
         logger.info("session %s was recorded with live 3D switched off; reading it at the geometry left and"
                     " right recorded at, %s", project.short_id, recorded.name)
@@ -268,8 +269,12 @@ def _refuse_uncalibrated_pair(metadata: dict, folder: Path, project: ProjectInfo
         )
 
 
-def _recorded_pair_geometry(metadata: dict) -> Optional[PresetGeometry]:
-    """The geometry left and right recorded at, from the session's configuration; None unless both share a known one."""
+def _recorded_pair_geometry(metadata: dict, project: ProjectInfo) -> Optional[PresetGeometry]:
+    """The geometry left and right recorded at, from the session's configuration; None unless both share one.
+
+    Raises CalibrationGeometryError when their configuration is there but cannot be read: the
+    pixels of the session's 2D points are then unknown, and no preset is a safe guess (R32).
+    """
     cameras = ((metadata.get("configuration") or {}).get("cameras")) or []
     params = {c.get("name"): c.get("params") or {} for c in cameras if isinstance(c, dict)}
     if not all(name in params for name in _LIVE_PAIR):
@@ -277,22 +282,30 @@ def _recorded_pair_geometry(metadata: dict) -> Optional[PresetGeometry]:
     try:
         geometries = {recorded_geometry(params[name]) for name in _LIVE_PAIR}
     except ValueError as error:
-        logger.warning("cannot read the recorded geometry of left and right: %s", error)
-        return None
+        raise CalibrationGeometryError(
+            f"session {project.short_id} was recorded with live 3D off and names no preset, and the recorded"
+            f" geometry of left and right is unknown: their configuration cannot be read ({error});"
+            f" {_CALIB_DIR_HINT}"
+        ) from error
     return geometries.pop() if len(geometries) == 1 else None
 
 
-def _offline_3d(project: ProjectInfo, location: str, folder: Path, calib_root: Optional[Path]) -> None:
+def _offline_3d(project: ProjectInfo, location: str, folder: Path, calib_root: Optional[Path],
+                legacy_error: Optional[BaseException] = None) -> None:
     """Offline 3D from every calibrated camera of the session (offline_3d.session_offline_3d), for a format-3 calibration.
 
-    It is an extra product: a failure is logged and the session's processing goes on. A
-    calibration outside the library
+    It is an extra product: a failure is logged and the session's processing goes on. It
+    does not depend on the left-right step: `legacy_error`, that step's failure, is logged
+    with its reason and offline 3D runs regardless. A calibration outside the library
     (--calib-dir) has its derived TOMLs put in the session folder's OFFLINE_DERIVED_DIR,
     never in the operator's library; the check's settings are still the library's.
     """
     try:
         if not folder.joinpath(INDEX_FILE).exists() or is_legacy_entry(folder) or load_index(folder).format < 3:
             return
+        if legacy_error is not None:
+            logger.warning("the left-right 3D of session %s failed: %s; offline 3D from every calibrated camera"
+                           " runs regardless", project.short_id, str(legacy_error) or type(legacy_error).__name__)
         library_dir, derived_dir = entry_library(folder), None
         if library_dir is None:
             library_dir = library_root(DEFAULT_CONFIG_DIR.expanduser() if calib_root is None else Path(calib_root))
@@ -341,26 +354,31 @@ def intersession_process(
     else:
         calib_src_dir = Path(calib_dir).expanduser()
     calib_folder = calib_src_dir
-    # A folder with a calibration.yaml is format 2 or 3, whether or not it reads: a legacy folder
-    # never has one, so it is never read the legacy way (which would also fail obscurely). The
-    # library's copy of a legacy folder has a generated one, marked format "legacy".
-    if calib_src_dir.joinpath(INDEX_FILE).exists() and not is_legacy_entry(calib_src_dir):
-        preset = _session_preset(calib_src_dir, _session_metadata(project), project)
-    else:
-        preset = None
-        if not calib_src_dir.is_dir():
-            logger.warning("calib_src_dir %s is not a directory",  calib_src_dir)
-    calib_src_dir = calib_src_dir.as_posix()
     vid_tag = "." + project.video_write_ext
     dlc_seg = "_raw2D"
     center_method = (1, SceneElement.Diamond)
-    #
-    df_lr, centered_df_3d = process_raw_data(
-        project,
-        location, vid_tag, dlc_seg, calib_src_dir, center_method,
-        frame_rate=frame_rate,
-        preset=preset,
-    )
+    try:
+        # A folder with a calibration.yaml is format 2 or 3, whether or not it reads: a legacy folder
+        # never has one, so it is never read the legacy way (which would also fail obscurely). The
+        # library's copy of a legacy folder has a generated one, marked format "legacy".
+        if calib_src_dir.joinpath(INDEX_FILE).exists() and not is_legacy_entry(calib_src_dir):
+            preset = _session_preset(calib_src_dir, _session_metadata(project), project)
+        else:
+            preset = None
+            if not calib_src_dir.is_dir():
+                logger.warning("calib_src_dir %s is not a directory",  calib_src_dir)
+        #
+        df_lr, centered_df_3d = process_raw_data(
+            project,
+            location, vid_tag, dlc_seg, calib_src_dir.as_posix(), center_method,
+            frame_rate=frame_rate,
+            preset=preset,
+        )
+    except Exception as error:
+        # The left-right step failed or was refused (no left-right pair, a swapped left, ...):
+        # offline 3D from the cameras that do match still runs, then the failure stands.
+        _offline_3d(project, location, calib_folder, calib_root, legacy_error=error)
+        raise
     _offline_3d(project, location, calib_folder, calib_root)
     #
     results_dict = segment_reaches(
