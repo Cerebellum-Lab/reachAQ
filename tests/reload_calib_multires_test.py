@@ -9,6 +9,7 @@ DCS is redone, gives zero offsets instead of a crash.
 """
 
 import dataclasses
+import hashlib
 import json
 import logging
 import pickle
@@ -590,18 +591,82 @@ def test_dcs_offsets_for_a_library_entry_go_beside_it(app_model, tmp_path):
     entry = _active_entry(app_model, tmp_path)
     _configure_with_serials(app_model, SERIALS)
     app_model.reload_calib(None)
-    path = app_model.camera_offsets_path()
     root = library.library_root(Path(app_model._preferences.configuration_location))
-    assert path == root / ".offsets" / entry.name / DEFAULT_CAM_OFFSET_FILE_NAME
+    assert app_model.camera_offsets_path() is None, "DCS has not run against this calibration"
     offsets = {"x_off": 1.0, "y_off": 2.0, "z_off": 3.0}
-    path.parent.mkdir(parents=True)
-    with path.open("wb") as fh:
-        pickle.dump(offsets, fh)
+    path = app_model.write_camera_offsets(entry, offsets)
+    assert path.parent == root / ".offsets" / entry.name and path.name.startswith("camera_offsets-")
+    assert app_model.camera_offsets_path() == path
     app_model.reload_calib(entry)
     assert app_model._pose_algorithm.cam_offsets == offsets
     assert not (entry / DEFAULT_CAM_OFFSET_FILE_NAME).exists()
     # Not an entry, so never listed as one.
     assert [e.id for e in library.list_entries(root)] == [entry.name]
+
+
+def test_two_dcs_runs_keep_both_files_and_load_the_newer(app_model, tmp_path):
+    from datetime import datetime, timezone
+
+    from calibration_metadata_test import _saved_calibration3d
+
+    entry = _active_entry(app_model, tmp_path)
+    _configure_with_serials(app_model, SERIALS)
+    root = library.library_root(Path(app_model._preferences.configuration_location))
+    first = library.write_offsets(root, entry.name, pickle.dumps({"x_off": 1.0, "y_off": 1.0, "z_off": 1.0}),
+                                  now=datetime(2026, 11, 20, 9, tzinfo=timezone.utc))
+    newer = {"x_off": 2.0, "y_off": 2.0, "z_off": 2.0}
+    second = app_model.write_camera_offsets(entry, newer)
+
+    app_model.reload_calib(None)
+
+    assert first.is_file() and second.is_file() and first != second
+    assert app_model._pose_algorithm.cam_offsets == newer
+    recorded = _saved_calibration3d(app_model, tmp_path)
+    assert recorded["id"] == entry.name
+    assert recorded["offsetsFile"] == {"name": second.name, "sha256": hashlib.sha256(second.read_bytes()).hexdigest()}
+
+
+def test_live_and_offline_read_the_same_offsets_file(app_model, tmp_path):
+    from datetime import datetime, timezone
+
+    from autotrainer.inference.analysis.prepare_jetson_data import _load_saved_offsets
+
+    entry = _active_entry(app_model, tmp_path)
+    _configure_with_serials(app_model, SERIALS)
+    root = library.library_root(Path(app_model._preferences.configuration_location))
+    for hour, value in ((9, 1.0), (10, 2.0), (11, 3.0)):
+        library.write_offsets(root, entry.name, pickle.dumps({"x_off": value, "y_off": value, "z_off": value}),
+                              now=datetime(2026, 11, 20, hour, tzinfo=timezone.utc))
+
+    app_model.reload_calib(None)
+    offline, save = _load_saved_offsets(str(entry))
+
+    assert app_model.camera_offsets_path() == library.current_offsets_path(root, entry.name)
+    assert app_model.camera_offsets_path().name == "camera_offsets-20261120T110000Z.pkl"
+    assert offline == app_model._pose_algorithm.cam_offsets == {"x_off": 3.0, "y_off": 3.0, "z_off": 3.0}
+    assert save is False
+
+
+@pytest.mark.parametrize("where", ["alone in .offsets", "in an imported legacy entry"])
+def test_a_plain_legacy_offsets_file_still_loads(app_model, tmp_path, where):
+    from calibration_metadata_test import _saved_calibration3d
+
+    entry = _active_entry(app_model, tmp_path)
+    _configure_with_serials(app_model, SERIALS)
+    root = library.library_root(Path(app_model._preferences.configuration_location))
+    offsets = {"x_off": 4.0, "y_off": 5.0, "z_off": 6.0}
+    if where == "alone in .offsets":
+        plain = root / ".offsets" / entry.name / DEFAULT_CAM_OFFSET_FILE_NAME
+        plain.parent.mkdir(parents=True)
+    else:
+        # As an imported legacy folder brings it; entries are never written, so a test stands in.
+        plain = entry / DEFAULT_CAM_OFFSET_FILE_NAME
+    plain.write_bytes(pickle.dumps(offsets))
+
+    app_model.reload_calib(None)
+
+    assert app_model._pose_algorithm.cam_offsets == offsets
+    assert _saved_calibration3d(app_model, tmp_path)["offsetsFile"]["name"] == DEFAULT_CAM_OFFSET_FILE_NAME
 
 
 def test_a_library_with_entries_and_no_pointer_is_not_imported_into_again(app_model, user_pref, tmp_path):

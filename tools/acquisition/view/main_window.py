@@ -1,8 +1,6 @@
 import os
 import logging
-import pickle
 import random
-import shutil
 import textwrap
 import threading
 import time
@@ -30,7 +28,6 @@ from autotrainer.core.logging import get_console_handler, get_verbose_logger
 from autotrainer.core.multiproc import make_daemon_timer, no_op_timer
 from autotrainer.core.pose_elements import SceneElement
 from autotrainer.core.event.api_event_kind import ApiEventKind
-from autotrainer.core.project.project_info import DATE_TIME_FORMAT
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 
 from autotrainer.inference import InferenceStatus, PoseResponse
@@ -768,15 +765,9 @@ class MainWindow(QMainWindow):
             z_off=cam_off.z,
         )
         # Beside a library entry, never inside it: an entry is not written to once in place.
-        cam_offsets_path = app_model.camera_offsets_path(calib_dir)
-        cam_offsets_path.parent.mkdir(parents=True, exist_ok=True)
-        if cam_offsets_path.exists():
-            now = datetime.now()
-            backup_path = cam_offsets_path.parent.joinpath(f"{cam_offsets_path.name}_{now.strftime(DATE_TIME_FORMAT)}")
-            shutil.copy(cam_offsets_path, backup_path)
-        logger.info("Writing new camera-offsets %s to file %s", cam_offsets, cam_offsets_path)
-        with cam_offsets_path.open("wb") as fh:
-            pickle.dump(cam_offsets, fh)
+        # Each run is a new file there; the newest is the one live and offline 3D read.
+        cam_offsets_path = app_model.write_camera_offsets(calib_dir, cam_offsets)
+        logger.info("Wrote new camera-offsets %s to file %s", cam_offsets, cam_offsets_path)
         #
         app_model = self._app_model
         app_model.reload_calib(calib_dir)

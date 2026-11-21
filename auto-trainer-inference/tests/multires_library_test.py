@@ -377,6 +377,41 @@ def test_an_unreadable_entry_is_left_out_with_a_warning(tmp_path, caplog):
     assert any("baddie" in r.getMessage() for r in caplog.records)
 
 
+# --- DCS offsets beside an entry -------------------------------------------------------
+
+def test_each_dcs_run_keeps_its_own_offsets_file_and_the_newest_is_current(tmp_path):
+    from datetime import timezone
+    from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
+
+    root = library_root(tmp_path)
+    assert library.OFFSETS_FILE_NAME == DEFAULT_CAM_OFFSET_FILE_NAME
+    assert library.current_offsets_path(root, "abc") is None
+    first = library.write_offsets(root, "abc", b"first", now=datetime(2026, 11, 20, 9, 0, 0, tzinfo=timezone.utc))
+    second = library.write_offsets(root, "abc", b"second", now=datetime(2026, 11, 20, 10, 0, 0, tzinfo=timezone.utc))
+
+    assert first.name == "camera_offsets-20261120T090000Z.pkl" and first.read_bytes() == b"first"
+    assert second.name == "camera_offsets-20261120T100000Z.pkl"
+    assert library.current_offsets_path(root, "abc") == second
+    assert first.parent == second.parent == root / ".offsets" / "abc"
+    # Two runs in one second, or a clock set back, still never overwrite and stay in name order.
+    third = library.write_offsets(root, "abc", b"third", now=datetime(2026, 11, 20, 10, 0, 0, tzinfo=timezone.utc))
+    earlier = library.write_offsets(root, "abc", b"back", now=datetime(2026, 11, 1, tzinfo=timezone.utc))
+    assert third.name == "camera_offsets-20261120T100001Z.pkl" and second.read_bytes() == b"second"
+    assert earlier.name == "camera_offsets-20261120T100002Z.pkl"
+    assert library.current_offsets_path(root, "abc") == earlier
+    assert len(list((root / ".offsets" / "abc").iterdir())) == 4
+
+
+def test_a_plain_offsets_file_alone_in_the_store_is_current(tmp_path):
+    root = library_root(tmp_path)
+    plain = root / ".offsets" / "abc" / "camera_offsets.pkl"
+    plain.parent.mkdir(parents=True)
+    plain.write_bytes(b"from before the files were versioned")
+    assert library.current_offsets_path(root, "abc") == plain
+    newer = library.write_offsets(root, "abc", b"new")
+    assert library.current_offsets_path(root, "abc") == newer and plain.is_file()
+
+
 # --- importing what predates the library ----------------------------------------------
 
 def test_import_keeps_format2_ids_and_marks_active(tmp_path):

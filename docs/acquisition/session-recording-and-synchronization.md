@@ -697,7 +697,12 @@ both the session and the acquisition metadata:
 - `cameras`: the calibration's cameras, `[{name, serial, cameraId}]` (left and
   right with null serials for format 2 and legacy), or null when there is none.
 - `matchesRecording`: false when the cameras recording differ from the
-  calibration's; null without a calibration.
+  calibration's, and when the active calibration could not be read; null
+  without a calibration.
+- `offsetsFile`: `{name, sha256}` of the DCS camera offsets file live 3D loaded
+  with the calibration (for a library entry, the newest
+  `calibrations/.offsets/<id>/camera_offsets-<UTC time>.pkl`), or null while it
+  has none and live 3D uses zero offsets.
 - `mismatch`: `{added, removed, swapped}`: recording cameras the calibration
   does not have, calibrated cameras no configured camera is any more, and
   recording cameras whose name the calibration has with another serial, as

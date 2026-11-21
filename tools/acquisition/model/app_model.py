@@ -104,6 +104,7 @@ from autotrainer.inference.multires_calibration.library import (
     ACTIVE_FILE,
     DECISIONS_FILE,
     active_id,
+    current_offsets_path,
     derived_root,
     entry_path,
     has_entries,
@@ -115,6 +116,7 @@ from autotrainer.inference.multires_calibration.library import (
     pointer_id,
     read_settings,
     update_settings,
+    write_offsets,
 )
 from autotrainer.inference.multires_calibration.store import (
     INDEX_FILE,
@@ -562,9 +564,6 @@ NO_ACTIVE_CALIBRATION = "no active 3D calibration"
 #: Why Calibrate Coordinate System is refused without an active 3D calibration.
 DCS_NEEDS_CALIBRATION = ("Calibrate Coordinate System needs an active 3D calibration, and there is none:"
                          " make or activate a 3D calibration first")
-#: Beside the library's entries: DCS's camera offsets for each entry, which an entry, never
-#: written to once in place, cannot hold. <library>/.offsets/<id>/camera_offsets.pkl
-_LIBRARY_OFFSETS_DIR = ".offsets"
 #: The two cameras today's live 3D triangulates, by their calibration names.
 _LIVE_PAIR = ("left", "right")
 #: The key in <library>/settings.yaml, and the reason live 3D gives while it is switched off.
@@ -603,11 +602,15 @@ class SetupDifference:
         return tuple(self.added), tuple(self.removed), tuple(self.swapped)
 
 
-def _load_camera_offsets(calib_dir: Path, offsets_path: Optional[Path] = None) -> Dict[str, Any]:
-    """The live 3D camera offsets for the calibration in `calib_dir`, or zero offsets when it has none.
+def _load_camera_offsets(
+    calib_dir: Path, offsets_path: Optional[Path] = None,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, str]]]:
+    """(the live 3D camera offsets for the calibration in `calib_dir`, or zero offsets when it
+    has none; {name, sha256} of the file they came from, None for zero offsets).
 
-    `offsets_path` is where DCS writes them for that calibration (AppModel.camera_offsets_path),
-    read first; a library entry imported from an older folder may hold its own copy, read next.
+    `offsets_path` is the file DCS keeps in force for that calibration
+    (AppModel.camera_offsets_path), read first; a library entry imported from an older folder
+    may hold its own copy, read next.
 
     DCS calibration (Calibrate Coordinate System) writes camera_offsets.pkl later, from
     the raw diamond position it measures with this calibration, so a freshly made
@@ -626,9 +629,10 @@ def _load_camera_offsets(calib_dir: Path, offsets_path: Optional[Path] = None) -
     if path_offsets is None:
         logger.warning("%s has no %s; live 3D uses zero camera offsets until DCS writes one",
                        calib_dir, DEFAULT_CAM_OFFSET_FILE_NAME)
-        return {"x_off": 0.0, "y_off": 0.0, "z_off": 0.0}
-    with open(path_offsets, "rb") as fh:
-        return pickle.load(fh)
+        return {"x_off": 0.0, "y_off": 0.0, "z_off": 0.0}, None
+    data = path_offsets.read_bytes()
+    logger.info("live 3D camera offsets from %s", path_offsets)
+    return pickle.loads(data), {"name": path_offsets.name, "sha256": hashlib.sha256(data).hexdigest()}
 
 
 def _readable_index(folder: Path) -> Optional[CalibrationIndex]:
@@ -1188,6 +1192,8 @@ class AppModel(ObservableObject):
         self._active_calibration_format: Optional[Union[int, str]] = None
         self._calibration_unreadable: Optional[str] = None
         self._live_3d_setting: Optional[bool] = None
+        # {name, sha256} of the camera offsets file the active calibration loaded, None for zero offsets.
+        self._active_offsets_file: Optional[Dict[str, str]] = None
         # What the operator confirmed (SetupDifference.confirmable), for one recording start:
         # the start after acknowledge_setup_difference keeps it, any later start clears it.
         self._acknowledged_difference: Optional[Tuple[Tuple[str, ...], ...]] = None
@@ -2546,18 +2552,37 @@ class AppModel(ObservableObject):
             return False
 
     def camera_offsets_path(self, folder: Optional[Path] = None) -> Optional[Path]:
-        """Where DCS writes the camera offsets of the calibration in `folder` (the active one by default).
+        """The camera offsets file in force for the calibration in `folder` (the active one by default).
 
-        Beside a library entry, <library>/.offsets/<id>/camera_offsets.pkl, since nothing writes
-        inside an entry; in any other folder (a legacy folder or one given explicitly), inside
-        it, as before. None when there is no calibration.
+        For a library entry, the one library.current_offsets_path picks in
+        <library>/.offsets/<id>/ (the newest DCS run's), as offline does; None when DCS has
+        written none there yet. In any other folder (a legacy folder or one given explicitly),
+        <folder>/camera_offsets.pkl, as before. None when there is no calibration.
         """
         folder = self._active_calibration_dir if folder is None else Path(folder)
         if folder is None:
             return None
         if self._is_library_entry(folder):
-            return self.calibration_library_root / _LIBRARY_OFFSETS_DIR / folder.name / DEFAULT_CAM_OFFSET_FILE_NAME
+            return current_offsets_path(self.calibration_library_root, folder.name)
         return folder / DEFAULT_CAM_OFFSET_FILE_NAME
+
+    def write_camera_offsets(self, folder: Path, cam_offsets: Mapping[str, Any]) -> Path:
+        """Keep DCS's `cam_offsets` for the calibration in `folder`, and return the file.
+
+        For a library entry, a new <library>/.offsets/<id>/camera_offsets-<UTC time>.pkl, never
+        overwriting an earlier run's (library.write_offsets). In any other folder,
+        <folder>/camera_offsets.pkl, the previous one first copied to a dated backup, as before.
+        """
+        folder = Path(folder)
+        data = pickle.dumps(dict(cam_offsets))
+        if self._is_library_entry(folder):
+            return write_offsets(self.calibration_library_root, folder.name, data)
+        path = folder / DEFAULT_CAM_OFFSET_FILE_NAME
+        if path.exists():
+            backup = path.with_name(f"{path.name}_{datetime.now().strftime(DATE_TIME_FORMAT)}")
+            shutil.copy(path, backup)
+        path.write_bytes(data)
+        return path
 
     def reload_calib(self, calib_dir: Optional[Path]):
         """Load the 3D calibration in `calib_dir`, else the library's active one.
@@ -2615,6 +2640,7 @@ class AppModel(ObservableObject):
         calibration_format = None
         live_preset = None
         disabled_reason = None
+        offsets_file = None
         if calib_src_dir is None:
             # No active entry in the library: 2D only, and the reason recorded.
             stereo_params = None
@@ -2644,7 +2670,7 @@ class AppModel(ObservableObject):
             # The measured frame replaces the camera angles and the square size.
             calib_metadata = None
             square_size = None
-            cam_offsets = _load_camera_offsets(calib_src_dir, self.camera_offsets_path(calib_src_dir))
+            cam_offsets, offsets_file = _load_camera_offsets(calib_src_dir, self.camera_offsets_path(calib_src_dir))
             live_preset, disabled_reason = self._load_live_preset(calib_src_dir, calibration_index, report=report)
             if live_preset is None:
                 stereo_params = cam_names = None
@@ -2664,7 +2690,7 @@ class AppModel(ObservableObject):
             # A library entry is named by its id; the board is in the name it was imported from.
             square_size, _, _, _ = calibration_FLIR.get_calibration_info(legacy_folder_name(calib_src_dir))
             cam_names = calibration_FLIR.get_video_list(calib_src_dir.as_posix())
-            cam_offsets = _load_camera_offsets(calib_src_dir, self.camera_offsets_path(calib_src_dir))
+            cam_offsets, offsets_file = _load_camera_offsets(calib_src_dir, self.camera_offsets_path(calib_src_dir))
         else:
             stereo_params = None
             calib_metadata = None
@@ -2676,6 +2702,7 @@ class AppModel(ObservableObject):
         self._active_calibration_index = calibration_index
         self._active_calibration_format = calibration_format
         self._active_calibration_preset = None if live_preset is None else live_preset.geometry
+        self._active_offsets_file = offsets_file
         self._live_3d_disabled_reason = disabled_reason
         self._install_pose_algorithm(
             stereo_params=stereo_params,
@@ -2723,6 +2750,7 @@ class AppModel(ObservableObject):
             else None
         )
         self._active_calibration_preset = None
+        self._active_offsets_file = None
         self._live_3d_disabled_reason = f"could not load {folder}: {type(err).__name__}: {err}"
         # No camera is in a calibration that did not load, whatever its index says.
         self._calibration_unreadable = _unreadable_reason(folder, f"{type(err).__name__}: {err}")
@@ -3044,8 +3072,9 @@ class AppModel(ObservableObject):
         library entry), None outside it; folder is its absolute path at record time. preset
         is the name of the preset live 3D loaded, None for legacy. override is the latest
         override decision for the id in the library's decisions.jsonl, else the index's own.
-        cameras are the calibration's; matchesRecording and mismatch compare them with the
-        cameras recording (camera_setup_difference), None without a calibration, and
+        offsetsFile is {name, sha256} of the DCS camera offsets file loaded with it, None while
+        it has none (zero offsets). cameras are the calibration's; matchesRecording and
+        mismatch compare them with the cameras recording (camera_setup_difference), None without a calibration, and
         mismatchAcknowledged says the operator chose to record anyway. With live 3D off (no
         stereo parameters loaded) the calibration is still named, preset is None, and
         live3dDisabledReason says why, as the operator was told.
@@ -3099,6 +3128,7 @@ class AppModel(ObservableObject):
             "mismatchAcknowledged": bool(
                 difference is not None and difference.differs
                 and difference.confirmable == self._acknowledged_difference),
+            "offsetsFile": None if self._active_offsets_file is None else dict(self._active_offsets_file),
         }
         if self._pose_algorithm is None or self._pose_algorithm.stereo_params is None:
             record["preset"] = None

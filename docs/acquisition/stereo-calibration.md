@@ -393,11 +393,14 @@ the active calibration is not the one the DCS was measured against:
 To redo it, set System Mode to Running, move the pellet spoon to a typical
 delivery position with the Set and Send buttons, and choose **Tools → Calibrate
 Coordinate System**. DCS records the id of the calibration it was measured
-against in `diamond_triangle_offset.yaml` and writes fresh `camera_offsets.pkl`
-for the active calibration: beside a library entry, as
-`calibrations/.offsets/<id>/camera_offsets.pkl`, because an entry is never
-written to; inside the folder for a calibration folder given explicitly (the
-simulator's). That clears the out-of-date state and
+against in `diamond_triangle_offset.yaml` and writes fresh camera offsets
+for the active calibration: beside a library entry, as a new
+`calibrations/.offsets/<id>/camera_offsets-<UTC %Y%m%dT%H%M%SZ>.pkl`, because
+an entry is never written to; inside the folder, as `camera_offsets.pkl`, for a
+calibration folder given explicitly (the simulator's). Each run is its own file
+and none is overwritten; the newest by name is the one live 3D and offline
+analysis both read (`library.current_offsets_path`), and the session metadata
+names it, with its hash, as `calibration3d.offsetsFile`. That clears the out-of-date state and
 unblocks Record. A DCS saved before calibration ids existed has none, so it is
 out of date against any format-2 calibration. A legacy calibration has no id: a
 DCS without one is accepted with it, but a DCS that records an id was measured
@@ -468,6 +471,7 @@ calibrations/
   settings.yaml       library-wide switches (only the file is named here)
   scout_move_list.yaml  the automatic move list saved for a camera set (mutable)
   .derived/           anipose files derived on demand; never inside an entry
+  .offsets/<id>/      DCS's camera offsets for entry <id>, one file per DCS run
 ```
 
 - **An entry never changes.** A session records the calibration's id, so the
@@ -597,9 +601,12 @@ A format-3 folder, for any 2 to 6 cameras:
                             geometry; only when reference images were captured
 ```
 
-DCS's `camera_offsets.pkl` for a library entry is kept beside it, in
-`calibrations/.offsets/<id>/`. An entry imported from an older folder carries
-that folder's own `camera_offsets.pkl`, which is read when `.offsets` has none.
+DCS's camera offsets for a library entry are kept beside it, in
+`calibrations/.offsets/<id>/`, one `camera_offsets-<UTC time>.pkl` per DCS run;
+the newest by name is in force. A plain `camera_offsets.pkl` there, from before
+the files were versioned, is read when there is no versioned one. An entry
+imported from an older folder carries that folder's own `camera_offsets.pkl`,
+which is read when `.offsets` has none.
 
 - A camera that saw too little is listed in `cameras` with `calibrated: false`
   and its reason. It is in no `calibration.toml` and no preset set: it is 2D

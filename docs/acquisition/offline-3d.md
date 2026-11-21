@@ -160,7 +160,8 @@ DCS measured. When the session's calibration is a library entry, those offsets
 are found in this order:
 
 1. the library's `.offsets/<id>/`: the newest `camera_offsets-<UTC time>.pkl`
-   by name, else a plain `camera_offsets.pkl`;
+   by name, else a plain `camera_offsets.pkl` (`library.current_offsets_path`,
+   the same choice live 3D makes);
 2. the entry's own `camera_offsets.pkl`, which an imported legacy folder may
    have brought with it.
 

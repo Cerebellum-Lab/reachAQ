@@ -269,6 +269,7 @@ def test_metadata_schema_3_fields(app_model, tmp_path):
             "swapped": [{"name": "left", "calibratedSerial": "21000001", "recordedSerial": "21000099"}],
         },
         "mismatchAcknowledged": True,
+        "offsetsFile": None,  # DCS has not run against it yet
         "live3dDisabledReason": app_model._live_3d_disabled_reason,
         "live3d": {"enabled": True, "disabledReason": app_model._live_3d_disabled_reason},
     }

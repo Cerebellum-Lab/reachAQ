@@ -7,7 +7,9 @@ Under <config>/calibrations/ (library_root):
     decisions.jsonl     append-only: one JSON object per line, {event, id, at, ...}
     settings.yaml       library-wide switches; this module only names the file (settings_path)
     .derived/           the cache load_preset_set derives other geometries into, outside any entry
-    .offsets/<id>/      the camera offsets DCS measured against entry <id> (offsets_dir)
+    .offsets/<id>/      the camera offsets DCS measured against entry <id> (offsets_dir): one
+                        camera_offsets-<UTC %Y%m%dT%H%M%SZ>.pkl per DCS run, never overwritten;
+                        the newest by name is the current one (current_offsets_path)
 
 A session names its calibration by id, so an entry never changes once it is in place: it is
 copied into <id>.partial, its files and folders are flushed to disk, and it is renamed to
@@ -37,7 +39,7 @@ import os
 import shutil
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -59,7 +61,12 @@ ACTIVE_FILE = "active.yaml"
 DECISIONS_FILE = "decisions.jsonl"
 SETTINGS_FILE = "settings.yaml"
 DERIVED_DIR_NAME = ".derived"
+#: The one place the offsets store's folder name is defined; live and offline both use it.
 OFFSETS_DIR_NAME = ".offsets"
+#: DCS's camera offsets file; prepare_jetson_data.DEFAULT_CAM_OFFSET_FILE_NAME is the same name.
+OFFSETS_FILE_NAME = "camera_offsets.pkl"
+#: The UTC time in a DCS run's own offsets file, camera_offsets-<time>.pkl; it sorts by name.
+OFFSETS_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 
 _PARTIAL_SUFFIX = ".partial"
 _LEGACY_PICKLE = Path("camera_matrix", "stereo_params.pickle")
@@ -118,6 +125,53 @@ def derived_root(root: Path) -> Path:
 def offsets_dir(root: Path, calibration_id: str) -> Path:
     """Where the camera offsets DCS measured against entry `calibration_id` are kept, beside it."""
     return Path(root) / OFFSETS_DIR_NAME / calibration_id
+
+
+def current_offsets_path(root: Path, calibration_id: str) -> Optional[Path]:
+    """The camera offsets in force for entry `calibration_id`: the newest
+    camera_offsets-<UTC time>.pkl in its .offsets folder by name, else a plain
+    camera_offsets.pkl there (written before the files were versioned), else None.
+
+    Live 3D (AppModel.camera_offsets_path) and offline (prepare_jetson_data) both pick the
+    file here, so they read the same one. An entry's own camera_offsets.pkl, which an
+    imported legacy folder may have, is the callers' fallback after this.
+    """
+    folder = offsets_dir(root, calibration_id)
+    stem, suffix = os.path.splitext(OFFSETS_FILE_NAME)
+    try:
+        stamped = sorted(p for p in folder.glob(f"{stem}-*{suffix}") if p.is_file())
+    except OSError:
+        stamped = []
+    if stamped:
+        return stamped[-1]
+    plain = folder / OFFSETS_FILE_NAME
+    return plain if plain.is_file() else None
+
+
+def write_offsets(root: Path, calibration_id: str, data: bytes, *, now: Optional[datetime] = None) -> Path:
+    """Keep `data` (a pickled offsets dict) as a new camera_offsets-<UTC time>.pkl of entry
+    `calibration_id`, and return it; it becomes current_offsets_path. No file is ever
+    overwritten: a name already taken (two runs in one second) takes the next second, so the
+    name order stays the time order. The file is written whole (temp file, then rename)."""
+    folder = offsets_dir(root, calibration_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    when = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0)
+    stem, suffix = os.path.splitext(OFFSETS_FILE_NAME)
+    current = current_offsets_path(root, calibration_id)
+    if current is not None and current.name != OFFSETS_FILE_NAME:
+        # Never before the current file in name order (a clock set back), which would hide the new one.
+        try:
+            newest = datetime.strptime(current.name[len(stem) + 1:-len(suffix)], OFFSETS_STAMP_FORMAT)
+            when = max(when, newest.replace(tzinfo=timezone.utc) + timedelta(seconds=1))
+        except ValueError:
+            pass
+    path = folder / f"{stem}-{when.strftime(OFFSETS_STAMP_FORMAT)}{suffix}"
+    while path.exists():
+        when += timedelta(seconds=1)
+        path = folder / f"{stem}-{when.strftime(OFFSETS_STAMP_FORMAT)}{suffix}"
+    _replace_bytes(path, data)
+    logger.info("kept the camera offsets of calibration %s as %s", calibration_id, path)
+    return path
 
 
 def entry_library(folder: Path) -> Optional[Path]:
