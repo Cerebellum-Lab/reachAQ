@@ -8,6 +8,7 @@ that is not a number in the field's range is refused beside the field and not sa
 Per-camera overrides stay in the YAML.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Dict, Mapping, Optional, Tuple
 
@@ -53,13 +54,15 @@ class Field:
 
     def parse(self, text: str) -> Tuple[bool, Optional[float]]:
         """(valid, value) for `text`: a number of the field's kind within its range, or empty
-        for an optional field (None)."""
+        for an optional field (None). Never raises: "inf" and "nan" are invalid."""
         text = text.strip()
         if not text:
             return self.optional, None
         try:
             value = float(text)
         except ValueError:
+            return False, None
+        if not math.isfinite(value):
             return False, None
         if self.kind is int:
             if value != int(value):

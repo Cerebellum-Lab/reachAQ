@@ -1198,12 +1198,15 @@ class MainWindow(QMainWindow):
         """Make library entry `calibration_id` the active calibration and load it
         (AppModel.set_active_calibration, under the session lock).
 
-        Returns None, or why it was not set or not loaded. Once the pointer names it, the
-        monthly reminder's label is reset, as after an install.
+        Returns None, or why it was not set or not loaded. When it was set active, the
+        monthly reminder's label is reset, as after an install, even if it then could not be
+        loaded; a refused call leaves the label as it was.
         """
         app_model = self._app_model
+        before = library.pointer_id(app_model.calibration_library_root)
         refusal = app_model.set_active_calibration(calibration_id)
-        if refusal is None or library.pointer_id(app_model.calibration_library_root) == calibration_id:
+        moved = before != calibration_id and library.pointer_id(app_model.calibration_library_root) == calibration_id
+        if refusal is None or moved:
             self._set_calibration_due_label(None)
         if refusal is not None:
             return refusal

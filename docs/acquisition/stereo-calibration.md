@@ -253,13 +253,15 @@ made, its cameras, its verdict, which one is **active**, and the cameras it left
 **2D only**, each with its reason, in red.
 
 - **Set active** makes the selected calibration the active one and loads it at
-  once, as an install does, and clears the monthly reminder's status-bar label.
+  once, as an install does, and clears the monthly reminder's status-bar label;
+  a refused set active leaves the label as it was.
   It is a configuration change, made under the same lock as Record, Stop and
   Abort, so no session can start while it writes and loads. It is refused with
   "set active is not possible while <state>" whenever the session is not Ready
   (arming, recording, stopping, analyzing or aborting) and while a 3D calibration
-  or the coordinate-system calibration runs; a calibration that cannot be found
-  or written is refused the same way, as a message. The menu item is unavailable
+  or the coordinate-system calibration runs. A calibration that cannot be found
+  or written is refused with "<id8> was not set active: <error>", the first 8
+  characters of its id and the library's error. The menu item is unavailable
   then too, and while the acquisition starts or stops, the hardware refreshes,
   the NI-DAQ is searched for or a laser calibration runs. It is recorded in `decisions.jsonl` like any
   other change of the active calibration, and a DCS measured against another

@@ -606,6 +606,10 @@ def test_empty_p95_saves_null(app_model):
     ("pose_consistency", "min_frames", "300.5"),
     ("pose_consistency", "p95_px", "0.5"),
     ("pose_consistency", "min_observations", "0"),
+    # Not finite: refused beside the field, never raised out of the slot.
+    ("pose_consistency", "min_frames", "inf"),
+    ("pose_consistency", "min_observations", "nan"),
+    ("pose_consistency", "median_px", "-inf"),
 ])
 def test_invalid_value_not_saved(app_model, check, key, text):
     ui = _checks_ui(app_model)

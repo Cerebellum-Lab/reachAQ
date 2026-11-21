@@ -310,6 +310,29 @@ def test_set_active_from_the_library_goes_through_the_app_model_and_resets_the_d
     assert calls == ["a" * 32, "c" * 32]
 
 
+def test_a_refused_set_active_of_the_active_entry_keeps_the_due_label(tmp_path, monkeypatch):
+    pointer = ["c" * 32]
+    answers = {"c" * 32: "set active is not possible while recording",
+               "d" * 32: "Set active, but it could not be loaded: broken. Restart the app."}
+    labels = []
+
+    def set_active(calibration_id):
+        if calibration_id == "d" * 32:
+            pointer[0] = calibration_id  # written, then the load failed
+        return answers[calibration_id]
+
+    app_model = SimpleNamespace(calibration_library_root=tmp_path, dcs_state=None, set_active_calibration=set_active)
+    window = SimpleNamespace(_app_model=app_model, _set_calibration_due_label=labels.append)
+    monkeypatch.setattr(main_window_module.library, "pointer_id", lambda root: pointer[0])
+
+    # Refused while recording: the pointer already named it, and the reminder stays.
+    assert MainWindow._set_active_calibration(window, "c" * 32) == answers["c" * 32]
+    assert labels == []
+    # Set active, then not loaded: the pointer moved, so the reminder of the old one goes.
+    assert MainWindow._set_active_calibration(window, "d" * 32) == answers["d" * 32]
+    assert labels == [None]
+
+
 def test_the_count_uses_the_right_plural():
     dialog = CalibrationDialog(_rig())
     assert dialog.count_text() == "3 cameras ticked"
