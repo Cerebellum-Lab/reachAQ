@@ -12,10 +12,17 @@ when value < warn. Every Metric records which way it grades (lower_is_worse), so
 JSON reads on its own and `thresholds` keeps the plain (warn, fail) shape.
 
 A value that cannot be determined (a parameter the capture does not fix, a stereo check
-with no waypoint seen by both cameras) is +inf with a note, never NaN, and takes the worst
+with no waypoint seen by both cameras of a pair) is +inf with a note, never NaN, and takes the worst
 status its thresholds allow: an undetermined quantity cannot pass a check. JSON has no
 infinity, so non-finite floats are written as the strings "inf", "-inf" and "nan", which
 keeps the file strict JSON, and from_json turns them back into floats.
+
+The one exception is the cross-camera triangulation check (loo_triangulation_px). A camera
+with no waypoint that two other fitted cameras also saw cannot be checked that way, which
+is a property of where the cameras look, not a fault of the calibration. Its metric has
+status UNDETERMINED and value None: it is neither a pass nor a fail and does not enter the
+verdict. When no camera can be checked (always so with 2 fitted cameras), the report's
+verdict_note says so, so the verdict does not read as a fully checked pass.
 
 The fit has 2 to 6 cameras. Per-camera metrics are graded for every fitted camera, and the
 pair metrics for every co-visible pair (two cameras that saw the board at a common
@@ -115,7 +122,17 @@ VERIFIED_NOTE = "verified: the motor reported the commanded position, not a trac
 # The first lines of the text report, one per camera the calibration left out.
 NOT_CALIBRATED = "NOT CALIBRATED (2D only)"
 
+# The status of a cross-camera triangulation check that is not possible for a camera.
+UNDETERMINED = "undetermined"
+LOO_UNDETERMINED_NOTE = (
+    "triangulation check not possible: no other two cameras saw the board at the same positions"
+)
+
 _STATUS_ORDER = ("fail", "warn", "pass")
+# The order of the text report's metric lines: an undetermined check comes before the passes.
+_DISPLAY_ORDER = ("fail", "warn", UNDETERMINED, "pass")
+# The verdict as the verdict note words it.
+_VERDICT_WORDS = {"pass": "passed", "warn": "warn", "fail": "fail"}
 # The coverage mask is rasterised at 1/4 of sensor resolution: one mask pixel is 16 sensor
 # px^2, and the rasteriser's boundary error of up to one mask pixel per edge is under 1 %
 # of a 1024 px ROI.
@@ -133,11 +150,11 @@ _NON_FINITE = {"inf": math.inf, "-inf": -math.inf, "nan": math.nan}
 class Metric:
     name: str
     camera: Optional[str]
-    value: float
+    value: Optional[float]  # None only when status is UNDETERMINED
     unit: str
     warn: Optional[float]
     fail: Optional[float]
-    status: str  # "pass", "warn" or "fail"
+    status: str  # "pass", "warn", "fail", or UNDETERMINED (not graded)
     note: str = ""
     lower_is_worse: bool = False
 
@@ -163,11 +180,15 @@ class QualityReport:
     override: Optional[dict] = None  # the operator's confirmation to install despite a fail
     # Every capture camera in capture order; empty in a report written before 2026-11-20.
     cameras: Dict[str, CameraVerdict] = field(default_factory=dict)
+    # Said with the verdict when no camera could have the cross-camera triangulation check,
+    # e.g. "passed; cross-camera triangulation check not possible with 2 cameras"; else "".
+    verdict_note: str = ""
 
     def to_json(self) -> str:
         data = {
             "created": self.created,
             "verdict": self.verdict,
+            "verdict_note": self.verdict_note,
             "metrics": [asdict(m) for m in self.metrics],
             "thresholds": {name: list(limits) for name, limits in self.thresholds.items()},
             "notes": list(self.notes),
@@ -183,7 +204,7 @@ class QualityReport:
             Metric(
                 name=m["name"],
                 camera=m["camera"],
-                value=_decode_float(m["value"]),
+                value=None if m["value"] is None else _decode_float(m["value"]),
                 unit=m["unit"],
                 warn=_decode_limit(m["warn"]),
                 fail=_decode_limit(m["fail"]),
@@ -203,6 +224,7 @@ class QualityReport:
             thresholds=thresholds,
             notes=list(data["notes"]),
             override=data.get("override"),
+            verdict_note=data.get("verdict_note", ""),
             cameras={
                 name: CameraVerdict(name=v["name"], calibrated=bool(v["calibrated"]), reason=v["reason"])
                 for name, v in (data.get("cameras") or {}).items()
@@ -212,22 +234,23 @@ class QualityReport:
     def to_text(self) -> str:
         """A summary for the operator: every camera that is not calibrated, then the verdict,
         then every metric, failures first."""
-        counts = {s: sum(m.status == s for m in self.metrics) for s in _STATUS_ORDER}
+        counts = {s: sum(m.status == s for m in self.metrics) for s in _DISPLAY_ORDER}
+        undetermined = f", {counts[UNDETERMINED]} {UNDETERMINED}" if counts[UNDETERMINED] else ""
         lines = [f"{NOT_CALIBRATED}: {v.name}: {v.reason}" for v in self.cameras.values() if not v.calibrated]
-        lines += [
+        verdict_line = (
             f"3D calibration quality: {self.verdict.upper()}"
-            f" ({counts['fail']} fail, {counts['warn']} warn, {counts['pass']} pass; created {self.created})"
-        ]
+            f" ({counts['fail']} fail, {counts['warn']} warn, {counts['pass']} pass{undetermined};"
+            f" created {self.created})"
+        )
+        lines.append(f"{verdict_line} - {self.verdict_note}" if self.verdict_note else verdict_line)
         if self.override:
             details = ", ".join(f"{key} {value}" for key, value in self.override.items())
             lines.append(f"Override recorded: {details}")
         lines.append("")
         # sorted is stable, so metrics of one status keep the order they were graded in.
-        for m in sorted(self.metrics, key=lambda m: _STATUS_ORDER.index(m.status)):
-            line = (
-                f"{m.status.upper():<6}{m.name:<30}{m.camera or '-':<7}"
-                f"{_format_value(m.value)} {m.unit}  [{_format_limits(m)}]"
-            )
+        for m in sorted(self.metrics, key=lambda m: _DISPLAY_ORDER.index(m.status)):
+            value = "-" if m.value is None else f"{_format_value(m.value)} {m.unit}"
+            line = f"{m.status.upper():<5} {m.name:<30}{m.camera or '-':<7}{value}  [{_format_limits(m)}]"
             lines.append(f"{line}  {m.note}" if m.note else line)
         if self.notes:
             lines.append("")
@@ -289,7 +312,9 @@ def build_report(
 
     `cameras` is every capture camera's verdict, in capture order; a fitted camera it leaves
     out is calibrated, and by default every fitted camera is. The verdict is "fail" if any
-    metric fails, else "warn" if any warns or any camera is not calibrated, else "pass".
+    metric fails, else "warn" if any warns or any camera is not calibrated, else "pass". An
+    UNDETERMINED triangulation check is neither: it does not enter the verdict, and when
+    every camera's is undetermined (always so with 2 fitted cameras) verdict_note says so.
     """
     missing = sorted(set(DEFAULT_THRESHOLDS) - set(thresholds))
     if missing:
@@ -365,10 +390,17 @@ def build_report(
         add("baseline_mm", None, math.inf, "mm", stereo_note)
         add("epipolar_error_px", None, math.inf, "sensor px", stereo_note)
         add("square_size_rel_error", None, math.inf, "ratio", stereo_note)
+    loo_checked = False
     if len(fitted) >= 3:
         for cam in fitted:
             loo, loo_note = _leave_one_out(fit, observations, cam)
-            add("loo_triangulation_px", cam, loo, "sensor px", loo_note)
+            if loo is None:
+                warn, fail = (_as_limit(limit) for limit in thresholds["loo_triangulation_px"])
+                metrics.append(Metric("loo_triangulation_px", cam, None, "sensor px", warn, fail, UNDETERMINED,
+                                      LOO_UNDETERMINED_NOTE))
+            else:
+                loo_checked = True
+                add("loo_triangulation_px", cam, loo, "sensor px", loo_note)
     add("motor_scale_dev", None, abs(fit.motor_scale - 1.0), "ratio")
     for check in cross_checks:
         add("cross_check_delta_px", None, check.max_intrinsic_delta_px, "preset px", f"preset {check.geometry.name}")
@@ -387,6 +419,10 @@ def build_report(
     if any(not v.calibrated for v in verdicts.values()):
         statuses.add("warn")  # a 2D-only camera never leaves the calibration a plain pass
     verdict = next((s for s in _STATUS_ORDER if s in statuses), "pass")
+    verdict_note = ""
+    if not loo_checked and len(fitted) >= 2:
+        where = "with 2 cameras" if len(fitted) == 2 else "for any camera"
+        verdict_note = f"{_VERDICT_WORDS[verdict]}; cross-camera triangulation check not possible {where}"
     return QualityReport(
         created=datetime.now().astimezone().isoformat(timespec="seconds"),
         verdict=verdict,
@@ -394,6 +430,7 @@ def build_report(
         thresholds={name: (_as_limit(warn), _as_limit(fail)) for name, (warn, fail) in thresholds.items()},
         notes=notes,
         cameras=verdicts,
+        verdict_note=verdict_note,
     )
 
 
@@ -552,7 +589,7 @@ def _stereo_checks(fit: MotorFrameFit, observations, board: BoardSpec, first: st
         np.linalg.norm(grid[:, 1:, :] - grid[:, :-1, :], axis=-1).ravel(),  # down each column
     ])
     square = abs(float(steps.mean()) - board.square_mm) / board.square_mm
-    return epipolar, square, f"{len(both)} waypoints with both cameras"
+    return epipolar, square, f"{len(both)} waypoints with {first} and {second}"
 
 
 def _change_metrics(fit: MotorFrameFit, previous: MotorFrameFit, add: Callable[..., Metric]) -> List[str]:
@@ -591,11 +628,11 @@ def _change_metrics(fit: MotorFrameFit, previous: MotorFrameFit, add: Callable[.
     return notes
 
 
-def _leave_one_out(fit: MotorFrameFit, observations, cam: str) -> Tuple[float, str]:
+def _leave_one_out(fit: MotorFrameFit, observations, cam: str) -> Tuple[Optional[float], str]:
     """(median px, note): over every corner of every waypoint where `cam` and at least two
     other fitted cameras found the board, the distance between `cam`'s corner and the point
     the others triangulate (each undistorted, then a linear DLT), projected through `cam`'s
-    model. Infinite when no waypoint has two others."""
+    model. (None, "") when no waypoint has two others: the check is undetermined."""
     others = [c for c in fit.cameras if c != cam]
     model = fit.cameras[cam]
     distances, waypoints = [], 0
@@ -609,7 +646,7 @@ def _leave_one_out(fit: MotorFrameFit, observations, cam: str) -> Tuple[float, s
         distances.append(np.linalg.norm(projected - np.asarray(o.corners[cam], float), axis=1))
         waypoints += 1
     if not distances:
-        return math.inf, f"no waypoint where {cam} found the board has it in two other cameras"
+        return None, ""
     return float(np.median(np.concatenate(distances))), f"{waypoints} waypoints with {cam} and 2 or more others"
 
 

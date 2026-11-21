@@ -20,8 +20,11 @@ import pytest
 
 from autotrainer.inference.multires_calibration.fit import WaypointObservation, fit_motor_frame
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
+from autotrainer.inference.multires_calibration.pipeline import per_camera_rule
 from autotrainer.inference.multires_calibration.report import (
     DEFAULT_THRESHOLDS,
+    LOO_UNDETERMINED_NOTE,
+    UNDETERMINED,
     CameraVerdict,
     CaptureSummary,
     PresetCrossCheck,
@@ -627,3 +630,84 @@ def test_a_report_written_before_the_camera_verdicts_still_loads(rig, fitted):
     data = json.loads(report.to_json())
     del data["cameras"]
     assert QualityReport.from_json(json.dumps(data)).cameras == {}
+
+
+def verdict_line(report):
+    (line,) = [line for line in report.to_text().splitlines() if line.startswith("3D calibration quality:")]
+    return line
+
+
+def test_two_camera_good_capture_passes_with_note(rig, fitted):
+    # With 2 cameras no camera can be checked against points the other two triangulate: the
+    # calibration passes, and says it was not checked that way.
+    report = report_for(fitted, rig.observations, rig.board, swept_roi(rig.observations))
+    note = "passed; cross-camera triangulation check not possible with 2 cameras"
+    assert report.verdict == "pass", not_passing(report)
+    assert report.verdict_note == note
+    assert verdict_line(report).startswith("3D calibration quality: PASS (")
+    assert verdict_line(report).endswith(f" - {note}")
+    assert json.loads(report.to_json())["verdict_note"] == note
+    assert QualityReport.from_json(report.to_json()) == report
+    # The note follows the verdict: a fail says fail.
+    failing = report_for(fitted, rig.observations, rig.board, swept_roi(rig.observations),
+                         capture=capture_for(rig.observations, unreached=1))
+    assert failing.verdict_note == "fail; cross-camera triangulation check not possible with 2 cameras"
+    # A report written before the note still loads, without one.
+    data = json.loads(report.to_json())
+    del data["verdict_note"]
+    assert QualityReport.from_json(json.dumps(data)).verdict_note == ""
+
+
+def test_chain_topology_is_not_failed_by_loo():
+    # C sees 0-15, B all 37, A 16-36: every waypoint has exactly two cameras, so no camera
+    # can be checked against two others. Each camera still meets the per-camera rule.
+    seen = {"cam_c": range(16), "cam_b": range(37), "cam_a": range(16, 37)}
+    cameras = ("cam_a", "cam_b", "cam_c")
+    chain = synthetic_rig(cameras=cameras, seen=seen, noise_px=0.1)
+    verdicts = per_camera_rule(chain.observations, cameras)
+    assert all(v.calibrated for v in verdicts.values()), verdicts
+    fit = fit_motor_frame(chain.observations, chain.board, IMAGE_SIZE, cameras)
+
+    report = report_for(fit, chain.observations, chain.board, swept_roi(chain.observations), cameras=verdicts)
+
+    assert report.verdict != "fail", not_passing(report)
+    loo = [m for m in report.metrics if m.name == "loo_triangulation_px"]
+    assert [m.camera for m in loo] == list(cameras)
+    assert all(m.status == UNDETERMINED and m.value is None and m.note == LOO_UNDETERMINED_NOTE for m in loo)
+    word = {"pass": "passed", "warn": "warn"}[report.verdict]
+    assert report.verdict_note == f"{word}; cross-camera triangulation check not possible for any camera"
+    assert verdict_line(report).endswith(f" - {report.verdict_note}")
+
+
+def test_undetermined_loo_is_shown_and_not_a_pass():
+    # left sees every waypoint, right and top 0-18 with it, camera4 19-36 with left alone:
+    # camera4 cannot be checked, the other three can.
+    cameras = ("left", "right", "top", "camera4")
+    seen = {"right": range(19), "top": range(19), "camera4": range(19, 37)}
+    four = synthetic_rig(cameras=cameras, seen=seen, noise_px=0.0)
+
+    report = report_for(four.truth, four.observations, four.board, swept_roi(four.observations))
+
+    undetermined = metric(report, "loo_triangulation_px", "camera4")
+    assert undetermined.status == UNDETERMINED and undetermined.status != "pass"
+    assert undetermined.value is None
+    assert undetermined.note == LOO_UNDETERMINED_NOTE
+    assert (undetermined.warn, undetermined.fail) == DEFAULT_THRESHOLDS["loo_triangulation_px"]
+    for cam in ("left", "right", "top"):
+        assert metric(report, "loo_triangulation_px", cam).status == "pass"
+    # Some cameras were checked, so the verdict carries no note, and the undetermined check
+    # does not enter it: the verdict is the warn of the 18 and 19 views kept alone.
+    assert report.verdict_note == ""
+    assert report.verdict == "warn"
+    assert {(name, status) for name, _, _, status in not_passing(report)} == {
+        ("views_kept", "warn"), ("loo_triangulation_px", UNDETERMINED)}
+    # The text shows it, as undetermined with no value, and counts it apart from the passes.
+    lines = report.to_text().splitlines()
+    (line,) = [line for line in lines if "loo_triangulation_px" in line and "camera4" in line]
+    assert line.startswith("UNDETERMINED loo_triangulation_px") and LOO_UNDETERMINED_NOTE in line
+    assert ", 1 undetermined;" in verdict_line(report)
+    # It survives the JSON as null, not as a number.
+    data = json.loads(report.to_json())
+    (saved,) = [m for m in data["metrics"] if m["name"] == "loo_triangulation_px" and m["camera"] == "camera4"]
+    assert saved["value"] is None and saved["status"] == UNDETERMINED
+    assert QualityReport.from_json(report.to_json()) == report
