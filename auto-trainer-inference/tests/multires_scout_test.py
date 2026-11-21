@@ -57,9 +57,9 @@ def _off_axis(model: CameraModel, centre, angle_deg: float) -> CameraModel:
 
 
 @pytest.fixture(scope="module")
-def scene():
+def cameras():
+    """(the rig, the scout grid, camera name -> model) for the good cameras and the three failing ones."""
     rig = synthetic_rig(cameras=GOOD)
-    board = rig.board
     grid = scout_grid(BOX, counts=COUNTS)
     models = dict(rig.truth.cameras)
     centre = np.mean([rig.world_corners(p) for p in grid], axis=(0, 1))
@@ -67,14 +67,21 @@ def scene():
     models["aimed_off"] = _shifted(models["camera4"], SIZE[0] / 2)
     models["grazing"] = _off_axis(models["left"], centre, 65.0)
     models["blurred"] = models["left"]
+    return rig, grid, models
+
+
+def _render(rig, models, name, point):
+    gray = render_board_frame(models[name], rig.world_corners(point), SIZE, rig.board)
+    return cv2.GaussianBlur(gray, (0, 0), FOCUS_SIGMA) if name == "blurred" else gray
+
+
+@pytest.fixture(scope="module")
+def scene(cameras):
+    rig, grid, models = cameras
     views = {i: {} for i in range(len(grid))}
     for i, point in enumerate(grid):
-        X = rig.world_corners(point)
-        for name, model in models.items():
-            gray = render_board_frame(model, X, SIZE, board)
-            if name == "blurred":
-                gray = cv2.GaussianBlur(gray, (0, 0), FOCUS_SIGMA)
-            views[i][name] = scout_view(name, gray, board)
+        for name in models:
+            views[i][name] = scout_view(name, _render(rig, models, name, point), rig.board)
     return grid, views
 
 
@@ -233,3 +240,87 @@ def test_saved_list_reused_only_for_same_serials(tmp_path):
 
 def test_scout_move_list_lives_in_the_library(tmp_path):
     assert scout.scout_move_list_path(tmp_path) == tmp_path / "calibrations" / "scout_move_list.yaml"
+
+
+VIDEO_POINTS = (0, 1, 4, 9)  # grid indices: a few points, each one axis from the one before in the grid
+STILL_FRAMES, MOVING_FRAMES, FPS = 6, 2, 40.0
+
+
+def test_views_from_a_scout_capture_take_each_dwell_by_time(cameras, tmp_path):
+    rig, grid, models = cameras
+    names = ("left", "right", "aimed_off")
+    points = [grid[i] for i in VIDEO_POINTS]
+    t0, step = 5000.0, 1.0 / FPS
+    videos, frame_times, dwells = {}, {}, []
+    for n, name in enumerate(names):
+        path = tmp_path / f"{name}.mp4"
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), FPS, SIZE, isColor=False)
+        assert writer.isOpened()
+        times, k = [], 0
+        for p, point in enumerate(points):
+            if p > 0:  # the stage moving: half way, so these frames hold another board position
+                between = (np.asarray(points[p - 1]) + np.asarray(point)) / 2
+                for _ in range(MOVING_FRAMES):
+                    writer.write(_render(rig, models, name, between))
+                    times.append(t0 + k * step)
+                    k += 1
+            still = _render(rig, models, name, point)
+            first = k
+            for _ in range(STILL_FRAMES):
+                writer.write(still)
+                times.append(t0 + k * step)
+                k += 1
+            if n == 0:
+                dwells.append((t0 + first * step - 0.001, t0 + (k - 1) * step + 0.001))
+        writer.release()
+        videos[name] = path
+        frame_times[name] = times
+
+    views = scout.scout_views_from_capture(videos, frame_times, points, dwells, rig.board)
+
+    assert set(views) == set(range(len(points)))
+    for p, i in enumerate(VIDEO_POINTS):
+        for name in ("left", "right"):
+            assert views[p][name].found, (p, name)
+            truth = cv2.projectPoints(rig.world_corners(grid[i]), models[name].rvec, models[name].tvec,
+                                      models[name].K, np.zeros(5))[0].reshape(-1, 2)
+            # The middle still frame, not a moving one: within a pixel, in either corner order.
+            err = min(np.abs(views[p][name].corners - truth).max(), np.abs(views[p][name].corners[::-1] - truth).max())
+            assert err < 1.0, (p, name, err)
+        assert not views[p]["aimed_off"].found and views[p]["aimed_off"].touches_edge == "right"
+    assert scout.video_sizes(videos) == {name: SIZE for name in names}
+
+    # A dwell with no frame in it is a view that found nothing.
+    late = dwells[:-1] + [(t0 + 100.0, t0 + 101.0)]
+    views = scout.scout_views_from_capture({"left": videos["left"]}, {"left": frame_times["left"]}, points, late,
+                                           rig.board)
+    assert views[len(points) - 1]["left"] == ScoutView("left", False, None, None, None, False)
+
+
+def test_the_ordered_path_is_capped_at_60_waypoints():
+    # Every point of a 4 x 4 x 3 grid seen by two cameras; a selection taken out of grid order
+    # needs inserted one-axis points between its picks.
+    grid = scout_grid(BOX)
+    rng = np.random.default_rng(1)
+    views = {i: {c: ScoutView(c, True, rng.uniform(0, 1000, (48, 2)), None, 0.78, True) for c in ("a", "b")}
+             for i in range(len(grid))}
+
+    selection, path = scout.choose_move_list(grid, views, ["a", "b"], max_path=60)
+    assert len(path) <= 60
+    for a, b in zip(path, path[1:]):
+        assert sum(u != v for u, v in zip(a, b)) == 1
+    assert set(selection.points) <= set(path) and path == order_path(selection.points)
+
+    selection, path = scout.choose_move_list(grid, views, ["a", "b"], max_path=20)
+    assert len(path) <= 20 and len(selection.points) < 20
+    uncapped = select_waypoints(grid, views, ["a", "b"])
+    assert len(order_path(uncapped.points)) > 20  # so the cap had something to do
+    for a, b in zip(path, path[1:]):
+        assert sum(u != v for u, v in zip(a, b)) == 1
+
+
+def test_configured_bounds_come_from_the_library_setting():
+    assert scout.configured_bounds({}) is None
+    assert scout.configured_bounds({"scoutBounds": {"lo": [0, 1, 2], "hi": [3, 4, 5]}}) == Bounds((0, 1, 2), (3, 4, 5))
+    assert scout.configured_bounds({"scoutBounds": {"lo": [0, 1], "hi": [3, 4, 5]}}) is None
+    assert scout.configured_bounds({"scoutBounds": "wide"}) is None

@@ -150,9 +150,78 @@ tooltip. **Start** is available only with 2 to 6 cameras ticked; **Cancel**
 starts nothing. The cameras are captured in camera-list order with the
 configured primary first.
 
-- **Move list**: *hand-written* is the only choice for now; *automatic (scout)*
-  is shown but not available yet.
+- **Move list**: *automatic (scout)*, the default, chooses the waypoints from a
+  scout pass before the capture (see [Automatic move list](#automatic-move-list));
+  *hand-written* is the fixed list of 37 waypoints described under Steps.
 - **Capture reference images** is shown but not available yet.
+
+### Automatic move list
+
+With *automatic (scout)* ticked, the stage first runs a short **scout pass**, and
+the capture then visits waypoints chosen from what each camera saw.
+
+**What the stage can do.** It moves the board in x, y and z and never tilts it.
+Every view of the board is therefore a parallel plane: angle variety comes only
+from seeing the board at different places across each camera's image, and
+depth (z) spread separates focal length from distance. A camera that looks at
+the board nearly edge-on sees it foreshortened wherever the stage puts it, and
+only re-aiming the camera helps.
+
+**The scout pass.**
+
+1. **Grid.** 4 x 4 x 3 = 48 points evenly spaced inside the box the hand-written
+   list already travels (its commanded motor positions, after the lower-limit
+   clamp; about x 0-17.7, y 0.1-25.1, z 19.8-32.8 mm on christielab10). The box
+   is never widened. An optional `scoutBounds` entry in the library's
+   `settings.yaml`, `{lo: [x, y, z], hi: [x, y, z]}` in motor mm, can narrow it.
+   The points are visited in serpentine order, so every move is one axis.
+2. **Short capture.** The scout records like the capture itself (same camera
+   settings, TRIGGER mode, home first), pausing 0.3 s at each point after the
+   usual settle at the configured speed. Nothing changes a speed, a limit or the
+   firmware. The scout **stops at once**, with the stage where it stopped, on a
+   motor driver fault, a command that is not acknowledged (as on a CAN error),
+   or a point the motor does not report reaching; the calibration then fails
+   with that reason. Its videos and timestamps are kept in the session as
+   `scout/source_videos/`.
+3. **Detection.** For each point, the middle frame of its pause (by the logged
+   times, column 0 of the timestamps file) is searched for the board, per
+   camera. On christielab10 the 48 settles (0.45-0.59 s each) and pauses add
+   about 40 s, before the cameras' start and stop and the detection.
+4. **Choice.** Up to 36 of the points that two or more cameras saw are chosen,
+   in turn: joining every camera to the others through shared views; giving
+   each camera 12 or more views that span all three axes; spreading each
+   camera's board corners over its image (a 4 x 4 grid of cells); then spreading
+   the points out. They are ordered into a short path, with a point added
+   wherever two in a row differ in more than one axis, so each move is one axis.
+   Those added points are waypoints too. The path is at most 60 waypoints; a
+   longer one is chosen again with fewer points.
+5. **Fallback.** With fewer than 12 points chosen, the capture uses the
+   hand-written list, and the log says so.
+
+**Advice before the capture.** When a camera found the board at fewer than 12
+points, or sees it at a grazing angle, a window lists each such camera with what
+to fix, and offers **Continue** or **Cancel**. Cancel captures nothing. Continue
+captures, and that camera ends up 2D only (see
+[A camera that saw too little: 2D only](#a-camera-that-saw-too-little-2d-only)).
+The messages are:
+
+| message | what it means |
+|---|---|
+| `board cut off at the <left/right/top/bottom> edge at <n> of <m> points: aim the camera towards that side or move the board start` | at most points, the board pattern reaches that image edge and is not detected |
+| `board in frame but never detected: check focus at the board distance, then lighting and exposure` | the board pattern is in view but the detector cannot read it: blur, low contrast or darkness |
+| `board seen at a grazing angle (aspect <a> vs 0.78): aim the camera more face-on; the stage cannot tilt the board` | the board is detected, but its median aspect (short side over long side of the whole 9 x 7-square board) is far from 7:9; the board foreshortened by more than about a 45-50 degree view |
+| `board never in view: the camera points elsewhere or the scout bounds miss its view` | no board pattern at any point |
+
+"Board pattern" is a local-contrast test, not a detection: other high-contrast
+texture in view can count as board, and a very dark image can count as none.
+
+**Saved list.** When every camera passed, the chosen list is saved as
+`calibrations/scout_move_list.yaml` with the date and the cameras' serials (a
+camera without one by name). The next automatic calibration with exactly the
+same cameras uses it without scouting, as long as every point is still inside
+today's hand-written box (a redone DCS can move it). Ticking a different set of
+cameras, or deleting the file, scouts again. If a camera was re-aimed without
+being swapped, delete the file or the saved list is reused.
 
 ### The calibration library
 
@@ -271,6 +340,8 @@ The capture creates a session folder in the normal data location. In it:
   `source_videos/left_timestamps.txt` and `right_timestamps.txt`, and
   `waypoints.yaml` (the commanded and reported motor positions, which waypoints
   were verified, the times, and the camera settings).
+- `scout/source_videos/` holds the scout pass's videos and timestamps files, when
+  the automatic move list ran a scout.
 - `4mm_6r_8c_4x.new/` is the new calibration, at format 3. It stays after an
   install as the session's record, and when a fail is kept out.
 
@@ -298,6 +369,7 @@ calibrations/
   active.yaml         the one mutable pointer: id, by (who), at (when)
   decisions.jsonl     append-only, one JSON object per line: event, id, at, ...
   settings.yaml       library-wide switches (only the file is named here)
+  scout_move_list.yaml  the automatic move list saved for a camera set (mutable)
   .derived/           anipose files derived on demand; never inside an entry
 ```
 

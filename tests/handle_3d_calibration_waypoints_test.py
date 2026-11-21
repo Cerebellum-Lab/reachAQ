@@ -11,6 +11,7 @@ Nothing here touches hardware: the motor, the cameras and the clock are fakes.
 """
 
 import contextlib
+from datetime import datetime
 import logging
 import math
 import urllib.parse
@@ -19,7 +20,6 @@ from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import yaml
 
@@ -45,6 +45,7 @@ from autotrainer.inference.multires_calibration.scout import (
     ScoutResult,
     Selection,
     order_path,
+    save_move_list,
     scout_grid,
 )
 from autotrainer.video.video_record import VideoRecordMode
@@ -1014,24 +1015,11 @@ def test_preset_sets_come_from_the_calibrated_cameras_only(tmp_path):
 
 
 # The scout pass: before a capture, the stage visits a coarse grid inside the box the
-# hand-written list travels, and every camera looks for the board at each point. The motion
-# is the capture's own: _command, the configured speeds' settle and wait_until_arrived. It
-# stops at the first move the motor does not confirm, sending nothing more.
+# hand-written list travels, recorded as a short capture through the capture's own camera
+# lifecycle. The motion is run_waypoints, strict: it stops at the first move the motor does
+# not confirm, or at a fault, sending nothing more.
 
-_BLANK = np.full((54, 72), 100, np.uint8)
 _SCOUT_BOX = Bounds((10.0, 20.0, 30.0), (14.0, 26.0, 34.0))
-
-
-class _Grabs:
-    """Camera frames for the scout: a blank image per camera, each grab logged with the motor's commands so far."""
-
-    def __init__(self, motor):
-        self.motor = motor
-        self.calls = []
-
-    def __call__(self, camera):
-        self.calls.append((camera, len(self.motor.commands)))
-        return _BLANK
 
 
 def _scout_motor(clock):
@@ -1040,39 +1028,24 @@ def _scout_motor(clock):
     return motor
 
 
-def test_run_scout_visits_the_grid_inside_its_bounds_and_looks_with_every_camera():
-    clock = _Clock()
-    motor = _scout_motor(clock)
-    grabs = _Grabs(motor)
+def _scout_grid_plan(counts=(2, 2, 2)):
+    return h3d.scout_plan(scout_grid(_SCOUT_BOX, counts=counts), _dcs())
 
-    result = h3d.run_scout(motor, ["left", "right", "camera4"], _SCOUT_BOX, grab=grabs, counts=(2, 2, 2),
-                           sleep=clock.sleep, clock=clock.now)
 
-    grid = scout_grid(_SCOUT_BOX, counts=(2, 2, 2))
-    # Point 0 commands every axis; each later point the one axis the serpentine grid changes.
-    assert motor.commands[:3] == list(zip("xyz", grid[0]))
-    assert motor.commands[3:] == [
-        ("xyz"[k], b[k]) for a, b in zip(grid, grid[1:]) for k in range(3) if a[k] != b[k]]
-    for axis, value in motor.commands:
+def test_scout_plan_moves_one_axis_per_waypoint():
+    plan = _scout_grid_plan()
+    assert [motor for *_, motor in plan] == scout_grid(_SCOUT_BOX, counts=(2, 2, 2))
+    for (_, _, a), (axis, value, b) in zip(plan, plan[1:]):
         k = "xyz".index(axis)
-        assert _SCOUT_BOX.lo[k] <= value <= _SCOUT_BOX.hi[k]
-    # Every camera looks once at every point, after the point's move.
-    assert len(grabs.calls) == 3 * len(grid)
-    # Each move settles at the configured speed: 1 s at point 0 (the motor reported nothing yet).
-    settles = _settles(clock.events)
-    assert settles[0] == 1.0
-    assert settles[1] == pytest.approx(h3d.settle_time(grid[1][0] - grid[0][0], SPEEDS["x"]))
-    # Blank frames: no board anywhere, so no move list and the aim advice for each camera.
-    assert result.points == [] and result.selection.points == []
-    assert set(result.diagnosis) == {"left", "right", "camera4"}
-    assert all(text.startswith("board never in view") for text in result.diagnosis.values())
-    assert set(result.views) == set(range(len(grid)))
+        assert [i for i in range(3) if a[i] != b[i]] == [k]
+        assert h3d._dcs_axis_to_motor(_dcs(), axis, value) == pytest.approx(b[k])
+    with pytest.raises(ValueError, match="one axis"):
+        h3d.scout_plan([(10.0, 20.0, 30.0), (14.0, 26.0, 30.0)], _dcs())
 
 
 def test_run_scout_stops_on_unverified_arrival(monkeypatch):
     clock = _Clock()
     motor = _scout_motor(clock)
-    grabs = _Grabs(motor)
     arrivals = []
     real_wait = h3d.wait_until_arrived
 
@@ -1083,16 +1056,14 @@ def test_run_scout_stops_on_unverified_arrival(monkeypatch):
         return real_wait(hard, target, **kwargs)
 
     monkeypatch.setattr(h3d, "wait_until_arrived", wait)
-    with pytest.raises(ScoutAborted, match="point 2"):
-        h3d.run_scout(motor, ["left", "right"], _SCOUT_BOX, grab=grabs, counts=(2, 2, 2),
-                      sleep=clock.sleep, clock=clock.now)
+    with pytest.raises(ScoutAborted, match="waypoint 2"):
+        run_waypoints(motor, _scout_grid_plan(), strict=True, dwell=0.3,
+                      sleep=clock.sleep, now=clock.now, clock=clock.now)
 
-    # Points 0 to 2 were commanded (3 axes, then one each), and nothing after point 2's move.
-    assert len(motor.commands) == 5
-    assert clock.events[-1][0] != "move" and [e for e in clock.events if e[0] == "move"][-1][2] == motor.commands[-1][1]
-    # The cameras looked at points 0 and 1 only.
-    assert len(grabs.calls) == 4
-    assert len(arrivals) == 3
+    # Waypoints 0 to 2 were commanded (3 axes, then one each), and nothing after.
+    assert len(motor.commands) == 5 and len(arrivals) == 3
+    # Points 0 and 1 dwelt 0.3 s; point 2 did not.
+    assert [e[1] for e in clock.events if e[0] == "sleep"].count(0.3) == 2
 
 
 def test_run_scout_stops_on_a_motor_fault_or_a_failed_command():
@@ -1106,25 +1077,122 @@ def test_run_scout_stops_on_a_motor_fault_or_a_failed_command():
         return real_move_y(value, absolute=absolute)
 
     motor.move_y = faulting_move_y
-    grabs = _Grabs(motor)
-    with pytest.raises(ScoutAborted, match="fault"):
-        h3d.run_scout(motor, ["left", "right"], _SCOUT_BOX, grab=grabs, sleep=clock.sleep, clock=clock.now)
-    # Point 0's y move faulted: x and y were sent, z never was, and no camera looked.
+    with pytest.raises(ScoutAborted, match="fault on Y"):
+        run_waypoints(motor, _scout_grid_plan(), strict=True, sleep=clock.sleep, now=clock.now, clock=clock.now)
+    # Waypoint 0's y move faulted: x and y were sent, z never was, and nothing settled.
     assert [axis for axis, _ in motor.commands] == ["x", "y"]
-    assert grabs.calls == []
+    assert not any(e[0] == "sleep" for e in clock.events)
 
     clock = _Clock()
     motor = _scout_motor(clock)
     motor.move_z = lambda value, *, absolute=True: None  # never queued, as when CAN is down
     with pytest.raises(ScoutAborted, match="not queued"):
-        h3d.run_scout(motor, ["left", "right"], _SCOUT_BOX, grab=_Grabs(motor), sleep=clock.sleep, clock=clock.now)
+        run_waypoints(motor, _scout_grid_plan(), strict=True, sleep=clock.sleep, now=clock.now, clock=clock.now)
     assert [axis for axis, _ in motor.commands] == ["x", "y"]
 
+    # Not strict, the capture logs an unverified waypoint and goes on, as before.
+    clock = _Clock()
+    motor = _scout_motor(clock)
+    log = run_waypoints(motor, _scout_grid_plan(), sleep=clock.sleep, now=clock.now, clock=clock.now)
+    assert all(log.verified)
 
-def _scout_result(n_selected):
-    points = [(10.0 + i, 40.0, 30.0) for i in range(n_selected)]
+
+class _ScoutRigMotor(_Motor):
+    """The capture's motor (connect, home, disconnect) that reports where it was commanded."""
+
+    def __init__(self, clock, calls):
+        super().__init__(clock, travel=0.0)
+        self.motor_configurations = _motor_configurations(**SPEEDS)
+        self._calls = calls
+
+    def connect(self, queue):
+        self._calls.append(("motor", "connect"))
+
+    def send_home(self):
+        return uuid.uuid4()
+
+    def disconnect(self):
+        self._calls.append(("motor", "disconnect"))
+
+
+def _scout_app_model(tmp_path, calls, clock):
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.hardware = _ScoutRigMotor(clock, calls)
+    session = tmp_path / "session"
+    for name in ("left", "right"):
+        (session / f"{name}_recording.mp4").write_bytes(b"")
+        (session / f"{name}_recording_timestamps.txt").write_text("1000.0,0\n")
+    return app_model
+
+
+def _scout_kwargs(app_model, tmp_path, clock, cameras):
+    return dict(project=app_model.make_project_info(), session_dir=tmp_path / "session",
+                cams_before_cfg=tuple(c.save_configuration() for c in cameras),
+                capture_list=h3d.capture_camera_list(cameras), counts=(2, 2, 2),
+                sleep=clock.sleep, now=clock.now, clock=clock.now)
+
+
+def test_run_scout_records_the_grid_as_a_short_capture(tmp_path, monkeypatch):
+    calls, clock = [], _Clock()
+    app_model = _scout_app_model(tmp_path, calls, clock)
+    cameras = [app_model.left_camera, app_model.right_camera]
+    seen = {}
+
+    def views_from_capture(videos, frame_times, targets, dwells, board):
+        seen.update(videos=videos, frame_times=frame_times, targets=targets, dwells=dwells)
+        return {i: {} for i in range(len(targets))}
+
+    monkeypatch.setattr(h3d, "scout_views_from_capture", views_from_capture)
+    monkeypatch.setattr(h3d, "video_sizes", lambda videos: {name: (1440, 1080) for name in videos})
+    # The hand-written plan's targets span the box; a configured box narrows it in z.
+    targets = [(10.0, 20.0, 30.0), (14.0, 26.0, 34.0)]
+    result = h3d.run_scout(app_model, cameras, targets, configured=Bounds((0, 0, 31.0), (99, 99, 99)),
+                           **_scout_kwargs(app_model, tmp_path, clock, cameras))
+
+    grid = scout_grid(Bounds((10.0, 20.0, 31.0), (14.0, 26.0, 34.0)), counts=(2, 2, 2))
+    assert seen["targets"] == grid
+    motor = app_model.hardware
+    # Homed, then the start position, then one axis per point, all in the box.
+    assert motor.commands[:3] == list(zip("xyz", grid[0])) and motor.commands[3:6] == list(zip("xyz", grid[0]))
+    for axis, value in motor.commands:
+        k = "xyz".index(axis)
+        assert (10.0, 20.0, 31.0)[k] <= value <= (14.0, 26.0, 34.0)[k]
+    assert all(leave - arrive == pytest.approx(0.3) for arrive, leave in seen["dwells"])
+    # Recorded through the capture's lifecycle, in TRIGGER mode; stopped and restored after.
+    _assert_cameras_stopped_and_restored(app_model, calls)
+    for name in ("left", "right"):
+        mine = [call[1:] for call in calls if call[0] == name]
+        loaded = [call[1] for call in mine if call[0] == "load_configuration"][0]
+        assert loaded.record_mode == VideoRecordMode.TRIGGER
+        assert ("on_trigger_recording", True) in mine
+    scout_videos = tmp_path / "session" / "scout" / "source_videos"
+    assert sorted(p.name for p in scout_videos.iterdir()) == [
+        "left.mp4", "left_timestamps.txt", "right.mp4", "right_timestamps.txt"]
+    assert seen["videos"] == {name: scout_videos / f"{name}.mp4" for name in ("left", "right")}
+    assert list(seen["frame_times"]["left"]) == [1000.0]
+    # Nothing seen: no list, and the aim advice.
+    assert result.points == [] and set(result.diagnosis) == {"left", "right"}
+
+
+def test_an_aborted_scout_stops_the_cameras_and_moves_no_video(tmp_path, monkeypatch):
+    calls, clock = [], _Clock()
+    app_model = _scout_app_model(tmp_path, calls, clock)
+    cameras = [app_model.left_camera, app_model.right_camera]
+    monkeypatch.setattr(h3d, "wait_until_arrived", lambda hard, target, **kwargs: (False, None))
+    with pytest.raises(ScoutAborted, match="waypoint 0"):
+        h3d.run_scout(app_model, cameras, [(10.0, 20.0, 30.0), (14.0, 26.0, 34.0)],
+                      **_scout_kwargs(app_model, tmp_path, clock, cameras))
+    # The start position (3) and waypoint 0's three axes, then nothing.
+    assert len(app_model.hardware.commands) == 6
+    _assert_cameras_stopped_and_restored(app_model, calls)
+    assert not (tmp_path / "session" / "scout").exists()
+
+
+def _scout_result(n_selected, diagnosis=None):
+    # inside the hand-written list's box on _dcs(): motor x 0.6-20, y 5-30, z 52-65
+    points = [(1.0 + i, 20.0, 60.0) for i in range(n_selected)]
     selection = Selection(points=points, per_camera={"left": n_selected, "right": n_selected}, connected=True)
-    return ScoutResult(points=order_path(points), selection=selection, diagnosis={}, views={})
+    return ScoutResult(points=order_path(points), selection=selection, diagnosis=diagnosis or {}, views={})
 
 
 def test_fewer_than_12_points_falls_back_to_handwritten():
@@ -1142,8 +1210,91 @@ def test_fewer_than_12_points_falls_back_to_handwritten():
     plan, used = h3d.choose_plan("scout", dcs, result)
     assert used == "scout"
     assert [motor for _, _, motor in plan] == result.points
-    # Every move after the first is one axis, logged with its DCS value.
-    for (_, _, a), (axis, value, b) in zip(plan, plan[1:]):
-        k = "xyz".index(axis)
-        assert [i for i in range(3) if a[i] != b[i]] == [k]
-        assert h3d._dcs_axis_to_motor(dcs, axis, value) == pytest.approx(b[k])
+
+
+def _scout_capture(tmp_path, monkeypatch, results, *, confirm=None):
+    """make_3d_calib with move_list "scout", run_scout faked to give `results` in turn."""
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.calibration_library_root = tmp_path / "calibrations"
+    session = tmp_path / "session"
+    for name in ("left", "right"):
+        (session / f"{name}_recording.mp4").touch()
+        (session / f"{name}_recording_timestamps.txt").write_text("")
+    seen = {"scouts": 0, "plans": []}
+
+    def fake_run_scout(app_model_, cameras, targets, **kwargs):
+        seen["scouts"] += 1
+        seen["targets"] = targets
+        return results.pop(0)
+
+    def fake_run_waypoints(hard, plan, **kwargs):
+        seen["plans"].append(plan)
+        return SimpleNamespace(verified=[True])
+
+    monkeypatch.setattr(h3d, "run_scout", fake_run_scout)
+    monkeypatch.setattr(h3d, "run_waypoints", fake_run_waypoints)
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture",
+                        lambda *a, **k: (session / "new", SimpleNamespace(id="abc"), SimpleNamespace(verdict="pass")))
+    cameras = [app_model.left_camera, app_model.right_camera]
+
+    def run():
+        for name in ("left", "right"):
+            (session / f"{name}_recording.mp4").touch()
+        return make_3d_calib(app_model, cameras, move_list="scout", confirm_scout=confirm)
+
+    return app_model, seen, run
+
+
+def test_scout_capture_uses_the_scout_list_and_saves_it_for_the_same_cameras(tmp_path, monkeypatch):
+    result = _scout_result(14)
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [result])
+
+    run()
+    assert seen["scouts"] == 1
+    assert seen["targets"] == [motor for *_, motor in plan_waypoints(start, moves, _dcs())]
+    assert [motor for *_, motor in seen["plans"][-1]] == result.points
+    saved = tmp_path / "calibrations" / "scout_move_list.yaml"
+    assert yaml.safe_load(saved.read_text())["cameras"] == ["left", "right"]  # no serials: by name
+
+    # The same cameras again: the saved list, no scout.
+    run()
+    assert seen["scouts"] == 1
+    assert [motor for *_, motor in seen["plans"][-1]] == result.points
+
+
+def test_scout_advice_asks_before_the_capture(tmp_path, monkeypatch):
+    advice = {"right": "board never in view: the camera points elsewhere or the scout bounds miss its view"}
+    asked = []
+
+    # Cancel: nothing captured, nothing saved.
+    (tmp_path / "cancel").mkdir()
+    app_model, seen, run = _scout_capture(tmp_path / "cancel", monkeypatch, [_scout_result(14, advice)],
+                                          confirm=lambda a: asked.append(a) or False)
+    with pytest.raises(h3d.ScoutCancelled):
+        run()
+    assert asked == [advice] and seen["plans"] == []
+
+    # Continue: the capture runs on the scout's list, but a list a camera failed is not saved.
+    (tmp_path / "continue").mkdir()
+    app_model, seen, run = _scout_capture(tmp_path / "continue", monkeypatch, [_scout_result(14, advice)],
+                                          confirm=lambda a: asked.append(a) or True)
+    run()
+    assert len(seen["plans"]) == 1 and asked == [advice, advice]
+    assert not (tmp_path / "continue" / "calibrations" / "scout_move_list.yaml").exists()
+    assert not (tmp_path / "cancel" / "calibrations" / "scout_move_list.yaml").exists()
+
+
+def test_a_scout_with_too_few_points_captures_the_handwritten_list(tmp_path, monkeypatch):
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(11)])
+    run()
+    assert seen["plans"] == [plan_waypoints(start, moves, _dcs())]
+    assert not (tmp_path / "calibrations" / "scout_move_list.yaml").exists()
+
+
+def test_a_saved_list_outside_todays_box_is_scouted_again(tmp_path, monkeypatch):
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(14)])
+    save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", [(500.0, 40.0, 30.0)], ["left", "right"],
+                   datetime(2026, 11, 20))
+    run()
+    assert seen["scouts"] == 1

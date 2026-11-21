@@ -19,6 +19,11 @@ from tools.acquisition.model.calibration_geometry import camera_serial
 SCOUT = "scout"
 HANDWRITTEN = "handwritten"
 NOT_AVAILABLE_YET = "not available yet"
+SCOUT_TOOLTIP = ("the stage first visits a coarse grid and every camera looks for the board; the waypoints are"
+                 " chosen from what they saw, or the hand-written list when fewer than 12 suit")
+HANDWRITTEN_TOOLTIP = "the fixed list of 37 waypoints"
+SCOUT_ADVICE_TITLE = "Some cameras saw too little of the board"
+SCOUT_ADVICE_CONTINUE = "Continue: the cameras named are calibrated 2D only"
 #: The red of every "2D only" mark.
 UNCALIBRATED_COLOR = "#c62828"
 
@@ -90,10 +95,10 @@ class CalibrationDialog(QDialog):
         moves = QGroupBox("Move list")
         moves_layout = QHBoxLayout(moves)
         self.scout_button = QRadioButton("automatic (scout)")
-        self.scout_button.setEnabled(False)
-        self.scout_button.setToolTip(NOT_AVAILABLE_YET)
+        self.scout_button.setToolTip(SCOUT_TOOLTIP)
+        self.scout_button.setChecked(True)
         self.handwritten_button = QRadioButton("hand-written")
-        self.handwritten_button.setChecked(True)
+        self.handwritten_button.setToolTip(HANDWRITTEN_TOOLTIP)
         group = self._move_group = QButtonGroup(self)
         group.addButton(self.scout_button)
         group.addButton(self.handwritten_button)
@@ -139,6 +144,22 @@ class CalibrationDialog(QDialog):
             move_list=SCOUT if self.scout_button.isChecked() else HANDWRITTEN,
             capture_references=self.references_box.isChecked(),
         )
+
+
+def scout_advice_text(diagnosis: Dict[str, str]) -> str:
+    """The scout's advice, one "<camera>: <advice>" line per camera that saw too little, then what Continue does."""
+    lines = [f"{camera}: {advice}" for camera, advice in diagnosis.items()]
+    return "\n".join([*lines, "", SCOUT_ADVICE_CONTINUE + "."])
+
+
+def confirm_scout_advice(parent, diagnosis: Dict[str, str]) -> bool:
+    """Show the scout's advice before the capture; True for Continue, False for Cancel."""
+    box = QMessageBox(QMessageBox.Icon.Warning, SCOUT_ADVICE_TITLE, scout_advice_text(diagnosis), parent=parent)
+    go_on = box.addButton("Continue", QMessageBox.ButtonRole.AcceptRole)
+    box.addButton(QMessageBox.StandardButton.Cancel)
+    box.setDefaultButton(go_on)
+    box.exec()
+    return box.clickedButton() is go_on
 
 
 def uncalibrated_lines(report: QualityReport) -> List[str]:

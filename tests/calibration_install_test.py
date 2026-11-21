@@ -380,7 +380,7 @@ def test_on_3d_calibrate_hands_the_calibration_to_the_install_flow_still_held(tm
     window._ask_calibration_cameras = lambda: CalibrationRequest(["left", "right"], "handwritten", False)
     asked = []
     monkeypatch.setattr(main_window_module, "make_3d_calib",
-                        lambda app_model, cameras, move_list=None: asked.append(cameras) or produced)
+                        lambda app_model, cameras, move_list=None, **kwargs: asked.append(cameras) or produced)
     monkeypatch.setattr(main_window_module, "threading", SimpleNamespace(Thread=_InlineThread))
     # show_result runs where it is called, instead of being posted to a Qt event loop.
     monkeypatch.setattr(main_window_module, "invoke_method", lambda method: method)

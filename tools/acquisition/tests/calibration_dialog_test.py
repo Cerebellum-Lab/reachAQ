@@ -23,6 +23,7 @@ from tools.acquisition.view.calibration_dialog import (  # noqa: E402
     CalibrationDialog,
     CalibrationRequest,
     result_page,
+    scout_advice_text,
 )
 from tools.acquisition.view.calibration_library_view import CalibrationLibraryView  # noqa: E402
 from tools.acquisition.view.main_window import MainWindow  # noqa: E402
@@ -68,7 +69,7 @@ def test_dialog_lists_every_camera_ticked_including_stimcam():
     assert all(box.isChecked() and box.isEnabled() for box in boxes)
     assert dialog.start_button.isEnabled()
     assert dialog.request() == CalibrationRequest(
-        cameras=["left", "right", "stimCam"], move_list="handwritten", capture_references=False)
+        cameras=["left", "right", "stimCam"], move_list="scout", capture_references=False)
 
 
 def test_the_request_puts_the_configured_primary_first():
@@ -107,12 +108,21 @@ def test_start_needs_two_to_six():
     assert dialog.start_button.isEnabled()
 
 
-def test_scout_and_references_wait_for_later():
+def test_the_scout_is_the_default_move_list_and_references_wait_for_later():
     dialog = CalibrationDialog(_rig())
-    assert not dialog.scout_button.isEnabled() and dialog.scout_button.toolTip() == "not available yet"
-    assert dialog.handwritten_button.isChecked()
+    assert dialog.scout_button.isEnabled() and dialog.scout_button.isChecked()
+    assert "hand-written list when fewer than 12" in dialog.scout_button.toolTip()
+    dialog.handwritten_button.setChecked(True)
+    assert dialog.request().move_list == "handwritten"
     assert not dialog.references_box.isEnabled() and dialog.references_box.toolTip() == "not available yet"
     assert not dialog.references_box.isChecked()
+
+
+def test_scout_advice_names_each_camera_and_what_continue_does():
+    text = scout_advice_text({"camera4": "board never in view: the camera points elsewhere or the scout bounds miss its view"})
+    assert text.splitlines()[0] == (
+        "camera4: board never in view: the camera points elsewhere or the scout bounds miss its view")
+    assert text.splitlines()[-1] == "Continue: the cameras named are calibrated 2D only."
 
 
 def test_uncalibrated_banner_names_camera_and_reason():
@@ -173,7 +183,7 @@ def test_make_3d_calibration_uses_the_dialog_choice(monkeypatch):
             pass
 
     monkeypatch.setattr(main_window_module, "make_3d_calib",
-                        lambda app_model, chosen, move_list=None: asked.append((list(chosen), move_list)))
+                        lambda app_model, chosen, move_list=None, **kwargs: asked.append((list(chosen), move_list)))
     monkeypatch.setattr(main_window_module, "threading", SimpleNamespace(Thread=_InlineThread))
     monkeypatch.setattr(main_window_module, "invoke_method", lambda method: method)
 

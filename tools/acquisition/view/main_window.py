@@ -64,7 +64,8 @@ from tools.acquisition.model.rfid_resolution import RfidResolutionKind
 from tools.acquisition.model.subsystem_status import SubsystemState
 from tools.acquisition.model.training_plan import get_plan_id
 from tools.acquisition.model.user_preferences import UserPreferences
-from tools.acquisition.view.calibration_dialog import CalibrationDialog, CalibrationRequest, result_page
+from tools.acquisition.view.calibration_dialog import (CalibrationDialog, CalibrationRequest, confirm_scout_advice,
+                                                  result_page)
 from tools.acquisition.view.calibration_library_view import CalibrationLibraryView
 from tools.acquisition.view.main_content import MainContent
 from tools.acquisition.view.multi_selection_menu import MultiSelectionMenu
@@ -113,6 +114,22 @@ def _allow_bidirectional_window_resizing(window: QMainWindow) -> None:
     window.setMinimumSize(_MINIMUM_RESIZABLE_WINDOW_SIZE)
     window.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
     window.layout().setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+
+
+def _ask_on_gui_thread(ask, *args) -> bool:
+    """Run `ask(*args)` on the GUI thread and wait for its answer; from the GUI thread it runs at once."""
+    answer = []
+    done = threading.Event()
+
+    def run():
+        try:
+            answer.append(bool(ask(*args)))
+        finally:
+            done.set()
+
+    InvokeMethod(run)
+    done.wait()
+    return bool(answer and answer[0])
 
 
 class MainWindow(QMainWindow):
@@ -889,7 +906,9 @@ class MainWindow(QMainWindow):
         def handle_3d_calib():
             nonlocal error, result
             try:
-                result = make_3d_calib(self._app_model, cameras, move_list=request.move_list)
+                result = make_3d_calib(self._app_model, cameras, move_list=request.move_list,
+                                       confirm_scout=lambda advice: _ask_on_gui_thread(
+                                           confirm_scout_advice, self, advice))
             except Exception as err:
                 logger.exception("3d-calib failed: %s", err)
                 error = err

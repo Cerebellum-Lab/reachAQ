@@ -11,8 +11,9 @@ The stage only translates the board, in x, y and z; it never tilts it. Every vie
 parallel plane, so a camera looking at the board edge-on sees it foreshortened wherever
 the stage puts it, and only re-aiming the camera helps.
 
-This module is planning only: it moves nothing. The motion is
-tools.acquisition.model.handle_3d_calibration.run_scout's.
+This module moves nothing. tools.acquisition.model.handle_3d_calibration.run_scout records
+the grid as a short capture, and scout_views_from_capture reads each point's frames back
+from its videos by the logged dwell times.
 
 The chosen list is kept as <config>/calibrations/scout_move_list.yaml with the date and the
 cameras' serials, and reused while the same cameras are ticked (load_move_list).
@@ -30,7 +31,7 @@ import numpy as np
 import yaml
 
 from autotrainer.core.logging import get_verbose_logger
-from autotrainer.inference.multires_calibration.extract import detect_board
+from autotrainer.inference.multires_calibration.extract import detect_board, distinct_waypoints, dwell_segments
 from autotrainer.inference.multires_calibration.fit import BoardSpec
 from autotrainer.inference.multires_calibration.library import library_root
 
@@ -43,6 +44,10 @@ DEFAULT_COUNTS = (4, 4, 3)
 MAX_POINTS = 36
 MIN_VIEWS = 12
 MIN_COVISIBLE = 8
+# The ordered path, with its inserted one-axis points, is at most this many waypoints.
+MAX_PATH = 60
+# The library setting that may narrow the scout's box: {"lo": [x, y, z], "hi": [x, y, z]} in motor mm.
+SCOUT_BOUNDS_SETTING = "scoutBounds"
 OCCUPANCY_CELLS = 4  # each camera's image is split 4 x 4 to measure how widely its views spread
 
 # The whole board, one square past the inner corners each way, is 9 x 7 squares: seen
@@ -362,6 +367,114 @@ def order_path(points: Sequence[Point]) -> List[Point]:
                 position[axis] = target[axis]
                 path.append(tuple(position))
     return path
+
+
+def choose_move_list(
+    grid: Sequence[Point],
+    views: Mapping[int, Mapping[str, ScoutView]],
+    cameras: Sequence[str],
+    *,
+    image_sizes: Optional[Mapping[str, Tuple[int, int]]] = None,
+    max_points: int = MAX_POINTS,
+    max_path: int = MAX_PATH,
+) -> Tuple[Selection, List[Point]]:
+    """(the selection, its ordered path) with the path at most `max_path` waypoints.
+
+    The one-axis points order_path inserts stay dwell waypoints, as more views. When the
+    path is longer than `max_path`, the selection is made again with one point fewer, until
+    it fits.
+    """
+    limit = max_points
+    while True:
+        selection = select_waypoints(grid, views, cameras, max_points=limit, image_sizes=image_sizes)
+        path = order_path(selection.points)
+        if len(path) <= max_path or limit <= 1:
+            if limit < max_points:
+                logger.info("scout: %d points make a path of %d waypoints, within %d",
+                            len(selection.points), len(path), max_path)
+            return selection, path
+        limit = min(limit, len(selection.points)) - 1
+
+
+def scout_views_from_capture(
+    videos: Mapping[str, Path],
+    frame_times: Mapping[str, Sequence[float]],
+    plan_targets: Sequence[Sequence[float]],
+    dwells: Sequence[Tuple[float, float]],
+    board: BoardSpec = BoardSpec(),
+) -> Dict[int, Dict[str, ScoutView]]:
+    """Plan index -> camera -> ScoutView, from a scout capture's videos.
+
+    Each distinct waypoint's frames are the camera's frames whose time (`frame_times`,
+    column 0 of its timestamps file) lies in the waypoint's logged dwell (dwell_segments);
+    the board is looked for in the middle one (scout_view). A waypoint with no frame in its
+    dwell, or whose frame the video does not have, is a view that found nothing.
+    """
+    targets = [np.asarray(t, float) for t in plan_targets]
+    distinct = distinct_waypoints(targets)
+    views: Dict[int, Dict[str, ScoutView]] = {i: {} for i in distinct}
+    for camera, video in videos.items():
+        segments = dwell_segments(frame_times[camera], targets, dwells)
+        wanted = {}
+        for i, (begin, stop) in zip(distinct, segments):
+            if stop > begin:
+                wanted[(begin + stop - 1) // 2] = i
+        frames = _frames_at(Path(video), set(wanted))
+        for i, (begin, stop) in zip(distinct, segments):
+            k = (begin + stop - 1) // 2
+            if stop > begin and k in frames:
+                views[i][camera] = scout_view(camera, frames[k], board)
+            else:
+                logger.warning("scout: %s has no frame in waypoint %d's dwell", camera, i)
+                views[i][camera] = ScoutView(camera, False, None, None, None, False)
+    return views
+
+
+def _frames_at(video: Path, indices: set) -> Dict[int, np.ndarray]:
+    """The grey frames of `video` at `indices`, read through once."""
+    capture = cv2.VideoCapture(str(video))
+    if not capture.isOpened():
+        raise OSError(f"could not open the video {video}")
+    frames, k, last = {}, 0, max(indices, default=-1)
+    try:
+        while k <= last:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if k in indices:
+                frames[k] = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            k += 1
+    finally:
+        capture.release()
+    return frames
+
+
+def video_sizes(videos: Mapping[str, Path]) -> Dict[str, Tuple[int, int]]:
+    """camera -> (width, height) of its video."""
+    sizes = {}
+    for camera, video in videos.items():
+        capture = cv2.VideoCapture(str(video))
+        try:
+            sizes[camera] = (int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        finally:
+            capture.release()
+    return sizes
+
+
+def configured_bounds(settings: Mapping) -> Optional[Bounds]:
+    """The library settings' scoutBounds as Bounds; None when unset or malformed (logged)."""
+    value = settings.get(SCOUT_BOUNDS_SETTING) if settings else None
+    if value is None:
+        return None
+    try:
+        lo = tuple(float(v) for v in value["lo"])
+        hi = tuple(float(v) for v in value["hi"])
+        if len(lo) != 3 or len(hi) != 3 or not all(math.isfinite(v) for v in lo + hi):
+            raise ValueError("three finite values each")
+    except (KeyError, TypeError, ValueError) as err:
+        logger.warning("ignoring the %s setting %r: %s", SCOUT_BOUNDS_SETTING, value, err)
+        return None
+    return Bounds(lo, hi)
 
 
 def diagnose(

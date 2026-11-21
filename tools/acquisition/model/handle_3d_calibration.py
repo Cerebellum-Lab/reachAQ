@@ -2,7 +2,8 @@ import math
 import shutil
 import time
 import dataclasses
-from typing import Dict, Any, Optional, List, Mapping, Sequence, Tuple
+from datetime import datetime
+from typing import Callable, Dict, Any, Optional, List, Mapping, Sequence, Tuple
 from pathlib import Path
 
 from autotrainer.core import Offset3DTuple, get_verbose_logger, ProjectInterval
@@ -14,6 +15,7 @@ from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.inference.multires_calibration.fit import BoardSpec, CaptureCamera
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
+from autotrainer.inference.multires_calibration.library import read_settings
 from autotrainer.inference.multires_calibration.pipeline import (
     MAX_CAMERAS,
     MIN_CAMERAS,
@@ -22,20 +24,27 @@ from autotrainer.inference.multires_calibration.pipeline import (
     WAYPOINT_LOG,
     WaypointLog,
     calibrate_capture,
+    load_frame_times,
     write_waypoint_log,
 )
 from autotrainer.inference.multires_calibration.report import QualityReport
 from autotrainer.inference.multires_calibration.scout import (
     DEFAULT_COUNTS,
+    MAX_PATH,
     MIN_VIEWS,
+    SCOUT_MOVE_LIST_FILE,
     Bounds,
     ScoutAborted,
     ScoutResult,
+    bounds_from_plan,
+    choose_move_list,
+    configured_bounds,
     diagnose,
-    order_path,
+    load_move_list,
+    save_move_list,
     scout_grid,
-    scout_view,
-    select_waypoints,
+    scout_views_from_capture,
+    video_sizes,
 )
 from autotrainer.inference.multires_calibration.store import CalibrationIndex
 
@@ -327,6 +336,7 @@ def run_waypoints(
     arrival_timeout: float = 2.0,
     capture_settings: Optional[Mapping[str, Any]] = None,
     cameras: Optional[Sequence[CaptureCamera]] = None,
+    strict: bool = False,
 ) -> WaypointLog:
     """Visit each waypoint of `plan` (plan_waypoints) in turn and log it.
 
@@ -335,6 +345,11 @@ def run_waypoints(
     there long enough for calibrate_capture to find it. Waypoint 0 commands every axis of
     the start. A waypoint the motor does not confirm is logged unverified and the capture
     goes on; the calibration report counts them.
+
+    `strict` (the scout) stops at once instead, raising ScoutAborted and sending no further
+    command: on a command that is not queued or acknowledged (a CAN error raises there), a
+    motor driver fault after any command or arrival, or a waypoint the motor does not
+    confirm. The stage is left where it stopped.
 
     The settle is per move, from the distance and hard.motor_configurations (settle_time);
     waypoint 0's starts from the position the motor last reported, and is the fallback when
@@ -360,7 +375,15 @@ def run_waypoints(
     for i, (axis, value, motor) in enumerate(plan):
         moved = AXES if i == 0 else (axis,)
         for move_axis in moved:
-            _command(hard, move_axis, motor[AXES.index(move_axis)])
+            if not strict:
+                _command(hard, move_axis, motor[AXES.index(move_axis)])
+                continue
+            try:
+                _command(hard, move_axis, motor[AXES.index(move_axis)])
+            except Exception as err:
+                raise ScoutAborted(f"waypoint {i}: the move of {move_axis} to {motor[AXES.index(move_axis)]:.3f}"
+                                   f" failed: {err}") from err
+            _abort_on_fault(hard, i)
         wait = _move_settle(limits, moved, motor, origin) if settle is None else settle
         logger.debug("waypoint %d: %s to %s, settle %.3f s", i, "".join(moved), motor, wait)
         sleep(wait)
@@ -368,6 +391,10 @@ def run_waypoints(
         arrived, reported = wait_until_arrived(
             hard, motor, tolerance=tolerance, timeout=arrival_timeout, sleep=sleep, now=clock)
         arrive = now()
+        if strict:
+            if not arrived:
+                raise ScoutAborted(f"waypoint {i}: the motor reported {reported}, not the commanded {motor}")
+            _abort_on_fault(hard, i)
         if not arrived:
             logger.warning("waypoint %d: the motor reported %s, not within %s of the commanded %s",
                            i, reported, tolerance, motor)
@@ -385,88 +412,19 @@ SCOUT = "scout"
 HANDWRITTEN = "handwritten"
 # The scout's list replaces the hand-written one only with at least this many chosen points.
 MIN_SCOUT_POINTS = MIN_VIEWS
+# The scout's pause at each grid point: about 12 frames at 40 fps, of which one is searched.
+SCOUT_DWELL_S = 0.3
+SCOUT_DIR_NAME = "scout"
 
 
-def _driver_fault(hard) -> Tuple[str, ...]:
-    return tuple(getattr(hard, "pellet_axes_with_driver_fault", ()) or ())
+class ScoutCancelled(RuntimeError):
+    """The operator chose Cancel at the scout's advice; nothing was captured."""
 
 
-def run_scout(
-    hard,
-    cameras: Sequence[str],
-    bounds: Bounds,
-    *,
-    grab,
-    board: BoardSpec = BoardSpec(),
-    counts: Sequence[int] = DEFAULT_COUNTS,
-    sleep=time.sleep,
-    clock=time.monotonic,
-    tolerance: float = 0.05,
-    arrival_timeout: float = 2.0,
-) -> ScoutResult:
-    """Visit scout_grid(bounds, counts) and look for the board with every camera at each point.
-
-    `bounds` come from scout.bounds_from_plan, the box the hand-written plan travels, so
-    the grid never leaves it. The motion is run_waypoints': _command for each axis that
-    changes, the settle for the distance at the motor's configured speeds (_move_settle),
-    then wait_until_arrived. Nothing changes a limit, a speed or the firmware.
-
-    `grab(camera)` returns one full-sensor grey frame from that camera. At each point every
-    camera's frame goes through scout.scout_view.
-
-    Stops at once, raising ScoutAborted and sending no further command, when a command is
-    not queued or acknowledged (a CAN error raises there), when the motor reports a driver
-    fault, when the motor does not confirm the point, or when a camera gives no frame. The
-    stage is left where it stopped; homing is the capture's prepare().
-
-    Returns the views, the chosen move list (select_waypoints, then order_path) and the
-    advice for each camera that saw too little (diagnose).
-    """
-    cameras = list(cameras)
-    grid = scout_grid(bounds, counts)
-    limits = axis_limits(getattr(hard, "motor_configurations", None))
-    origin = _reported_position(hard)
-    previous = None
-    views = {}
-    sizes = {}
-    logger.notice("Scouting %d points in %s - %s with %s", len(grid), bounds.lo, bounds.hi, ", ".join(cameras))
-    for i, point in enumerate(grid):
-        moved = AXES if previous is None else tuple(a for k, a in enumerate(AXES) if point[k] != previous[k])
-        for axis in moved:
-            try:
-                _command(hard, axis, point[AXES.index(axis)])
-            except Exception as err:
-                raise ScoutAborted(f"scout point {i}: the move of {axis} to {point[AXES.index(axis)]:.3f}"
-                                   f" failed: {err}") from err
-            if _driver_fault(hard):
-                raise ScoutAborted(f"scout point {i}: motor driver fault on {', '.join(_driver_fault(hard))}")
-        sleep(_move_settle(limits, moved, point, origin))
-        origin = previous = point
-        arrived, reported = wait_until_arrived(
-            hard, point, tolerance=tolerance, timeout=arrival_timeout, sleep=sleep, now=clock)
-        if not arrived:
-            raise ScoutAborted(f"scout point {i}: the motor reported {reported}, not the commanded {point}")
-        if _driver_fault(hard):
-            raise ScoutAborted(f"scout point {i}: motor driver fault on {', '.join(_driver_fault(hard))}")
-        views[i] = {}
-        for camera in cameras:
-            try:
-                frame = grab(camera)
-            except Exception as err:
-                raise ScoutAborted(f"scout point {i}: {camera} gave no frame: {err}") from err
-            if frame is None:
-                raise ScoutAborted(f"scout point {i}: {camera} gave no frame")
-            sizes[camera] = (int(frame.shape[1]), int(frame.shape[0]))
-            views[i][camera] = scout_view(camera, frame, board)
-        logger.debug("scout point %d %s: found by %s", i, point,
-                     [c for c in cameras if views[i][c].found] or "none")
-    selection = select_waypoints(grid, views, cameras, image_sizes=sizes)
-    diagnosis = diagnose(views, cameras, sizes)
-    logger.info("scout chose %d points; views per camera %s; cameras joined: %s",
-                len(selection.points), selection.per_camera, selection.connected)
-    for camera, advice in diagnosis.items():
-        logger.warning("%s: %s", camera, advice)
-    return ScoutResult(points=order_path(selection.points), selection=selection, diagnosis=diagnosis, views=views)
+def _abort_on_fault(hard, waypoint: int) -> None:
+    faulted = tuple(getattr(hard, "pellet_axes_with_driver_fault", ()) or ())
+    if faulted:
+        raise ScoutAborted(f"waypoint {waypoint}: motor driver fault on {', '.join(faulted)}")
 
 
 def scout_plan(
@@ -575,19 +533,256 @@ def calibrate_waypoint_capture(
     return output_dir, index, report
 
 
+def _prepare_capture(app_model, hard, cameras, cams_before_cfg, cam_params, record_mode, project, start_xyz) -> None:
+    """Connect and home the stage, go to `start_xyz`, give the cameras the capture's
+    configuration and start them recording: the one camera lifecycle the capture and the
+    scout share (_record_plan)."""
+    logger.notice("Preparing ..")
+    #
+    logger.info("Connecting to HW ..")
+    hard.connect(app_model.message_handler.input_queue)
+    token = hard.send_home()
+    hard.wait_pending_command_acked(token)
+    #
+    # Waypoint 0 is reached before recording starts, so the video opens on it rather
+    # than on the move from home, which would add a stationary segment no waypoint has.
+    logger.verbose("Setting start position")
+    for axis, motor_value in zip(AXES, start_xyz):
+        _command(hard, axis, motor_value)
+    #
+    for cam, cfg in zip(cameras, cams_before_cfg):
+        params = cam_params.copy()
+        params["primary"] = cfg.params.get("primary", "off")
+        logger.info("Preparing cam %s with params=%s", cam.name, params)
+        new_cfg = dataclasses.replace(
+            cfg,
+            record_mode=record_mode,
+            record_prebuffer_duration=0,
+            is_enabled=True,
+            is_record_enabled=True,
+            params=params,
+        )
+        cam.load_configuration(new_cfg)
+        cam.project = project
+
+    #
+
+    for cam in cameras:
+        if cam.is_primary:
+            logger.info("%s: prepare capture ..", cam.name)
+            if not cam.on_prepare_capture():
+                raise RuntimeError(f"{cam.name}.on_prepare_capture() failed")
+            cam.wait_for_capture_status(CaptureProcessStatus.RUNNING, timeout=5)
+
+    for cam in cameras:
+        if not cam.is_primary:
+            logger.info("%s: prepare capture ..", cam.name)
+            if not cam.on_prepare_capture():
+                raise RuntimeError(f"{cam.name}.on_prepare_capture() failed")
+
+    wait_cams_capture_status(cameras, CaptureProcessStatus.RUNNING, timeout=5)
+
+    for cam in cameras:
+        if not cam.is_primary:
+            logger.info("%s: capture start ..", cam.name)
+            cam.on_capture_start()
+    for cam in cameras:
+        if cam.is_primary:
+            logger.info("%s: capture start ..", cam.name)
+            cam.on_capture_start()
+
+    if record_mode == VideoRecordMode.TRIGGER:
+        logger.info("Triggering recording")
+        for cam in cameras:
+            cam.on_trigger_recording(True)
+
+    logger.notice("Waiting RECORDING on cams")
+    wait_cams_capture_status(cameras, CaptureProcessStatus.RECORDING, 5)
+
+
+def _stop_recording(cameras, record_mode) -> None:
+    if record_mode == VideoRecordMode.TRIGGER:
+        logger.info("Requesting cameras stop recording")
+        for cam in reversed(cameras):
+            cam.on_trigger_recording(False)
+        wait_cams_capture_status(cameras, CaptureProcessStatus.RUNNING, 15)
+
+
+def _teardown_capture(cameras, hard, cams_before_cfg, failed: Optional[BaseException]) -> Optional[BaseException]:
+    """Stop the cameras, disconnect the stage and restore the cameras' configurations, on
+    every path; returns `failed`, or the cameras' failure to stop when nothing failed before."""
+    for camera in reversed(cameras):
+        logger.info("%s: notify end cam", camera.name)
+        camera.on_capture_notify_end()
+    for camera in reversed(cameras):
+        logger.info("%s: stopping cam", camera.name)
+        camera.on_capture_stop()
+    hard.disconnect()
+    try:
+        wait_cams_capture_status(cameras, CaptureProcessStatus.TERMINATED, 5)
+    except RuntimeError as err:
+        # The configurations are restored all the same, but videos that may still be
+        # being written are not calibrated from.
+        logger.error("Cameras did not stop: %s", err)
+        if failed is None:
+            failed = err
+    logger.verbose("Resetting cams to previous config")
+    for camera, cam_cfg in zip(cameras, cams_before_cfg):
+        camera.load_configuration(cam_cfg)
+    return failed
+
+
+def _collect_videos(project, cameras, record_mode, dest_dir: Path) -> None:
+    """Move each camera's video to <dest_dir>/source_videos/<camera>.mp4 and copy its
+    timestamps file beside it; extraction takes the waypoints' frames by those times."""
+    Path(dest_dir, SOURCE_VIDEOS).mkdir(parents=True, exist_ok=True)
+    for camera in cameras:
+        video_path, timestamps_path, *_ = project.get_video_path(
+            camera.name,
+            allow_overwrite=True,
+            interval=ProjectInterval.HOUR if record_mode == VideoRecordMode.CONTINUOUS else ProjectInterval.NONE
+        )
+        vp = Path(video_path)
+        target = Path(dest_dir, SOURCE_VIDEOS, f"{camera.name}.mp4")
+        logger.verbose("%s -> %s", vp.as_posix(), target.as_posix())
+        vp.rename(target)
+        # A copy, so the session keeps its own.
+        ts_target = Path(dest_dir, SOURCE_VIDEOS, f"{camera.name}{TIMESTAMPS_SUFFIX}")
+        logger.verbose("%s -> %s", timestamps_path, ts_target.as_posix())
+        shutil.copyfile(timestamps_path, ts_target)
+
+
+def _record_plan(
+    app_model, cameras, cams_before_cfg, cam_params, record_mode, project, plan, capture_list, dest_dir: Path,
+    *, label: str = "3d calib", **waypoint_options,
+) -> WaypointLog:
+    """Record `cameras` while the stage visits `plan`, then put the videos in `dest_dir`.
+
+    The capture and the scout both record through here: _prepare_capture, run_waypoints
+    (given `waypoint_options`), the recording stopped, and _teardown_capture on every path.
+    The first error is raised after the teardown, and then no video is moved.
+    """
+    hard = app_model.hardware
+    failed = None
+    log = None
+    try:
+        _prepare_capture(app_model, hard, cameras, cams_before_cfg, cam_params, record_mode, project, plan[0][2])
+        logger.notice("Running %s ..", label)
+        logger.info("Now executing the moves, pausing at each waypoint ..")
+        log = run_waypoints(hard, plan, capture_settings=capture_settings_of(cam_params), cameras=capture_list,
+                            **waypoint_options)
+        logger.success("executed %s moves; the motor reported %d of %d waypoints at their commanded position",
+                       len(plan) - 1, sum(log.verified), len(log.verified))
+        _stop_recording(cameras, record_mode)
+    except Exception as err:
+        logger.exception("Could not prepare and run %s: %s", label, err)
+        failed = err
+    finally:
+        failed = _teardown_capture(cameras, hard, cams_before_cfg, failed)
+
+    if failed is not None:
+        raise failed
+    _collect_videos(project, cameras, record_mode, dest_dir)
+    return log
+
+
+def run_scout(
+    app_model: AppModel,
+    cameras: Sequence[VideoCaptureModel],
+    plan_targets: Sequence[Sequence[float]],
+    *,
+    project,
+    session_dir: Path,
+    cams_before_cfg,
+    capture_list: Sequence[CaptureCamera],
+    cam_params: Optional[Dict[str, Any]] = None,
+    record_mode: VideoRecordMode = VideoRecordMode.TRIGGER,
+    configured: Optional[Bounds] = None,
+    counts: Sequence[int] = DEFAULT_COUNTS,
+    board: BoardSpec = BoardSpec(),
+    max_path: int = MAX_PATH,
+    **timing,
+) -> ScoutResult:
+    """A short capture over a coarse grid, then the move list every camera sees.
+
+    The grid is scout_grid inside bounds_from_plan(plan_targets, configured): the box the
+    hand-written plan's targets span, never wider. It is recorded as the capture is
+    (_record_plan, TRIGGER), each point one axis from the one before and paused
+    SCOUT_DWELL_S, with run_waypoints strict: a motor fault, a failed command or a point
+    the motor does not confirm raises ScoutAborted at once, sending nothing more. The
+    videos and timestamps go to <session>/scout/source_videos.
+
+    Each point's frames are taken by its logged dwell and the board looked for in the
+    middle one (scout_views_from_capture). The move list is choose_move_list's, and the
+    advice diagnose's. `timing` (sleep, now, clock) goes to run_waypoints, for tests.
+    """
+    if cam_params is None:
+        cam_params = default_params
+    dcs = app_model.behavior.algorithm.loaded_diamond_triangle_config
+    bounds = bounds_from_plan(plan_targets, configured)
+    grid = scout_grid(bounds, counts)
+    plan = scout_plan(grid, dcs)
+    names = [camera.name for camera in cameras]
+    logger.notice("Scouting %d points in %s - %s with %s", len(grid), bounds.lo, bounds.hi, ", ".join(names))
+    scout_dir = Path(session_dir, SCOUT_DIR_NAME)
+    log = _record_plan(app_model, cameras, cams_before_cfg, cam_params, record_mode, project, plan, capture_list,
+                       scout_dir, label="scout", dwell=SCOUT_DWELL_S, strict=True, **timing)
+    videos = {name: Path(scout_dir, SOURCE_VIDEOS, f"{name}.mp4") for name in names}
+    frame_times = load_frame_times(scout_dir, names)
+    if frame_times is None:
+        raise RuntimeError(f"the scout capture in {scout_dir} has no timestamps files")
+    views = scout_views_from_capture(videos, frame_times, log.motor, log.times, board)
+    sizes = video_sizes(videos)
+    selection, path = choose_move_list(grid, views, names, image_sizes=sizes, max_path=max_path)
+    diagnosis = diagnose(views, names, sizes)
+    logger.info("scout chose %d points (a path of %d waypoints); views per camera %s; cameras joined: %s",
+                len(selection.points), len(path), selection.per_camera, selection.connected)
+    for camera, advice in diagnosis.items():
+        logger.warning("%s: %s", camera, advice)
+    return ScoutResult(points=path, selection=selection, diagnosis=diagnosis, views=views)
+
+
+def saved_scout_list(root: Optional[Path], identities: Sequence[str], bounds: Bounds):
+    """The scout list saved in the library `root` for these cameras, or None when there is
+    none, or a point lies outside `bounds` (today's hand-written box: the DCS may have moved
+    it) or two in a row differ in other than one axis."""
+    if root is None:
+        return None
+    points = load_move_list(Path(root, SCOUT_MOVE_LIST_FILE), identities)
+    if points is None:
+        return None
+    if not all(lo <= v <= hi for p in points for v, lo, hi in zip(p, bounds.lo, bounds.hi)):
+        logger.warning("the saved scout move list leaves the hand-written list's box %s - %s; scouting again",
+                       bounds.lo, bounds.hi)
+        return None
+    if not all(sum(a != b for a, b in zip(p, q)) == 1 for p, q in zip(points, points[1:])):
+        logger.warning("the saved scout move list has a move of more than one axis; scouting again")
+        return None
+    return points
+
+
 def make_3d_calib(
     app_model: AppModel,
     cameras: Sequence[VideoCaptureModel],
     cam_params: Optional[Dict[str, Any]] = None,
     record_mode: VideoRecordMode = VideoRecordMode.TRIGGER,
     move_list: Optional[str] = None,
+    confirm_scout: Optional[Callable[[Mapping[str, str]], bool]] = None,
 ) -> Tuple[Path, Path, CalibrationIndex, QualityReport]:
     """Capture the board paused at every waypoint with `cameras`, then calibrate them from it.
 
     `cameras` are 2 to 6 distinct cameras; the primary is put first, for the trigger order.
     Each camera's own live geometry gives its presets (capture_live_geometries), and the
     waypoint log records each one's name, serial and camera id (capture_camera_list).
-    `move_list` is "handwritten" (the default, `moves`); the scout pass comes later.
+
+    `move_list` is "handwritten" (the default, `moves`) or "scout". With "scout", the list
+    saved in the calibration library for the same cameras (by serial, by name without one)
+    is used when it lies inside the hand-written list's box; otherwise the scout runs
+    (run_scout). When a camera fails the rule, `confirm_scout(advice by camera)` is asked
+    first: False raises ScoutCancelled and nothing is captured; True goes on, and that
+    camera ends up 2D only. Then choose_plan: the scout's list with 12 or more chosen
+    points, else the hand-written list. A scout list every camera passed is saved for next
+    time.
 
     The cameras record in TRIGGER mode, as a session's do. On christielab10 (2026-11-19)
     START_CONTINUOUS never reached RECORDING ("left: no RECORDING within 5 s", three runs),
@@ -606,8 +801,8 @@ def make_3d_calib(
     diamond_triangle_cfg = app_model.behavior.algorithm.loaded_diamond_triangle_config
     if diamond_triangle_cfg is None or not diamond_triangle_cfg.fully_valid:
         raise RuntimeError(f"Please first calibrate diamond-triangle by starting the acquisition")
-    if move_list not in (None, "handwritten"):
-        raise ValueError(f"unknown move list {move_list!r}; only the hand-written list is available")
+    if move_list not in (None, HANDWRITTEN, SCOUT):
+        raise ValueError(f"unknown move list {move_list!r}; it is {SCOUT!r} or {HANDWRITTEN!r}")
     given = list(cameras)
     names = [camera.name for camera in given]
     if not MIN_CAMERAS <= len(given) <= MAX_CAMERAS:
@@ -622,7 +817,6 @@ def make_3d_calib(
     live_geometries = capture_live_geometries(cameras)
     capture_list = capture_camera_list(cameras)
     cams_before_cfg = tuple(camera.save_configuration() for camera in cameras)
-    hard = app_model.hardware
     #
     project = app_model.make_project_info()
     project.calculate_next_session_index()
@@ -638,132 +832,27 @@ def make_3d_calib(
     src_dir = Path(
         calibration_FLIR.make_new_calibration(square_size, row_ct, col_ct, oversample, sess_path.location))
 
-    def prepare():
-        logger.notice("Preparing ..")
-        #
-        logger.info("Connecting to HW ..")
-        hard.connect(app_model.message_handler.input_queue)
-        token = hard.send_home()
-        hard.wait_pending_command_acked(token)
-        #
-        # Waypoint 0 is reached before recording starts, so the video opens on it rather
-        # than on the move from home, which would add a stationary segment no waypoint has.
-        logger.verbose("Setting start position")
-        for axis, motor_value in zip(AXES, plan[0][2]):
-            _command(hard, axis, motor_value)
-        #
-        for cam, cfg in zip(cameras, cams_before_cfg):
-            params = cam_params.copy()
-            params["primary"] = cfg.params.get("primary", "off")
-            logger.info("Preparing cam %s with params=%s", cam.name, params)
-            new_cfg = dataclasses.replace(
-                cfg,
-                record_mode=record_mode,
-                record_prebuffer_duration=0,
-                is_enabled=True,
-                is_record_enabled=True,
-                params=params,
-            )
-            cam.load_configuration(new_cfg)
-            cam.project = project
+    if move_list == SCOUT:
+        root = getattr(app_model, "calibration_library_root", None)
+        identities = [camera.serial or camera.name for camera in capture_list]
+        configured = None if root is None else configured_bounds(read_settings(root))
+        targets = [motor for *_, motor in plan]
+        saved = saved_scout_list(root, identities, bounds_from_plan(targets, configured))
+        if saved is not None:
+            logger.notice("Using the scout move list saved for these cameras: %d waypoints", len(saved))
+            plan = scout_plan(saved, diamond_triangle_cfg)
+        else:
+            scout = run_scout(app_model, cameras, targets, project=project, session_dir=Path(sess_path.location),
+                              cams_before_cfg=cams_before_cfg, capture_list=capture_list, cam_params=cam_params,
+                              record_mode=record_mode, configured=configured)
+            if scout.diagnosis and confirm_scout is not None and not confirm_scout(dict(scout.diagnosis)):
+                raise ScoutCancelled("cancelled at the scout's advice; nothing was captured")
+            plan, used = choose_plan(SCOUT, diamond_triangle_cfg, scout)
+            if used == SCOUT and root is not None and not scout.diagnosis:
+                save_move_list(Path(root, SCOUT_MOVE_LIST_FILE), scout.points, identities, datetime.now())
 
-        #
-
-        for cam in cameras:
-            if cam.is_primary:
-                logger.info("%s: prepare capture ..", cam.name)
-                if not cam.on_prepare_capture():
-                    raise RuntimeError(f"{cam.name}.on_prepare_capture() failed")
-                cam.wait_for_capture_status(CaptureProcessStatus.RUNNING, timeout=5)
-
-        for cam in cameras:
-            if not cam.is_primary:
-                logger.info("%s: prepare capture ..", cam.name)
-                if not cam.on_prepare_capture():
-                    raise RuntimeError(f"{cam.name}.on_prepare_capture() failed")
-
-        wait_cams_capture_status(cameras, CaptureProcessStatus.RUNNING, timeout=5)
-
-        for cam in cameras:
-            if not cam.is_primary:
-                logger.info("%s: capture start ..", cam.name)
-                cam.on_capture_start()
-        for cam in cameras:
-            if cam.is_primary:
-                logger.info("%s: capture start ..", cam.name)
-                cam.on_capture_start()
-
-        if record_mode == VideoRecordMode.TRIGGER:
-            logger.info("Triggering recording")
-            for cam in cameras:
-                cam.on_trigger_recording(True)
-
-        logger.notice("Waiting RECORDING on cams")
-        wait_cams_capture_status(cameras, CaptureProcessStatus.RECORDING, 5)
-
-    def run() -> WaypointLog:
-        logger.notice("Running 3d calib ..")
-        logger.info("Now executing calib moves, pausing at each waypoint ..")
-
-        waypoint_log = run_waypoints(hard, plan, capture_settings=capture_settings_of(cam_params),
-                                     cameras=capture_list)
-
-        logger.success("executed %s moves; the motor reported %d of %d waypoints at their commanded position",
-                       len(moves), sum(waypoint_log.verified), len(waypoint_log.verified))
-
-        if record_mode == VideoRecordMode.TRIGGER:
-            logger.info("Requesting cameras stop recording")
-            for cam in reversed(cameras):
-                cam.on_trigger_recording(False)
-            wait_cams_capture_status(cameras, CaptureProcessStatus.RUNNING, 15)
-        return waypoint_log
-
-    failed = None
-    log = None
-    try:
-        prepare()
-        log = run()
-    except Exception as err:
-        logger.exception("Could not prepare and run 3d calib: %s", err)
-        failed = err
-    finally:
-        for camera in reversed(cameras):
-            logger.info("%s: notify end cam", camera.name)
-            camera.on_capture_notify_end()
-        for camera in reversed(cameras):
-            logger.info("%s: stopping cam", camera.name)
-            camera.on_capture_stop()
-        hard.disconnect()
-        try:
-            wait_cams_capture_status(cameras, CaptureProcessStatus.TERMINATED, 5)
-        except RuntimeError as err:
-            # The configurations are restored all the same, but videos that may still be
-            # being written are not calibrated from.
-            logger.error("Cameras did not stop: %s", err)
-            if failed is None:
-                failed = err
-        logger.verbose("Resetting cams to previous config")
-        for camera, cam_cfg in zip(cameras, cams_before_cfg):
-            camera.load_configuration(cam_cfg)
-
-    if failed is not None:
-        raise failed
-
-    for camera in cameras:
-        video_path, timestamps_path, *_ = project.get_video_path(
-            camera.name,
-            allow_overwrite=True,
-            interval=ProjectInterval.HOUR if record_mode == VideoRecordMode.CONTINUOUS else ProjectInterval.NONE
-        )
-        vp = Path(video_path)
-        target = src_dir.joinpath(f"{SOURCE_VIDEOS}/{camera.name}.mp4")
-        logger.verbose("%s -> %s", vp.as_posix(), target.as_posix())
-        vp.rename(target)
-        # Extraction takes each waypoint's frames by the times its dwell was logged, from
-        # this file; a copy, so the session keeps its own.
-        ts_target = src_dir.joinpath(SOURCE_VIDEOS, f"{camera.name}{TIMESTAMPS_SUFFIX}")
-        logger.verbose("%s -> %s", timestamps_path, ts_target.as_posix())
-        shutil.copyfile(timestamps_path, ts_target)
+    log = _record_plan(app_model, cameras, cams_before_cfg, cam_params, record_mode, project, plan, capture_list,
+                       src_dir)
 
     logger.notice("Calibrating every preset from the capture in %s", src_dir)
     output_dir, index, report = calibrate_waypoint_capture(
