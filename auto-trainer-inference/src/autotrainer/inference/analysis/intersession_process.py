@@ -14,10 +14,11 @@ from autotrainer.core.reach_event import ReachEvent
 
 from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR
 
+from autotrainer.inference.analysis.offline_3d import recorded_geometry, session_offline_3d
 from autotrainer.inference.analysis.prepare_jetson_data import process_raw_data
 from autotrainer.inference.analysis.parse_pellet_presentations_jetson import segment_reaches
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry
-from autotrainer.inference.multires_calibration.library import is_legacy_entry
+from autotrainer.inference.multires_calibration.library import entry_library, is_legacy_entry, library_root
 from autotrainer.inference.multires_calibration.products import stereo_pair_geometry
 from autotrainer.inference.multires_calibration.store import (
     INDEX_FILE,
@@ -42,6 +43,11 @@ AvailableShiftXYZ = numpy.array([[-5, 5], [-5, 5], [-5, 5]])
 _segment_reach_debug: int = int(os.getenv("AUTOTRAINER_SEGMENT_REACH_DEBUG", 0))
 
 _CALIB_DIR_HINT = "pass --calib-dir to choose the calibration folder"
+# The live3dDisabledReason the app records while the operator has switched live 3D off
+# (tools/acquisition/model/app_model.LIVE_3D_OFF). Live 3D off by choice says nothing
+# about whether the calibration fits the session, so offline 3D does not refuse it.
+LIVE_3D_OFF = "live 3D is off"
+_LIVE_PAIR = ("left", "right")
 
 
 def resolve_session_calibration(project: ProjectInfo, calib_root: Path) -> Path:
@@ -157,10 +163,14 @@ def _warn_if_made_after(folder: Path, start: datetime, project: ProjectInfo) -> 
 def _session_preset(folder: Path, metadata: dict, project: ProjectInfo) -> LoadedPreset:
     """The preset of the format-2 or 3 calibration in `folder` that the session's 2D points are in.
 
-    That is the preset its live 3D used, named in its metadata. A session whose live 3D was
-    off (calibration3d records a live3dDisabledReason, for example a camera geometry that
-    matched no preset) is refused: the pixels of its 2D points are unknown, and reading them at
-    a preset that may not be theirs would be silently wrong (rulings R32, R35). Any other
+    That is the preset its live 3D used, named in its metadata. A session whose live 3D
+    could not run (calibration3d records a live3dDisabledReason, for example a camera
+    geometry that matched no preset) is refused: the pixels of its 2D points are unknown, and
+    reading them at a preset that may not be theirs would be silently wrong (rulings R32,
+    R35). A session recorded with live 3D switched off (LIVE_3D_OFF) is read like any other,
+    unless its left or right camera was recorded as not in the calibration (a swapped body,
+    say), which is refused; without a preset in its metadata it is read at the geometry
+    left and right recorded at, from its configuration, when that is known. Any other
     session without a preset takes the base preset, the largest binning, since its 2D pose
     files are in inference space, the base capture's pixels (spec, "Offline 3D input"). That
     is a session recorded before calibration3d existed, or one whose live 3D ran on a legacy
@@ -174,13 +184,21 @@ def _session_preset(folder: Path, metadata: dict, project: ProjectInfo) -> Loade
     """
     index = load_index(folder)
     calibration3d = _calibration3d(metadata)
-    if "live3dDisabledReason" in calibration3d:
+    switched_off = _live_3d_switched_off(calibration3d)
+    if "live3dDisabledReason" in calibration3d and not switched_off:
         raise CalibrationResolutionError(
             f"session {project.short_id} was recorded with live 3D off"
             f" ({calibration3d['live3dDisabledReason']}), so no preset of the calibration in {folder}"
             f" is known to match its 2D points; {_CALIB_DIR_HINT}"
         )
+    if switched_off:
+        _refuse_uncalibrated_pair(metadata, folder, project)
     name = calibration3d.get("preset")
+    recorded = _recorded_pair_geometry(metadata) if switched_off and name is None else None
+    if recorded is not None:
+        logger.info("session %s was recorded with live 3D switched off; reading it at the geometry left and"
+                    " right recorded at, %s", project.short_id, recorded.name)
+        return load_preset(folder, recorded)
     if name is None:
         geometry = _live_pair_geometry(index) if index.format >= 3 else None
         if geometry is not None:
@@ -215,6 +233,62 @@ def _session_preset(folder: Path, metadata: dict, project: ProjectInfo) -> Loade
             )
         geometry, = matches
     return load_preset(folder, geometry)
+
+
+def _live_3d_switched_off(calibration3d: dict) -> bool:
+    """Whether the operator had switched live 3D off (schema 3's live3d.enabled, or its reason)."""
+    live3d = calibration3d.get("live3d")
+    if isinstance(live3d, dict) and live3d.get("enabled") is False:
+        return True
+    return calibration3d.get("live3dDisabledReason") == LIVE_3D_OFF
+
+
+def _refuse_uncalibrated_pair(metadata: dict, folder: Path, project: ProjectInfo) -> None:
+    """Raise CalibrationResolutionError when left or right was recorded as not in the calibration."""
+    cameras = ((metadata.get("hardware") or {}).get("configured") or {}).get("cameras")
+    if not isinstance(cameras, dict):
+        return
+    problems = [
+        f"{name}: {cameras[name].get('uncalibratedReason') or 'not in the calibration'}"
+        for name in _LIVE_PAIR
+        if isinstance(cameras.get(name), dict) and cameras[name].get("inCalibration") is False
+    ]
+    if problems:
+        raise CalibrationResolutionError(
+            f"session {project.short_id} recorded cameras the calibration in {folder} does not hold as left and"
+            f" right ({'; '.join(problems)}), so its left-right 3D cannot be read from it; {_CALIB_DIR_HINT}"
+        )
+
+
+def _recorded_pair_geometry(metadata: dict) -> Optional[PresetGeometry]:
+    """The geometry left and right recorded at, from the session's configuration; None unless both share a known one."""
+    cameras = ((metadata.get("configuration") or {}).get("cameras")) or []
+    params = {c.get("name"): c.get("params") or {} for c in cameras if isinstance(c, dict)}
+    if not all(name in params for name in _LIVE_PAIR):
+        return None
+    try:
+        geometries = {recorded_geometry(params[name]) for name in _LIVE_PAIR}
+    except ValueError as error:
+        logger.warning("cannot read the recorded geometry of left and right: %s", error)
+        return None
+    return geometries.pop() if len(geometries) == 1 else None
+
+
+def _offline_3d(project: ProjectInfo, location: str, folder: Path, calib_root: Optional[Path]) -> None:
+    """Offline 3D from every calibrated camera of the session (offline_3d.session_offline_3d), for a format-3 calibration.
+
+    It is an extra product: a failure is logged and the session's processing goes on.
+    """
+    try:
+        if not folder.joinpath(INDEX_FILE).exists() or is_legacy_entry(folder) or load_index(folder).format < 3:
+            return
+        library_dir = entry_library(folder)
+        if library_dir is None:
+            library_dir = library_root(DEFAULT_CONFIG_DIR.expanduser() if calib_root is None else Path(calib_root))
+        session_offline_3d(Path(location), folder, _session_metadata(project), library_dir=library_dir)
+    except Exception:
+        logger.exception("offline 3D of session %s with the calibration in %s failed; its 2D processing goes on",
+                         project.short_id, folder)
 
 
 def _live_pair_geometry(index) -> Optional[PresetGeometry]:
@@ -253,6 +327,7 @@ def intersession_process(
             project, DEFAULT_CONFIG_DIR.expanduser() if calib_root is None else Path(calib_root))
     else:
         calib_src_dir = Path(calib_dir).expanduser()
+    calib_folder = calib_src_dir
     # A folder with a calibration.yaml is format 2 or 3, whether or not it reads: a legacy folder
     # never has one, so it is never read the legacy way (which would also fail obscurely). The
     # library's copy of a legacy folder has a generated one, marked format "legacy".
@@ -273,6 +348,7 @@ def intersession_process(
         frame_rate=frame_rate,
         preset=preset,
     )
+    _offline_3d(project, location, calib_folder, calib_root)
     #
     results_dict = segment_reaches(
         project_info=project,

@@ -436,9 +436,9 @@ calibrations/
   - Nothing switches it on by itself: not a calibration, not an install.
   - The session metadata records it as `calibration3d.live3d`:
     `{enabled, disabledReason}`. With live 3D off, `live3dDisabledReason` is
-    "live 3D is off" too. Offline 3D refuses a session with a
-    `live3dDisabledReason` (its 2D points' preset is not recorded), so a session
-    recorded with live 3D off cannot be triangulated offline for now.
+    "live 3D is off" too. Offline 3D does not refuse such a session: it reads
+    it at the preset named, else at the geometry left and right recorded at
+    (see [Offline 3D](offline-3d.md)).
 
 A format-3 folder, for any 2 to 6 cameras:
 
@@ -546,8 +546,13 @@ preset is never substituted, because its pixels are not the frames' pixels.
 - `preset` names the preset to read. A session with no `calibration3d`, or one
   recorded on a legacy calibration, is read at the base preset (the largest
   binning).
-- A session recorded with live 3D off (`live3dDisabledReason`), an id not found,
-  an ambiguous match or no match is refused with "pass --calib-dir".
+- A session whose live 3D could not run (any `live3dDisabledReason` but
+  "live 3D is off"), an id not found, an ambiguous match or no match is refused
+  with "pass --calib-dir". A session recorded with live 3D switched off is read
+  as usual; only a left or right camera recorded as not in the calibration (a
+  swapped body) refuses it.
+- With a format-3 calibration, offline 3D from every calibrated camera follows;
+  see [Offline 3D](offline-3d.md).
 - A session older than every kept calibration is refused too, with
   "pass --calib-dir", the session's time and when the calibration it would have
   landed on was made: the calibration it was recorded with is gone, and the

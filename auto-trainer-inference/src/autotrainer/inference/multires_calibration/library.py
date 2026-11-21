@@ -7,6 +7,7 @@ Under <config>/calibrations/ (library_root):
     decisions.jsonl     append-only: one JSON object per line, {event, id, at, ...}
     settings.yaml       library-wide switches; this module only names the file (settings_path)
     .derived/           the cache load_preset_set derives other geometries into, outside any entry
+    .offsets/<id>/      the camera offsets DCS measured against entry <id> (offsets_dir)
 
 A session names its calibration by id, so an entry never changes once it is in place: it is
 copied into <id>.partial and renamed to <id>, and nothing here writes inside it afterwards.
@@ -52,6 +53,7 @@ ACTIVE_FILE = "active.yaml"
 DECISIONS_FILE = "decisions.jsonl"
 SETTINGS_FILE = "settings.yaml"
 DERIVED_DIR_NAME = ".derived"
+OFFSETS_DIR_NAME = ".offsets"
 LEGACY_FORMAT = "legacy"
 
 _PARTIAL_SUFFIX = ".partial"
@@ -106,6 +108,19 @@ def update_settings(root: Path, **changes) -> dict:
 def derived_root(root: Path) -> Path:
     """Where load_preset_set derives geometries no stored set has; never inside an entry."""
     return Path(root) / DERIVED_DIR_NAME
+
+
+def offsets_dir(root: Path, calibration_id: str) -> Path:
+    """Where the camera offsets DCS measured against entry `calibration_id` are kept, beside it."""
+    return Path(root) / OFFSETS_DIR_NAME / calibration_id
+
+
+def entry_library(folder: Path) -> Optional[Path]:
+    """The library `folder` is an entry of, or None when it is not a library entry."""
+    folder = Path(folder)
+    if folder.parent.name == LIBRARY_DIR_NAME and _is_entry_name(folder.name) and (folder / INDEX_FILE).is_file():
+        return folder.parent
+    return None
 
 
 def entry_path(root: Path, calibration_id: str) -> Path:

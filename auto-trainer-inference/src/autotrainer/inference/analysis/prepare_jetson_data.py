@@ -567,8 +567,25 @@ def _load_saved_offsets(src_dir: str, *, save_missing: bool = True) -> Tuple[Opt
     """(the camera offsets saved in src_dir or None, whether to save the generated ones there).
 
     With save_missing False, missing offsets are generated for this run only and never saved.
+
+    A calibration library entry is never written to, so for one save_missing is ignored and
+    nothing is saved. Its offsets are the ones DCS keeps beside it, in the library's
+    .offsets/<id>/: the newest camera_offsets-<UTC time>.pkl by name, else a plain
+    camera_offsets.pkl there; failing both, the entry's own camera_offsets.pkl, which an
+    imported legacy folder may have brought with it.
     """
+    # Imported here, not at the top: the live pose process imports this module and has no use for the library.
+    from autotrainer.inference.multires_calibration.library import entry_library, offsets_dir
+
     path_offsets = os.path.join(src_dir, DEFAULT_CAM_OFFSET_FILE_NAME)
+    library = entry_library(Path(src_dir))
+    if library is not None:
+        save_missing = False
+        store = offsets_dir(library, Path(src_dir).name)
+        stem, suffix = os.path.splitext(DEFAULT_CAM_OFFSET_FILE_NAME)
+        stored = sorted(store.glob(f"{stem}-*{suffix}")) or [p for p in [store / DEFAULT_CAM_OFFSET_FILE_NAME] if p.is_file()]
+        if stored:
+            path_offsets = str(stored[-1])
     if os.path.isfile(path_offsets):
         with open(path_offsets, "rb") as handle:
             cam_offsets = pickle.load(handle)
