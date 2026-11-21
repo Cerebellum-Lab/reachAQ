@@ -12,7 +12,7 @@ from autotrainer.video import VideoRecordMode
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
-from autotrainer.inference.multires_calibration.fit import CaptureCamera
+from autotrainer.inference.multires_calibration.fit import BoardSpec, CaptureCamera
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
 from autotrainer.inference.multires_calibration.pipeline import (
     MAX_CAMERAS,
@@ -25,6 +25,18 @@ from autotrainer.inference.multires_calibration.pipeline import (
     write_waypoint_log,
 )
 from autotrainer.inference.multires_calibration.report import QualityReport
+from autotrainer.inference.multires_calibration.scout import (
+    DEFAULT_COUNTS,
+    MIN_VIEWS,
+    Bounds,
+    ScoutAborted,
+    ScoutResult,
+    diagnose,
+    order_path,
+    scout_grid,
+    scout_view,
+    select_waypoints,
+)
 from autotrainer.inference.multires_calibration.store import CalibrationIndex
 
 from tools.acquisition.model.app_model import AppModel
@@ -367,6 +379,133 @@ def run_waypoints(
         log.dcs_moves.append((axis, value))
         log.times.append((arrive, leave))
     return log
+
+
+SCOUT = "scout"
+HANDWRITTEN = "handwritten"
+# The scout's list replaces the hand-written one only with at least this many chosen points.
+MIN_SCOUT_POINTS = MIN_VIEWS
+
+
+def _driver_fault(hard) -> Tuple[str, ...]:
+    return tuple(getattr(hard, "pellet_axes_with_driver_fault", ()) or ())
+
+
+def run_scout(
+    hard,
+    cameras: Sequence[str],
+    bounds: Bounds,
+    *,
+    grab,
+    board: BoardSpec = BoardSpec(),
+    counts: Sequence[int] = DEFAULT_COUNTS,
+    sleep=time.sleep,
+    clock=time.monotonic,
+    tolerance: float = 0.05,
+    arrival_timeout: float = 2.0,
+) -> ScoutResult:
+    """Visit scout_grid(bounds, counts) and look for the board with every camera at each point.
+
+    `bounds` come from scout.bounds_from_plan, the box the hand-written plan travels, so
+    the grid never leaves it. The motion is run_waypoints': _command for each axis that
+    changes, the settle for the distance at the motor's configured speeds (_move_settle),
+    then wait_until_arrived. Nothing changes a limit, a speed or the firmware.
+
+    `grab(camera)` returns one full-sensor grey frame from that camera. At each point every
+    camera's frame goes through scout.scout_view.
+
+    Stops at once, raising ScoutAborted and sending no further command, when a command is
+    not queued or acknowledged (a CAN error raises there), when the motor reports a driver
+    fault, when the motor does not confirm the point, or when a camera gives no frame. The
+    stage is left where it stopped; homing is the capture's prepare().
+
+    Returns the views, the chosen move list (select_waypoints, then order_path) and the
+    advice for each camera that saw too little (diagnose).
+    """
+    cameras = list(cameras)
+    grid = scout_grid(bounds, counts)
+    limits = axis_limits(getattr(hard, "motor_configurations", None))
+    origin = _reported_position(hard)
+    previous = None
+    views = {}
+    sizes = {}
+    logger.notice("Scouting %d points in %s - %s with %s", len(grid), bounds.lo, bounds.hi, ", ".join(cameras))
+    for i, point in enumerate(grid):
+        moved = AXES if previous is None else tuple(a for k, a in enumerate(AXES) if point[k] != previous[k])
+        for axis in moved:
+            try:
+                _command(hard, axis, point[AXES.index(axis)])
+            except Exception as err:
+                raise ScoutAborted(f"scout point {i}: the move of {axis} to {point[AXES.index(axis)]:.3f}"
+                                   f" failed: {err}") from err
+            if _driver_fault(hard):
+                raise ScoutAborted(f"scout point {i}: motor driver fault on {', '.join(_driver_fault(hard))}")
+        sleep(_move_settle(limits, moved, point, origin))
+        origin = previous = point
+        arrived, reported = wait_until_arrived(
+            hard, point, tolerance=tolerance, timeout=arrival_timeout, sleep=sleep, now=clock)
+        if not arrived:
+            raise ScoutAborted(f"scout point {i}: the motor reported {reported}, not the commanded {point}")
+        if _driver_fault(hard):
+            raise ScoutAborted(f"scout point {i}: motor driver fault on {', '.join(_driver_fault(hard))}")
+        views[i] = {}
+        for camera in cameras:
+            try:
+                frame = grab(camera)
+            except Exception as err:
+                raise ScoutAborted(f"scout point {i}: {camera} gave no frame: {err}") from err
+            if frame is None:
+                raise ScoutAborted(f"scout point {i}: {camera} gave no frame")
+            sizes[camera] = (int(frame.shape[1]), int(frame.shape[0]))
+            views[i][camera] = scout_view(camera, frame, board)
+        logger.debug("scout point %d %s: found by %s", i, point,
+                     [c for c in cameras if views[i][c].found] or "none")
+    selection = select_waypoints(grid, views, cameras, image_sizes=sizes)
+    diagnosis = diagnose(views, cameras, sizes)
+    logger.info("scout chose %d points; views per camera %s; cameras joined: %s",
+                len(selection.points), selection.per_camera, selection.connected)
+    for camera, advice in diagnosis.items():
+        logger.warning("%s: %s", camera, advice)
+    return ScoutResult(points=order_path(selection.points), selection=selection, diagnosis=diagnosis, views=views)
+
+
+def scout_plan(
+    points: Sequence[Tuple[float, float, float]], dcs: DiamondTriangleOffsetConfig
+) -> List[Tuple[str, float, Tuple[float, float, float]]]:
+    """A scout move list as plan_waypoints gives one: (axis, DCS value, motor xyz).
+
+    `points` are motor positions, each one axis from the one before (order_path); waypoint
+    0's axis is z, as the hand-written start's last move is. Raises ValueError when two
+    points in a row differ in other than one axis.
+    """
+    plan = []
+    for k, point in enumerate(points):
+        point = tuple(float(v) for v in point)
+        if k == 0:
+            axis = AXES[-1]
+        else:
+            changed = [a for j, a in enumerate(AXES) if point[j] != plan[-1][2][j]]
+            if len(changed) != 1:
+                raise ValueError(f"scout point {k} {point} is not one axis from {plan[-1][2]}")
+            axis = changed[0]
+        i = AXES.index(axis)
+        value = float(dcs.motor_to_diamond(Offset3DTuple(*point))[i])
+        plan.append((axis, value, point))
+    return plan
+
+
+def choose_plan(
+    move_list: Optional[str], dcs: DiamondTriangleOffsetConfig, scout: Optional[ScoutResult]
+) -> Tuple[List[Tuple[str, float, Tuple[float, float, float]]], str]:
+    """(the plan, which list it is): the scout's when `move_list` is "scout" and the scout
+    chose MIN_SCOUT_POINTS or more points, otherwise the hand-written list."""
+    if move_list == SCOUT and scout is not None and len(scout.selection.points) >= MIN_SCOUT_POINTS:
+        return scout_plan(scout.points, dcs), SCOUT
+    if move_list == SCOUT:
+        chosen = 0 if scout is None else len(scout.selection.points)
+        logger.warning("the scout chose %d points, fewer than %d: using the hand-written move list",
+                       chosen, MIN_SCOUT_POINTS)
+    return plan_waypoints(start, moves, dcs), HANDWRITTEN
 
 
 def wait_cams_capture_status(cameras, capture_status: CaptureProcessStatus, timeout: float = 3):

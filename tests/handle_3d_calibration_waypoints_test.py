@@ -19,6 +19,7 @@ from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import yaml
 
@@ -38,6 +39,14 @@ from autotrainer.inference.multires_calibration.pipeline import (
     write_waypoint_log,
 )
 from autotrainer.inference.multires_calibration.report import QualityReport
+from autotrainer.inference.multires_calibration.scout import (
+    Bounds,
+    ScoutAborted,
+    ScoutResult,
+    Selection,
+    order_path,
+    scout_grid,
+)
 from autotrainer.video.video_record import VideoRecordMode
 from tools.acquisition.model import handle_3d_calibration as h3d
 from tools.acquisition.model import hardware_model as hardware_model_module
@@ -1002,3 +1011,139 @@ def test_preset_sets_come_from_the_calibrated_cameras_only(tmp_path):
         tmp_path / "calibration", fit=FIT, preset_sets=repeated, board=BoardSpec(), report=_REPORT, capture={},
         cameras=[CaptureCamera("left", None, 0), CaptureCamera("right", None, 1), CaptureCamera("camera4", None, 4)])
     assert [s["name"] for s in index.preset_sets] == ["live"]
+
+
+# The scout pass: before a capture, the stage visits a coarse grid inside the box the
+# hand-written list travels, and every camera looks for the board at each point. The motion
+# is the capture's own: _command, the configured speeds' settle and wait_until_arrived. It
+# stops at the first move the motor does not confirm, sending nothing more.
+
+_BLANK = np.full((54, 72), 100, np.uint8)
+_SCOUT_BOX = Bounds((10.0, 20.0, 30.0), (14.0, 26.0, 34.0))
+
+
+class _Grabs:
+    """Camera frames for the scout: a blank image per camera, each grab logged with the motor's commands so far."""
+
+    def __init__(self, motor):
+        self.motor = motor
+        self.calls = []
+
+    def __call__(self, camera):
+        self.calls.append((camera, len(self.motor.commands)))
+        return _BLANK
+
+
+def _scout_motor(clock):
+    motor = _Motor(clock, travel=0.0)
+    motor.motor_configurations = _motor_configurations(**SPEEDS)
+    return motor
+
+
+def test_run_scout_visits_the_grid_inside_its_bounds_and_looks_with_every_camera():
+    clock = _Clock()
+    motor = _scout_motor(clock)
+    grabs = _Grabs(motor)
+
+    result = h3d.run_scout(motor, ["left", "right", "camera4"], _SCOUT_BOX, grab=grabs, counts=(2, 2, 2),
+                           sleep=clock.sleep, clock=clock.now)
+
+    grid = scout_grid(_SCOUT_BOX, counts=(2, 2, 2))
+    # Point 0 commands every axis; each later point the one axis the serpentine grid changes.
+    assert motor.commands[:3] == list(zip("xyz", grid[0]))
+    assert motor.commands[3:] == [
+        ("xyz"[k], b[k]) for a, b in zip(grid, grid[1:]) for k in range(3) if a[k] != b[k]]
+    for axis, value in motor.commands:
+        k = "xyz".index(axis)
+        assert _SCOUT_BOX.lo[k] <= value <= _SCOUT_BOX.hi[k]
+    # Every camera looks once at every point, after the point's move.
+    assert len(grabs.calls) == 3 * len(grid)
+    # Each move settles at the configured speed: 1 s at point 0 (the motor reported nothing yet).
+    settles = _settles(clock.events)
+    assert settles[0] == 1.0
+    assert settles[1] == pytest.approx(h3d.settle_time(grid[1][0] - grid[0][0], SPEEDS["x"]))
+    # Blank frames: no board anywhere, so no move list and the aim advice for each camera.
+    assert result.points == [] and result.selection.points == []
+    assert set(result.diagnosis) == {"left", "right", "camera4"}
+    assert all(text.startswith("board never in view") for text in result.diagnosis.values())
+    assert set(result.views) == set(range(len(grid)))
+
+
+def test_run_scout_stops_on_unverified_arrival(monkeypatch):
+    clock = _Clock()
+    motor = _scout_motor(clock)
+    grabs = _Grabs(motor)
+    arrivals = []
+    real_wait = h3d.wait_until_arrived
+
+    def wait(hard, target, **kwargs):
+        arrivals.append(tuple(target))
+        if len(arrivals) == 3:
+            return False, (0.0, 0.0, 0.0)
+        return real_wait(hard, target, **kwargs)
+
+    monkeypatch.setattr(h3d, "wait_until_arrived", wait)
+    with pytest.raises(ScoutAborted, match="point 2"):
+        h3d.run_scout(motor, ["left", "right"], _SCOUT_BOX, grab=grabs, counts=(2, 2, 2),
+                      sleep=clock.sleep, clock=clock.now)
+
+    # Points 0 to 2 were commanded (3 axes, then one each), and nothing after point 2's move.
+    assert len(motor.commands) == 5
+    assert clock.events[-1][0] != "move" and [e for e in clock.events if e[0] == "move"][-1][2] == motor.commands[-1][1]
+    # The cameras looked at points 0 and 1 only.
+    assert len(grabs.calls) == 4
+    assert len(arrivals) == 3
+
+
+def test_run_scout_stops_on_a_motor_fault_or_a_failed_command():
+    clock = _Clock()
+    motor = _scout_motor(clock)
+    motor.pellet_axes_with_driver_fault = ()
+    real_move_y = motor.move_y
+
+    def faulting_move_y(value, *, absolute=True):
+        motor.pellet_axes_with_driver_fault = ("Y",)
+        return real_move_y(value, absolute=absolute)
+
+    motor.move_y = faulting_move_y
+    grabs = _Grabs(motor)
+    with pytest.raises(ScoutAborted, match="fault"):
+        h3d.run_scout(motor, ["left", "right"], _SCOUT_BOX, grab=grabs, sleep=clock.sleep, clock=clock.now)
+    # Point 0's y move faulted: x and y were sent, z never was, and no camera looked.
+    assert [axis for axis, _ in motor.commands] == ["x", "y"]
+    assert grabs.calls == []
+
+    clock = _Clock()
+    motor = _scout_motor(clock)
+    motor.move_z = lambda value, *, absolute=True: None  # never queued, as when CAN is down
+    with pytest.raises(ScoutAborted, match="not queued"):
+        h3d.run_scout(motor, ["left", "right"], _SCOUT_BOX, grab=_Grabs(motor), sleep=clock.sleep, clock=clock.now)
+    assert [axis for axis, _ in motor.commands] == ["x", "y"]
+
+
+def _scout_result(n_selected):
+    points = [(10.0 + i, 40.0, 30.0) for i in range(n_selected)]
+    selection = Selection(points=points, per_camera={"left": n_selected, "right": n_selected}, connected=True)
+    return ScoutResult(points=order_path(points), selection=selection, diagnosis={}, views={})
+
+
+def test_fewer_than_12_points_falls_back_to_handwritten():
+    dcs = _dcs()
+    handwritten = plan_waypoints(start, moves, dcs)
+
+    plan, used = h3d.choose_plan("scout", dcs, _scout_result(11))
+    assert used == "handwritten" and plan == handwritten
+    plan, used = h3d.choose_plan("scout", dcs, None)
+    assert used == "handwritten" and plan == handwritten
+    plan, used = h3d.choose_plan("handwritten", dcs, _scout_result(20))
+    assert used == "handwritten" and plan == handwritten
+
+    result = _scout_result(12)
+    plan, used = h3d.choose_plan("scout", dcs, result)
+    assert used == "scout"
+    assert [motor for _, _, motor in plan] == result.points
+    # Every move after the first is one axis, logged with its DCS value.
+    for (_, _, a), (axis, value, b) in zip(plan, plan[1:]):
+        k = "xyz".index(axis)
+        assert [i for i in range(3) if a[i] != b[i]] == [k]
+        assert h3d._dcs_axis_to_motor(dcs, axis, value) == pytest.approx(b[k])
