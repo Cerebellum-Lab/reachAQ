@@ -472,27 +472,45 @@ calibrations/
 
 - **An entry never changes.** A session records the calibration's id, so the
   entry it names must still be the one it was recorded with. An entry is copied
-  to `<id>.partial` and renamed into place, so a power cut leaves no entry that
-  loads, and nothing writes inside it afterwards. Adding an id that is already
-  there is refused.
+  to `<id>.partial`, its files and folders are flushed to disk, and it is renamed
+  into place, so a power cut leaves no entry that loads, and nothing writes
+  inside it afterwards. An entry whose `calibration.yaml` is empty is not an
+  entry. Adding an id that is already there with other content is refused;
+  adding it again with byte-identical content (a retry after a crash between
+  adding and activating it) keeps the entry, and the install then activates it.
 - **What happens to an entry afterwards is a decision.** Making it active and
   installing it over a failed quality check (**Install anyway…**) are lines in
   `decisions.jsonl`, for example
   `{"event": "set_active", "id": "…", "by": "ben", "at": "2026-11-20T14:05:06"}`.
   The log is only ever appended to.
-- **`active.yaml` is replaced whole** (temp file, then rename), so a power cut
-  leaves the old pointer or the new one. A missing or corrupt `active.yaml`, or
-  one that names an entry that is not there, means there is no active
-  calibration: the library reports none and logs why; it never raises.
+- **`active.yaml` is replaced whole** (temp file, flushed, then rename), so a
+  power cut leaves the old pointer or the new one. When the `set_active`
+  decision cannot be appended after the pointer moved, the previous
+  `active.yaml` is put back and the install fails with that write's error, so
+  the pointer never names an activation the log does not have. A missing or
+  corrupt `active.yaml` (binary garbage, an impossible date, a list), or one
+  that names an entry that is not there, means there is no active calibration:
+  the library reports none and logs why; it never raises.
 - **Older calibrations are imported, not moved.** `import_existing` copies the
   `4mm_6r_8c_4x` folder and every dated backup into the library. A format-2
-  folder keeps its id. A legacy folder (no `calibration.yaml`) gets a new id,
-  its `stereo_params.pickle` time as its date, and a generated
-  `calibration.yaml` marked `format: legacy`. It sets the active pointer to the
-  active folder's entry when there is none yet, skips anything already in the
-  library (so it can run again), and leaves the old folders as they were.
+  folder keeps its id. A legacy folder (no `calibration.yaml`) gets an id made
+  from its content, a uuid5 over the sha256 of `camera_matrix/stereo_params.pickle`
+  and that file's modification time in nanoseconds, without the folder's name,
+  so the active folder and the dated backup it is later renamed to are imported
+  once. It also gets its `stereo_params.pickle` time as its date, and a
+  generated `calibration.yaml` marked `format: legacy` that records it as
+  `created`; offline's made-by check reads that `created`, not the copy's file
+  times. The import sets the active pointer to the active folder's entry when
+  there is none yet, skips anything already in the library (so it can run
+  again), records one `import` decision per entry (one that could not be written
+  is written on the next import), and leaves the old folders as they were.
+  Legacy ids made from the folder's name existed only on this branch, never on
+  a rig, so none needs migrating; a session that already names one still
+  resolves while that entry is kept.
 - **Finding a calibration.** A session's metadata id is looked up in the library
-  first, then among the old folders. A session with no id is resolved by time:
+  first, then among the old folders; a library entry whose `calibration.yaml`
+  does not load does not hide an old folder with the same id. A session with no
+  id is resolved by time:
   the entry the log shows as active then, or, for a time before the log begins,
   the old folders' dated backups as before.
 - **The app loads the active entry.** At start, and whenever no calibration
@@ -642,9 +660,12 @@ preset is never substituted, because its pixels are not the frames' pixels.
 - `id` finds the calibration under `--calib-root` (default `~/Autotrainer`),
   whether it is the active folder or a dated backup. With no id, the session's
   start time picks the calibration that was active then.
-- `preset` names the preset to read. A session with no `calibration3d`, or one
-  recorded on a legacy calibration, is read at the base preset (the largest
-  binning).
+- `preset` names the preset to read. With a format-3 calibration, a session
+  that names none is read at the calibration's live preset set (the geometry
+  the cameras recorded at), and refused with a plain reason when it has none;
+  it is never read at the largest binning, which would be a silent misread. With
+  a format-2 calibration, a session with no `calibration3d`, or one recorded on
+  a legacy calibration, is read at the base preset (the largest binning).
 - A session whose live 3D could not run (any `live3dDisabledReason` but
   "live 3D is off"), an id not found, an ambiguous match or no match is refused
   with "pass --calib-dir". A session recorded with live 3D switched off is read
@@ -805,7 +826,8 @@ lists the geometries.
 - **A crash during an install.** The entry is copied as `<id>.partial` and
   renamed into place, then `active.yaml` is replaced whole, so a crash leaves
   the previous calibration active, or the new one, never half of either. A
-  leftover `<id>.partial` is removed by the next write of that id.
+  leftover `<id>.partial` is removed by the next write of that id, and an entry
+  left in place but never activated is activated by a retry of the same install.
 - **Camera movement is checked against the previous calibration only.** Both
   cameras shifting by the same vector cannot be told from the board being
   remounted, and the change metrics do not see it. The DCS, redone after every

@@ -40,6 +40,7 @@ from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSE
 from autotrainer.inference.multires_calibration import store
 from autotrainer.inference.multires_calibration.geometry import (
     PresetGeometry,
+    PresetSet,
     presets_from_base,
     sensor_to_preset_points,
 )
@@ -75,7 +76,10 @@ def _write_format2(folder: Path, made: Optional[datetime] = None) -> store.Calib
     """A format-2 calibration in `folder`, made now or, for a session resolved by time that
     must not predate it (resolve_for_time refuses that), at `made`."""
     folder.parent.mkdir(parents=True, exist_ok=True)
-    index = store.write_calibration(folder, fit=RIG.truth, presets=PRESETS, board=RIG.board, report=_REPORT,
+    # The live set comes first, as the capture tool writes it: the cameras recorded at BASE.
+    sets = [PresetSet("live", {cam: BASE for cam in RIG.truth.cameras})]
+    sets += [PresetSet(g.name, {cam: g for cam in RIG.truth.cameras}) for g in PRESETS]
+    index = store.write_calibration(folder, fit=RIG.truth, preset_sets=sets, board=RIG.board, report=_REPORT,
                                     capture={})
     if made is not None:
         index_path = folder / store.INDEX_FILE
@@ -84,6 +88,20 @@ def _write_format2(folder: Path, made: Optional[datetime] = None) -> store.Calib
         index_path.write_text(yaml.safe_dump(data, sort_keys=False))
         index = store.load_index(folder)
     return index
+
+
+def _write_true_format2(folder: Path, made: datetime) -> None:
+    """A format-2 folder, as calibrations made before 2026-11-20 are: one presets/<name>/ per
+    preset with left and right at it, and an index listing the presets, no cameras or sets."""
+    folder.parent.mkdir(parents=True, exist_ok=True)
+    store.write_calibration(folder, fit=RIG.truth, presets=PRESETS, board=RIG.board, report=_REPORT, capture={})
+    index_path = folder / store.INDEX_FILE
+    data = yaml.safe_load(index_path.read_text())
+    data.update(format=2, created=made.isoformat(timespec="seconds"),
+                presets=[dict(s["cameras"]["left"], name=s["name"]) for s in data.pop("preset_sets")])
+    data.pop("cameras")
+    index_path.write_text(yaml.safe_dump(data, sort_keys=False))
+    assert store.load_index(folder).format == 2 and store.load_index(folder).presets == tuple(PRESETS)
 
 
 def _write_legacy(folder: Path, made: datetime) -> Path:
@@ -291,9 +309,10 @@ def test_a_session_recorded_with_live_3d_off_is_refused(tmp_path, monkeypatch):
 def test_a_legacy_live_session_reaching_format2_uses_the_base_preset(tmp_path, monkeypatch, caplog, route):
     root = tmp_path / "Autotrainer"
     folder = root / NAME
+    # A real format-2 folder: a format-3 one is read at its live set, never at the base preset.
     # Made before the session: by time, a format-2 calibration made after it would be refused
     # (test_a_session_older_than_every_kept_calibration_is_refused).
-    _write_format2(folder, made=datetime(2026, 6, 1))
+    _write_true_format2(folder, made=datetime(2026, 6, 1))
     project = _project(tmp_path)
     # Live 3D ran on a legacy calibration: no id, no preset, and it was not off.
     _write_metadata(project, _metadata(IN_SECOND_WINDOW, id=None, created="2026-03-03T09:08:15", preset=None,

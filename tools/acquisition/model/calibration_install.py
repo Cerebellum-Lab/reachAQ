@@ -31,6 +31,7 @@ from autotrainer.inference.multires_calibration.library import (
     record_decision,
     set_active,
 )
+from autotrainer.inference.multires_calibration.store import load_index
 
 logger = get_verbose_logger(__name__)
 
@@ -70,19 +71,29 @@ def install_calibration(
     <location>/calibrations/<id>. `new_dir` is copied, not moved, and stays as it is. `now`
     is kept for the callers; the library stamps its own times.
 
-    When the pointer cannot be written the new entry is removed again and the previous
-    calibration stays active, so the install can be retried. A decision that cannot be
-    written after the install is logged, not raised: the calibration is installed by then.
+    When the pointer or its decision cannot be written the new entry is removed again and the
+    previous calibration stays active (set_active puts the old pointer back), so the install
+    can be retried; the caller gets that write's error. A retry of the same calibration after
+    a crash between adding and activating it finds the identical entry, keeps it and
+    activates it (add_entry); an entry that was already there is never removed by a failed
+    retry. A decision that cannot be written after the install is logged, not raised: the
+    calibration is installed by then.
     """
     new_dir = Path(new_dir)
     root = library_root(configuration_location)
     if Path(new_dir, DEFAULT_CAM_OFFSET_FILE_NAME).exists():
         raise ValueError(f"{new_dir} holds a {DEFAULT_CAM_OFFSET_FILE_NAME}; offsets come only from DCS")
+    existed = root.joinpath(load_index(new_dir).id).exists()
     calibration_id = add_entry(root, new_dir)
     try:
         set_active(root, calibration_id, by=by or getpass.getuser())
     except BaseException:
-        discard_entry(root, calibration_id)
+        if not existed:
+            try:
+                discard_entry(root, calibration_id)
+            except Exception:
+                # The activation's own error is the one the caller needs, not the rollback's.
+                logger.exception("could not remove calibration %s again after its activation failed", calibration_id)
         raise
     if override is not None:
         try:

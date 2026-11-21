@@ -176,11 +176,10 @@ def _session_preset(folder: Path, metadata: dict, project: ProjectInfo) -> Loade
     is a session recorded before calibration3d existed, or one whose live 3D ran on a legacy
     calibration and reaches this format-2 folder; the latter is warned about.
 
-    A format-3 calibration may hold no left-right pair at all, and its presets are then empty.
-    Without a preset in the metadata such a session is read at the live preset set, the one
-    the cameras recorded at, when it holds left and right at one geometry; else at the base
-    preset, as above, when the calibration has any left-right preset; otherwise
-    CalibrationGeometryError says there is no preset to read.
+    A format-3 calibration follows one order: the preset the metadata names, else its live
+    preset set (the geometry the cameras recorded at) when that holds left and right at one
+    geometry, else CalibrationGeometryError. It never falls back to the largest binning: the
+    live set is what the cameras recorded, so any other preset would be a silent misread.
     """
     index = load_index(folder)
     calibration3d = _calibration3d(metadata)
@@ -204,6 +203,12 @@ def _session_preset(folder: Path, metadata: dict, project: ProjectInfo) -> Loade
         if geometry is not None:
             logger.info("session %s names no preset; using the live preset set of %s (%s)",
                         project.short_id, folder, geometry.name)
+        elif index.format >= 3:
+            raise CalibrationGeometryError(
+                f"session {project.short_id} names no preset, and the calibration in {folder} has no live"
+                f" preset set with left and right at one geometry, so its 2D points have no known preset;"
+                f" {_CALIB_DIR_HINT}"
+            )
         elif not index.presets:
             raise CalibrationGeometryError(
                 f"the calibration in {folder} has no left-right preset, so session {project.short_id}"

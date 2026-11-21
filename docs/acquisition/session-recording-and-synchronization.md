@@ -743,9 +743,12 @@ read at the session's `preset`. A session whose `calibration3d` has a
 since the pixels of its 2D points are not known to match any preset. A session
 with no `calibration3d` at all, or whose live 3D ran on a legacy calibration
 (`id` and `preset` null, no `live3dDisabledReason`), is read at the base preset
-(largest binning); the legacy case logs a warning naming the folder, since it
-reaches a format-2 folder only through `--calib-dir` or a deleted legacy
-backup. Offline 3D never writes
+(largest binning) of a format-2 calibration; the legacy case logs a warning
+naming the folder, since it reaches a format-2 folder only through
+`--calib-dir` or a deleted legacy backup. A format-3 calibration is read at the
+session's `preset`, else at its live preset set, and a session that names no
+preset under a format-3 calibration without a live set is refused: the largest
+binning would be a guess at the pixels. Offline 3D never writes
 `camera_offsets.pkl` into a format-2 calibration folder: only DCS does, and for
 a library entry it writes beside it, in `calibrations/.offsets/<id>/`.
 

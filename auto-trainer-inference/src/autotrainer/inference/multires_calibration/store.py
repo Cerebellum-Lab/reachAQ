@@ -87,6 +87,8 @@ CALIBRATION_FORMAT = 3
 # The formats the readers accept: 2 (left and right only) and 3.
 READABLE_FORMATS = (2, 3)
 INDEX_FILE = "calibration.yaml"
+# The format of the calibration.yaml the library generates for an imported legacy folder.
+LEGACY_FORMAT = "legacy"
 
 _SENSOR_FIT_FILE = Path("sensor", "fit.yaml")
 _PRESETS_DIR = "presets"
@@ -499,15 +501,38 @@ def calibration_created(folder: Path) -> datetime:
     """When the calibration in `folder` was made, as a local naive time to the second.
 
     A legacy folder records no date, so its stereo_params.pickle's mtime stands in: the
-    legacy install copies the folder with shutil.copytree, which keeps file times. A corrupt
+    legacy install copies the folder with shutil.copytree, which keeps file times. The
+    library's copy of one (format "legacy") records that time as `created` when it is
+    imported, which is read instead, whatever the copy's own file times are. A corrupt
     index raises rather than falling back to a pickle a format-2 folder does not have.
     """
     folder = Path(folder)
     index = _parse_index(folder)
     if index is not None:
         return index.created
+    marker = _legacy_marker_created(folder)
+    if marker is not None:
+        return marker
     mtime = (folder / _CAMERA_MATRIX_DIR / _STEREO_FILE).stat().st_mtime
     return datetime.fromtimestamp(mtime).replace(microsecond=0)
+
+
+def _legacy_marker_created(folder: Path) -> Optional[datetime]:
+    """The `created` of an imported legacy entry's generated calibration.yaml, or None when
+    `folder` has none or it cannot be read."""
+    path = folder / INDEX_FILE
+    if not path.is_file():
+        return None
+    try:
+        data = _read_yaml(path)
+        if not isinstance(data, dict) or data.get("format") != LEGACY_FORMAT:
+            return None
+        created = data["created"]
+        created = created if isinstance(created, datetime) else datetime.fromisoformat(str(created))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, KeyError, TypeError, ValueError) as error:
+        logger.warning("the legacy calibration marker %s has no readable created time: %s", path, error)
+        return None
+    return created.replace(microsecond=0)
 
 
 def calibration_candidates(root: Path, name: str = DEFAULT_3D_CALIB_DIR_NAME) -> List[CalibrationCandidate]:
@@ -551,16 +576,30 @@ def find_calibration(root: Path, calibration_id: str) -> Path:
 
     The library (<root>/calibrations) is searched first, then the active folder and its dated
     backups, which hold calibrations the library has not imported (library.import_existing).
+    A library entry whose index does not load (corrupt, half-written) does not shadow an old
+    folder with the same id: that folder is used, and the entry is warned about.
     """
     from autotrainer.inference.multires_calibration import library  # library imports this module
 
+    broken: Optional[str] = None
     try:
-        return library.entry_path(library.library_root(root), calibration_id)
-    except CalibrationResolutionError:
-        pass
+        entry = library.entry_path(library.library_root(root), calibration_id)
+    except CalibrationResolutionError as error:
+        if library.library_root(root).joinpath(calibration_id).is_dir():
+            broken = str(error)
+    else:
+        try:
+            if not library.is_legacy_entry(entry):
+                load_index(entry)
+            return entry
+        except (OSError, ValueError) as error:
+            broken = f"{entry / INDEX_FILE} does not load: {error}"
+            logger.warning("the library entry %s cannot be read; looking for calibration %s in the folders"
+                           " under %s instead: %s", entry, calibration_id, root, error)
     matches = [c.path for c in calibration_candidates(root) if c.calibration_id == calibration_id]
     if not matches:
-        raise CalibrationResolutionError(f"no calibration under {root} has id {calibration_id}")
+        detail = f" (the library's entry is unreadable: {broken})" if broken else ""
+        raise CalibrationResolutionError(f"no calibration under {root} has id {calibration_id}{detail}")
     if len(matches) > 1:
         raise CalibrationResolutionError(
             f"{len(matches)} calibrations under {root} have id {calibration_id}: {', '.join(p.name for p in matches)}"

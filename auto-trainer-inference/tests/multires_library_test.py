@@ -115,16 +115,62 @@ def test_add_then_activate(tmp_path):
         (calibration_id, True, "pass", ["left", "right"], {})]
 
 
-def test_add_refuses_an_existing_id(tmp_path):
+def test_add_refuses_an_existing_id_with_other_content(tmp_path):
     root = library_root(tmp_path)
     built = tmp_path / "built"
     calibration_id = _built(built)
     add_entry(root, built)
     before = _hashes(root / calibration_id)
+    (built / store.INDEX_FILE).write_text((built / store.INDEX_FILE).read_text() + "# edited\n")
     with pytest.raises(FileExistsError, match=calibration_id):
         add_entry(root, built)
     assert _hashes(root / calibration_id) == before
     assert not list(root.glob("*.partial"))
+
+
+def test_a_retry_of_an_identical_entry_is_kept_and_can_be_activated(tmp_path):
+    # A crash between add_entry and set_active left the entry; the retry adds the same build.
+    root = library_root(tmp_path)
+    built = tmp_path / "built"
+    calibration_id = _built(built)
+    add_entry(root, built)
+    before = _hashes(root / calibration_id)
+
+    assert add_entry(root, built) == calibration_id
+    set_active(root, calibration_id, by="ben")
+
+    assert _hashes(root / calibration_id) == before
+    assert active_id(root) == calibration_id
+    assert not list(root.glob("*.partial"))
+
+
+def test_add_flushes_the_entry_before_it_is_renamed_into_place(tmp_path, monkeypatch):
+    root = library_root(tmp_path)
+    built = tmp_path / "built"
+    _built(built)
+    events = []
+    real_fsync, real_replace = library.os.fsync, library.os.replace
+    monkeypatch.setattr(library.os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(library.os, "replace", lambda a, b: (events.append(("replace", Path(b).name)),
+                                                             real_replace(a, b))[1])
+    calibration_id = add_entry(root, built)
+    n_files = sum(1 for p in built.rglob("*") if p.is_file())
+    rename = events.index(("replace", calibration_id))
+    assert events[:rename].count("fsync") >= n_files
+
+    events.clear()
+    set_active(root, calibration_id, by="ben")
+    assert events.index("fsync") < events.index(("replace", ACTIVE_FILE)), "active.yaml's temp file is flushed first"
+
+
+def test_an_entry_with_an_empty_index_is_not_an_entry(tmp_path):
+    root = library_root(tmp_path)
+    built = tmp_path / "built"
+    calibration_id = _built(built)
+    add_entry(root, built)
+    (root / calibration_id / store.INDEX_FILE).write_bytes(b"")
+    with pytest.raises(CalibrationResolutionError, match="empty"):
+        entry_path(root, calibration_id)
 
 
 def test_add_refuses_a_folder_that_is_not_a_calibration(tmp_path):
@@ -160,6 +206,55 @@ def test_active_id_is_none_for_missing_corrupt_or_dangling_pointer(tmp_path, con
         assert active_id(root) is None
     assert any("no active calibration" in r.getMessage() for r in caplog.records)
     assert list_entries(root) == []
+
+
+@pytest.mark.parametrize("content", [b"id: %s\nat: 2026-13-45\n", b"\x00\xff\xfe\x81garbage\xc3", b"- id: %s\n"],
+                         ids=["bad_timestamp", "binary_garbage", "list_at_top_level"])
+def test_active_id_never_raises(tmp_path, content, caplog):
+    root = library_root(tmp_path)
+    built = tmp_path / "built"
+    calibration_id = _built(built)
+    add_entry(root, built)
+    (root / ACTIVE_FILE).write_bytes(content.replace(b"%s", calibration_id.encode()))
+    with caplog.at_level(logging.WARNING):
+        assert active_id(root) is None
+    assert any("no active calibration" in r.getMessage() for r in caplog.records)
+    assert [e.active for e in list_entries(root)] == [False]
+
+
+def test_a_failed_decision_puts_the_previous_pointer_back(tmp_path, monkeypatch):
+    root = library_root(tmp_path)
+    first, second = tmp_path / "first", tmp_path / "second"
+    first_id, second_id = _built(first), _built(second)
+    add_entry(root, first)
+    add_entry(root, second)
+    set_active(root, first_id, by="ben")
+    old_pointer = (root / ACTIVE_FILE).read_bytes()
+    old_decisions = (root / DECISIONS_FILE).read_bytes()
+
+    def refuse(root, record):
+        raise OSError("decisions.jsonl: read-only file system")
+
+    monkeypatch.setattr(library, "_append_decision", refuse)
+    with pytest.raises(OSError, match="read-only file system"):
+        set_active(root, second_id, by="ben")
+    monkeypatch.undo()
+
+    assert (root / ACTIVE_FILE).read_bytes() == old_pointer
+    assert active_id(root) == first_id
+    assert (root / DECISIONS_FILE).read_bytes() == old_decisions
+    assert not list(root.glob(f"{ACTIVE_FILE}.*.tmp"))
+
+
+def test_a_failed_first_decision_leaves_no_pointer(tmp_path, monkeypatch):
+    root = library_root(tmp_path)
+    built = tmp_path / "built"
+    calibration_id = _built(built)
+    add_entry(root, built)
+    monkeypatch.setattr(library, "_append_decision", lambda root, record: (_ for _ in ()).throw(OSError("no")))
+    with pytest.raises(OSError, match="no"):
+        set_active(root, calibration_id, by="ben")
+    assert not (root / ACTIVE_FILE).exists()
 
 
 def test_set_active_is_atomic(tmp_path, monkeypatch):
@@ -351,6 +446,100 @@ def test_import_with_nothing_to_import_makes_an_empty_library(tmp_path):
     assert active_id(library_root(tmp_path)) is None
 
 
+def test_a_legacy_folder_renamed_to_a_backup_is_not_imported_twice(tmp_path):
+    config = tmp_path / "Autotrainer"
+    config.mkdir()
+    _legacy(config / NAME, datetime(2026, 7, 7))
+    legacy_id, = import_existing(config)
+    root = library_root(config)
+    # The legacy install's next calibration moves the active folder to a dated backup.
+    (config / NAME).rename(config / f"{NAME}_20260801_120000")
+
+    assert import_existing(config) == []
+    assert [e.id for e in list_entries(root)] == [legacy_id]
+    assert [(r["event"], r["id"]) for r in _decisions(root) if r["event"] == "import"] == [("import", legacy_id)]
+    assert active_id(root) == legacy_id
+
+
+def test_a_legacy_id_comes_from_the_content_not_the_name(tmp_path):
+    a = _legacy(tmp_path / "a", datetime(2026, 7, 7))
+    b = _legacy(tmp_path / "b", datetime(2026, 7, 7))
+    c = _legacy(tmp_path / "c", datetime(2026, 7, 8))
+    pickle = Path("camera_matrix", "stereo_params.pickle")
+    assert library.legacy_id(a / pickle) == library.legacy_id(b / pickle) != library.legacy_id(c / pickle)
+    (b / pickle).write_bytes(b"another pickle")
+    os.utime(b / pickle, (datetime(2026, 7, 7).timestamp(),) * 2)
+    assert library.legacy_id(a / pickle) != library.legacy_id(b / pickle)
+
+
+def test_a_failed_import_decision_is_retried_on_the_next_import(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    root = library_root(config)
+    real_record = library.record_decision
+    failed = []
+
+    def flaky(root, calibration_id, kind, detail):
+        if kind == "import" and not failed:
+            failed.append(calibration_id)
+            raise OSError("disk full")
+        return real_record(root, calibration_id, kind, detail)
+
+    monkeypatch.setattr(library, "record_decision", flaky)
+    added = import_existing(config)
+    monkeypatch.undo()
+    assert len(added) == 3 and active_id(root) == FORMAT2_ID, "a failed decision does not stop the import"
+    assert failed[0] not in [r["id"] for r in _decisions(root) if r["event"] == "import"]
+
+    assert import_existing(config) == []
+    imports = [r["id"] for r in _decisions(root) if r["event"] == "import"]
+    assert sorted(imports) == sorted(added), "each entry has exactly one import decision"
+
+
+def test_a_discard_on_a_first_install_does_not_warn_about_the_pointer(tmp_path, caplog):
+    root = library_root(tmp_path)
+    built = tmp_path / "built"
+    calibration_id = _built(built)
+    add_entry(root, built)
+    with caplog.at_level(logging.WARNING):
+        library.discard_entry(root, calibration_id)
+    assert not any("no active calibration" in r.getMessage() for r in caplog.records)
+    assert not (root / calibration_id).exists()
+
+
+def test_an_imported_legacy_entry_is_dated_by_its_marker(tmp_path):
+    config = tmp_path / "Autotrainer"
+    config.mkdir()
+    _legacy(config / NAME, datetime(2026, 7, 7, 8, 30))
+    legacy_id, = import_existing(config)
+    folder = library_root(config) / legacy_id
+    # A copy that lost the file times (a restore from a backup, say) still has the marker.
+    pickle_path = folder / "camera_matrix" / "stereo_params.pickle"
+    os.utime(pickle_path, (datetime(2026, 11, 1).timestamp(),) * 2)
+
+    assert store.calibration_created(folder) == datetime(2026, 7, 7, 8, 30)
+    # The made-by check reads the marker: a session after 07-07 resolves; one before refuses.
+    assert store._check_made_by(folder, datetime(2026, 8, 1)) is None
+    with pytest.raises(CalibrationResolutionError, match="was made later"):
+        store._check_made_by(folder, datetime(2026, 7, 1))
+
+
+def test_a_corrupt_library_entry_does_not_shadow_an_old_folder_with_its_id(tmp_path, caplog):
+    config = tmp_path / "Autotrainer"
+    config.mkdir()
+    old_id = _built(config / NAME)
+    root = library_root(config)
+    add_entry(root, config / NAME)
+    (root / old_id / store.INDEX_FILE).write_text("format: 3\nid: [half-written\n")
+
+    with caplog.at_level(logging.WARNING):
+        assert store.find_calibration(config, old_id) == config / NAME
+    assert any("cannot be read" in r.getMessage() for r in caplog.records)
+
+    shutil.rmtree(config / NAME)
+    with pytest.raises(CalibrationResolutionError, match="unreadable"):
+        store.find_calibration(config, old_id)
+
+
 # --- sessions --------------------------------------------------------------------------
 
 def _project(tmp_path: Path, when: datetime = datetime(2026, 11, 20)) -> ProjectInfo:
@@ -450,6 +639,21 @@ def test_a_format_3_session_with_no_preset_is_read_at_the_live_set(tmp_path, mon
     _built(folder)
     preset = _preset_seen(tmp_path, monkeypatch, folder)
     assert preset.geometry == BASE
+
+
+def test_a_format_3_session_with_no_preset_and_no_live_set_is_refused(tmp_path, monkeypatch):
+    # The live set is what the cameras recorded at; the largest binning would be a guess.
+    folder = tmp_path / "entry"
+    store.write_calibration(folder, fit=RIG.truth, presets=presets_from_base(BASE), board=RIG.board,
+                            report=_REPORT, capture={})
+    index = store.load_index(folder)
+    assert index.format == 3 and index.presets and "live" not in [s["name"] for s in index.preset_sets]
+    monkeypatch.setattr(intersession_module, "process_raw_data", lambda *a, **k: pytest.fail("processed"))
+    project = _project(tmp_path)
+    _write_metadata(project, datetime(2026, 11, 20, 9), id=index.id)
+    with pytest.raises(CalibrationGeometryError,
+                       match=r"names no preset, and the calibration in .* has no live preset set"):
+        intersession_process(project, calib_dir=folder)
 
 
 def test_a_format_3_session_names_its_preset(tmp_path, monkeypatch):

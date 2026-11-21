@@ -158,6 +158,44 @@ def test_a_failed_pointer_write_leaves_no_entry_and_the_previous_one_active(tmp_
     assert library.active_id(root) == store.load_index(new_dir).id
 
 
+def test_a_failed_activation_decision_keeps_the_pointer_and_reports_its_own_error(tmp_path, monkeypatch):
+    location = tmp_path / "config"
+    location.mkdir()
+    first = tmp_path / "first"
+    first_id = _calibration(first)
+    install_calibration(first, location, now=NOW)
+    root = library.library_root(location)
+    pointer = (root / library.ACTIVE_FILE).read_bytes()
+    new_dir = tmp_path / "new"
+    _calibration(new_dir)
+
+    def refuse(root, record):
+        raise OSError("decisions.jsonl: no space left on device")
+
+    monkeypatch.setattr(library, "_append_decision", refuse)
+    with pytest.raises(OSError, match="no space left on device"):
+        install_calibration(new_dir, location, now=NOW)
+    monkeypatch.undo()
+
+    assert (root / library.ACTIVE_FILE).read_bytes() == pointer
+    assert library.active_id(root) == first_id
+    assert [e.id for e in library.list_entries(root)] == [first_id], "the new entry is removed again"
+
+
+def test_a_retry_after_a_crash_before_activation_installs_the_same_entry(tmp_path):
+    location = tmp_path / "config"
+    location.mkdir()
+    new_dir = tmp_path / "new"
+    new_id = _calibration(new_dir)
+    root = library.library_root(location)
+    library.add_entry(root, new_dir)  # the crash came before set_active
+
+    installed = install_calibration(new_dir, location, now=NOW, by="ben")
+
+    assert installed == root / new_id and library.active_id(root) == new_id
+    assert [e.id for e in library.list_entries(root)] == [new_id]
+
+
 def test_an_override_is_a_decision_and_the_calibration_is_not_edited(tmp_path):
     location = tmp_path / "config"
     new_dir = tmp_path / "new"
