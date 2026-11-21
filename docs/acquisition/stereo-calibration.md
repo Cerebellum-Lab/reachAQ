@@ -31,8 +31,8 @@ used, see
 ## Steps
 
 1. **Mount the board on the motor.** It is the 4 mm board with 6 x 8 inner
-   corners. Mount it so it moves with the stage and both cameras see it at the
-   start position. The board is only translated, never tilted, and its
+   corners. Mount it so it moves with the stage and every camera to be
+   calibrated sees it at the start position. The board is only translated, never tilted, and its
    orientation on the stage does not need to be measured: the fit solves for it.
 2. Choose **Tools → Make 3D calibration**, tick the cameras to calibrate and
    press **Start** (see
@@ -82,11 +82,15 @@ the verdict, then the rest of the report.
 Each camera must meet the per-camera rule before it is fitted:
 
 1. at least 12 board views kept;
-2. the views' commanded positions vary along each of the stage's x, y and z;
+2. the views' commanded positions span all three stage directions: as points,
+   they do not all lie on one line or in one plane. A move list that steps
+   along a diagonal varies x, y and z but spans one direction, and fails;
 3. at least 8 of its views were also seen by another calibrated camera;
 4. it is connected to the other calibrated cameras through shared views (two
-   cameras are connected when they saw the board at the same position). Only the
-   largest connected group is calibrated.
+   cameras are connected when they saw the board at the same position; one
+   shared position is enough, since rule 3 already asks for 8). Only the
+   largest connected group is calibrated; of two equal groups, the one holding
+   the camera listed first in the capture is.
 
 A camera that fails is **not calibrated**: the other cameras are fitted without
 it, it records 2D only, and the report's first lines name it and the reason, for
@@ -100,8 +104,10 @@ The reasons are `too few board views: n of 12 needed`, `board views do not span
 all 3 stage axes`, `too few views shared with another camera: n of 8 needed` and
 `not connected to the other cameras through shared views`. Rule 3 is applied
 until nothing changes, so a camera whose shared views are only with cameras that
-were left out is left out too. A 2D-only camera makes the verdict at least warn.
-Its views, rejections and coverage image are still in the report.
+were left out is left out too. None of its metrics is graded. What is kept of
+it: the report's notes count its rejected views by reason, the calibration
+folder holds its coverage image (`coverage_<camera>.png`), and the verdict line
+is at least warn.
 
 If fewer than 2 cameras meet the rule, the calibration is refused, nothing is
 written, and **3D calibration failed** names each camera and its reason.
@@ -669,6 +675,17 @@ that cannot be determined is infinite and takes the worst status its limits
 allow, so an undetermined quantity cannot pass. The report records the thresholds
 it was graded with.
 
+The one exception is `loo_triangulation_px`. A camera with no position that two
+other calibrated cameras also saw cannot be checked that way; that is where the
+cameras look, not a fault of the calibration. Its row reads `UNDETERMINED`, with
+no value and the note `triangulation check not possible: no other two cameras
+saw the board at the same positions`. It is neither a pass nor a fail and does
+not change the verdict. When no camera could be checked, the verdict line says
+so after the counts, for example `passed; cross-camera triangulation check not
+possible with 2 cameras` (always so with 2 calibrated cameras), or `... not
+possible for any camera` with 3 or more. The JSON keeps the same text as
+`verdict_note`.
+
 Only the calibrated cameras are graded. A pair metric is graded for every pair
 of them that saw the board at the same position, and its camera is the pair,
 for example `left-right`.
@@ -702,6 +719,8 @@ for example `left-right`.
 
 - An informational metric has no limits: it is recorded so months can be
   compared and never changes the verdict.
+- `stereo_reprojection_rms_px` keeps the name it had with two cameras, but it
+  pools every calibrated camera's corners, however many cameras there are.
 - The change metrics appear only when the previous calibration is a format-2
   or format-3 folder whose fit can be read. Otherwise the report notes "no
   comparable previous calibration". They compare the cameras both calibrations
@@ -791,10 +810,26 @@ lists the geometries.
   cameras shifting by the same vector cannot be told from the board being
   remounted, and the change metrics do not see it. The DCS, redone after every
   calibration, measures the origin.
-- **The anipose file has been checked without aniposelib.** It is tested by
-  reading it back and repeating `CameraGroup.triangulate`'s arithmetic
-  (`cv2.undistortPoints`, then a DLT per camera pose); aniposelib was not
-  installed. The DeepLabCut pickle is tested against DLC's own reader.
+- **The anipose file is checked in aniposelib 0.8.0 itself, in a separate
+  virtualenv.** aniposelib needs opencv-contrib-python, which would replace the
+  reachaq environment's cv2, so reachaq never imports it.
+  `auto-trainer-inference/tests/multires_anipose_compat_check.py` writes a
+  calibration of the synthetic 3-camera rig in the reachaq environment, then
+  loads each of its TOMLs with `CameraGroup.load` in the virtualenv and checks
+  the cameras, the metadata keys and `CameraGroup.project` against the fit's
+  pixels (to 1e-6 px):
+
+  ```
+  python3 -m venv ~/anipose-check-venv
+  ~/anipose-check-venv/bin/pip install aniposelib==0.8.0 toml
+  PYTHONPATH=<the repo's package src dirs> python \
+      auto-trainer-inference/tests/multires_anipose_compat_check.py --write-inputs OUT
+  for t in OUT/*.toml; do ~/anipose-check-venv/bin/python \
+      auto-trainer-inference/tests/multires_anipose_compat_check.py "$t" "${t%.toml}.json"; done
+  ```
+
+  It is not part of the pytest suite. The DeepLabCut pickle is tested against
+  DLC's own reader.
 - **The fit holds k3 at 0** (see Part 3).
 
 ---
