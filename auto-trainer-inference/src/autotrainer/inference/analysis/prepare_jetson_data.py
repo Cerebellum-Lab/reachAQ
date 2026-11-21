@@ -5,6 +5,8 @@ Created on Tue Jan 16 16:15:29 2024
 """
 import copy
 import functools
+import hashlib
+import json
 import sys
 import os
 import glob
@@ -527,6 +529,7 @@ def reorient_and_center(
     bpts,
     center_method: str,
     frame_rate: int,
+    recorded_offsets: Optional[dict] = None,
 ):
     df_3d = filtered_df_3d
     path_cam_mat = os.path.join(src_dir, 'camera_matrix')
@@ -544,7 +547,7 @@ def reorient_and_center(
     square_size, _, _, _ = cal_flir.get_calibration_info(legacy_folder_name(Path(src_dir)))
     cam_names = cal_flir.get_video_list(src_dir)
 
-    cam_offsets, save_offsets = _load_saved_offsets(src_dir)
+    cam_offsets, save_offsets = _load_saved_offsets(src_dir, recorded=recorded_offsets)
 
     res_df_3d = reorient_and_center_step1(
         df_3d=df_3d,
@@ -563,17 +566,63 @@ def reorient_and_center(
     return res_df_3d
 
 
-def _load_saved_offsets(src_dir: str, *, save_missing: bool = True) -> Tuple[Optional[dict], bool]:
+def session_offsets_file(project: ProjectInfo) -> Optional[dict]:
+    """The camera offsets file the session's live 3D loaded, {name, sha256}, from its metadata
+    (hardware.configured.calibration3d.offsetsFile); None when it records none or has no metadata."""
+    path = Path(project.get_metadata_file() + ".json")
+    try:
+        with path.open(encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    configured = ((data.get("hardware") or {}).get("configured") or {}) if isinstance(data, dict) else {}
+    calibration3d = configured.get("calibration3d") if isinstance(configured, dict) else None
+    recorded = calibration3d.get("offsetsFile") if isinstance(calibration3d, dict) else None
+    if isinstance(recorded, dict) and isinstance(recorded.get("name"), str) and isinstance(recorded.get("sha256"), str):
+        return {"name": recorded["name"], "sha256": recorded["sha256"]}
+    return None
+
+
+def _recorded_offsets_path(src_dir: str, recorded: dict) -> Tuple[Optional[Path], str]:
+    """(the file the session recorded, if it is still kept with the same sha256, else None;
+    why not, when it is None). It is looked for where its calibration's offsets are kept:
+    .offsets/<offsets_key>/, the entry's own .offsets/<id>/, then the calibration folder."""
+    from autotrainer.inference.multires_calibration.library import entry_library, offsets_dir, offsets_key
+
+    name = Path(recorded["name"]).name
+    folder = Path(src_dir)
+    library = entry_library(folder)
+    places = []
+    if library is not None:
+        places += [offsets_dir(library, offsets_key(library, folder.name)), offsets_dir(library, folder.name)]
+    places.append(folder)
+    for place in dict.fromkeys(places):
+        candidate = place / name
+        if candidate.is_file():
+            if hashlib.sha256(candidate.read_bytes()).hexdigest() == recorded["sha256"]:
+                return candidate, ""
+            return None, f"{candidate} does not have the sha256 the session recorded"
+    return None, f"{name} is no longer kept for the calibration in {src_dir}"
+
+
+def _load_saved_offsets(
+    src_dir: str, *, save_missing: bool = True, recorded: Optional[dict] = None,
+) -> Tuple[Optional[dict], bool]:
     """(the camera offsets saved in src_dir or None, whether to save the generated ones there).
 
     With save_missing False, missing offsets are generated for this run only and never saved.
 
+    `recorded` is the offsets file the session's live 3D used ({name, sha256},
+    session_offsets_file). When it is still kept with the same sha256 it is used, so a
+    session is reprocessed with its own offsets even after DCS was redone; otherwise one note
+    says which file is used instead and why.
+
     A calibration library entry is never written to, so for one save_missing is ignored and
     nothing is saved. Its offsets are the ones DCS keeps beside it, in the library's
-    .offsets/<id>/, picked by library.current_offsets_path as live 3D picks them: the newest
-    camera_offsets-<UTC time>.pkl by name, else a plain camera_offsets.pkl there; failing
-    both, the entry's own camera_offsets.pkl, which an imported legacy folder may have
-    brought with it.
+    .offsets/<offsets_key>/, picked by library.current_offsets_path as live 3D picks them:
+    the newest camera_offsets-<UTC time>.pkl by name, else a plain camera_offsets.pkl there;
+    failing both, the entry's own camera_offsets.pkl, which an imported legacy folder may
+    have brought with it.
     """
     # Imported here, not at the top: the live pose process imports this module and has no use for the library.
     from autotrainer.inference.multires_calibration.library import current_offsets_path, entry_library
@@ -585,6 +634,14 @@ def _load_saved_offsets(src_dir: str, *, save_missing: bool = True) -> Tuple[Opt
         stored = current_offsets_path(library, Path(src_dir).name)
         if stored is not None:
             path_offsets = str(stored)
+    if recorded is not None:
+        kept, why = _recorded_offsets_path(src_dir, recorded)
+        if kept is not None:
+            path_offsets = str(kept)
+        else:
+            instead = path_offsets if os.path.isfile(path_offsets) else "none, offsets are generated"
+            logger.warning("not using the camera offsets the session recorded (%s): %s; using %s",
+                          recorded["name"], why, instead)
     if os.path.isfile(path_offsets):
         with open(path_offsets, "rb") as handle:
             cam_offsets = pickle.load(handle)
@@ -625,6 +682,7 @@ def reorient_and_center_measured(
     bpts,
     center_method,
     frame_rate: int,
+    recorded_offsets: Optional[dict] = None,
 ):
     """reorient_and_center for a format-2 calibration: the preset's measured frame replaces the angles.
 
@@ -633,7 +691,7 @@ def reorient_and_center_measured(
     folder, where live 3D reads them too, but never written there: only DCS writes them
     (ruling R33). Saved offsets from an offline run would otherwise pose as DCS for live 3D.
     """
-    cam_offsets, save_offsets = _load_saved_offsets(src_dir, save_missing=False)
+    cam_offsets, save_offsets = _load_saved_offsets(src_dir, save_missing=False, recorded=recorded_offsets)
     res_df_3d = reorient_and_center_step1(
         df_3d=filtered_df_3d,
         src_dir=src_dir,
@@ -987,15 +1045,19 @@ def process_raw_data(
         raise RuntimeError(f"No tracking obtained for {session}")
     #
     raw_path_3D = os.path.join(vid_dir, vid_name_base + '_filtered3D.h5')
+    # The offsets the session's live 3D used, read again when they are still kept.
+    recorded_offsets = session_offsets_file(project)
     centered_path_3d = os.path.join(vid_dir, vid_name_base + '_centered3D.h5')
     if preset is not None:
         filtered_df_3d = triangulate_3d_measured(df_LR, preset, bodyparts, min_cluster, p_thresh)
         centered_df_3d = reorient_and_center_measured(
-            filtered_df_3d, centered_path_3d, calib_src_dir, preset, bodyparts, center_method, frame_rate)
+            filtered_df_3d, centered_path_3d, calib_src_dir, preset, bodyparts, center_method, frame_rate,
+            recorded_offsets=recorded_offsets)
         return df_LR, centered_df_3d
     filtered_df_3d = triangulate_3D(df_LR, raw_path_3D, calib_src_dir, bodyparts, min_cluster, p_thresh)
     #
     centered_df_3d = reorient_and_center(
-        filtered_df_3d, centered_path_3d, calib_src_dir, bodyparts, center_method, frame_rate)
+        filtered_df_3d, centered_path_3d, calib_src_dir, bodyparts, center_method, frame_rate,
+        recorded_offsets=recorded_offsets)
     #
     return df_LR, centered_df_3d

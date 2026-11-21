@@ -164,12 +164,17 @@ checks:
 ## Camera offsets
 
 The centred left-right 3D of intersession analysis uses the camera offsets that
-DCS measured. When the session's calibration is a library entry, those offsets
-are found in this order:
+DCS measured. A session that recorded the offsets its live 3D used
+(`calibration3d.offsetsFile`, name and sha256) is reprocessed with that file
+while it is still kept with the same sha256, even when DCS was redone since.
+Otherwise one warning names the recorded file, why it is not used, and the
+file used instead, which is found, for a library entry, in this order:
 
-1. the library's `.offsets/<id>/`: the newest `camera_offsets-<UTC time>.pkl`
-   by name, else a plain `camera_offsets.pkl` (`library.current_offsets_path`,
-   the same choice live 3D makes);
+1. the library's `.offsets/<key>/`, `<key>` being the oldest id with the
+   entry's fit: the newest `camera_offsets-<UTC time>.pkl` by name, else a
+   plain `camera_offsets.pkl`; when that folder has neither, the entry's own
+   `.offsets/<id>/` the same way (`library.current_offsets_path`, the same
+   choice live 3D makes);
 2. the entry's own `camera_offsets.pkl`, which an imported legacy folder may
    have brought with it.
 

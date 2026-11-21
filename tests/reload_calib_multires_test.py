@@ -738,3 +738,52 @@ def test_dcs_is_refused_without_an_active_calibration(app_model, user_pref):
         " make or activate a 3D calibration first")
     assert not (Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME).exists()
     assert not root.joinpath(".offsets").exists()
+
+
+def _session_recording(tmp_path, offsets_file):
+    from datetime import datetime
+
+    from autotrainer.core import ProjectInfo
+
+    project = ProjectInfo(root=(tmp_path / "Data").as_posix(), device_id="rig", when=datetime(2026, 11, 20), session=3)
+    path = Path(project.get_metadata_file() + ".json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"metadataSchemaVersion": 3, "hardware": {"configured": {
+        "calibration3d": {"offsetsFile": offsets_file}}}}), encoding="utf-8")
+    return project
+
+
+def test_reprocessing_uses_the_offsets_the_session_recorded(app_model, tmp_path, caplog):
+    from autotrainer.inference.analysis.prepare_jetson_data import _load_saved_offsets, session_offsets_file
+
+    entry = _active_entry(app_model, tmp_path)
+    _configure_with_serials(app_model, SERIALS)
+    used = app_model.write_camera_offsets(entry, {"x_off": 1.0, "y_off": 1.0, "z_off": 1.0})
+    app_model.reload_calib(None)
+    from calibration_metadata_test import _saved_calibration3d
+    recorded = _saved_calibration3d(app_model, tmp_path)["offsetsFile"]
+    assert recorded["name"] == used.name
+    app_model.write_camera_offsets(entry, {"x_off": 2.0, "y_off": 2.0, "z_off": 2.0})  # DCS redone later
+    project = _session_recording(tmp_path, recorded)
+
+    assert session_offsets_file(project) == recorded
+    with caplog.at_level(logging.WARNING):
+        assert _load_saved_offsets(str(entry), recorded=session_offsets_file(project)) == (
+            {"x_off": 1.0, "y_off": 1.0, "z_off": 1.0}, False)
+    assert not [r for r in caplog.records if "recorded" in r.getMessage()]
+    # Without a record, the newest.
+    assert _load_saved_offsets(str(entry))[0] == {"x_off": 2.0, "y_off": 2.0, "z_off": 2.0}
+
+
+def test_reprocessing_with_a_changed_recorded_file_falls_back_and_says_so(app_model, tmp_path, caplog):
+    from autotrainer.inference.analysis.prepare_jetson_data import _load_saved_offsets
+
+    entry = _active_entry(app_model, tmp_path)
+    used = app_model.write_camera_offsets(entry, {"x_off": 1.0, "y_off": 1.0, "z_off": 1.0})
+    newest = app_model.write_camera_offsets(entry, {"x_off": 2.0, "y_off": 2.0, "z_off": 2.0})
+    recorded = {"name": used.name, "sha256": "0" * 64}
+
+    with caplog.at_level(logging.WARNING):
+        assert _load_saved_offsets(str(entry), recorded=recorded)[0] == {"x_off": 2.0, "y_off": 2.0, "z_off": 2.0}
+    notes = [r.getMessage() for r in caplog.records if "the session recorded" in r.getMessage()]
+    assert len(notes) == 1 and used.name in notes[0] and "sha256" in notes[0] and str(newest) in notes[0]
