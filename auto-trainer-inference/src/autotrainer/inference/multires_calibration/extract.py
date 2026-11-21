@@ -76,8 +76,9 @@ _STATIC_RATIO = 2.0
 # allows for the threshold catching the slow end of a move a frame or two apart.
 _MAX_START_OFFSET_FRAMES = 3
 # The same rule for segments from the logged dwells, in seconds between the cameras' frame
-# times at a dwell's start. Three frames at the capture's 40 fps; a camera at another rate
-# still has its dwell start within a frame of the others.
+# times at a dwell's start: three frames at the capture's 40 fps. Each camera's dwell starts
+# at its first frame after the logged arrival, so two cameras' starts differ by less than the
+# slower camera's frame period. That is within 75 ms for any camera faster than about 13 fps.
 _MAX_START_OFFSET_S = 0.075
 # How many cameras a capture may have.
 MIN_CAMERAS = 2
@@ -315,10 +316,10 @@ def extract_observations(
     Raises WaypointAlignmentError, naming the camera, when its stationary segments do not
     number exactly the distinct waypoints, or with logged dwells, when it has no frame
     times, they do not number its frames or do not increase, or a dwell holds fewer than 8
-    frames; and naming both cameras when a segment starts more than 3 frames apart in two
-    of them (more than 75 ms apart, by frame time, with logged dwells). A board found in none of the frames, or whose detections disagree by more than
-    1 px within the segment, only drops that camera from that waypoint and is listed in
-    `rejected`.
+    frames; and naming the two cameras when a segment starts more than 3 frames apart in
+    two of them (more than 75 ms apart, by frame time, with logged dwells). A board found in
+    none of the frames, or whose detections disagree by more than 1 px within the segment,
+    only drops that camera from that waypoint and is listed in `rejected`.
     """
     _check_refine(refine)
     if frames_per_waypoint < 1:

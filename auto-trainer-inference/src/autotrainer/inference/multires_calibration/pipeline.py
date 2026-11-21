@@ -15,8 +15,9 @@ calibrate_capture turns it into a calibration folder (store.py):
 
 1. The board is detected at each paused waypoint (extract.py) and tagged with the waypoint's
    COMMANDED motor position. The waypoint's frames are those of its logged dwell when every
-   camera has a timestamps file, and its stationary segment by motion otherwise. The fit measures the motor scale against the board's squares,
-   so a measured position would hide exactly the error the fit is there to find.
+   camera has a timestamps file, and its stationary segment by motion otherwise. The fit
+   measures the motor scale against the board's squares, so a measured position would hide
+   exactly the error the fit is there to find.
 2. Each camera is held to the per-camera rule (per_camera_rule): enough views, spread over
    the stage, enough of them shared with another calibrated camera, and connected to the
    others through shared views. A camera that fails it is not calibrated, so it is 2D only:
@@ -45,8 +46,8 @@ calibrate_capture turns it into a calibration folder (store.py):
 7. The calibration is written with the coverage images (one per capture camera, calibrated
    or not) and waypoints.yaml, and the capture's reference/<camera>.png when it has them,
    all before its index (store.write_calibration's extra_files). The source videos are not
-   copied: the
-   index's capture.capture_folder names the capture folder, absolute, where they stay.
+   copied: the index's capture.capture_folder names the capture folder, absolute, where they
+   stay.
 
 Errors are not caught here: WaypointAlignmentError from extraction, CalibrationRefused
 from the per-camera rule, RuntimeError and ValueError from the sensor fit and
@@ -142,7 +143,8 @@ UNREACHED_TOLERANCE_MM = 0.1
 # leaves out (axis skew).
 MIN_VIEWS = 12
 MIN_COVISIBLE = 8
-# Commanded positions that differ by no more than this on an axis (mm) do not span it.
+# The singular values of a camera's centred commanded positions (mm) at or below this do
+# not count toward their rank: views whose positions have rank under 3 do not span the stage.
 _SPAN_TOLERANCE_MM = 1e-6
 
 
@@ -190,7 +192,8 @@ def capture_cameras(log: WaypointLog) -> List[str]:
 
 
 def write_waypoint_log(path: Path, log: WaypointLog) -> None:
-    """Write `log` as plain YAML. Raises ValueError when its lists do not all have one entry per waypoint."""
+    """Write `log` as plain YAML. Raises ValueError when its lists do not all have one entry
+    per waypoint, or a camera name is not a valid file name."""
     _check_waypoint_log(log)
     data = {
         "motor": [[float(v) for v in p] for p in log.motor],
@@ -209,8 +212,9 @@ def write_waypoint_log(path: Path, log: WaypointLog) -> None:
 
 
 def load_waypoint_log(path: Path) -> WaypointLog:
-    """The log in `path`. Raises ValueError when a field is missing or garbled, or when its
-    lists do not all have one entry per waypoint."""
+    """The log in `path`. Raises ValueError when a field is missing or garbled, when its
+    lists do not all have one entry per waypoint, or when a camera name is not a valid file
+    name: each names source_videos/<camera>.mp4 and files in the calibration."""
     path = Path(path)
     with path.open(encoding="utf-8") as fh:
         data = yaml.safe_load(fh)
@@ -257,16 +261,18 @@ def per_camera_rule(observations: Sequence[WaypointObservation], cameras: Sequen
     """Each camera's verdict, in the order of `cameras`. A camera is calibrated when
 
     1. it kept at least MIN_VIEWS board views ("too few board views: {n} of 12 needed");
-    2. their commanded positions vary on each of x, y and z ("board views do not span all 3
-       stage axes");
+    2. their commanded positions span all three stage directions: the centred positions
+       have rank 3 ("board views do not span all 3 stage axes"). Views that vary on every
+       axis but lie on one line or in one plane, such as a diagonal move list, do not;
     3. at least MIN_COVISIBLE of its views were also seen by another calibrated camera ("too
        few views shared with another camera: {n} of 8 needed"). This is repeated until
        nothing changes, so a camera whose shared views are only with cameras the rule
        dropped is dropped too;
     4. it is in the largest group of calibrated cameras connected through shared views ("not
        connected to the other cameras through shared views"). Two cameras are connected
-       when they saw the board at a common waypoint. Of equal groups, the one holding the
-       camera listed first wins.
+       when they saw the board at a common waypoint; one is enough, as rule 3 already asks
+       each camera for 8 shared views. Of equal groups, the one holding the camera listed
+       first wins.
 
     The first rule a camera fails gives its reason. Dropping a camera from the shared views
     (rule 3) can only lower the others' counts, so the cameras left are the largest set in
@@ -279,7 +285,7 @@ def per_camera_rule(observations: Sequence[WaypointObservation], cameras: Sequen
         motor = np.array([np.asarray(o.motor_mm, float).reshape(3) for o in observations if cam in o.corners])
         if len(motor) < MIN_VIEWS:
             reasons[cam] = f"too few board views: {len(motor)} of {MIN_VIEWS} needed"
-        elif not np.all(np.ptp(motor, axis=0) > _SPAN_TOLERANCE_MM):
+        elif _rank(motor) < 3:
             reasons[cam] = "board views do not span all 3 stage axes"
 
     def seen_by_calibrated(o: WaypointObservation) -> List[str]:
@@ -317,6 +323,11 @@ def per_camera_rule(observations: Sequence[WaypointObservation], cameras: Sequen
             if cam not in largest:
                 reasons[cam] = "not connected to the other cameras through shared views"
     return {cam: CameraVerdict(cam, cam not in reasons, reasons.get(cam, "")) for cam in cameras}
+
+
+def _rank(motor: np.ndarray) -> int:
+    """The rank of the (n, 3) positions about their mean, to _SPAN_TOLERANCE_MM."""
+    return int(np.sum(np.linalg.svd(motor - motor.mean(axis=0), compute_uv=False) > _SPAN_TOLERANCE_MM))
 
 
 def unreached_waypoints(log: WaypointLog, tolerance: float = UNREACHED_TOLERANCE_MM) -> List[int]:
@@ -537,9 +548,10 @@ def _cross_checks(
 
     `videos` holds the calibrated cameras, the fit's. observations[i] is the waypoint of every
     camera's segments[cam][i], as extraction returned them. A camera is detected only at the
-    waypoints where it was kept, in the same frames extraction used there, and its corners are the per-corner median over the frames
-    that found the board. Each detection is put in the order of the sensor detection mapped
-    into the preset, so the direct fit labels the board as the sensor fit did.
+    waypoints where it was kept, in the same frames extraction used there, and its corners
+    are the per-corner median over the frames that found the board. Each detection is put in
+    the order of the sensor detection mapped into the preset, so the direct fit labels the
+    board as the sensor fit did.
     """
     binned = [g for g in presets if g.binning > 1]
     # preset name -> per waypoint -> camera -> the detections in its frames
@@ -717,6 +729,10 @@ def _check_inside_sensor(g: PresetGeometry, image_size: Tuple[int, int]) -> None
 
 
 def _check_waypoint_log(log: WaypointLog) -> None:
+    for camera in log.cameras:
+        name = camera.name
+        if not name or "/" in name or "\\" in name or ".." in name:
+            raise ValueError(f"camera name {name!r} is not a valid file name")
     n = len(log.motor)
     for name in _PER_WAYPOINT_FIELDS:
         count = len(getattr(log, name))

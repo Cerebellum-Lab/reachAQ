@@ -768,3 +768,60 @@ def test_cameras_outside_the_largest_connected_group_are_refused():
     assert all(verdicts[cam].calibrated for cam in "abc")
     for cam in "de":
         assert verdicts[cam] == CameraVerdict(cam, False, "not connected to the other cameras through shared views")
+
+
+def test_collinear_diagonal_views_make_the_camera_2d_only():
+    # Every axis varies, but the positions lie on one line: they span one stage direction,
+    # not three, so the fit could not separate the axes.
+    diagonal = [(float(w), float(w), float(w)) for w in range(37)]
+    verdicts = per_camera_rule(observations_seen_by({cam: range(37) for cam in "abc"}, motor=diagonal), "abc")
+    assert verdicts == {cam: CameraVerdict(cam, False, "board views do not span all 3 stage axes") for cam in "abc"}
+    # A plane through the diagonal (rank 2) is refused the same way.
+    plane = [(float(w), float(w % 5), float(w + w % 5)) for w in range(37)]
+    verdicts = per_camera_rule(observations_seen_by({cam: range(37) for cam in "abc"}, motor=plane), "abc")
+    assert not any(v.calibrated for v in verdicts.values())
+
+
+def test_of_two_equal_groups_the_first_listed_cameras_group_wins():
+    seen = {"a": range(18), "b": range(18), "c": range(18, 37), "d": range(18, 37)}
+    observations = observations_seen_by(seen)
+    unconnected = "not connected to the other cameras through shared views"
+    verdicts = per_camera_rule(observations, "abcd")
+    assert [cam for cam in "abcd" if verdicts[cam].calibrated] == ["a", "b"]
+    assert verdicts["c"].reason == verdicts["d"].reason == unconnected
+    verdicts = per_camera_rule(observations, "cdab")
+    assert [cam for cam in "cdab" if verdicts[cam].calibrated] == ["c", "d"]
+    assert verdicts["a"].reason == verdicts["b"].reason == unconnected
+
+
+def test_one_shared_waypoint_connects_two_groups():
+    # a and b see 0-18, c and d 18-36: waypoint 18 alone joins the groups, so all four are
+    # calibrated together (each already has 8 or more shared views within its group).
+    seen = {"a": range(19), "b": range(19), "c": range(18, 37), "d": range(18, 37)}
+    verdicts = per_camera_rule(observations_seen_by(seen), "abcd")
+    assert all(v.calibrated for v in verdicts.values()), verdicts
+
+
+def test_a_bridge_camera_with_too_few_shared_views_is_dropped_by_the_shared_view_rule():
+    # e sees 13-25 (13 views) and joins a-b (0-15) and c-d (22-36), but shares only 3 + 4 of
+    # its views. Rule 3 drops it, so its reason is the shared views, not connectivity; the
+    # groups it bridged are then apart, and the first-listed one is kept.
+    seen = {"a": range(16), "b": range(16), "c": range(22, 37), "d": range(22, 37), "e": range(13, 26)}
+    verdicts = per_camera_rule(observations_seen_by(seen), "abcde")
+    assert verdicts["e"] == CameraVerdict("e", False, "too few views shared with another camera: 7 of 8 needed")
+    assert verdicts["a"].calibrated and verdicts["b"].calibrated
+    for cam in "cd":
+        assert verdicts[cam] == CameraVerdict(cam, False, "not connected to the other cameras through shared views")
+
+
+@pytest.mark.parametrize("name", ["", "../left", "a/b", "a\\b", ".."])
+def test_a_camera_name_that_is_not_a_file_name_is_refused(tmp_path, name):
+    log = make_log()
+    path = tmp_path / WAYPOINT_LOG
+    write_waypoint_log(path, log)
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data["cameras"][0]["name"] = name
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="is not a valid file name") as raised:
+        load_waypoint_log(path)
+    assert repr(name) in str(raised.value)
