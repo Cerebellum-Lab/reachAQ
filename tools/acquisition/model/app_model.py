@@ -2489,8 +2489,13 @@ class AppModel(ObservableObject):
 
         Off, 2D pose keeps running; the drift monitor and the DCS are unavailable with the
         reason "live 3D is off" (_install_pose_algorithm, refresh_dcs_state). Nothing switches
-        it on again by itself.
+        it on again by itself. Refused with a RuntimeError while a session is not Ready, and
+        with "live 3D cannot be switched while <state>" while a 3D or coordinate-system
+        calibration runs (the states set active refuses in); Preferences shows the reason.
         """
+        state = _SET_ACTIVE_REFUSED_STATUSES.get(self._status)
+        if state is not None:
+            raise RuntimeError(f"live 3D cannot be switched while {state}")
         self._require_session_ready_for_configuration("Changing live 3D")
         enabled = bool(enabled)
         self._live_3d_setting = self._read_live_3d_setting()

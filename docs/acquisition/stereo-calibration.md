@@ -605,8 +605,9 @@ calibrations/
   means on, and the file is replaced whole (temp file, then rename), keeping any
   other key in it. It is read once per calibration load and when it is
   switched, not on every use. Switching it reinstalls the pose algorithm at once,
-  and only while the session is Ready; outside Ready the switch goes back and
-  Preferences shows why.
+  and only while the session is Ready and no 3D or coordinate-system
+  calibration runs; otherwise the switch goes back and Preferences shows why,
+  for example "live 3D cannot be switched while a 3D calibration runs".
   - **Off**, 2D pose keeps running. The drift monitor and the DCS are
     unavailable, with the reason "live 3D is off": the loaded DCS configuration
     is kept but not used (as when it is out of date), a move given in DCS is

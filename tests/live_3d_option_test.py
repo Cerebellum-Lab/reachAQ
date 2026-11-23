@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import importlib
 
+import pytest
 import yaml
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -19,6 +20,7 @@ from autotrainer.core import Offset3DTuple
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.inference.multires_calibration import library
 from calibration_metadata_test import _saved_calibration3d  # noqa: E402
+from tools.acquisition.model.app_model_status import AppModelStatus  # noqa: E402
 from tools.acquisition.view import preferences_content as preferences_module  # noqa: E402
 from tools.acquisition.view.preferences_content import PreferencesContent  # noqa: E402
 
@@ -162,6 +164,21 @@ def test_the_setting_is_read_once_per_load_not_on_every_access(app_model, monkey
     assert app_model.live_3d_enabled is False
     # The setter reads the file once, and its reload once more.
     assert len(reads) - after_load <= 2
+
+
+def test_the_toggle_is_refused_during_a_3d_or_coordinate_system_calibration(app_model):
+    previous = app_model._status
+    try:
+        for status, state in ((AppModelStatus.CALIBRATION_DCS, "the coordinate system is calibrated"),
+                              (AppModelStatus.CALIBRATION_3D, "a 3D calibration runs")):
+            app_model._status = status
+            with pytest.raises(RuntimeError) as refused:
+                app_model.live_3d_enabled = False
+            assert str(refused.value) == f"live 3D cannot be switched while {state}"
+            assert app_model.live_3d_enabled is True
+    finally:
+        app_model._status = previous
+    assert not _settings_file(app_model).exists(), "nothing was stored"
 
 
 def test_the_preferences_toggle_reverts_and_says_why_when_refused(app_model, monkeypatch):
