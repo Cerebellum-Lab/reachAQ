@@ -153,6 +153,33 @@ def test_the_installed_page_leads_with_the_banner():
     assert BANNER in text
 
 
+@pytest.mark.parametrize("click, expected", [("Set as active", True), ("Keep, don't activate", False), (None, True)],
+                         ids=["set_active", "keep", "closed"])
+def test_a_warn_with_a_2d_only_camera_offers_set_as_active_or_keep(monkeypatch, click, expected):
+    shown = []
+
+    def exec_(box):
+        buttons = {b.text(): b for b in box.buttons()}
+        shown.append((box.windowTitle(), box.text(), sorted(buttons), box.defaultButton().text()))
+        if click is not None:
+            buttons[click].click()
+        else:
+            box.escapeButton().click()
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", exec_)
+    host = QWidget()
+    try:
+        assert MainWindow._ask_activate_3d_calib(host, _report("warn")) is expected
+    finally:
+        host.deleteLater()
+    (title, text, buttons, default), = shown
+    assert title == "3D calibration done"
+    assert BANNER in text and "3D calibration quality: WARN" in text
+    assert buttons == ["Keep, don't activate", "Set as active"]
+    assert default == "Set as active"
+
+
 def test_make_3d_calibration_uses_the_dialog_choice(monkeypatch):
     cameras = {name: SimpleNamespace(name=name) for name in ("left", "right", "stimCam")}
     asked = []

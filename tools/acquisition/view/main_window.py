@@ -993,6 +993,7 @@ class MainWindow(QMainWindow):
         and a status restore or a dialog that fails is logged without losing the event.
         """
         installed_report = None
+        kept_id = None
         load_error = None
         try:
             if error is None:
@@ -1003,8 +1004,10 @@ class MainWindow(QMainWindow):
                     logger.exception("3d-calib could not be completed: %s", err)
                     error = err
                 else:
-                    if installed is not None:
-                        installed_dir, installed_report = installed
+                    if installed is not None and not installed[2]:
+                        kept_id = index.id
+                    elif installed is not None:
+                        installed_dir, installed_report, _activated = installed
                         try:
                             self._app_model.reload_calib(installed_dir)
                         except Exception as err:
@@ -1028,6 +1031,15 @@ class MainWindow(QMainWindow):
                 self._show_3d_calib_installed(installed_report, load_error)
             except Exception:
                 logger.exception("the installed 3D calibration's outcome could not be shown")
+        elif kept_id is not None:
+            try:
+                self._show_msg_box(
+                    "3D calibration kept",
+                    f"3D calibration {kept_id[:8]} is in the calibration library, not active. Set it active"
+                    " from Tools → Calibration library when you want to use it.",
+                    QMessageBox.Icon.Information)
+            except Exception:
+                logger.exception("the kept 3D calibration's outcome could not be shown")
         self._post_api_event(ApiEventKind.calibration3dCompleted)
 
     def _show_3d_calib_installed(self, report: QualityReport, load_error: Optional[BaseException]) -> None:
@@ -1059,13 +1071,18 @@ class MainWindow(QMainWindow):
         self._app_model.status = prev_status
 
     def _install_3d_calib(self, new_dir: Path, index: CalibrationIndex,
-                          report: QualityReport) -> Optional[Tuple[Path, QualityReport]]:
+                          report: QualityReport) -> Optional[Tuple[Path, QualityReport, bool]]:
         """Install the calibration in `new_dir` on a pass or warn report, or on a fail the operator overrides.
 
-        Returns (the installed folder, the report as installed, with any override), or None
-        when the previous calibration is kept. Loading it is left to the caller.
+        A pass or warn asks Set as active or Keep, don't activate (_ask_activate_3d_calib);
+        kept, the calibration is added to the library and the previous one stays active.
+        Returns (the library entry's folder, the report as installed, with any override,
+        whether it was made active), or None when a failed calibration is kept out. Loading it
+        is left to the caller.
         """
-        install, override = decide_install(report.verdict, lambda: self._ask_install_failed_3d_calib(report))
+        install, override, activate = decide_install(
+            report.verdict, lambda: self._ask_install_failed_3d_calib(report),
+            lambda: self._ask_activate_3d_calib(report))
         if not install:
             logger.notice("kept the previous 3D calibration: %s (%s) failed its quality checks", new_dir, index.id)
             return None
@@ -1077,12 +1094,32 @@ class MainWindow(QMainWindow):
         try:
             installed = install_calibration(
                 new_dir, Path(self._preferences.configuration_location), now=datetime.now(),
-                by=getpass.getuser(), override=record if override else None)
+                by=getpass.getuser(), override=record if override else None, activate=activate)
         except Exception:
             logger.error("3D calibration %s: install failed", index.id)
             raise
+        if not activate:
+            logger.success("3D calibration %s: kept in the library, not active", index.id)
+            return installed, report, False
         logger.success("3D calibration %s: installed", index.id)
-        return installed, report
+        return installed, report, True
+
+    def _ask_activate_3d_calib(self, report: QualityReport) -> bool:
+        """Whether to make a calibration whose report passed or warned the active one.
+
+        The result page, with Set as active (the default) and Keep, don't activate. Closing
+        the box sets it active, as the default does.
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle("3D calibration done")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(result_page(report))
+        activate = box.addButton("Set as active", QMessageBox.ButtonRole.AcceptRole)
+        keep = box.addButton("Keep, don't activate", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(activate)
+        box.setEscapeButton(activate)
+        box.exec()
+        return box.clickedButton() != keep
 
     def _ask_install_failed_3d_calib(self, report: QualityReport) -> bool:
         """Whether to install a calibration whose quality report failed.

@@ -1,6 +1,7 @@
 """Installing a new 3D calibration: its quality report decides, an override is explicit and recorded.
 
-A pass or warn report installs at once; a fail keeps the previous calibration unless the
+A pass or warn report offers Set as active (the default) or Keep, don't activate, which adds
+the calibration to the library without moving the pointer; a fail keeps the previous calibration unless the
 operator confirms an override twice, and the override is recorded as a decision in the
 calibration library, never written into the calibration. An install adds the calibration to
 the library, <location>/calibrations/<id>, and makes it active; the 4mm_6r_8c_4x folder and
@@ -221,11 +222,44 @@ def _never_asked():
     raise AssertionError("asked to override a report that did not fail")
 
 
+def _never_asked_to_activate():
+    raise AssertionError("asked Set as active for a report that failed")
+
+
 def test_fail_verdict_keeps_previous_without_confirmation():
-    assert decide_install("fail", lambda: False) == (False, False)
-    assert decide_install("fail", lambda: True) == (True, True)
-    assert decide_install("warn", _never_asked) == (True, False)
-    assert decide_install("pass", _never_asked) == (True, False)
+    assert decide_install("fail", lambda: False, _never_asked_to_activate) == (False, False, False)
+    assert decide_install("fail", lambda: True, _never_asked_to_activate) == (True, True, True)
+    assert decide_install("warn", _never_asked) == (True, False, True)
+    assert decide_install("pass", _never_asked) == (True, False, True)
+
+
+@pytest.mark.parametrize("verdict", ["pass", "warn"])
+def test_a_passing_report_asks_set_as_active_or_keep(verdict):
+    assert decide_install(verdict, _never_asked, lambda: True) == (True, False, True)
+    assert decide_install(verdict, _never_asked, lambda: False) == (True, False, False)
+
+
+def test_keep_adds_the_entry_and_leaves_the_pointer(tmp_path):
+    location = tmp_path / "config"
+    first = tmp_path / "first"
+    first_id = _calibration(first)
+    install_calibration(first, location, now=NOW, by="ben")
+    root = library.library_root(location)
+    pointer = (root / library.ACTIVE_FILE).read_bytes()
+    new_dir = tmp_path / "new"
+    new_id = _calibration(new_dir, synthetic_rig(noise_px=0.0, frame_rotation_deg=5.0))
+
+    kept = install_calibration(new_dir, location, now=NOW, by="ben", activate=False)
+
+    assert kept == root / new_id and _contents(kept) == _contents(new_dir)
+    assert (root / library.ACTIVE_FILE).read_bytes() == pointer
+    assert library.active_id(root) == first_id
+    assert sorted(e.id for e in library.list_entries(root)) == sorted([first_id, new_id])
+    assert [(d["event"], d["id"]) for d in _decisions(root)] == [("set_active", first_id), ("kept", new_id)]
+    assert _decisions(root)[-1]["detail"] == {"by": "ben"}
+    # It can be set active later, from the library.
+    library.set_active(root, new_id, by="ben")
+    assert library.active_id(root) == new_id
 
 
 def test_an_unknown_verdict_installs_nothing():
@@ -280,7 +314,8 @@ def _given_back(window) -> bool:
             and not window.make_3d_calib_action.checked and window._app_model.status is AppModelStatus.IDLE)
 
 
-def _window(location: Path, monkeypatch, *, override_answer=None, dcs_after=DcsState.VALID, reload_error=None):
+def _window(location: Path, monkeypatch, *, override_answer=None, dcs_after=DcsState.VALID, reload_error=None,
+            activate_answer=True):
     """A window, mid-calibration, whose dialogs, events and model calls are recorded.
 
     override_answer is what the fail dialog and its confirmation answer together; None
@@ -289,7 +324,7 @@ def _window(location: Path, monkeypatch, *, override_answer=None, dcs_after=DcsS
     if one is given. given_back records, at each call of the dialog and of reload_calib,
     whether the app had already been given back.
     """
-    seen = SimpleNamespace(boxes=[], errors=[], events=[], reloaded=[], given_back=[])
+    seen = SimpleNamespace(boxes=[], errors=[], events=[], reloaded=[], given_back=[], activate_asked=[])
 
     def reload_calib(path):
         seen.given_back.append(("reload", _given_back(window)))
@@ -304,6 +339,10 @@ def _window(location: Path, monkeypatch, *, override_answer=None, dcs_after=DcsS
             raise AssertionError(f"asked to override a {report.verdict} report")
         return override_answer
 
+    def ask_activate(report):
+        seen.activate_asked.append(report.verdict)
+        return activate_answer
+
     app_model = SimpleNamespace(reload_calib=reload_calib, dcs_state=DcsState.VALID,
                                 status=AppModelStatus.CALIBRATION_3D, left_camera="left", right_camera="right")
     window = SimpleNamespace(
@@ -312,6 +351,7 @@ def _window(location: Path, monkeypatch, *, override_answer=None, dcs_after=DcsS
         _post_api_event=lambda kind, *args: seen.events.append((kind, *args)),
         _show_msg_box=lambda title, text, icon: seen.boxes.append((title, text)),
         _ask_install_failed_3d_calib=ask,
+        _ask_activate_3d_calib=ask_activate,
         run_action=_Action(enabled=False),
         make_3d_calib_action=_Action(enabled=False, checked=True),
         _calibration_due_label=_Label(),
@@ -459,9 +499,37 @@ def test_a_passing_report_installs_at_once_and_only_a_stale_dcs_gets_the_notice(
     assert store.load_index(installed).override is None
     assert seen.reloaded == [installed]
     assert seen.given_back == [("reload", False)]
+    assert seen.activate_asked == [verdict]
+    assert library.active_id(library.library_root(location)) == produced[2].id
     assert [title for title, _ in seen.boxes] == ["3D calibration installed"]
     assert f"3D calibration quality: {verdict.upper()}" in seen.boxes[0][1]
     assert seen.events == [(ApiEventKind.calibration3dCompleted,)]
+    assert _given_back(window)
+
+
+@pytest.mark.parametrize("verdict", ["pass", "warn"])
+def test_keep_dont_activate_adds_the_entry_and_leaves_the_previous_one_active(
+        tmp_path, location, monkeypatch, verdict):
+    first = tmp_path / "first"
+    first_id = _calibration(first)
+    install_calibration(first, location, now=NOW, by="ben")
+    root = library.library_root(location)
+    pointer = (root / library.ACTIVE_FILE).read_bytes()
+    produced = _produced(tmp_path / "session", verdict)
+    window, seen = _window(location, monkeypatch, activate_answer=False)
+
+    _finish(window, None, produced)
+
+    new_id = produced[2].id
+    assert (root / library.ACTIVE_FILE).read_bytes() == pointer and library.active_id(root) == first_id
+    assert new_id in [e.id for e in library.list_entries(root)]
+    assert (_decisions(root)[-1]["event"], _decisions(root)[-1]["id"]) == ("kept", new_id)
+    assert seen.reloaded == [], "the active calibration is unchanged, so nothing reloads"
+    assert seen.boxes == [("3D calibration kept",
+                           f"3D calibration {new_id[:8]} is in the calibration library, not active. Set it active"
+                           " from Tools → Calibration library when you want to use it.")]
+    assert seen.events == [(ApiEventKind.calibration3dCompleted,)]
+    assert window._calibration_due_label.visible is True, "the active calibration is still the old one"
     assert _given_back(window)
 
 

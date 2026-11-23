@@ -1,8 +1,11 @@
 """Install a new 3D calibration into the configuration location, as its quality report allows.
 
-A pass or warn report installs at once; a warn only informs. A fail keeps the previous
-calibration unless the operator confirms an override. The override is a decision in the
-library's decisions.jsonl, not an edit of the calibration: library entries never change.
+A pass or warn report offers Set as active (the default) or Keep, don't activate; a warn
+only informs. Kept, the calibration is added to the library without moving the pointer, and
+the library records a "kept" decision; it can be set active later from the library view. A
+fail keeps the previous calibration unless the operator confirms an override. The override
+is a decision in the library's decisions.jsonl, not an edit of the calibration: library
+entries never change.
 
 An install adds the calibration to the library (<location>/calibrations) and makes it the
 active entry, which is what the app loads. The 4mm_6r_8c_4x folder and its dated backups
@@ -36,17 +39,19 @@ from autotrainer.inference.multires_calibration.store import load_index
 logger = get_verbose_logger(__name__)
 
 
-def decide_install(verdict: str, ask_override: Callable[[], bool]) -> Tuple[bool, bool]:
-    """(install, override) for a new calibration whose quality report has `verdict`.
+def decide_install(verdict: str, ask_override: Callable[[], bool],
+                   ask_activate: Callable[[], bool] = lambda: True) -> Tuple[bool, bool, bool]:
+    """(install, override, activate) for a new calibration whose quality report has `verdict`.
 
-    pass and warn install without asking. fail installs only when ask_override() confirms,
-    and the install is then an override.
+    pass and warn are added to the library, and made active when ask_activate() says so (Set
+    as active); otherwise only kept. fail installs, active, only when ask_override() confirms,
+    and the install is then an override; ask_activate is not asked for a fail.
     """
     if verdict in ("pass", "warn"):
-        return True, False
+        return True, False, bool(ask_activate())
     if verdict == "fail":
         confirmed = bool(ask_override())
-        return confirmed, confirmed
+        return confirmed, confirmed, confirmed
     raise ValueError(f"unknown quality verdict {verdict!r}; expected pass, warn or fail")
 
 
@@ -62,8 +67,9 @@ def install_calibration(
     now: datetime,
     by: Optional[str] = None,
     override: Optional[dict] = None,
+    activate: bool = True,
 ) -> Path:
-    """Make `new_dir` the active calibration under `configuration_location`.
+    """Make `new_dir` the active calibration under `configuration_location`, or only keep it.
 
     `new_dir` is added to the library as a new entry, which is made the active one by `by`
     (the operating-system user when None); `override`, the operator's confirmation of a
@@ -78,6 +84,10 @@ def install_calibration(
     activates it (add_entry); an entry that was already there is never removed by a failed
     retry. A decision that cannot be written after the install is logged, not raised: the
     calibration is installed by then.
+
+    With `activate` False the entry is only added (kept): the pointer is not moved, `override`
+    is ignored (only a fail is overridden, and an override always activates), and a decision
+    {"event": "kept", "detail": {"by"}} is appended.
     """
     new_dir = Path(new_dir)
     root = library_root(configuration_location)
@@ -85,6 +95,16 @@ def install_calibration(
         raise ValueError(f"{new_dir} holds a {DEFAULT_CAM_OFFSET_FILE_NAME}; offsets come only from DCS")
     existed = root.joinpath(load_index(new_dir).id).exists()
     calibration_id = add_entry(root, new_dir)
+    if not activate:
+        # Kept: in the library, the pointer where it was. The decision is logged, not raised,
+        # when it cannot be written: the entry is kept by then.
+        try:
+            record_decision(root, calibration_id, "kept", {"by": str(by or getpass.getuser())})
+        except OSError:
+            logger.exception("calibration %s is kept, but the decision could not be recorded", calibration_id)
+        target = entry_path(root, calibration_id)
+        logger.success("kept the 3D calibration from %s as %s, not active", new_dir, target)
+        return target
     try:
         set_active(root, calibration_id, by=by or getpass.getuser())
     except BaseException:

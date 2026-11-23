@@ -72,7 +72,7 @@ below the stage's lower limit is commanded at the limit and logged; see
 The report starts with every camera that could not be calibrated, then lists
 failures, warnings and passes, each with its value and limits, then notes. The
 thresholds are in [The quality report](#the-quality-report). On screen (the
-installed report, the failed-report dialog and **Show report** in the library),
+result page with its Set as active choice, the installed report, the failed-report dialog and **Show report** in the library),
 each camera that could not be calibrated is a red line at the top, for example
 **camera4 NOT CALIBRATED (2D only): too few board views: 4 of 12 needed**, then
 the verdict, then the rest of the report.
@@ -114,11 +114,18 @@ written, and **3D calibration failed** names each camera and its reason.
 
 | Verdict | Meaning | What happens |
 | --- | --- | --- |
-| pass | Every metric is within its warn limit | Installed at once; the report is shown |
-| warn | At least one metric is beyond its warn limit, none beyond its fail limit | Installed at once; the report is shown. Read the warnings; nothing blocks |
+| pass | Every metric is within its warn limit | The report is shown with **Set as active** (the default) or **Keep, don't activate** |
+| warn | At least one metric is beyond its warn limit, none beyond its fail limit | As for pass. Read the warnings; nothing blocks |
 | fail | At least one metric is beyond its fail limit | Not installed. A dialog offers **Keep previous** (the default) or **Install anyway…** |
 
-- **Keep previous** changes nothing: the active calibration and the DCS stay as
+- **Set as active** installs the calibration: it is added to the library and
+  made the active one. Closing the report does the same.
+- **Keep, don't activate** adds the calibration to the library without moving
+  the active pointer: the active calibration and the DCS stay as they are, and
+  the library records `event: kept` (with `by` under `detail`) in
+  `decisions.jsonl`. "3D calibration kept" names it; set it active later from
+  **Tools → Calibration library…**.
+- **Keep previous** (a fail) changes nothing: the active calibration and the DCS stay as
   they are. The failed calibration remains in the capture's session folder as
   `4mm_6r_8c_4x.new` with its report, so you can see why. Correct the cause and
   run the capture again.
@@ -530,7 +537,8 @@ calibrations/
   entry. Adding an id that is already there with other content is refused;
   adding it again with byte-identical content (a retry after a crash between
   adding and activating it) keeps the entry, and the install then activates it.
-- **What happens to an entry afterwards is a decision.** Making it active and
+- **What happens to an entry afterwards is a decision.** Making it active,
+  keeping it without making it active (**Keep, don't activate**, `kept`) and
   installing it over a failed quality check (**Install anyway…**) are lines in
   `decisions.jsonl`, for example
   `{"event": "set_active", "id": "…", "by": "ben", "at": "2026-11-20T14:05:06"}`.
