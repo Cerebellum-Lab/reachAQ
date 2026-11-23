@@ -949,6 +949,58 @@ lists the geometries.
   DLC's own reader.
 - **The fit holds k3 at 0** (see Part 3).
 
+## Deploying and rolling back
+
+The release before the library is v3.1.0 (and its v3.1.x fixes). Format 2
+existed only while this version was developed, never on a rig, so a rollback is
+always to the legacy reader.
+
+**What v3.1.0 reads after a rollback.**
+
+- **Calibrations.** v3.1.0 has no calibration library and reads no
+  `calibration.yaml`, at format 2 or 3: it cannot read a format-3 entry. It
+  loads only `4mm_6r_8c_4x`, which this version never writes, so the rig goes
+  back to the last calibration made before the upgrade. Calibrations made on
+  this version are not visible to it.
+- **The coordinate system.** A DCS made on this version against a calibration
+  made on it records that calibration's library id (`calibration_id` in
+  `diamond_triangle_offset.yaml`). v3.1.0 has no out-of-date check: it does not
+  accept the field, reading the file raises a TypeError, and its configuration
+  load fails. Before starting v3.1.0, remove that file (or put back the copy
+  backed up before the deploy). A DCS made on this version against the
+  imported legacy calibration records no id and loads.
+- **Camera offsets.** v3.1.0 never reads `calibrations/.offsets`. It reads
+  `4mm_6r_8c_4x/camera_offsets.pkl`, which this version leaves as it was: the
+  offsets of the last DCS before the upgrade. Redo Calibrate Coordinate System
+  on v3.1.0 before running sessions, so the DCS file and the offsets are from
+  one run.
+- **Sessions.** v3.1.0's session validator accepts only metadata schema 2, so
+  it fails sessions recorded on this version (schema 3) with "Unsupported
+  pre-release session schema". Validate them with this version.
+
+**Rolling forward again.**
+
+- `active.yaml` still names the calibration that was active before the
+  rollback, and it stays active.
+- Every `4mm_6r_8c_4x` folder or dated backup that v3.1.0 wrote meanwhile (a new
+  calibration there moves the old folder to a dated backup) is imported as a
+  new entry with an `import` decision, never active. When the `4mm_6r_8c_4x`
+  calibration was made after the active one, the status bar says "A
+  calibration made by an older version (<date>) was imported; set it active in
+  the calibration library to use it." See
+  [Calibration library](#calibration-library).
+- A DCS that v3.1.0 saved records no id. Under a calibration made on this
+  version it is out of date, and Record is blocked until DCS is redone; under
+  an imported legacy calibration it counts as valid, but this version reads that
+  entry's own copy of its offsets, not the ones v3.1.0 wrote to
+  `4mm_6r_8c_4x`. Redo Calibrate Coordinate System after a roll-forward in
+  either case.
+
+**The scout move list.** It is not the default yet. On the first calibration
+on a rig, choose *automatic (scout)* by hand and watch the scout pass: its first
+approach to the coarse grid moves all three axes at once. Once it has passed on
+a rig, the dialog's default becomes the scout.
+
 ---
 
 # Part 3: developer notes
