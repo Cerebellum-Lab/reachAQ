@@ -166,6 +166,16 @@ def test_the_setting_is_read_once_per_load_not_on_every_access(app_model, monkey
     assert len(reads) - after_load <= 2
 
 
+def test_calibrate_coordinate_system_is_refused_while_live_3d_is_off(app_model):
+    assert app_model.dcs_refusal() is None
+
+    app_model.live_3d_enabled = False
+    assert app_model.dcs_refusal() == LIVE_3D_OFF
+
+    app_model.live_3d_enabled = True
+    assert app_model.dcs_refusal() is None
+
+
 def test_the_toggle_is_refused_during_a_3d_or_coordinate_system_calibration(app_model):
     previous = app_model._status
     try:

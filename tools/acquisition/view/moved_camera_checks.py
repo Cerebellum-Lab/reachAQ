@@ -149,10 +149,27 @@ class MovedCameraChecks(QGroupBox):
         layout.addWidget(error, row + 2, 0, 1, 3)
 
     def _switch_changed(self, check: str, enabled: bool) -> None:
-        if check == REFERENCE_CHECK:
-            self._app_model.reference_image_check_enabled = enabled
-        else:
-            self._app_model.update_moved_camera_check(check, enabled=enabled)
+        """Store the switch; when settings.yaml cannot be written, the switch goes back and the
+        error is shown beside it."""
+        error = self.errors[check]
+        try:
+            if check == REFERENCE_CHECK:
+                self._app_model.reference_image_check_enabled = enabled
+            else:
+                self._app_model.update_moved_camera_check(check, enabled=enabled)
+        except OSError as err:
+            switch = self.switches[check]
+            switch.blockSignals(True)
+            try:
+                switch.setChecked(not enabled)
+            finally:
+                switch.blockSignals(False)
+            error.setText(f"not saved: {err}")
+            error.setVisible(True)
+            return
+        if error.text().startswith("not saved:"):
+            error.setText("")
+            error.setVisible(False)
 
     def _field_edited(self, check: str, field: Field) -> None:
         edit = self.fields[(check, field.key)]
@@ -170,9 +187,17 @@ class MovedCameraChecks(QGroupBox):
                                                                            else ""))
             error.setVisible(True)
             return
+        try:
+            self._app_model.update_moved_camera_check(check, **{field.key: value})
+        except OSError as err:
+            # settings.yaml could not be written: the field shows what is stored again.
+            edit.setText(self._stored[(check, field.key)])
+            edit.setStyleSheet("")
+            error.setText(f"{field.label}: not saved: {err}")
+            error.setVisible(True)
+            return
         edit.setStyleSheet("")
         self._clear_error(error, field)
-        self._app_model.update_moved_camera_check(check, **{field.key: value})
         self._stored[(check, field.key)] = edit.text().strip()
 
     @staticmethod

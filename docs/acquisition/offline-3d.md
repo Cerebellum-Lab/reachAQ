@@ -156,6 +156,11 @@ way to deal with a moved camera.
 The verdicts are logged and written to `poseConsistency` in
 `offline3d_report.json`.
 
+The check does not take a camera out of the 3D: `points3d.h5` and
+`reprojections.h5` include a camera flagged "possibly moved" (or in a pair
+reported "pair inconsistent"). Check each camera's `status` in
+`poseConsistency` in `offline3d_report.json` before relying on the 3D points.
+
 ### Measured behaviour
 
 In synthetic sessions with no noise, one camera's 2D points were shifted by
@@ -196,11 +201,17 @@ checks:
     min_frames: 300       # minimum frames, about 2 s at 150 Hz
     min_observations: 1000  # minimum keypoint observations
     min_confidence: 0.5   # likelihood cutoff for points that are used
-    per_camera:           # optional; overrides for one camera, by its calibration name
+    per_camera:           # optional; overrides for one camera, by its configured name
       camera4: {median_px: 8.0}
 ```
 
 - The limits are global. A `per_camera` entry overrides only the keys it gives.
+- A `per_camera` entry is keyed by the camera's configured name (its name in
+  the app and in the session's `hardware.configured.cameras`), as for the
+  reference-image check. Offline 3D maps it to the calibration's name for that
+  camera by serial, so the override follows a renamed camera; the verdicts in
+  `poseConsistency` are by the calibration's name. A key that names no camera
+  of the session is not used.
 - The global `min_confidence` is also the cutoff that the triangulation itself
   uses.
 - A missing or invalid value falls back to its default, and a warning is logged.

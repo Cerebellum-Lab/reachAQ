@@ -890,6 +890,10 @@ def capture_reference_images(
     return written
 
 
+QUALITY_REPORT_JSON = "quality_report.json"
+QUALITY_REPORT_TEXT = "quality_report.txt"
+
+
 def copy_with_references(source: Path, references: Mapping[str, Path], built: Path, *, now: datetime) -> str:
     """Build in `built` a copy of the calibration in `source` that holds `references`
     (calibration camera name -> PNG) as reference/<name>.png, under a new id, and return it.
@@ -897,7 +901,9 @@ def copy_with_references(source: Path, references: Mapping[str, Path], built: Pa
     The fit and every file but the old references are copied as they are. The index gets
     the new id, parent_id (the source's id) and references_captured (`now`); its created
     stays the fit's, so the calibration is as old as its fit. The anipose TOMLs name the
-    calibration by id in their metadata, so the old id is replaced by the new one there.
+    calibration by id in their metadata, so the old id is replaced by the new one there,
+    and in quality_report.json and quality_report.txt, whose notes also get the line
+    "references added to <the source's id, 8 characters>", so the copy's report says what it is.
     Raises ValueError for a source that is not at format 2 or 3 (a legacy import).
     """
     source, built = Path(source), Path(built)
@@ -910,6 +916,12 @@ def copy_with_references(source: Path, references: Mapping[str, Path], built: Pa
     data["references_captured"] = now.replace(microsecond=0).isoformat()
     for toml in built.rglob("*.toml"):
         toml.write_text(toml.read_text(encoding="utf-8").replace(source_id, new_id), encoding="utf-8")
+    report_json = Path(built, QUALITY_REPORT_JSON)
+    if report_json.is_file():
+        report = QualityReport.from_json(report_json.read_text(encoding="utf-8").replace(source_id, new_id))
+        report = dataclasses.replace(report, notes=[*report.notes, f"references added to {source_id[:8]}"])
+        report_json.write_text(report.to_json(), encoding="utf-8")
+        Path(built, QUALITY_REPORT_TEXT).write_text(report.to_text() + "\n", encoding="utf-8")
     Path(built, REFERENCE_DIR).mkdir()
     for name, png in references.items():
         shutil.copyfile(png, Path(built, REFERENCE_DIR, f"{name}.png"))

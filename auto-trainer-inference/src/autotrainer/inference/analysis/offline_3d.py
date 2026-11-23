@@ -879,7 +879,7 @@ def session_offline_3d(
         return None
     loaded = load_preset_set(folder, {used[name]: g for name, g in geometries.items()},
                              derived_root=derived_root(library_dir) if derived_dir is None else Path(derived_dir))
-    settings = read_pose_consistency_settings(library_dir)
+    settings = _per_camera_by_calibration_name(read_pose_consistency_settings(library_dir), used)
     result = _export(session_dir, loaded.toml_path, {used[name]: sources[name] for name in used},
                      min_confidence=settings.limits.min_confidence)
     verdicts = {}
@@ -891,6 +891,19 @@ def session_offline_3d(
         report["poseConsistency"] = {name: v.to_plain() for name, v in verdicts.items()}
     _write_report(session_dir, report)
     return replace(result, excluded=excluded, consistency=verdicts)
+
+
+def _per_camera_by_calibration_name(settings: PoseConsistencySettings,
+                                    used: Mapping[str, str]) -> PoseConsistencySettings:
+    """`settings` with its per_camera overrides moved from the configured camera names they
+    are given under to the calibration's names the residuals carry, through `used` (recorded
+    name -> calibration name, matched by serial), as the reference-image check takes them. A
+    key that names no camera used is dropped, with a note in the log."""
+    per_camera = {calibration: settings.per_camera[recorded] for recorded, calibration in used.items()
+                  if recorded in settings.per_camera}
+    for name in set(settings.per_camera) - set(used):
+        logger.info("checks.pose_consistency.per_camera.%s names no camera of this session; not used", name)
+    return replace(settings, per_camera=per_camera)
 
 
 def _write_report(session_dir: Path, report: dict) -> None:

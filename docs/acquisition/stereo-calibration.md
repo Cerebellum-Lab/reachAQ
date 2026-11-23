@@ -22,8 +22,10 @@ used, see
   through the DCS mapping, so a DCS that is out of date is fine; with none, the
   capture stops with "Please first calibrate diamond-triangle by starting the
   acquisition".
-- The left camera is configured at binning 4, the live preset. A binning that
-  is not a multiple of 4 stops the capture before the stage moves.
+- The primary camera is configured at binning 4, the live preset: the presets
+  the report grades come from the primary camera's binning, not the left
+  camera's. A binning that is not a multiple of 4 stops the capture before the
+  stage moves.
 - The capture records the 2 to 6 cameras ticked in the calibration dialog
   (below). Each camera's own configured geometry gives its presets, and
   `waypoints.yaml` records each camera's name, serial and camera id.
@@ -289,7 +291,8 @@ made, its cameras, its verdict, which one is **active**, and the cameras it left
   Entries never change, so the images go into a **new entry** with the same fit:
   a copy under a new id, with `parent_id` naming the original and
   `references_captured` the time; its `created` stays the fit's, so the monthly
-  reminder is not reset. The app then offers to set it active. Its
+  reminder is not reset. Its quality report is the original's, with the note
+  "references added to <the original's id, 8 characters>". The app then offers to set it active. Its
   `sensor/fit.yaml` is byte-identical to its parent's, so it is the same
   calibration geometrically: the coordinate system stays valid (a DCS measured
   against any id of that `parent_id` chain with the same fit counts, and the
@@ -380,7 +383,10 @@ centre), a rotation about the optical axis and a scale. It takes about 8 ms per
 - **ok**: within every limit.
 
 The settings live in `calibrations/settings.yaml`, global, with an optional
-override per camera (by its configured name) for a camera with a busy view:
+override per camera for a camera with a busy view. It is keyed by the camera's
+configured name (its name in the app), as `checks.pose_consistency.per_camera`
+is (see [Offline 3D](offline-3d.md)): the name the camera has now, not its name
+in the calibration:
 
 ```yaml
 checks:
@@ -630,8 +636,8 @@ calibrations/
   for example "live 3D cannot be switched while a 3D calibration runs".
   - **Off**, 2D pose keeps running. The drift monitor and the DCS are
     unavailable, with the reason "live 3D is off": the loaded DCS configuration
-    is kept but not used (as when it is out of date), a move given in DCS is
-    refused with that reason, and animals' saved pellet positions in DCS are
+    is kept but not used (as when it is out of date), a move given in DCS and
+    Calibrate Coordinate System are refused with that reason, and animals' saved pellet positions in DCS are
     kept, not zeroed. Preferences shows "Drift monitor and DCS need live 3D"
     beside the switch.
   - Nothing switches it on by itself: not a calibration, not an install.

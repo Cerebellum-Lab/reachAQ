@@ -608,6 +608,29 @@ def test_session_offline_3d_runs_the_check_when_enabled(tmp_path):
 THREE = {"left": "21000001", "right": "21000002", "camera4": "21000004"}
 
 
+def test_a_per_camera_override_is_given_by_the_configured_name(tmp_path):
+    # As the reference-image check takes it: the camera's name in the app, which the session
+    # maps to the calibration's name by serial (here camera4 has been renamed stimCam).
+    entry = _entry(tmp_path / "Autotrainer")
+    library.update_settings(entry.parent, checks={"pose_consistency": {
+        "enabled": True, "min_frames": 10, "min_observations": 10,
+        "per_camera": {"stimCam": {"median_px": 9.0}, "camera4": {"median_px": 1.0}}}})
+    project, session, metadata = _recorded_session(tmp_path, entry, THREE, _motor_points(40))
+    _pose_path(project, "camera4").rename(_pose_path(project, "stimCam"))
+    cameras = metadata["hardware"]["configured"]["cameras"]
+    cameras["stimCam"] = cameras.pop("camera4")
+    for camera in metadata["configuration"]["cameras"]:
+        if camera["name"] == "camera4":
+            camera["name"] = "stimCam"
+
+    result = session_offline_3d(project, entry, metadata, library_dir=entry.parent)
+
+    assert json.loads((session / "offline3d_report.json").read_text(encoding="utf-8"))["cameras"]["stimCam"] == "camera4"
+    # stimCam's override is camera4's; the calibration name camera4 is no configured camera's.
+    assert result.consistency["camera4"].median_limit_px == 9.0
+    assert result.consistency["left"].median_limit_px == result.consistency["right"].median_limit_px == 6.0
+
+
 def test_a_calibrated_camera_without_a_readable_pose_file_is_named(tmp_path):
     entry = _entry(tmp_path / "Autotrainer")
     project, session, metadata = _recorded_session(tmp_path, entry, THREE, _motor_points(20))

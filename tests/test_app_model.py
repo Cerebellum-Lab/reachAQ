@@ -1675,7 +1675,7 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
     # and inference shape recorded for every camera, and schema 3's camera
     # identity and calibration fields: hardware.configured.calibration3d and each
     # camera's serial, cameraId, inCalibration and uncalibratedReason. Measured
-    # 20_992 bytes on a clean tree (2026-11-21); a dirty tree's version suffix
+    # 20_992 bytes on a clean tree (2026-11-20); a dirty tree's version suffix
     # (.dYYYYMMDD) adds 10.
     assert len(serialized_json) < 23_000
     assert saved["artifacts"]["alignment"]["$ref"] == "streams/alignment.json"

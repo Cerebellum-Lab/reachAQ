@@ -3121,9 +3121,12 @@ class AppModel(ObservableObject):
 
         DCS is measured in the active 3D calibration's frame and its offsets are kept with
         that calibration, so without one it is refused rather than writing offsets into a
-        stand-in folder."""
+        stand-in folder. It measures with live 3D, so while live 3D is switched off it is
+        refused with "live 3D is off"."""
         if self._active_calibration_dir is None:
             return DCS_NEEDS_CALIBRATION
+        if not self.live_3d_enabled:
+            return LIVE_3D_OFF
         return None
 
     @property

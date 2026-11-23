@@ -7,6 +7,7 @@ reference clip are fakes that write a short video when their recording stops.
 """
 
 import dataclasses
+import importlib
 import os
 import re
 import statistics
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME  # noqa: E402
 from autotrainer.inference.multires_calibration import library, store  # noqa: E402
+from autotrainer.inference.multires_calibration.report import QualityReport  # noqa: E402
 from calibration_metadata_test import _saved_calibration3d  # noqa: E402
 from handle_3d_calibration_waypoints_test import _CaptureCamera, _capture_app_model  # noqa: E402
 from reload_calib_multires_test import BASE_PARAMS, _configure_live_pair, _write_multires  # noqa: E402
@@ -471,6 +473,16 @@ def test_capture_now_copy_inherits_the_fit_under_a_new_id(tmp_path):
     tomls = list(entry.rglob("*.toml"))
     assert tomls and all(new_id in t.read_text() and source_id not in t.read_text() for t in tomls)
     assert (entry / "reference" / "left.png").read_bytes() == png.read_bytes()
+    # The copy's report says what it is, in both forms, and names the copy, never the source.
+    report = QualityReport.from_json((entry / "quality_report.json").read_text(encoding="utf-8"))
+    parent_report = QualityReport.from_json((source / "quality_report.json").read_text(encoding="utf-8"))
+    assert report.notes == [*parent_report.notes, f"references added to {source_id[:8]}"]
+    assert dataclasses.replace(report, notes=parent_report.notes) == parent_report
+    text = (entry / "quality_report.txt").read_text(encoding="utf-8")
+    assert text == report.to_text() + "\n" and f"- references added to {source_id[:8]}" in text
+    for name in ("quality_report.json", "quality_report.txt"):
+        assert source_id not in (entry / name).read_text(encoding="utf-8").replace(
+            f"references added to {source_id[:8]}", "")
     # The source entry is untouched.
     assert {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()} == before
 
@@ -622,6 +634,35 @@ def test_invalid_value_not_saved(app_model, check, key, text):
     _edit(ui, check, key, "3" if key not in ("min_quality",) else "0.7")
     assert key in _stored(app_model)["checks"][check]
     assert not error.isVisibleTo(ui) and not edit.styleSheet()
+
+
+@pytest.mark.parametrize("check", ["reference_image", "pose_consistency"])
+def test_a_settings_file_that_cannot_be_written_reverts_the_switch_and_the_field(app_model, monkeypatch, check):
+    app_model_module = importlib.import_module("tools.acquisition.model.app_model")
+    ui = _checks_ui(app_model)
+
+    def refuse(root, **changes):
+        raise PermissionError(13, "Permission denied", "settings.yaml")
+
+    monkeypatch.setattr(app_model_module, "update_settings", refuse)
+    switch, error = ui.switches[check], ui.errors[check]
+
+    switch.setChecked(True)  # never raises out of the slot
+    assert not switch.isChecked(), "the switch shows what is stored"
+    assert error.isVisibleTo(ui) and error.text() == "not saved: [Errno 13] Permission denied: 'settings.yaml'"
+
+    key = "max_shift_px" if check == "reference_image" else "median_px"
+    edit = _edit(ui, check, key, "3")
+    assert edit.text() == ("4" if check == "reference_image" else "6"), "the field shows what is stored"
+    assert error.text().endswith("not saved: [Errno 13] Permission denied: 'settings.yaml'")
+    assert not library.settings_path(app_model.calibration_library_root).exists()
+
+    # Once the file can be written, both save and the error goes.
+    monkeypatch.undo()
+    _edit(ui, check, key, "3")
+    switch.setChecked(True)
+    assert _stored(app_model)["checks"][check] == {key: 3.0, "enabled": True}
+    assert not error.isVisibleTo(ui)
 
 
 def test_preferences_shows_the_checks_beside_their_switches(app_model):
