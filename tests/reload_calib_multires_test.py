@@ -12,8 +12,10 @@ import dataclasses
 import hashlib
 import json
 import logging
+import os
 import pickle
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from unittest import mock
@@ -669,9 +671,9 @@ def test_a_plain_legacy_offsets_file_still_loads(app_model, tmp_path, where):
     assert _saved_calibration3d(app_model, tmp_path)["offsetsFile"]["name"] == DEFAULT_CAM_OFFSET_FILE_NAME
 
 
-def test_a_library_with_entries_and_no_pointer_is_not_imported_into_again(app_model, user_pref, tmp_path):
-    # A rig whose active.yaml went missing: an old folder is still there, and importing it
-    # again would make its calibration active behind the operator's back.
+def test_a_library_with_entries_and_no_pointer_imports_but_never_activates(app_model, user_pref, tmp_path):
+    # A rig whose active.yaml went missing: an old folder is still there. It is imported, but
+    # making its calibration active would do it behind the operator's back.
     entry = _active_entry(app_model, tmp_path)
     old = _write_multires(Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME)
     root = entry.parent
@@ -685,8 +687,51 @@ def test_a_library_with_entries_and_no_pointer_is_not_imported_into_again(app_mo
     assert app_model._live_3d_disabled_reason == f"no active calibration in {root}: active.yaml is missing"
     assert app_model._pose_algorithm.stereo_params is None, "2D only"
     assert not (root / library.ACTIVE_FILE).exists()
-    assert [e.id for e in library.list_entries(root)] == [entry.name], "the old folder was not imported"
-    assert store.load_index(old).id not in [e.id for e in library.list_entries(root)]
+    assert sorted(e.id for e in library.list_entries(root)) == sorted([entry.name, store.load_index(old).id])
+    assert library.latest_decision(root, store.load_index(old).id, "import") == {"source": DEFAULT_3D_CALIB_DIR_NAME}
+
+
+def _legacy_folder(folder: Path, content: bytes, when: float) -> Path:
+    """A legacy calibration folder as an older version installs it: its pickle, dated `when`."""
+    pickle_path = folder / "camera_matrix" / "stereo_params.pickle"
+    pickle_path.parent.mkdir(parents=True, exist_ok=True)
+    pickle_path.write_bytes(content)
+    os.utime(pickle_path, (when, when))
+    return folder
+
+
+def test_a_newer_calibration_of_an_older_version_is_imported_not_activated(app_model, user_pref, tmp_path):
+    # Rolled back, then forward: the older version installed into 4mm_6r_8c_4x meanwhile.
+    entry = _active_entry(app_model, tmp_path)
+    root = entry.parent
+    made = store.calibration_created(entry).timestamp()
+    folder = _legacy_folder(Path(user_pref.configuration_location) / DEFAULT_3D_CALIB_DIR_NAME, b"first",
+                            made - 86400)
+    _configure_with_serials(app_model, SERIALS)
+    pointer = (root / library.ACTIVE_FILE).read_bytes()
+
+    with mock.patch.object(app_model, "on_error") as on_error:
+        app_model.reload_calib(None)
+    first = library.legacy_id(folder / "camera_matrix" / "stereo_params.pickle")
+    assert sorted(e.id for e in library.list_entries(root)) == sorted([entry.name, first])
+    assert _calibration_errors(on_error) == [], "older than the active calibration: no note"
+
+    # The older version recalibrated after the first import: a new content id, imported again.
+    later = made + 86400
+    _legacy_folder(folder, b"second", later)
+    with mock.patch.object(app_model, "on_error") as on_error:
+        app_model.reload_calib(None)
+
+    second = library.legacy_id(folder / "camera_matrix" / "stereo_params.pickle")
+    assert second != first
+    assert sorted(e.id for e in library.list_entries(root)) == sorted([entry.name, first, second])
+    assert (root / library.ACTIVE_FILE).read_bytes() == pointer and library.active_id(root) == entry.name
+    assert app_model.active_calibration_dir == entry
+    assert library.latest_decision(root, second, "import") == {"source": DEFAULT_3D_CALIB_DIR_NAME}
+    date = datetime.fromtimestamp(later).strftime("%Y-%m-%d %H:%M")
+    assert _calibration_errors(on_error) == [
+        f"A calibration made by an older version ({date}) was imported; set it active in the calibration"
+        " library to use it."]
 
 
 def test_a_calibration_that_fails_to_load_puts_no_camera_in_it(app_model, tmp_path):

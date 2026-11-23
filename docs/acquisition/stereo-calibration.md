@@ -562,8 +562,8 @@ calibrations/
   once. It also gets its `stereo_params.pickle` time as its date, and a
   generated `calibration.yaml` marked `format: legacy` that records it as
   `created`; offline's made-by check reads that `created`, not the copy's file
-  times. The import sets the active pointer to the active folder's entry when
-  there is none yet, skips anything already in the library (so it can run
+  times. The first import, into a library never used, sets the active pointer
+  to the active folder's entry when there is none yet; later ones never do. It skips anything already in the library (so it can run
   again), records one `import` decision per entry (one that could not be written
   is written on the next import), and leaves the old folders as they were.
   Legacy ids made from the folder's name existed only on this branch, never on
@@ -578,8 +578,18 @@ calibrations/
 - **The app loads the active entry.** At start, and whenever no calibration
   folder is given, it reads `active.yaml`. When the library has never been used
   (no entry and no `decisions.jsonl`), the app first runs `import_existing`, so a
-  rig keeps its calibration on its first start with the library. A library that
-  has entries but no `active.yaml` is not imported into again, since that could
+  rig keeps its calibration on its first start with the library. Once the
+  library is in use (it has an entry, `active.yaml` or `decisions.jsonl`), every
+  start imports the `4mm_6r_8c_4x` folder and dated backups it does not hold yet,
+  each with an `import` decision, and never moves the pointer for them: an older
+  version run in between (see
+  [Deploying and rolling back](#deploying-and-rolling-back)) installs into
+  `4mm_6r_8c_4x`. When the `4mm_6r_8c_4x` folder's calibration is not the active
+  one and was made after it (its pickle's modification time for a legacy folder,
+  its `created` for a format-2 one), or there is no active one, the status bar
+  says "A calibration made by an older version (<date>) was imported; set it
+  active in the calibration library to use it." A library that has entries but
+  no `active.yaml` gets no active calibration from that import, since that could
   make an old folder's calibration active behind the operator's back: the app
   records 2D with "no active calibration in …/calibrations: active.yaml is
   missing" until a calibration is made active. A missing, corrupt or dangling

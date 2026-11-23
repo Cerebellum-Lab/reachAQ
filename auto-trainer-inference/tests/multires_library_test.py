@@ -496,6 +496,25 @@ def test_a_legacy_folder_renamed_to_a_backup_is_not_imported_twice(tmp_path):
     assert active_id(root) == legacy_id
 
 
+def test_a_roll_forward_import_never_sets_the_pointer(tmp_path):
+    config = _config(tmp_path)
+
+    added = import_existing(config, activate=False)
+
+    root = library_root(config)
+    assert len(added) == 3 and not (root / library.ACTIVE_FILE).exists()
+    assert [r["event"] for r in _decisions(root)] == ["import"] * 3
+    assert library.active_folder_id(config) == FORMAT2_ID
+
+
+def test_the_active_folder_id_of_a_legacy_folder_is_its_content_id(tmp_path):
+    config = tmp_path / "Autotrainer"
+    config.mkdir()
+    assert library.active_folder_id(config) is None
+    _legacy(config / NAME, datetime(2026, 7, 7))
+    assert library.active_folder_id(config) == library.legacy_id(config / NAME / "camera_matrix" / "stereo_params.pickle")
+
+
 def test_a_legacy_id_comes_from_the_content_not_the_name(tmp_path):
     a = _legacy(tmp_path / "a", datetime(2026, 7, 7))
     b = _legacy(tmp_path / "b", datetime(2026, 7, 7))

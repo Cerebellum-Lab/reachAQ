@@ -503,7 +503,7 @@ def latest_decision(root: Path, calibration_id: str, kind: str) -> Optional[dict
     return found
 
 
-def import_existing(config_dir: Path) -> List[str]:
+def import_existing(config_dir: Path, *, activate: bool = True) -> List[str]:
     """Copy the 4mm_6r_8c_4x folder and every dated backup under `config_dir` into the library.
 
     Returns the ids this call added, oldest first; an id already in the library is skipped,
@@ -513,7 +513,8 @@ def import_existing(config_dir: Path) -> List[str]:
     one "import" decision: one whose decision could not be written (or was imported without
     one) gets it on the next call. A folder that cannot be imported is warned about and left
     out. When the library has no readable active pointer, the active folder's entry becomes
-    it. The old folders are not changed.
+    it, unless `activate` is False: the roll-forward import of a library already in use never
+    moves the pointer. The old folders are not changed.
     """
     config_dir = Path(config_dir)
     root = library_root(config_dir)
@@ -538,9 +539,29 @@ def import_existing(config_dir: Path) -> List[str]:
             active_source = calibration_id
         if is_new:
             added.append(calibration_id)
-    if active_source is not None and active_id(root) is None:
+    if activate and active_source is not None and active_id(root) is None:
         set_active(root, active_source, by="import")
     return added
+
+
+def active_folder_id(config_dir: Path) -> Optional[str]:
+    """The library id of the 4mm_6r_8c_4x folder under `config_dir`, the one an older version
+    installs into: its format-2 id, or legacy_id for a legacy folder. None when there is no
+    such folder or it is not a calibration this version reads. Never raises."""
+    try:
+        candidates = [c for c in calibration_candidates(Path(config_dir)) if c.active_until is None]
+        if not candidates:
+            return None
+        candidate, = candidates
+        if candidate.calibration_id is not None:
+            return candidate.calibration_id
+        if (candidate.path / INDEX_FILE).exists():
+            return None
+        pickle_path = candidate.path / _LEGACY_PICKLE
+        return legacy_id(pickle_path) if pickle_path.is_file() else None
+    except (OSError, ValueError) as error:
+        logger.warning("could not identify the calibration in %s: %s", config_dir, error)
+        return None
 
 
 def _import_folder(root: Path, known_id: Optional[str], folder: Path) -> Tuple[Optional[str], bool]:

@@ -104,6 +104,7 @@ from autotrainer.inference.multires_calibration.geometry import PresetGeometry
 from autotrainer.inference.multires_calibration.library import (
     ACTIVE_FILE,
     DECISIONS_FILE,
+    active_folder_id,
     active_id,
     current_offsets_path,
     derived_root,
@@ -545,6 +546,11 @@ def _metadata_without_nonfinite_numbers(value):
 
 #: Schema 3 (2026-11-20) adds the calibration's cameras and identity by serial; readers keep 2.
 METADATA_SCHEMA_VERSION = 3
+
+
+def _local_naive(when: datetime) -> datetime:
+    """`when` as a local time without a zone, as calibration times are kept."""
+    return when.astimezone().replace(tzinfo=None) if when.tzinfo is not None else when
 
 
 def _describe_geometry(g: PresetGeometry) -> str:
@@ -1216,6 +1222,9 @@ class AppModel(ObservableObject):
         # recomputes this (refresh_dcs_state), as every later calibration or DCS load does.
         self._dcs_state = DcsState.MISSING
         self._dcs_state_lock = threading.RLock()
+        # A note about the 3D calibration for the operator, from a load that could not report it
+        # (the constructor's): the next load that reports gives it (_load_calibration).
+        self._calibration_note: Optional[str] = None
         # The camera configuration is not loaded yet, so a format-2 calibration's
         # preset is picked from SpinCam's default geometry here, and again from
         # the configured geometry at the end of every configuration load. That
@@ -2554,14 +2563,21 @@ class AppModel(ObservableObject):
         into again, which could make an old folder's calibration active behind the operator's
         back: there is no active calibration, 2D only, with the reason
         "no active calibration in <library>: active.yaml is missing".
+
+        A library already in use imports, on every start, the older version's folders it does
+        not hold yet (a rollback and roll-forward: an older version installs into
+        4mm_6r_8c_4x), never moving the pointer for them (_import_older_calibrations).
         """
         if calib_dir is not None:
             return Path(calib_dir).expanduser(), None
         config = Path(self._preferences.configuration_location).expanduser()
         root = library_root(config)
         pointer = root / ACTIVE_FILE
+        in_use = pointer.exists() or has_entries(root) or root.joinpath(DECISIONS_FILE).exists()
+        if in_use:
+            self._import_older_calibrations(config, root)
         if not pointer.exists():
-            if has_entries(root) or root.joinpath(DECISIONS_FILE).exists():
+            if in_use:
                 logger.warning("no active 3D calibration: the library %s has calibrations but no %s",
                                root, ACTIVE_FILE)
                 return None, f"no active calibration in {root}: {ACTIVE_FILE} is missing"
@@ -2589,6 +2605,35 @@ class AppModel(ObservableObject):
                               " that is not in the library")
             return None, f"{NO_ACTIVE_CALIBRATION}: {pointer} does not exist"
         return root / calibration_id, None
+
+    def _import_older_calibrations(self, config: Path, root: Path) -> None:
+        """Import the 4mm_6r_8c_4x folder and its dated backups that the library does not hold
+        yet, as entries with an "import" decision, never active (import_existing(activate=False)).
+
+        When the 4mm_6r_8c_4x folder's calibration is not the active one and was made after it
+        (or there is no active one), the operator is told, once per start, that it was
+        imported and must be set active to be used. Never raises: a failure is logged.
+        """
+        self._calibration_note = None
+        try:
+            added = import_existing(config, activate=False)
+            if added:
+                logger.notice("imported %d 3D calibration(s) made by an older version into the library %s,"
+                              " not active: %s", len(added), root, ", ".join(added))
+            folder_id = active_folder_id(config)
+            current = pointer_id(root)
+            if folder_id is None or folder_id == current or not root.joinpath(folder_id).is_dir():
+                return
+            made = _local_naive(calibration_created(root / folder_id))
+            if (current is not None and root.joinpath(current).is_dir()
+                    and made <= _local_naive(calibration_created(root / current))):
+                return
+        except Exception:
+            logger.exception("could not import the 3D calibrations made by an older version under %s", config)
+            return
+        self._calibration_note = (f"A calibration made by an older version ({made:%Y-%m-%d %H:%M}) was imported;"
+                                  " set it active in the calibration library to use it.")
+        logger.warning("3D calibration %s: %s", folder_id, self._calibration_note)
 
     def _is_library_entry(self, folder: Optional[Path]) -> bool:
         if folder is None:
@@ -2672,6 +2717,9 @@ class AppModel(ObservableObject):
         """Load the calibration in `calib_src_dir`, as _resolve_calibration gave it with
         `no_calibration`, the reason there is none when it is None."""
         logger.info("loading calib from %s", calib_src_dir)
+        if report and self._calibration_note is not None:
+            note, self._calibration_note = self._calibration_note, None
+            self.on_error("3D calibration", note)
         # The live 3D setting is read once per load, then cached (live_3d_enabled).
         self._live_3d_setting = self._read_live_3d_setting()
         self._calibration_unreadable = None
