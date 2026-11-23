@@ -71,7 +71,7 @@ def test_dialog_lists_every_camera_ticked_including_stimcam():
     assert all(box.isChecked() and box.isEnabled() for box in boxes)
     assert dialog.start_button.isEnabled()
     assert dialog.request() == CalibrationRequest(
-        cameras=["left", "right", "stimCam"], move_list="scout", capture_references=False)
+        cameras=["left", "right", "stimCam"], move_list="handwritten", capture_references=False)
 
 
 def test_the_request_puts_the_configured_primary_first():
@@ -110,12 +110,15 @@ def test_start_needs_two_to_six():
     assert dialog.start_button.isEnabled()
 
 
-def test_the_scout_is_the_default_move_list_and_references_wait_for_later():
+def test_the_handwritten_list_is_the_default_and_references_wait_for_later():
+    # Until the scout has been checked on a rig, it is offered but not the default.
     dialog = CalibrationDialog(_rig())
-    assert dialog.scout_button.isEnabled() and dialog.scout_button.isChecked()
-    assert "hand-written list when fewer than 12" in dialog.scout_button.toolTip()
-    dialog.handwritten_button.setChecked(True)
+    assert dialog.handwritten_button.isChecked() and not dialog.scout_button.isChecked()
     assert dialog.request().move_list == "handwritten"
+    assert dialog.scout_button.isEnabled()
+    assert "hand-written list when fewer than 12" in dialog.scout_button.toolTip()
+    dialog.scout_button.setChecked(True)
+    assert dialog.request().move_list == "scout"
     assert dialog.references_box.isEnabled() and dialog.references_box.toolTip() == REFERENCES_TOOLTIP
     assert not dialog.references_box.isChecked()
 
@@ -373,8 +376,9 @@ def test_the_count_uses_the_right_plural():
 def test_scout_again_is_offered_only_with_the_scout():
     dialog = CalibrationDialog(_rig())
     box = dialog.rescout_box
-    assert box.text() == "Scout again" and not box.isChecked() and box.isEnabled()
-    assert dialog.request().rescout is False
+    assert box.text() == "Scout again" and not box.isChecked() and not box.isEnabled()
+    dialog.scout_button.setChecked(True)
+    assert box.isEnabled() and dialog.request().rescout is False
     box.setChecked(True)
     assert dialog.request() == CalibrationRequest(
         cameras=["left", "right", "stimCam"], move_list="scout", capture_references=False, rescout=True)
@@ -491,3 +495,19 @@ def test_capture_now_records_the_primary_the_entry_did_not_calibrate():
                        " enable it, or make a new calibration with the cameras that can.")
     assert main_window_module.reference_capture_cameras([primary], {}) == (
         "None of the configured cameras is one this calibration calibrated.")
+
+
+def test_the_capture_now_prompt_does_not_ask_to_redo_the_coordinate_system(monkeypatch):
+    # The copy keeps the fit, so a DCS of it stays valid; when one does go stale, set active
+    # says so after the fact (_set_active_calibration's STALE check).
+    asked = []
+    monkeypatch.setattr(main_window_module, "QMessageBox", SimpleNamespace(
+        question=lambda parent, title, text, *args: asked.append((title, text)) or QMessageBox.StandardButton.No,
+        StandardButton=QMessageBox.StandardButton))
+    window = SimpleNamespace(_library_view=None)
+    MainWindow._finish_reference_capture(window, "a" * 32, {"id": "c" * 32})
+    (title, text), = asked
+    assert title == "Reference images captured"
+    assert text == ("The reference images are in a new calibration, cccccccc, with the fit of aaaaaaaa."
+                    " Set it active now?")
+    assert "redo" not in text.lower() and "redone" not in text.lower()

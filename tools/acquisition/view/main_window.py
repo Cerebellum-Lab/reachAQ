@@ -1220,8 +1220,7 @@ class MainWindow(QMainWindow):
             self,
             "Reference images captured",
             f"The reference images are in a new calibration, {new_id[:8]}, with the fit of {source_id[:8]}. "
-            "Set it active now? The coordinate system must then be redone "
-            "(Tools → Calibrate Coordinate System), as after any change of the active calibration.",
+            "Set it active now?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if rsp == QMessageBox.StandardButton.Yes:

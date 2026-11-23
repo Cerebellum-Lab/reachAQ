@@ -163,9 +163,11 @@ tooltip. **Start** is available only with 2 to 6 cameras ticked; **Cancel**
 starts nothing. The cameras are captured in camera-list order with the
 configured primary first.
 
-- **Move list**: *automatic (scout)*, the default, chooses the waypoints from a
-  scout pass before the capture (see [Automatic move list](#automatic-move-list));
-  *hand-written* is the fixed list of 37 waypoints described under Steps.
+- **Move list**: *hand-written*, the default, is the fixed list of 37 waypoints
+  described under Steps; *automatic (scout)* chooses the waypoints from a scout
+  pass before the capture (see [Automatic move list](#automatic-move-list)).
+  The scout is not yet the default: it becomes the default once it has been
+  checked on a rig (see the [deploy notes](#deploying-and-rolling-back)).
   **Scout again**, unticked by default and offered only with the scout, ignores
   the list saved for these cameras this time and scouts (see *Saved list*
   below); the saved list is not deleted.
