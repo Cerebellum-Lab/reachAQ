@@ -1,9 +1,10 @@
 import math
 import threading
 import time
-from typing import Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List
 
 import pandas
+from numpy import ndarray
 
 from PySide6 import QtCore
 from PySide6.QtCore import QTimer, Slot, Signal, Qt, QSize, QPoint, QPointF, QRect
@@ -345,6 +346,10 @@ class MainContent(ContentWidget):
             return 2
         return 3
 
+    def displayed_frames(self) -> Dict[str, Optional[ndarray]]:
+        """Each reach camera's newest displayed frame by name (CameraContent.displayed_frame)."""
+        return {camera.name: content.displayed_frame() for camera, content in self._reach_camera_contents}
+
     def _clear_reach_camera_grid(self) -> None:
         for camera, camera_content in self._reach_camera_contents:
             camera.set_display_fcn(None)
@@ -433,6 +438,7 @@ class MainContent(ContentWidget):
             app_model.inference,
         )
         behavior_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        behavior_content.frame_source = self.displayed_frames
         self._mid_splitter.addWidget(behavior_content)
         self._content_widgets.append(behavior_content)
 

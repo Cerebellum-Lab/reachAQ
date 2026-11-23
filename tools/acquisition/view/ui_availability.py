@@ -18,6 +18,8 @@ class UiAvailability:
     protocol_selection: bool
     notes: bool
     calibration: bool
+    # Tools → Calibration library…: its Set active changes the active calibration.
+    calibration_library: bool = False
 
 
 def calculate_ui_availability(
@@ -61,6 +63,11 @@ def calculate_ui_availability(
         subject=session_identity,
         protocol_selection=session_identity,
         notes=True,
+        # AppModel.set_active_calibration's own rule: a Ready session and no calibration running.
+        calibration_library=session_ready and stable_mode and ordinary_mode,
+        # Calibrate Coordinate System. has_valid_dcs is whether a fully valid DCS
+        # configuration is loaded, stale or not: this action is how a DCS made stale
+        # by a new 3D calibration is redone, so staleness must not disable it.
         calibration=(
             session_ready
             and stable_mode

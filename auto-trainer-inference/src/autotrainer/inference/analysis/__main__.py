@@ -25,8 +25,11 @@ def main():
     parser.add_argument("date", type=lambda v: datetime.strptime(v, "%Y%m%d"))
     parser.add_argument("session", type=int)
     parser.add_argument("--data-dir", type=Path, required=True)
-    parser.add_argument("--calib-dir", type=Path,
-                        default=DEFAULT_CONFIG_DIR.expanduser().joinpath(DEFAULT_3D_CALIB_DIR_NAME))
+    parser.add_argument("--calib-dir", type=Path, default=None,
+                        help="calibration folder to use; by default the session's own is found under"
+                             " --calib-root, by the id in its metadata or else by its start time")
+    parser.add_argument("--calib-root", type=Path, default=DEFAULT_CONFIG_DIR.expanduser(),
+                        help=f"where {DEFAULT_3D_CALIB_DIR_NAME} and its timestamped backups are")
     parser.add_argument("--log-level", type=lambda val: int(val) if val.isdigit() else val,
                         default=logging.WARNING)
     parser.add_argument("--analysis-debug-level", type=int, help="integer", default=0)
@@ -43,6 +46,7 @@ def main():
     result = intersession_process(
         project_info,
         calib_dir=args.calib_dir,
+        calib_root=args.calib_root,
         debug_level=args.analysis_debug_level,
     )
     sess_path = project_info.get_session_path()

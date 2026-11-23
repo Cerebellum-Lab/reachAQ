@@ -89,11 +89,18 @@ class QCaptureView(QWidget):
 
         self._camera_name_label = QLabel("")
 
+        # A short status tag beside the name, such as "2D only"; hidden while it has no text.
+        self._tag_label = QLabel("")
+        self._tag_label.setStyleSheet(
+            "background-color: #c62828; color: white; font-weight: bold; border-radius: 3px; padding: 0 4px;")
+        self._tag_label.setVisible(False)
+
         top_layout = QHBoxLayout()
         top_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.addWidget(self._camera)
         top_layout.addWidget(self._camera_name_label)
+        top_layout.addWidget(self._tag_label)
 
         card_widget = self._card_widget = CardWidget(title="Capture", header_right_layout=top_layout)
 
@@ -213,6 +220,16 @@ class QCaptureView(QWidget):
 
     def setTitle(self, title: str):
         self._card_widget.header.setTitle(title)
+
+    @property
+    def tag_label(self) -> QLabel:
+        return self._tag_label
+
+    def setTag(self, text: str, tooltip: str = "") -> None:
+        """Show `text` as a tag in the header, with `tooltip`; an empty text hides it."""
+        self._tag_label.setText(text)
+        self._tag_label.setToolTip(tooltip)
+        self._tag_label.setVisible(bool(text))
 
     def setSize(self, width: int, height: int):
         self._image_width = width

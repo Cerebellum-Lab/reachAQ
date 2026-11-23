@@ -1,6 +1,8 @@
 import dataclasses
 import functools
+import hashlib
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import List
@@ -21,6 +23,7 @@ from autotrainer.inference.analysis import (
     prepare_jetson_data,
 )
 from autotrainer.core.reach_event import ReachEvent
+from autotrainer.inference.multires_calibration.library import import_existing, library_root
 
 import pytest
 
@@ -197,6 +200,34 @@ def test_fp_and_xp_not_same(project_info, caplog):
     event = res.other_events[0]
     assert event.method == 'other'
     assert event.outcome == 'dropped'
+
+
+def _tree_hashes(folder: Path) -> dict:
+    return {str(p.relative_to(folder)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(folder.rglob("*")) if p.is_file()}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="disabled on non-posix")
+def test_a_legacy_library_entry_is_never_written_to(project_info, tmp_path):
+    """The legacy path saves offsets it generates into a legacy folder; never into a library
+    entry, which is immutable once in place."""
+    config = tmp_path / "Autotrainer"
+    legacy = config / DEFAULT_3D_CALIB_DIR_NAME
+    shutil.copytree(calib_dir, legacy)
+    # No offsets anywhere, so the legacy path generates them.
+    legacy.joinpath(prepare_jetson_data.DEFAULT_CAM_OFFSET_FILE_NAME).unlink()
+    legacy_id, = import_existing(config)
+    entry = library_root(config) / legacy_id
+    before = _tree_hashes(entry)
+    project_info.session = 2
+    project_info.root = this_dir.joinpath("fp-and-xp-not-same").as_posix()
+    project_info.device_id = "agx001"
+    project_info.when = datetime(2025, 6, 23)
+    project_info.camera_names = ("left", "right")
+    res = intersession_process(project_info, calib_dir=entry)
+    assert isinstance(res, IntersessionResponse)
+    assert _tree_hashes(entry) == before
+    assert not library_root(config).joinpath(".offsets").exists(), "offline never writes the DCS offsets store"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="disabled on non-posix")

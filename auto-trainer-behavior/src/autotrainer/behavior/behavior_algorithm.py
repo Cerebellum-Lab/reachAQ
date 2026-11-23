@@ -253,6 +253,8 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         self._diamond_triangle_offset_config_path = diamond_triangle_offset_config_path
 
         self._diamond_triangle_offset_config: Optional[DiamondTriangleOffsetConfig] = None
+        # Set while the loaded DCS configuration is stale (set_dcs_suppressed).
+        self._dcs_suppressed = False
 
         self._diamond_triangle_drift: Optional[Offset3DTuple] = None
         self._diamond_triangle_prev_drifts: Deque[Offset3DTuple] = collections.deque(maxlen=150)
@@ -833,12 +835,32 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
 
     @property
     def diamond_triangle_config(self) -> Optional[DiamondTriangleOffsetConfig]:
-        return self._diamond_triangle_offset_config
+        """The DCS configuration its consumers use: None while it is held off (set_dcs_suppressed)."""
+        return None if self._dcs_suppressed else self._diamond_triangle_offset_config
 
     @diamond_triangle_config.setter
     def diamond_triangle_config(self, value):
-        prev, self._diamond_triangle_offset_config = self._diamond_triangle_offset_config, value
-        self._on_property_changed(BehaviorAlgoProps.DIAMOND_TRIANGLE_CONFIG, value, prev)
+        # Replaces the loaded configuration; a hold stays until set_dcs_suppressed lifts it.
+        prev = self.diamond_triangle_config
+        self._diamond_triangle_offset_config = value
+        self._on_property_changed(BehaviorAlgoProps.DIAMOND_TRIANGLE_CONFIG, self.diamond_triangle_config, prev)
+
+    @property
+    def loaded_diamond_triangle_config(self) -> Optional[DiamondTriangleOffsetConfig]:
+        """The DCS configuration as loaded, also while it is held off."""
+        return self._diamond_triangle_offset_config
+
+    def set_dcs_suppressed(self, suppressed: bool) -> None:
+        """Hold the loaded DCS configuration off its consumers, or give it back to them.
+
+        A DCS configuration measured against another 3D calibration than the active one
+        is stale (the acquisition app decides that). While suppressed, diamond_triangle_config
+        is None, which every consumer already treats as no DCS; a change is announced
+        as a DIAMOND_TRIANGLE_CONFIG property change.
+        """
+        prev = self.diamond_triangle_config
+        self._dcs_suppressed = bool(suppressed)
+        self._on_property_changed(BehaviorAlgoProps.DIAMOND_TRIANGLE_CONFIG, self.diamond_triangle_config, prev)
 
     def load_diamond_triangle_config(self, path: Optional[Path] = None):
         if path is None:
@@ -1292,7 +1314,7 @@ class BehaviorAlgorithm(ObservableObject, BehaviorAlgorithmProtocol):
         offset: Offset3DTuple,
         motor_position: Offset3DTuple,
     ):
-        cfg = self._diamond_triangle_offset_config
+        cfg = self.diamond_triangle_config  # None while a stale one is held off
         if cfg is None:
             return
         drift = cfg.diamond_to_motor(offset) - motor_position

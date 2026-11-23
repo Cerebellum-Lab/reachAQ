@@ -12,7 +12,7 @@ from PySide6 import QtCore
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QWidget, QFormLayout, QLineEdit, QComboBox, QLabel, QHBoxLayout, QPushButton,
                                QTabWidget, QVBoxLayout, QCheckBox, QDoubleSpinBox, QSpinBox, QGridLayout,
-                               QLayout, QSizePolicy, QGroupBox, QFileDialog, QDialog)
+                               QLayout, QSizePolicy, QGroupBox, QFileDialog, QDialog, QMessageBox)
 
 from autotrainer.behavior.pellet_trial import (
     AttemptAssignmentPolicy,
@@ -34,6 +34,7 @@ from tools.acquisition.model.animal_sources.config import (
     load_source_configuration,
 )
 from tools.acquisition.view.animal_source_setup_dialog import AnimalSourceSetupDialog
+from tools.acquisition.view.moved_camera_checks import REFERENCE_CHECK, MovedCameraChecks
 
 logger = get_verbose_logger(__name__)
 
@@ -240,6 +241,39 @@ class PreferencesContent(QWidget):
         analysis_layout.addWidget(toggle)
         analysis_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
         top_layout.addLayout(analysis_layout)
+        #
+        live_3d_layout = QHBoxLayout()
+        live_3d_layout.addWidget(QLabel("Live 3D:"))
+        toggle = self._live_3d_toggle = QSwitch()
+        toggle.setToolTip(
+            "Triangulates the left and right pose into 3D during live preview and recording sessions. "
+            "On by default. Off, 2D pose keeps running, and the drift monitor and DCS are unavailable."
+        )
+        toggle.setChecked(app_model.live_3d_enabled)
+        live_3d_note = self._live_3d_note = QLabel("Drift monitor and DCS need live 3D")
+        live_3d_note.setVisible(not toggle.isChecked())
+        def live_3d_state_changed(x: int):
+            try:
+                app_model.live_3d_enabled = x != 0
+            except RuntimeError as err:
+                # Refused outside Ready: the switch goes back to what is in force, and says why.
+                live_3d_toggle = self._live_3d_toggle
+                live_3d_toggle.blockSignals(True)
+                live_3d_toggle.setChecked(app_model.live_3d_enabled)
+                live_3d_toggle.blockSignals(False)
+                QMessageBox.warning(self, "Live 3D", str(err))
+            live_3d_note.setVisible(not app_model.live_3d_enabled)
+        toggle.stateChanged.connect(live_3d_state_changed)  # after setChecked
+        live_3d_layout.addWidget(toggle)
+        live_3d_layout.addWidget(live_3d_note)
+        live_3d_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        top_layout.addLayout(live_3d_layout)
+        #
+        # Each moved-camera check's switch with its limits beside it, read afresh each time
+        # Preferences opens.
+        moved_checks = self._moved_camera_checks = MovedCameraChecks(app_model)
+        self._reference_check_toggle = moved_checks.switches[REFERENCE_CHECK]
+        top_layout.addWidget(moved_checks)
         #
         inference_model_layout = QHBoxLayout()
         inference_model_layout.addWidget(QLabel("Inference model:"))

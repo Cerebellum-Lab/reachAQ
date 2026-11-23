@@ -37,6 +37,7 @@ class UserPreferences(ObservableObject):
     CONFIGURATION_LOCATION = "configuration_location"
     SERIAL_NUMBER = "serial_number"
     LIVE_FEED_REFRESH_RATE = "live_feed_refresh_rate"
+    CALIBRATION_REMINDER_DAYS = "calibration_reminder_days"
     LOG_LOCATION = "log_location"
     LOG_LEVEL = "log_level"
     SELECTED_ANIMAL = "selected_animal"
@@ -95,6 +96,7 @@ class UserPreferences(ObservableObject):
         self._log_level: int = settings.value("system/log_level", logging.WARNING, int)  # noqa
 
         self._live_feed_refresh_rate: int = settings.value("display/refresh_rate", 15, int)  # noqa
+        self._calibration_reminder_days: int = settings.value("calibration/reminder_days", 30, int)  # noqa
         self._measurement_graph: str = settings.value("ui/measurement_graph", "")  # noqa
 
         # The animal metadata source this user set up, as JSON (see
@@ -249,6 +251,17 @@ class UserPreferences(ObservableObject):
         prev, self._live_feed_refresh_rate = self._live_feed_refresh_rate, value
         self._settings.setValue("display/refresh_rate", value)
         self._on_property_changed(self.LIVE_FEED_REFRESH_RATE, value, prev)
+
+    @property
+    def calibration_reminder_days(self) -> int:
+        """How many days old the active 3D calibration may be before the app suggests a new one."""
+        return self._calibration_reminder_days
+
+    @calibration_reminder_days.setter
+    def calibration_reminder_days(self, value: int):
+        prev, self._calibration_reminder_days = self._calibration_reminder_days, value
+        self._settings.setValue("calibration/reminder_days", value)
+        self._on_property_changed(self.CALIBRATION_REMINDER_DAYS, value, prev)
 
     @property
     def log_location(self) -> str:

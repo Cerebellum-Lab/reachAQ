@@ -1,0 +1,31 @@
+3D calibration quality: WARN (0 fail, 2 warn, 24 pass; created 2026-11-20T15:36:56-07:00)
+
+WARN  coverage_roi_fraction         left   0.4227 of ROI  [warn < 0.5, fail < 0.25]
+WARN  coverage_roi_fraction         right  0.4243 of ROI  [warn < 0.5, fail < 0.25]
+PASS  views_kept                    left   37 views  [warn < 20, fail < 10]
+PASS  covisible_views               left   37 views  [warn < 8, fail < 4]
+PASS  views_kept                    right  37 views  [warn < 20, fail < 10]
+PASS  covisible_views               right  37 views  [warn < 8, fail < 4]
+PASS  waypoints_unverified          -      0 waypoints  [warn > 0]  verified: the motor reported the commanded position, not a traced arrival
+PASS  waypoints_unreached           -      0 waypoints  [fail > 0]
+PASS  reprojection_rms_px           left   0 sensor px  [warn > 0.5, fail > 1]
+PASS  coverage_frame_fraction       left   0.285 of frame  [no limits]
+PASS  fx_fy_ratio_dev               left   0.001996 ratio  [warn > 0.01, fail > 0.03]
+PASS  focal_rel_std                 left   0 ratio  [warn > 0.005, fail > 0.02]
+PASS  principal_point_offset_frac   left   0.006551 of ROI half-side  [warn > 0.2, fail > 0.4]
+PASS  max_distortion_shift_px       left   17.52 sensor px  [warn > 60, fail > 150]
+PASS  reprojection_rms_px           right  0 sensor px  [warn > 0.5, fail > 1]
+PASS  coverage_frame_fraction       right  0.2861 of frame  [no limits]
+PASS  fx_fy_ratio_dev               right  0.001996 ratio  [warn > 0.01, fail > 0.03]
+PASS  focal_rel_std                 right  0 ratio  [warn > 0.005, fail > 0.02]
+PASS  principal_point_offset_frac   right  0.01705 of ROI half-side  [warn > 0.2, fail > 0.4]
+PASS  max_distortion_shift_px       right  16.66 sensor px  [warn > 60, fail > 150]
+PASS  stereo_reprojection_rms_px    -      0 sensor px  [no limits]
+PASS  focal_pair_rel                left-right0.004338 ratio  [warn > 0.1]
+PASS  baseline_mm                   left-right102.6 mm  [no limits]
+PASS  epipolar_error_px             left-right1.957e-13 sensor px  [warn > 0.5, fail > 1]  37 waypoints with both cameras
+PASS  square_size_rel_error         left-right8.882e-16 ratio  [warn > 0.01, fail > 0.03]  37 waypoints with both cameras
+PASS  motor_scale_dev               -      0 ratio  [warn > 0.01]
+
+Notes:
+- no comparable previous calibration

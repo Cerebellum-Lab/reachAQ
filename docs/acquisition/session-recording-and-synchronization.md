@@ -657,7 +657,9 @@ host-arrival cross-check under `arrivalPairing`; each holds the `slip` above,
 left out (an empty list when none), and those latches are named in `reason`,
 which on a valid record is a note and not a failure: read `valid`.
 
-Final session JSON/YAML uses `metadataSchemaVersion: 2`. It records the animal
+Final session JSON/YAML uses `metadataSchemaVersion: 3` (since 2026-11-20; schema 3
+only adds the calibration fields below to schema 2, and readers, the session
+validator included, accept both). It records the animal
 snapshot, `counts`, recording completion, stop policy/result, compact hardware
 state at Record, and only hardware entries that changed by finalization. The
 `artifacts` section references the authoritative `alignment.json`,
@@ -667,6 +669,96 @@ embedded under `configuration` so each recording is independently reproducible.
 `boundary.durationSeconds` is the final camera-bounded duration. Non-finite
 values are normalized to JSON/YAML null; finalized metadata is never written
 with non-standard `NaN` tokens.
+
+`hardware.configured.cameras[<name>]` gains, at schema 3:
+
+- `serial`: the camera's serial, its `host` for a Spinnaker camera, null for any
+  other scheme.
+- `cameraId`: its camera id (0 left, 1 right, 3 to 6 the others).
+- `inCalibration`: true when the active calibration calibrated this camera,
+  matched by serial (by name when either side has no serial), so 3D can use it.
+- `uncalibratedReason`: null when `inCalibration`, else why the camera is 2D
+  only: `not in the active calibration`, `swapped: calibrated serial X, now Y`,
+  the calibration's own reason (for example `too few board views: 4 of 12
+  needed`), or `no active 3D calibration`.
+
+`hardware.configured.calibration3d` names the active 3D calibration and what live
+3D did with it. It sits beside `hardware.configured.cameras` and is written in
+both the session and the acquisition metadata:
+
+- `id`: the calibration's id (`calibration.yaml`), or null for a legacy
+  calibration or none. Offline reprocessing finds the calibration by this id, in
+  the calibration library first, then the old folders. No copy of the
+  calibration is stored; the id is the reference, and library entries never
+  change.
+- `path`: the calibration folder relative to the configuration location
+  (`calibrations/<id>` for a library entry), or null for a folder outside it.
+- `format`: 3, 2, `legacy`, or null when none was loaded.
+- `cameras`: the calibration's cameras, `[{name, serial, cameraId}]` (left and
+  right with null serials for format 2 and legacy), or null when there is none.
+- `matchesRecording`: false when the cameras recording differ from the
+  calibration's, and when the active calibration could not be read; null
+  without a calibration.
+- `offsetsFile`: `{name, sha256}` of the DCS camera offsets file live 3D loaded
+  with the calibration (for a library entry, the newest
+  `calibrations/.offsets/<key>/camera_offsets-<UTC time>.pkl`), or null while it
+  has none and live 3D uses zero offsets.
+- `mismatch`: `{added, removed, swapped}`: recording cameras the calibration
+  does not have, calibrated cameras no configured camera is any more, and
+  recording cameras whose name the calibration has with another serial, as
+  `[{name, calibratedSerial, recordedSerial}]`. A calibrated camera that is
+  simply not recording is not a mismatch. Null without a calibration.
+- `mismatchAcknowledged`: true when the operator chose to record anyway with
+  exactly these added, removed and swapped cameras
+  (`AppModel.acknowledge_setup_difference`, the GUI's "Record anyway?"). Calibrated
+  cameras turned off do not change it. An acknowledgement covers the one recording
+  start it was given for; headless and API starts never ask, so they record any
+  mismatch with false. The independent stimCam is never `added`: it is never
+  3D-posed.
+- `created`: when the calibration was made, local ISO time to the second. A
+  legacy folder records no date, so its `camera_matrix/stereo_params.pickle`
+  modification time stands in.
+- `preset`: the preset live 3D loaded, such as `256x256_bin4`; null for a legacy
+  calibration and whenever live 3D was off.
+- `folder`: the calibration folder's absolute path when the session ran.
+  Readers use `id`, not `folder`.
+- `override`: the operator's recorded override of a failed quality report (the
+  latest `override` decision for the id in the library's `decisions.jsonl`, else
+  one stored in an older calibration's index), or null.
+- `live3dDisabledReason`: present only when live 3D was off (no stereo
+  parameters loaded). It holds the message the operator was shown, for example
+  a camera geometry that matches no preset, a swapped left or right camera, or
+  "no active 3D calibration: …" when the library has no usable active entry.
+  The calibration is still named when it could be read.
+
+Offline 3D (`python -m autotrainer.inference.analysis`, and the app's own
+intersession analysis) uses `--calib-dir` as given. Without it, it resolves the
+session's calibration under `--calib-root` (default the settings directory, `~/Autotrainer` unless
+`REACHAQ_CONFIG_DIR` moves it; the app's
+configuration location in the app): by `calibration3d.id` when the session has
+one, otherwise as the calibration active at the session's start. The start is
+the record start the app sets, else the metadata's `boundary.startWallTime`,
+the schema-1 `sessionBoundary.startWallTime` or `start_record_timestamp`, or
+`createdUtc`, else the session date. When only the date is known, the
+calibration must not have changed that day. An id not found, an ambiguous
+match, or no match refuses with "pass --calib-dir". A session older than every
+kept calibration uses the oldest one, with a warning. A format-2 calibration is
+read at the session's `preset`. A session whose `calibration3d` has a
+`live3dDisabledReason` (live 3D was off) is refused with "pass --calib-dir",
+since the pixels of its 2D points are not known to match any preset. A session
+with no `calibration3d` at all, or whose live 3D ran on a legacy calibration
+(`id` and `preset` null, no `live3dDisabledReason`), is read at the base preset
+(largest binning) of a format-2 calibration; the legacy case logs a warning
+naming the folder, since it reaches a format-2 folder only through
+`--calib-dir` or a deleted legacy backup. A format-3 calibration is read at the
+session's `preset`, else at its live preset set, and a session that names no
+preset under a format-3 calibration without a live set is refused: the largest
+binning would be a guess at the pixels. Offline 3D never writes
+`camera_offsets.pkl` into a format-2 calibration folder: only DCS does, and for
+a library entry it writes beside it, in `calibrations/.offsets/<key>/`, keyed by
+the entry's fit.
+
+How the calibration is made, stored and graded: [Multi-resolution stereo calibration](stereo-calibration.md).
 
 The [local API](local-api.md) publishes explicit session and pellet-attempt
 events. ReachAQ's status schema contains no alarm, emergency,

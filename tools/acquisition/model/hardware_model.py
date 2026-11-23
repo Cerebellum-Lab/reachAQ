@@ -15,7 +15,7 @@ from typing import Optional, Tuple, Dict, Union, List
 from autotrainer.core.api import ApiEventKind, ApiDetectorKind
 from autotrainer.core import (ObservableObject, SystemCommandKind, MessageHandler, AnimalSubject, Offset3DTuple,
                               get_verbose_logger, Motor, EventManager, HardwareConfiguration,
-                              get_perf_now, SystemStatusMessageKind)
+                              get_perf_now, SystemStatusMessageKind, MotorConfigurations)
 from autotrainer.core.logging import log_hardware_initialization
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.core.event import post_api_detector_event_content
@@ -94,6 +94,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self._board_status_timeout: Optional[float] = None
         self._device_ack_timeout_delay: Optional[float] = None
         self._device_conn: Optional[DeviceConnectionProtocol] = None
+        # What the last connect wrote to the pellet controller (WRITE_MOTOR_CONFIGURATION).
+        self._motor_configurations: Optional[MotorConfigurations] = None
         self._can_device: Optional[CanDevice] = None
         self._can_latency_observer = None
         self._device_uuid_ack_timeout_engaged = False
@@ -119,6 +121,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         message_handler.decoded_message_received += self._decoded_device_message
 
         self._dcs_config: Optional[DiamondTriangleOffsetConfig] = None
+        # Why moves given in DCS refuse while _dcs_config is None, when the app says (set_diamond_triangle_config).
+        self._dcs_unavailable_reason: Optional[str] = None
         # Cache physical and requested coordinates separately so relative moves
         # cannot silently overwrite the saved pellet-send position.
         self._last_motor_coordinates = _nans_offset3dTuple
@@ -217,11 +221,20 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         if cfg is None or not cfg.fully_valid:
             if return_none:
                 return None
+            if cfg is None and self._dcs_unavailable_reason:
+                raise RuntimeError(f"DCS move refused: {self._dcs_unavailable_reason}")
             raise RuntimeError(f"DCS config not defined or not fully valid: {None if cfg is None else cfg.__dict__}")
         return cfg
 
-    def set_diamond_triangle_config(self, config: Optional[DiamondTriangleOffsetConfig]):
+    def set_diamond_triangle_config(self, config: Optional[DiamondTriangleOffsetConfig], *,
+                                    unavailable_reason: Optional[str] = None):
+        """The DCS configuration moves given in DCS convert with; None refuses them.
+
+        `unavailable_reason` says why a None is held back rather than missing (the app's
+        stale DCS), and a refused move says it; it is dropped with any configuration.
+        """
         self._dcs_config = config
+        self._dcs_unavailable_reason = unavailable_reason if config is None else None
 
     @property
     def load_arm_position(self) -> float:
@@ -230,6 +243,12 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     @property
     def cover_arm_position(self) -> float:
         return self._cover_arm_position
+
+    @property
+    def motor_configurations(self) -> Optional[MotorConfigurations]:
+        """The motor configurations the last connect wrote to the pellet controller, or None
+        before one. A stepper moves at its configuration's maximum velocity and acceleration."""
+        return self._motor_configurations
 
     @property
     def last_position(self) -> Optional[Offset3DTuple]:
@@ -735,7 +754,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         # 1)
         config_started = time.perf_counter()
         log_hardware_initialization(logger, "START | pellet motor configuration")
-        device_conn.load_default_motor_config()
+        self._motor_configurations = device_conn.load_default_motor_config()
         log_hardware_initialization(
             logger,
             "READY | pellet motor configuration | elapsed=%.3fs",

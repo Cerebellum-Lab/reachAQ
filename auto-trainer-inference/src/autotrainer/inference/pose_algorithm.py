@@ -206,6 +206,7 @@ class PoseAlgorithm:
         square_size: Optional[int] = None,
         cam_offsets: Optional[List[float]] = None,
         confidence_threshold: Optional[float] = None,
+        frame_transform: Optional[numpy.ndarray] = None,
     ):
         super().__init__()
         # None keeps the class defaults, so every existing caller and test is
@@ -232,6 +233,17 @@ class PoseAlgorithm:
         self._cam_names = cam_names
         self._square_size = square_size
         self._cam_offsets = cam_offsets
+        # A format-2 calibration's measured 3D frame: oriented = (raw - offsets)
+        # @ frame_transform, in mm. It takes the place of the camera angles in
+        # calib_metadata, the axis flip and square_size, which only legacy
+        # calibrations have.
+        self._frame_transform = (
+            None if frame_transform is None
+            else numpy.array(frame_transform, dtype=float)
+        )
+        if self._frame_transform is not None and self._frame_transform.shape != (3, 3):
+            raise ValueError(
+                f"frame_transform must be 3x3, got shape {self._frame_transform.shape}")
         self._frame_rate: Optional[int] = None
         #
         axis_labels = self._2d_axis_labels = ['x', 'y', 'likelihood']
@@ -324,6 +336,10 @@ class PoseAlgorithm:
     @property
     def cam_offsets(self):
         return self._cam_offsets
+
+    @property
+    def frame_transform(self) -> Optional[numpy.ndarray]:
+        return self._frame_transform
 
     @property
     def part_names(self) -> list:
@@ -481,7 +497,9 @@ class PoseAlgorithm:
     #   rotate_3d    its reorient loop rebuilds three rotation matrices per
     #                body part from angles that vary by neither part, frame
     #                nor session, then applies a fixed axis flip and scale.
-    #                That whole loop is one constant 3x3 matrix.
+    #                That whole loop is one constant 3x3 matrix. A format-2
+    #                calibration measures that matrix and passes it in as
+    #                frame_transform.
     #
     # So the live path is undistort, triangulate, one affine transform. The
     # shared helpers are untouched and still serve the offline pipeline, and
@@ -505,15 +523,19 @@ class PoseAlgorithm:
         pair = f"{self._cam_names[0]}-{self._cam_names[1]}"
         if pair not in self._stereo_params.as_pickle_dict():
             return f"no stereo entry for {pair!r}"
-        if not self._calib_metadata or self._calib_metadata.get("camera_pos") is None:
+        # A measured frame replaces the camera angles and the square size.
+        legacy_frame = self._frame_transform is None
+        if legacy_frame and (
+                not self._calib_metadata
+                or self._calib_metadata.get("camera_pos") is None):
             # The reference reads camLele and its siblings unconditionally in
             # its reorient loop, so without camera_pos it raises rather than
             # returning something different. Fall back and let it raise.
             return "no camera_pos in the calibration metadata"
         if not self._cam_offsets:
-            # The reference synthesises offsets from camera_pos in this case.
+            # The reference synthesises its own offsets in this case.
             return "no camera offsets"
-        if self._square_size is None:
+        if legacy_frame and self._square_size is None:
             return "no square size"
         return None
 
@@ -524,20 +546,25 @@ class PoseAlgorithm:
         params = self._stereo_params.matrix
         pair = f"{self._cam_names[0]}-{self._cam_names[1]}"
         rot_cor = self._stereo_params.as_pickle_dict()[pair]["rot_cor"]
-        camera_pos = self._calib_metadata["camera_pos"]
-        # The means reorient_and_center_step1 takes, in its argument order.
-        avg_azi = numpy.mean((camera_pos["camLazi"], camera_pos["camRazi"]))
-        avg_ele = numpy.mean((camera_pos["camLele"], camera_pos["camRele"]))
-        # Derived by running the shared rotation on the identity rather than
-        # transcribing its matrices, so the two cannot drift apart.
-        rotation = rotate_3d_points(
-            numpy.eye(3), x_degrees=avg_azi, y_degrees=avg_ele,
-            z_degrees=-rot_cor,
-        )
-        # The loop then writes (-x, -z, -y), which is itself a linear map.
-        flip = numpy.array([[-1.0, 0.0, 0.0],
-                            [0.0, 0.0, -1.0],
-                            [0.0, -1.0, 0.0]])
+        if self._frame_transform is not None:
+            # Measured whole, already in mm; a format-2 rot_cor is 0.0.
+            transform = self._frame_transform
+        else:
+            camera_pos = self._calib_metadata["camera_pos"]
+            # The means reorient_and_center_step1 takes, in its argument order.
+            avg_azi = numpy.mean((camera_pos["camLazi"], camera_pos["camRazi"]))
+            avg_ele = numpy.mean((camera_pos["camLele"], camera_pos["camRele"]))
+            # Derived by running the shared rotation on the identity rather than
+            # transcribing its matrices, so the two cannot drift apart.
+            rotation = rotate_3d_points(
+                numpy.eye(3), x_degrees=avg_azi, y_degrees=avg_ele,
+                z_degrees=-rot_cor,
+            )
+            # The loop then writes (-x, -z, -y), which is itself a linear map.
+            flip = numpy.array([[-1.0, 0.0, 0.0],
+                                [0.0, 0.0, -1.0],
+                                [0.0, -1.0, 0.0]])
+            transform = (rotation @ flip) * float(self._square_size)
         self._live_3d_cache = {
             "undistort": tuple(
                 (params[f"cameraMatrix{i}"], params[f"distCoeffs{i}"],
@@ -548,7 +575,7 @@ class PoseAlgorithm:
             "offsets": numpy.array(
                 [self._cam_offsets["x_off"], self._cam_offsets["y_off"],
                  self._cam_offsets["z_off"]], dtype=float),
-            "transform": (rotation @ flip) * float(self._square_size),
+            "transform": transform,
         }
         return self._live_3d_cache
 
@@ -697,6 +724,7 @@ class PoseAlgorithm:
             square_size=self._square_size,
             save_offsets=False,
             src_dir="/dev/null",
+            frame_transform=self._frame_transform,
         )
         return raw_df_3d, df_3d
 

@@ -28,6 +28,7 @@ from autotrainer.inference.backend_selection import (
 )
 from autotrainer.inference.pose_result_process import InferenceMonitorDataProc
 from autotrainer.inference.analysis import intersession_process, IntersessionResponse
+from autotrainer.inference.analysis.intersession_process import intersession_offline_3d
 
 from autotrainer.behavior import SegmentationConfiguration, DetectionConfiguration, \
     InferenceProtocol, IntersessionBlock, IntersessionDetection, BehaviorAlgorithm
@@ -50,6 +51,29 @@ def _describe_exit(exitcode: int) -> str:
     return f"pose process exited with code {exitcode}"
 
 
+_SINGLE_THREAD_ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")
+
+
+def _yield_to_live_acquisition() -> None:
+    """The pool worker runs the offline 3D pass while the next session can be recording and
+    running live pose on the same rig: one numeric thread, at a lower scheduling priority.
+
+    The variables take effect for a BLAS that loads after this; one a forked worker inherited
+    already running is limited through threadpoolctl, when it is installed."""
+    for name in _SINGLE_THREAD_ENV:
+        os.environ[name] = "1"
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(limits=1)
+    except Exception:
+        pass
+    if hasattr(os, "nice"):
+        try:
+            os.nice(10)
+        except OSError:
+            pass
+
+
 class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
     IS_ENABLED = "is_enabled"
@@ -70,6 +94,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         pose_algorithm: PoseAlgorithm,
         *,
         calib_dir: Optional[Path] = None,
+        calib_root: Optional[Path] = None,
         record_stop_sema: Optional[SemaphoreType] = None,
         mp_manager=None,
     ):
@@ -97,7 +122,10 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         self._overlay_parts: tuple = ()
         self._pose_algorithm = pose_algorithm
         self._pose_parts: List[str] = []
+        # Offline analysis uses calib_dir as given. Without one it finds each session's own
+        # calibration under calib_root (~/Autotrainer when None), the one its live 3D used.
         self._calib_dir = calib_dir
+        self._calib_root = calib_root
 
         self._msg_thread: Optional[threading.Thread] = None
         # Ends the message loop. The None sentinel alone was not enough: a
@@ -293,6 +321,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
     @staticmethod
     def _pool_init(log_dct_cfg):
+        _yield_to_live_acquisition()
         pool_init(log_dct_cfg)
         # pre-import the intersession_process module, so that it's already imported on first analysis:
         from autotrainer.inference.analysis import intersession_process
@@ -812,6 +841,10 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
     def _intersession_process_execute(*args, **kwargs):
         return intersession_process(*args, **kwargs)
 
+    @staticmethod
+    def _intersession_offline_3d_execute(*args, **kwargs):
+        return intersession_offline_3d(*args, **kwargs)
+
     def _intersession_process(self, intersession_detection: IntersessionDetection):
         det_cfg = intersession_detection.configuration
         project = det_cfg.project
@@ -823,7 +856,9 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
                 args=(project,),
                 kwds=dict(
                     calib_dir=self._calib_dir,
+                    calib_root=self._calib_root,
                     frame_rate=det_cfg.frame_rate,
+                    offline_3d=False,
                 ),
             )
             result = async_res.get()
@@ -832,9 +867,11 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
             processed_ok = False
             result = None
             error = str(err)
+            failure = err
         else:
             processed_ok = True
             error = None
+            failure = None
 
         if processed_ok:
             result: IntersessionResponse
@@ -850,3 +887,30 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
         intersession_detection.configuration.complete(processed_ok, error=error)
         self._intersession_detection = None
+        self._offline_3d_after_detection(pool, project, failure)
+
+    def _offline_3d_after_detection(self, pool, project, failure: Optional[BaseException]) -> None:
+        """Offline 3D of the session, once its detection response is out and the detection is
+        complete: on a long session it takes minutes, and behaviour must not wait for it. It
+        runs in the same pool, on this thread, so the next detection joins it before it starts
+        (_check_previous_offline_thread). `failure` is the detection's error, if it failed;
+        offline 3D runs regardless. Its own failure is logged, never raised. A stop meanwhile
+        terminates the pool: the pass is then abandoned (its files are renamed into place only
+        when complete, so none is half-written; a temporary file may be left), rather than this
+        thread waiting on it for ever."""
+        if pool is None:
+            return
+        try:
+            async_res = pool.apply_async(
+                self._intersession_offline_3d_execute,
+                args=(project,),
+                kwds=dict(calib_dir=self._calib_dir, calib_root=self._calib_root, legacy_error=failure),
+            )
+            while not async_res.ready():
+                if self._process_pool is not pool:
+                    logger.warning("offline 3D of session %s abandoned: live inference was stopped", project.session)
+                    return
+                async_res.wait(1.0)
+            async_res.get()
+        except Exception as err:
+            logger.exception("offline 3D after the detection of session %s failed: %s", project.session, err)

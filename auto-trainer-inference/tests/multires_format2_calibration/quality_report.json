@@ -1,0 +1,406 @@
+{
+  "created": "2026-11-20T15:36:56-07:00",
+  "verdict": "warn",
+  "metrics": [
+    {
+      "name": "views_kept",
+      "camera": "left",
+      "value": 37.0,
+      "unit": "views",
+      "warn": 20.0,
+      "fail": 10.0,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": true
+    },
+    {
+      "name": "covisible_views",
+      "camera": "left",
+      "value": 37.0,
+      "unit": "views",
+      "warn": 8.0,
+      "fail": 4.0,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": true
+    },
+    {
+      "name": "views_kept",
+      "camera": "right",
+      "value": 37.0,
+      "unit": "views",
+      "warn": 20.0,
+      "fail": 10.0,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": true
+    },
+    {
+      "name": "covisible_views",
+      "camera": "right",
+      "value": 37.0,
+      "unit": "views",
+      "warn": 8.0,
+      "fail": 4.0,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": true
+    },
+    {
+      "name": "waypoints_unverified",
+      "camera": null,
+      "value": 0.0,
+      "unit": "waypoints",
+      "warn": 0.0,
+      "fail": null,
+      "status": "pass",
+      "note": "verified: the motor reported the commanded position, not a traced arrival",
+      "lower_is_worse": false
+    },
+    {
+      "name": "waypoints_unreached",
+      "camera": null,
+      "value": 0.0,
+      "unit": "waypoints",
+      "warn": null,
+      "fail": 0.0,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": false
+    },
+    {
+      "name": "reprojection_rms_px",
+      "camera": "left",
+      "value": 0.0,
+      "unit": "sensor px",
+      "warn": 0.5,
+      "fail": 1.0,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": false
+    },
+    {
+      "name": "coverage_roi_fraction",
+      "camera": "left",
+      "value": 0.4227294921875,
+      "unit": "of ROI",
+      "warn": 0.5,
+      "fail": 0.25,
+      "status": "warn",
+      "note": "",
+      "lower_is_worse": true
+    },
+    {
+      "name": "coverage_frame_fraction",
+      "camera": "left",
+      "value": 0.28502057613168724,
+      "unit": "of frame",
+      "warn": null,
+      "fail": null,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": true
+    },
+    {
+      "name": "fx_fy_ratio_dev",
+      "camera": "left",
+      "value": 0.001996007984031878,
+      "unit": "ratio",
+      "warn": 0.01,
+      "fail": 0.03,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": false
+    },
+    {
+      "name": "focal_rel_std",
+      "camera": "left",
+      "value": 0.0,
+      "unit": "ratio",
+      "warn": 0.005,
+      "fail": 0.02,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": false
+    },
+    {
+      "name": "principal_point_offset_frac",
+      "camera": "left",
+      "value": 0.0065509804028314154,
+      "unit": "of ROI half-side",
+      "warn": 0.2,
+      "fail": 0.4,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": false
+    },
+    {
+      "name": "max_distortion_shift_px",
+      "camera": "left",
+      "value": 17.515306187901654,
+      "unit": "sensor px",
+      "warn": 60.0,
+      "fail": 150.0,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": false
+    },
+    {
+      "name": "reprojection_rms_px",
+      "camera": "right",
+      "value": 0.0,
+      "unit": "sensor px",
+      "warn": 0.5,
+      "fail": 1.0,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": false
+    },
+    {
+      "name": "coverage_roi_fraction",
+      "camera": "right",
+      "value": 0.424346923828125,
+      "unit": "of ROI",
+      "warn": 0.5,
+      "fail": 0.25,
+      "status": "warn",
+      "note": "",
+      "lower_is_worse": true
+    },
+    {
+      "name": "coverage_frame_fraction",
+      "camera": "right",
+      "value": 0.2861111111111111,
+      "unit": "of frame",
+      "warn": null,
+      "fail": null,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": true
+    },
+    {
+      "name": "fx_fy_ratio_dev",
+      "camera": "right",
+      "value": 0.001996007984031878,
+      "unit": "ratio",
+      "warn": 0.01,
+      "fail": 0.03,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": false
+    },
+    {
+      "name": "focal_rel_std",
+      "camera": "right",
+      "value": 0.0,
+      "unit": "ratio",
+      "warn": 0.005,
+      "fail": 0.02,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": false
+    },
+    {
+      "name": "principal_point_offset_frac",
+      "camera": "right",
+      "value": 0.0170549308560283,
+      "unit": "of ROI half-side",
+      "warn": 0.2,
+      "fail": 0.4,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": false
+    },
+    {
+      "name": "max_distortion_shift_px",
+      "camera": "right",
+      "value": 16.662940033946718,
+      "unit": "sensor px",
+      "warn": 60.0,
+      "fail": 150.0,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": false
+    },
+    {
+      "name": "stereo_reprojection_rms_px",
+      "camera": null,
+      "value": 0.0,
+      "unit": "sensor px",
+      "warn": null,
+      "fail": null,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": false
+    },
+    {
+      "name": "focal_pair_rel",
+      "camera": "left-right",
+      "value": 0.004338394793926247,
+      "unit": "ratio",
+      "warn": 0.1,
+      "fail": null,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": false
+    },
+    {
+      "name": "baseline_mm",
+      "camera": "left-right",
+      "value": 102.6060429977005,
+      "unit": "mm",
+      "warn": null,
+      "fail": null,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": false
+    },
+    {
+      "name": "epipolar_error_px",
+      "camera": "left-right",
+      "value": 1.957244842242242e-13,
+      "unit": "sensor px",
+      "warn": 0.5,
+      "fail": 1.0,
+      "status": "pass",
+      "note": "37 waypoints with both cameras",
+      "lower_is_worse": false
+    },
+    {
+      "name": "square_size_rel_error",
+      "camera": "left-right",
+      "value": 8.881784197001252e-16,
+      "unit": "ratio",
+      "warn": 0.01,
+      "fail": 0.03,
+      "status": "pass",
+      "note": "37 waypoints with both cameras",
+      "lower_is_worse": false
+    },
+    {
+      "name": "motor_scale_dev",
+      "camera": null,
+      "value": 0.0,
+      "unit": "ratio",
+      "warn": 0.01,
+      "fail": null,
+      "status": "pass",
+      "note": "",
+      "lower_is_worse": false
+    }
+  ],
+  "thresholds": {
+    "views_kept": [
+      20.0,
+      10.0
+    ],
+    "covisible_views": [
+      8.0,
+      4.0
+    ],
+    "reprojection_rms_px": [
+      0.5,
+      1.0
+    ],
+    "coverage_roi_fraction": [
+      0.5,
+      0.25
+    ],
+    "fx_fy_ratio_dev": [
+      0.01,
+      0.03
+    ],
+    "focal_rel_std": [
+      0.005,
+      0.02
+    ],
+    "focal_pair_rel": [
+      0.1,
+      null
+    ],
+    "principal_point_offset_frac": [
+      0.2,
+      0.4
+    ],
+    "max_distortion_shift_px": [
+      60.0,
+      150.0
+    ],
+    "epipolar_error_px": [
+      0.5,
+      1.0
+    ],
+    "square_size_rel_error": [
+      0.01,
+      0.03
+    ],
+    "loo_triangulation_px": [
+      0.5,
+      1.0
+    ],
+    "motor_scale_dev": [
+      0.01,
+      null
+    ],
+    "waypoints_unverified": [
+      0.0,
+      null
+    ],
+    "waypoints_unreached": [
+      null,
+      0.0
+    ],
+    "cross_check_delta_px": [
+      1.5,
+      null
+    ],
+    "cross_check_corner_offset_px": [
+      0.1,
+      0.25
+    ],
+    "camera_rotation_change_deg": [
+      0.5,
+      null
+    ],
+    "baseline_change_mm": [
+      1.0,
+      null
+    ],
+    "focal_change_rel": [
+      0.02,
+      null
+    ],
+    "stereo_reprojection_rms_px": [
+      null,
+      null
+    ],
+    "preset_reprojection_rms_px": [
+      null,
+      null
+    ],
+    "baseline_mm": [
+      null,
+      null
+    ],
+    "coverage_frame_fraction": [
+      null,
+      null
+    ]
+  },
+  "notes": [
+    "no comparable previous calibration"
+  ],
+  "override": null,
+  "cameras": {
+    "left": {
+      "name": "left",
+      "calibrated": true,
+      "reason": ""
+    },
+    "right": {
+      "name": "right",
+      "calibrated": true,
+      "reason": ""
+    }
+  }
+}
