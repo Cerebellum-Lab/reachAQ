@@ -121,7 +121,8 @@ written, and **3D calibration failed** names each camera and its reason.
 | fail | At least one metric is beyond its fail limit | Not installed. A dialog offers **Keep previous** (the default) or **Install anyway…** |
 
 - **Set as active** installs the calibration: it is added to the library and
-  made the active one. Closing the report does the same.
+  made the active one. Closing the report does not: it keeps the calibration
+  without activating it.
 - **Keep, don't activate** adds the calibration to the library without moving
   the active pointer: the active calibration and the DCS stay as they are, and
   the library records `event: kept` (with `by` under `detail`) in
@@ -593,8 +594,9 @@ calibrations/
   `4mm_6r_8c_4x`. When the `4mm_6r_8c_4x` folder's calibration is not the active
   one and was made after it (its pickle's modification time for a legacy folder,
   its `created` for a format-2 one), or there is no active one, the status bar
-  says "A calibration made by an older version (<date>) was imported; set it
-  active in the calibration library to use it." A library that has entries but
+  says "A calibration made by an older version (<date>) is in the calibration
+  library; set it active there to use it." No note shows when there is no
+  active.yaml: the no-active-calibration reason covers it. A library that has entries but
   no `active.yaml` gets no active calibration from that import, since that could
   make an old folder's calibration active behind the operator's back: the app
   records 2D with "no active calibration in …/calibrations: active.yaml is
@@ -961,6 +963,33 @@ The release before the library is v3.1.0 (and its v3.1.x fixes). Format 2
 existed only while this version was developed, never on a rig, so a rollback is
 always to the legacy reader.
 
+**Before deploying.**
+
+1. Back up `~/Autotrainer/diamond_triangle_offset.yaml` (the default
+   configuration folder; use your own if the configuration location was
+   changed). A rollback may need it.
+2. Note the version now installed, so you know what to roll back to.
+
+**Rolling back to v3.1.0, in order.**
+
+1. Stop the app.
+2. Install v3.1.0.
+3. If `~/Autotrainer/diamond_triangle_offset.yaml` contains a `calibration_id:`
+   line, put back the backup from before the deploy, or remove the file.
+   Otherwise v3.1.0 fails to load its configuration.
+4. Start the app.
+5. Redo Calibrate Coordinate System.
+6. Sessions recorded by this version validate only with this version.
+
+**Rolling forward again, in order.**
+
+1. Stop the app.
+2. Install this version.
+3. Start the app. Calibrations made meanwhile by v3.1.0 are imported, not
+   activated, and the status note says so.
+4. If you want one of them, set it active in the calibration library.
+5. Redo Calibrate Coordinate System.
+
 **What v3.1.0 reads after a rollback.**
 
 - **Calibrations.** v3.1.0 has no calibration library and reads no
@@ -992,8 +1021,8 @@ always to the legacy reader.
   calibration there moves the old folder to a dated backup) is imported as a
   new entry with an `import` decision, never active. When the `4mm_6r_8c_4x`
   calibration was made after the active one, the status bar says "A
-  calibration made by an older version (<date>) was imported; set it active in
-  the calibration library to use it." See
+  calibration made by an older version (<date>) is in the calibration library;
+  set it active there to use it." See
   [Calibration library](#calibration-library).
 - A DCS that v3.1.0 saved records no id. Under a calibration made on this
   version it is out of date, and Record is blocked until DCS is redone; under
