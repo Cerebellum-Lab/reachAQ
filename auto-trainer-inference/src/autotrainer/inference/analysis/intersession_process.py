@@ -328,6 +328,14 @@ def _live_pair_geometry(index) -> Optional[PresetGeometry]:
     return None
 
 
+def _session_calibration(project: ProjectInfo, calib_dir: Optional[Path], calib_root: Optional[Path]) -> Path:
+    """`calib_dir` as given, else the session's own under calib_root (resolve_session_calibration)."""
+    if calib_dir is None:
+        return resolve_session_calibration(
+            project, DEFAULT_CONFIG_DIR.expanduser() if calib_root is None else Path(calib_root))
+    return Path(calib_dir).expanduser()
+
+
 def intersession_process(
     project: ProjectInfo,
     *,
@@ -335,24 +343,28 @@ def intersession_process(
     calib_root: Optional[Path] = None,
     frame_rate: int = 150,
     debug_level: int = _segment_reach_debug,
+    offline_3d: bool = True,
 ) -> IntersessionResponse:
     """
     Called after pose processing for intersession analysis.
+
+    The detection response (reach segmentation, the response behaviour is updated from) is
+    built first; offline 3D runs after it, since it takes minutes on a long session and the
+    response does not depend on it. When the left-right step or the segmentation fails,
+    offline 3D still runs, then the failure is raised.
 
     :param project: current project info for finding/defining file names
     :param calib_dir: calibration folder to use as given. When None, the session's own is
         resolved under calib_root with resolve_session_calibration.
     :param calib_root: where the calibration and its backups are, DEFAULT_CONFIG_DIR when None.
     :param debug_level: integer debug level.
+    :param offline_3d: False leaves offline 3D to the caller (intersession_offline_3d), which
+        then hands the response on without waiting for it.
     :return: information required to update behavior for future sessions
     """
     location, _, _ = project.get_session_path()
     logger.info("process intersession pose data using %s", location)
-    if calib_dir is None:
-        calib_src_dir = resolve_session_calibration(
-            project, DEFAULT_CONFIG_DIR.expanduser() if calib_root is None else Path(calib_root))
-    else:
-        calib_src_dir = Path(calib_dir).expanduser()
+    calib_src_dir = _session_calibration(project, calib_dir, calib_root)
     calib_folder = calib_src_dir
     vid_tag = "." + project.video_write_ext
     dlc_seg = "_raw2D"
@@ -377,10 +389,44 @@ def intersession_process(
     except Exception as error:
         # The left-right step failed or was refused (no left-right pair, a swapped left, ...):
         # offline 3D from the cameras that do match still runs, then the failure stands.
-        _offline_3d(project, location, calib_folder, calib_root, legacy_error=error)
+        if offline_3d:
+            _offline_3d(project, location, calib_folder, calib_root, legacy_error=error)
         raise
-    _offline_3d(project, location, calib_folder, calib_root)
-    #
+    try:
+        response = _detection_response(project, location, center_method, df_lr, centered_df_3d,
+                                       debug_level=debug_level, frame_rate=frame_rate)
+    except Exception:
+        if offline_3d:
+            _offline_3d(project, location, calib_folder, calib_root)
+        raise
+    if offline_3d:
+        _offline_3d(project, location, calib_folder, calib_root)
+    return response
+
+
+def intersession_offline_3d(
+    project: ProjectInfo,
+    *,
+    calib_dir: Optional[Path] = None,
+    calib_root: Optional[Path] = None,
+    legacy_error: Optional[BaseException] = None,
+) -> None:
+    """Offline 3D alone, for a caller that ran intersession_process(offline_3d=False) and has
+    handed its response on. `legacy_error` is that call's failure, if it failed. Never raises:
+    a calibration that cannot be resolved was that call's failure already, and is only logged."""
+    location, _, _ = project.get_session_path()
+    try:
+        folder = _session_calibration(project, calib_dir, calib_root)
+    except Exception as err:
+        logger.warning("no offline 3D for session %s: its calibration is not resolved: %s",
+                       project.short_id, str(err) or type(err).__name__)
+        return
+    _offline_3d(project, location, folder, calib_root, legacy_error=legacy_error)
+
+
+def _detection_response(project: ProjectInfo, location, center_method, df_lr, centered_df_3d, *,
+                        debug_level: int, frame_rate: int) -> IntersessionResponse:
+    """Reach segmentation, and the response behaviour is updated from."""
     results_dict = segment_reaches(
         project_info=project,
         session=location,

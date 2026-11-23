@@ -2113,6 +2113,11 @@ class MainWindow(QMainWindow):
         time.sleep(1.5)
         return fake_result
 
+    @staticmethod
+    def _simulate_intersession_offline_3d(*args, **kwargs):
+        # A simulated session has no pose files to triangulate.
+        logger.verbose("Simulate intersession offline 3D: skipped")
+
     def _prepare_simulated_analysis_result(self):
         app_model = self._app_model
         if self.analysis_results_action.isChecked():
@@ -2129,6 +2134,7 @@ class MainWindow(QMainWindow):
                 rh_max_vp_list=[Offset3DTuple(x, y, z)]
             )
             inference._intersession_process_execute = partial(self._simulate_intersession_process, fake_result=res)
+            inference._intersession_offline_3d_execute = self._simulate_intersession_offline_3d
 
     def _internal_set_pellet_seen(self):
         self._app_model.behavior.algorithm.update_pellet_seen(True)
@@ -2152,10 +2158,12 @@ class MainWindow(QMainWindow):
         if is_checked:
             self._orig_inference_analysis_feed = inference._feed_intersession_analysis_execute
             self._orig_inference_analysis_process = inference._intersession_process_execute
+            self._orig_inference_offline_3d = inference._intersession_offline_3d_execute
         else:
             logger.verbose("Restoring intersession segmentation and detection to real procedures")
             inference._feed_intersession_analysis_execute = self._orig_inference_analysis_feed
             inference._intersession_process_execute = self._orig_inference_analysis_process
+            inference._intersession_offline_3d_execute = self._orig_inference_offline_3d
 
     def _simulate_sessions(
         self,

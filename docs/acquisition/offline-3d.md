@@ -11,6 +11,16 @@ in the stereo calibration guide.
 Offline 3D is an extra product. If it fails, the error is logged and the
 session's 2D processing and reach segmentation carry on.
 
+It runs last, after reach segmentation and the detection response. In the app,
+the response goes to behaviour and the detection completes first; offline 3D
+then runs in the same analysis process, and the next session's detection waits
+for it. On christielab10 a 45-minute session at 150 Hz (405 000 frames, 3
+cameras, 16 keypoints) takes about 75 s, which the detection no longer waits
+for. Stopping live inference meanwhile abandons the pass: `points3d.h5`
+and `reprojections.h5` are then not written, though a temporary `*.tmp` file
+may be left beside them. Run from the command line (`python -m
+autotrainer.inference.analysis`), it runs before the result is printed.
+
 It does not depend on the left-right step. A session whose calibration has no
 left and right camera, or whose left or right is swapped, still triangulates
 the cameras that match. When the left-right step fails or is refused, its

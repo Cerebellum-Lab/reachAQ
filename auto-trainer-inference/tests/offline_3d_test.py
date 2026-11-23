@@ -785,6 +785,43 @@ def test_intersession_runs_offline_3d_after_2d_processing(tmp_path, monkeypatch)
     assert calls == ["2d", ("3d", location, entry, entry.name, entry.parent, None)]
 
 
+def _recorded_order(tmp_path, monkeypatch):
+    """A session whose 2D step, segmentation, response and offline 3D are stubs that record their order."""
+    config = tmp_path / "Autotrainer"
+    entry = _entry(config)
+    project = _project(tmp_path)
+    _write_metadata(project, _metadata(IN_SECOND_WINDOW, id=entry.name, preset=BASE.name))
+    calls = []
+    monkeypatch.setattr(intersession_module, "process_raw_data",
+                        lambda *args, **kwargs: calls.append("2d") or (None, None))
+    monkeypatch.setattr(intersession_module, "segment_reaches", lambda **kwargs: calls.append("segment") or {
+        "pellets_consumed": 0, "reach_events": [], "other_events": []})
+    monkeypatch.setattr(intersession_module, "IntersessionResponse",
+                        lambda **fields: calls.append("response") or ("response", fields))
+    monkeypatch.setattr(intersession_module, "session_offline_3d",
+                        lambda project, folder, data, **kwargs: calls.append("3d"))
+    return project, entry, calls
+
+
+def test_intersession_builds_the_response_before_offline_3d(tmp_path, monkeypatch):
+    project, entry, calls = _recorded_order(tmp_path, monkeypatch)
+
+    response = intersession_process(project, calib_dir=entry)
+
+    assert calls == ["2d", "segment", "response", "3d"]
+    assert response == ("response", {"food_consumed": 0, "reach_events": [], "other_events": []})
+
+
+def test_intersession_can_leave_offline_3d_to_its_caller(tmp_path, monkeypatch):
+    # The app hands the response on first, then runs the pass (InferenceModel._offline_3d_after_detection).
+    project, entry, calls = _recorded_order(tmp_path, monkeypatch)
+
+    intersession_process(project, calib_dir=entry, offline_3d=False)
+    assert calls == ["2d", "segment", "response"]
+    intersession_module.intersession_offline_3d(project, calib_dir=entry)
+    assert calls == ["2d", "segment", "response", "3d"]
+
+
 def test_intersession_offline_3d_failure_does_not_stop_the_session(tmp_path, monkeypatch, caplog):
     config = tmp_path / "Autotrainer"
     entry = _entry(config)

@@ -225,10 +225,53 @@ def test_intersession_analysis_is_given_the_root_not_a_folder(tmp_path):
 
     model._intersession_process(detection)
 
-    (args, kwds), = [(c.kwargs["args"], c.kwargs["kwds"]) for c in pool.apply_async.call_args_list]
-    assert args == (detection.configuration.project,)
-    assert kwds == {"calib_dir": None, "calib_root": tmp_path / "Autotrainer", "frame_rate": 150}
+    (args, kwds), (args_3d, kwds_3d) = [(c.kwargs["args"], c.kwargs["kwds"]) for c in pool.apply_async.call_args_list]
+    assert args == args_3d == (detection.configuration.project,)
+    assert kwds == {"calib_dir": None, "calib_root": tmp_path / "Autotrainer", "frame_rate": 150,
+                    "offline_3d": False}
+    assert kwds_3d["calib_dir"] is None and kwds_3d["calib_root"] == tmp_path / "Autotrainer"
     detection.configuration.complete.assert_called_once()
+
+
+def test_the_detection_response_is_handed_on_before_offline_3d(tmp_path):
+    order = []
+    model = InferenceModel.__new__(InferenceModel)
+    model._calib_dir = None
+    model._calib_root = tmp_path / "Autotrainer"
+    model._event_manager = mock.Mock()
+    model._intersession_detection = None
+    model.detection_result_ready = lambda project, result: order.append(("response", result))
+    pool = model._process_pool = mock.Mock()
+
+    def apply_async(target, *, args, kwds):
+        order.append(target.__name__)
+        return mock.Mock(ready=lambda: True, get=lambda: "detected")
+
+    pool.apply_async.side_effect = apply_async
+    detection = mock.Mock()
+    detection.configuration.project = ProjectInfo(root=str(tmp_path), device_id="rig", session=3,
+                                                  when=datetime(2026, 5, 1))
+    detection.configuration.frame_rate = 150
+    detection.configuration.complete.side_effect = lambda ok, error: order.append(("complete", ok))
+
+    model._intersession_process(detection)
+
+    assert order == ["_intersession_process_execute", ("response", "detected"), ("complete", True),
+                     "_intersession_offline_3d_execute"]
+
+
+def test_offline_3d_after_the_detection_is_abandoned_when_inference_stops(tmp_path):
+    model = InferenceModel.__new__(InferenceModel)
+    model._calib_dir, model._calib_root = None, tmp_path
+    pool = mock.Mock()
+    pending = pool.apply_async.return_value
+    pending.ready.return_value = False
+    model._process_pool = None  # stop terminated the pool and dropped it
+    project = ProjectInfo(root=str(tmp_path), device_id="rig", session=3, when=datetime(2026, 5, 1))
+
+    model._offline_3d_after_detection(pool, project, None)
+
+    pending.get.assert_not_called()
 
 
 def test_metadata_schema_3_fields(app_model, tmp_path):
