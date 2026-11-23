@@ -75,6 +75,7 @@ reachaq-headless = "reachaq.app.headless:main"
 reachaq-validate-session = "reachaq.session_validation.cli:main"
 reachaq-animal-metadata = "reachaq.app.model.animal_sources.cli:main"
 reachaq-diagnostics = "reachaq.app.model.diagnostic_bundle:main"
+reachaq-convert-pose-h5 = "reachaq.core.pose_h5_labels:main"
 reachaq-softmouse-publish = "reachaq.softmouse_sync.cli:main"
 
 [tool.setuptools_scm]

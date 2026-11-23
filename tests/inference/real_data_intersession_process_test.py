@@ -15,6 +15,7 @@ import pandas as pd
 import verboselogs
 
 from reachaq.core import Offset3DTuple, ProjectInfo, get_verbose_logger
+from reachaq.core import pose_h5_labels
 from reachaq.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from reachaq.inference import PoseResponse, PoseLocation
 from reachaq.inference.analysis import (
@@ -177,10 +178,20 @@ def assert_pose_response_almost_equal(
     assert_deep_almost_equal(r1.parts_3d_offsets, r2.parts_3d_offsets, delta=off_delta)
 
 
+def _converted_fp_and_xp_not_same(tmp_path: Path) -> Path:
+    # The 2025-06-23 recording predates plain-string pose labels; convert a copy
+    # the way an operator would before reprocessing it.
+    root = tmp_path / "fp-and-xp-not-same"
+    shutil.copytree(this_dir.joinpath("fp-and-xp-not-same"), root)
+    assert pose_h5_labels.main(["--in-place", str(root)]) == 0
+    return root
+
+
 @pytest.mark.skipif(os.name != "posix", reason="disabled on non-posix")
-def test_fp_and_xp_not_same(project_info, caplog):
+def test_fp_and_xp_not_same(project_info, caplog, tmp_path):
+    root = _converted_fp_and_xp_not_same(tmp_path)
     project_info.session = 2
-    project_info.root = this_dir.joinpath("fp-and-xp-not-same").as_posix()
+    project_info.root = root.as_posix()
     project_info.device_id = "agx001"
     project_info.when = datetime(2025, 6, 23)
     project_info.camera_names = ("left", "right")
@@ -220,7 +231,7 @@ def test_a_legacy_library_entry_is_never_written_to(project_info, tmp_path):
     entry = library_root(config) / legacy_id
     before = _tree_hashes(entry)
     project_info.session = 2
-    project_info.root = this_dir.joinpath("fp-and-xp-not-same").as_posix()
+    project_info.root = _converted_fp_and_xp_not_same(tmp_path).as_posix()
     project_info.device_id = "agx001"
     project_info.when = datetime(2025, 6, 23)
     project_info.camera_names = ("left", "right")
