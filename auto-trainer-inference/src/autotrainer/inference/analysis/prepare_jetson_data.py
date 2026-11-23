@@ -96,7 +96,16 @@ def identify_dropped_frames(
         "frame_present_secondary",
         "utc_when",
     ]
-    timestamps_df = pd.read_csv(timestamp_file, header=0, names=timing_csv_fields, skipinitialspace=True, delimiter=",")
+    # Select columns by their header name: the writer adds frame_when_<camera>
+    # and frame_present_<camera> per camera, and fixed ``names`` on a wider file
+    # map onto its last columns instead.
+    timestamps_df = pd.read_csv(timestamp_file, header=0, skipinitialspace=True, delimiter=",")
+    if cam_col_present_name not in timestamps_df.columns:
+        if len(timestamps_df.columns) != len(timing_csv_fields):
+            raise ValueError(
+                f"{timestamp_file} has no {cam_col_present_name} column: {list(timestamps_df.columns)}"
+            )
+        timestamps_df.columns = timing_csv_fields
     dropped_frame_vector = np.ndarray((len(timestamps_df),), dtype=np.uint8)
     dropped_frame_vector[:] = timestamps_df[cam_col_present_name].apply(lambda val: val != 1).array
     return dropped_frame_vector
