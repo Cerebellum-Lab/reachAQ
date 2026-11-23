@@ -1107,8 +1107,8 @@ class MainWindow(QMainWindow):
     def _ask_activate_3d_calib(self, report: QualityReport) -> bool:
         """Whether to make a calibration whose report passed or warned the active one.
 
-        The result page, with Set as active (the default) and Keep, don't activate. Closing
-        the box sets it active, as the default does.
+        The result page, with Set as active (the default, on Enter) and Keep, don't activate.
+        Closing the box (Escape) keeps the calibration without activating it.
         """
         box = QMessageBox(self)
         box.setWindowTitle("3D calibration done")
@@ -1117,7 +1117,7 @@ class MainWindow(QMainWindow):
         activate = box.addButton("Set as active", QMessageBox.ButtonRole.AcceptRole)
         keep = box.addButton("Keep, don't activate", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(activate)
-        box.setEscapeButton(activate)
+        box.setEscapeButton(keep)
         box.exec()
         return box.clickedButton() != keep
 

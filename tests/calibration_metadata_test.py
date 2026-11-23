@@ -274,6 +274,22 @@ def test_offline_3d_after_the_detection_is_abandoned_when_inference_stops(tmp_pa
     pending.get.assert_not_called()
 
 
+def test_the_pool_worker_yields_to_live_acquisition(monkeypatch):
+    from tools.acquisition.model import inference_model as inference_model_module
+
+    niced, initialised = [], []
+    for name in inference_model_module._SINGLE_THREAD_ENV:
+        monkeypatch.setenv(name, "8")
+    monkeypatch.setattr(inference_model_module.os, "nice", lambda increment: niced.append(increment), raising=False)
+    monkeypatch.setattr(inference_model_module, "pool_init", lambda cfg: initialised.append(cfg))
+
+    InferenceModel._pool_init("log-config")
+
+    assert {name: os.environ[name] for name in inference_model_module._SINGLE_THREAD_ENV} == {
+        "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1"}
+    assert niced == [10] and initialised == ["log-config"]
+
+
 def test_metadata_schema_3_fields(app_model, tmp_path):
     """Schema 3: the calibration by id and library path, its cameras with serials, and how
     the recording's cameras compare; each camera's serial and place in the calibration."""

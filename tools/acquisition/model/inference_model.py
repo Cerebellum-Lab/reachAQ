@@ -51,6 +51,29 @@ def _describe_exit(exitcode: int) -> str:
     return f"pose process exited with code {exitcode}"
 
 
+_SINGLE_THREAD_ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")
+
+
+def _yield_to_live_acquisition() -> None:
+    """The pool worker runs the offline 3D pass while the next session can be recording and
+    running live pose on the same rig: one numeric thread, at a lower scheduling priority.
+
+    The variables take effect for a BLAS that loads after this; one a forked worker inherited
+    already running is limited through threadpoolctl, when it is installed."""
+    for name in _SINGLE_THREAD_ENV:
+        os.environ[name] = "1"
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(limits=1)
+    except Exception:
+        pass
+    if hasattr(os, "nice"):
+        try:
+            os.nice(10)
+        except OSError:
+            pass
+
+
 class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
     IS_ENABLED = "is_enabled"
@@ -298,6 +321,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
 
     @staticmethod
     def _pool_init(log_dct_cfg):
+        _yield_to_live_acquisition()
         pool_init(log_dct_cfg)
         # pre-import the intersession_process module, so that it's already imported on first analysis:
         from autotrainer.inference.analysis import intersession_process

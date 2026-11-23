@@ -156,7 +156,7 @@ def test_the_installed_page_leads_with_the_banner():
     assert BANNER in text
 
 
-@pytest.mark.parametrize("click, expected", [("Set as active", True), ("Keep, don't activate", False), (None, True)],
+@pytest.mark.parametrize("click, expected", [("Set as active", True), ("Keep, don't activate", False), (None, False)],
                          ids=["set_active", "keep", "closed"])
 def test_a_warn_with_a_2d_only_camera_offers_set_as_active_or_keep(monkeypatch, click, expected):
     shown = []
