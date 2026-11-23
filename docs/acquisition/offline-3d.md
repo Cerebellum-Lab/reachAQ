@@ -24,7 +24,7 @@ autotrainer.inference.analysis`), it runs before the result is printed.
 It does not depend on the left-right step. A session whose calibration has no
 left and right camera, or whose left or right is swapped, still triangulates
 the cameras that match. When the left-right step fails or is refused, its
-reason is logged ("the left-right 3D of session ... failed: ...; offline 3D
+reason is logged ("the earlier analysis step of session ... failed: ...; offline 3D
 from every calibrated camera runs regardless"), offline 3D runs, and the
 left-right failure then stands as before.
 

@@ -680,9 +680,10 @@ def test_a_library_with_entries_and_no_pointer_imports_but_never_activates(app_m
     (root / library.ACTIVE_FILE).unlink()
     _configure_with_serials(app_model, SERIALS)
 
-    with mock.patch.object(app_model, "on_error"):
+    with mock.patch.object(app_model, "on_error") as on_error:
         app_model.reload_calib(None)
 
+    assert _calibration_errors(on_error) == [], "no roll-forward note without a pointer"
     assert app_model.active_calibration_dir is None
     assert app_model._live_3d_disabled_reason == f"no active calibration in {root}: active.yaml is missing"
     assert app_model._pose_algorithm.stereo_params is None, "2D only"
@@ -730,8 +731,8 @@ def test_a_newer_calibration_of_an_older_version_is_imported_not_activated(app_m
     assert library.latest_decision(root, second, "import") == {"source": DEFAULT_3D_CALIB_DIR_NAME}
     date = datetime.fromtimestamp(later).strftime("%Y-%m-%d %H:%M")
     assert _calibration_errors(on_error) == [
-        f"A calibration made by an older version ({date}) was imported; set it active in the calibration"
-        " library to use it."]
+        f"A calibration made by an older version ({date}) is in the calibration library; set it active"
+        " there to use it."]
 
 
 def test_a_calibration_that_fails_to_load_puts_no_camera_in_it(app_model, tmp_path):

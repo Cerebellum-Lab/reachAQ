@@ -498,6 +498,10 @@ def _export(session_dir: Path, calibration_toml: Path, sources: Mapping[str, Pos
 
     points3d_path = session_dir / POINTS3D_FILE
     reprojections_path = session_dir / REPROJECTIONS_FILE
+    # A pass that was stopped (live inference stopped, a crash) leaves its temporary files.
+    for stale in (*session_dir.glob(f"{POINTS3D_FILE}.*.tmp"), *session_dir.glob(f"{REPROJECTIONS_FILE}.*.tmp")):
+        with suppress(OSError):
+            stale.unlink()
     temps = [path.with_name(f"{path.name}.{os.getpid()}.tmp") for path in (points3d_path, reprojections_path)]
     used = total = 0
     try:

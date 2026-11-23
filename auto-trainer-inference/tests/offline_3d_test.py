@@ -330,6 +330,20 @@ def test_a_failed_export_leaves_no_partial_file_and_the_old_one_as_it_was(tmp_pa
     assert {p.name: p.read_bytes() for p in session.iterdir()} == before
 
 
+def test_an_export_removes_the_temporary_files_a_stopped_pass_left(tmp_path):
+    cameras = _ring(3)
+    session, toml, files = _session(tmp_path, cameras, _points(30))
+    stale = [session / "points3d.h5.1234.tmp", session / "reprojections.h5.1234.tmp"]
+    other = session / "notes.tmp"
+    for path in (*stale, other):
+        path.write_bytes(b"partial")
+
+    result = export_session_3d(session, toml, files)
+
+    assert not any(path.exists() for path in stale) and other.exists()
+    assert result.points3d_path.exists() and result.reprojections_path.exists()
+
+
 # --- the pose-consistency check -----------------------------------------------------------
 
 def test_moved_camera_is_flagged(tmp_path):
@@ -748,7 +762,8 @@ def test_offline_3d_runs_for_a_session_without_a_left_right_pair(tmp_path, caplo
     # The left-right step has no pair to read: it is refused, and offline 3D runs regardless.
     with caplog.at_level(logging.WARNING), pytest.raises(CalibrationGeometryError, match="left and right"):
         intersession_process(project, calib_root=config)
-    assert "the left-right 3D of session" in caplog.text and "runs regardless" in caplog.text
+    assert "the earlier analysis step of session" in caplog.text and "runs regardless" in caplog.text
+    assert "the left-right 3D of session" not in caplog.text, "a segmentation failure is not a left-right failure"
     with h5py.File(session / "points3d.h5", "r") as fh:
         assert [n.decode() for n in fh["camera_names"][()]] == ["a", "b", "c"]
         np.testing.assert_allclose(fh["points3d"][()], X, atol=1e-3)

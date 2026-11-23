@@ -2622,7 +2622,8 @@ class AppModel(ObservableObject):
                               " not active: %s", len(added), root, ", ".join(added))
             folder_id = active_folder_id(config)
             current = pointer_id(root)
-            if folder_id is None or folder_id == current or not root.joinpath(folder_id).is_dir():
+            if (current is None or folder_id is None or folder_id == current
+                    or not root.joinpath(folder_id).is_dir()):
                 return
             made = _local_naive(calibration_created(root / folder_id))
             if (current is not None and root.joinpath(current).is_dir()
@@ -2631,8 +2632,8 @@ class AppModel(ObservableObject):
         except Exception:
             logger.exception("could not import the 3D calibrations made by an older version under %s", config)
             return
-        self._calibration_note = (f"A calibration made by an older version ({made:%Y-%m-%d %H:%M}) was imported;"
-                                  " set it active in the calibration library to use it.")
+        self._calibration_note = (f"A calibration made by an older version ({made:%Y-%m-%d %H:%M}) is in the"
+                                  " calibration library; set it active there to use it.")
         logger.warning("3D calibration %s: %s", folder_id, self._calibration_note)
 
     def _is_library_entry(self, folder: Optional[Path]) -> bool:

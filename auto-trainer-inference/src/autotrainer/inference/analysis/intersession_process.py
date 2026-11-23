@@ -295,7 +295,7 @@ def _offline_3d(project: ProjectInfo, location: str, folder: Path, calib_root: O
     """Offline 3D from every calibrated camera of the session (offline_3d.session_offline_3d), for a format-3 calibration.
 
     It is an extra product: a failure is logged and the session's processing goes on. It
-    does not depend on the left-right step: `legacy_error`, that step's failure, is logged
+    does not depend on the earlier analysis (left-right 3D, segmentation): `legacy_error`, its failure, is logged
     with its reason and offline 3D runs regardless. A calibration outside the library
     (--calib-dir) has its derived TOMLs put in the session folder's OFFLINE_DERIVED_DIR,
     never in the operator's library; the check's settings are still the library's.
@@ -304,8 +304,8 @@ def _offline_3d(project: ProjectInfo, location: str, folder: Path, calib_root: O
         if not folder.joinpath(INDEX_FILE).exists() or is_legacy_entry(folder) or load_index(folder).format < 3:
             return
         if legacy_error is not None:
-            logger.warning("the left-right 3D of session %s failed: %s; offline 3D from every calibrated camera"
-                           " runs regardless", project.short_id, str(legacy_error) or type(legacy_error).__name__)
+            logger.warning("the earlier analysis step of session %s failed: %s; offline 3D from every calibrated"
+                           " camera runs regardless", project.short_id, str(legacy_error) or type(legacy_error).__name__)
         library_dir, derived_dir = entry_library(folder), None
         if library_dir is None:
             library_dir = library_root(DEFAULT_CONFIG_DIR.expanduser() if calib_root is None else Path(calib_root))
