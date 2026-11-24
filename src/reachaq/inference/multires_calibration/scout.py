@@ -33,7 +33,7 @@ import yaml
 
 from reachaq.core.logging import get_verbose_logger
 from reachaq.inference.multires_calibration.extract import detect_board, distinct_waypoints, dwell_segments
-from reachaq.inference.multires_calibration.fit import BoardSpec
+from reachaq.inference.multires_calibration.fit import BoardSpec, valid_corners
 from reachaq.inference.multires_calibration.library import library_root
 
 logger = get_verbose_logger(__name__)
@@ -49,6 +49,10 @@ MIN_COVISIBLE = 8
 MAX_PATH = 60
 # The library setting that may narrow the scout's box: {"lo": [x, y, z], "hi": [x, y, z]} in motor mm.
 SCOUT_BOUNDS_SETTING = "scoutBounds"
+# The library setting that names the calibration board (configured_board); unset, it is
+# BoardSpec(), the 4 mm 6 x 8 checkerboard.
+BOARD_SETTING = "board"
+_BOARD_KEYS = ("kind", "square_mm", "rows", "cols", "marker_mm", "dictionary")
 OCCUPANCY_CELLS = 4  # each camera's image is split 4 x 4 to measure how widely its views spread
 
 # The whole board, one square past the inner corners each way, is 9 x 7 squares: seen
@@ -100,8 +104,9 @@ class Bounds:
 class ScoutView:
     """What one camera saw at one grid point.
 
-    `found` with its (rows*cols, 2) `corners`, and `aspect`, the board's short side over its
-    long side as seen (BOARD_ASPECT face-on); `board_pixels` when the frame holds a
+    `found` with its (rows*cols, 2) `corners` (NaN rows where a ChArUco board's corner was
+    not found), and `aspect`, the board's short side over its long side as seen
+    (BOARD_ASPECT face-on); `board_pixels` when the frame holds a
     board-like patch, found or not, and `touches_edge`, the image edge that patch reaches,
     or None.
     """
@@ -233,8 +238,14 @@ def board_aspect(corners: np.ndarray, board: BoardSpec = BoardSpec()) -> float:
 
     The mean square's height over its width, times BOARD_ASPECT: BOARD_ASPECT face-on,
     above it when the view shortens the board's long side, below it when the short side.
+    A partial ChArUco view takes the mean over the neighbouring corner pairs it found.
     """
     c = np.asarray(corners, float).reshape(board.rows, board.cols, 2)
+    if not np.all(np.isfinite(c)):
+        along = np.linalg.norm(c[:, 1:] - c[:, :-1], axis=-1)
+        down = np.linalg.norm(c[1:, :] - c[:-1, :], axis=-1)
+        width, height = np.nanmean(along), np.nanmean(down)
+        return float(height / width * (board.rows + 1) / (board.cols + 1))
     width = (np.linalg.norm(c[0, -1] - c[0, 0]) + np.linalg.norm(c[-1, -1] - c[-1, 0])) / 2 / (board.cols - 1)
     height = (np.linalg.norm(c[-1, 0] - c[0, 0]) + np.linalg.norm(c[-1, -1] - c[0, -1])) / 2 / (board.rows - 1)
     return float(height / width * (board.rows + 1) / (board.cols + 1))
@@ -398,9 +409,12 @@ def _cells(corners, camera, views, image_sizes) -> set:
     else:
         every = np.concatenate([v[camera].corners for v in views.values()
                                 if camera in v and v[camera].found])
+        every = every[valid_corners(every)]
         lo = every.min(axis=0)
         size = np.maximum(every.max(axis=0) - lo, 1e-9)
-    cell = np.clip(((np.asarray(corners) - lo) / size * OCCUPANCY_CELLS).astype(int), 0, OCCUPANCY_CELLS - 1)
+    corners = np.asarray(corners)
+    corners = corners[valid_corners(corners)]  # a partial ChArUco view's detected corners
+    cell = np.clip(((corners - lo) / size * OCCUPANCY_CELLS).astype(int), 0, OCCUPANCY_CELLS - 1)
     return {(int(u), int(v)) for u, v in cell}
 
 
@@ -561,6 +575,43 @@ def video_sizes(videos: Mapping[str, Path]) -> Dict[str, Tuple[int, int]]:
     return sizes
 
 
+def configured_board(settings: Mapping) -> BoardSpec:
+    """The library settings' board as a BoardSpec; BoardSpec(), the checkerboard, when unset.
+
+    The setting is {kind, square_mm, rows, cols, marker_mm, dictionary}, rows and cols
+    counting inner corners; a key left out takes BoardSpec's default. Unlike scoutBounds it
+    is never ignored: a malformed board would calibrate against the wrong geometry, so
+    ValueError is raised, naming the key, for an unknown key or kind, an unknown dictionary,
+    a marker not smaller than its square, a dictionary too small for the board, or a value
+    of the wrong type.
+    """
+    value = settings.get(BOARD_SETTING) if settings else None
+    if value is None:
+        return BoardSpec()
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{BOARD_SETTING}: it must be a mapping of {', '.join(_BOARD_KEYS)}, got {value!r}")
+    unknown = sorted(str(k) for k in value if k not in _BOARD_KEYS)
+    if unknown:
+        raise ValueError(f"{BOARD_SETTING}.{unknown[0]}: unknown key; expected {', '.join(_BOARD_KEYS)}")
+    fields = {}
+    for key, kind in (("square_mm", float), ("rows", int), ("cols", int), ("marker_mm", float)):
+        if value.get(key) is None:
+            continue
+        raw = value[key]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or (kind is int and raw != int(raw)):
+            raise ValueError(f"{BOARD_SETTING}.{key}: {raw!r} is not a{'n integer' if kind is int else ' number'}")
+        fields[key] = kind(raw)
+        if not math.isfinite(fields[key]) or fields[key] <= 0 or (kind is int and fields[key] < 2):
+            raise ValueError(f"{BOARD_SETTING}.{key}: {raw!r} is out of range")
+    for key in ("kind", "dictionary"):
+        if value.get(key) is not None:
+            fields[key] = str(value[key])
+    try:
+        return BoardSpec(**fields)
+    except ValueError as err:
+        raise ValueError(f"{BOARD_SETTING}.{err}") from None
+
+
 def configured_bounds(settings: Mapping) -> Optional[Bounds]:
     """The library settings' scoutBounds as Bounds; None when unset or malformed (logged)."""
     value = settings.get(SCOUT_BOUNDS_SETTING) if settings else None
@@ -637,7 +688,8 @@ def _view_edge(view: ScoutView, size: Optional[Tuple[int, int]]) -> Optional[str
     if size is None:
         return None
     width, height = size
-    u, v = view.corners[:, 0], view.corners[:, 1]
+    found = view.corners[valid_corners(view.corners)]
+    u, v = found[:, 0], found[:, 1]
     gaps = {"left": u.min(), "right": width - 1 - u.max(), "top": v.min(), "bottom": height - 1 - v.max()}
     edge = min(_EDGES, key=lambda e: gaps[e])
     return edge if gaps[edge] <= _CORNER_EDGE_MARGIN_PX else None

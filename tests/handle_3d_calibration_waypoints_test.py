@@ -868,6 +868,42 @@ def test_the_capture_triggers_recording_like_a_session(tmp_path, monkeypatch):
         assert start < on < recording < off
 
 
+def test_the_library_board_setting_reaches_the_calibration(tmp_path, monkeypatch):
+    from reachaq.inference.multires_calibration import library
+
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.calibration_library_root = tmp_path / "calibrations"
+    library.update_settings(app_model.calibration_library_root, board={
+        "kind": "charuco", "square_mm": 4.0, "rows": 6, "cols": 8, "marker_mm": 3.0, "dictionary": "DICT_4X4_50"})
+    boards = []
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: SimpleNamespace(verified=[True]))
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture",
+                        lambda *a, **k: boards.append(k["board"]) or (None, SimpleNamespace(id="cal"),
+                                                                      SimpleNamespace(verdict="pass")))
+    for name in ("left", "right"):
+        (tmp_path / "session" / f"{name}_recording.mp4").write_bytes(b"")
+        (tmp_path / "session" / f"{name}_recording_timestamps.txt").write_text("")
+
+    make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert boards == [BoardSpec(kind="charuco", marker_mm=3.0, dictionary="DICT_4X4_50")]
+
+
+def test_a_bad_board_setting_stops_the_calibration_before_any_motion(tmp_path, monkeypatch):
+    from reachaq.inference.multires_calibration import library
+
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.calibration_library_root = tmp_path / "calibrations"
+    library.update_settings(app_model.calibration_library_root, board={"kind": "charuco", "marker_mm": 5.0,
+                                                                        "dictionary": "DICT_4X4_50"})
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: calls.append(("run_waypoints",)))
+
+    with pytest.raises(ValueError, match=r"board\.marker_mm"):
+        make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert not [call for call in calls if call[0] == "motor"] and ("run_waypoints",) not in calls
+
+
 def test_cameras_that_do_not_stop_fail_a_capture_that_ran(tmp_path, monkeypatch):
     calls = []
     app_model = _capture_app_model(tmp_path, calls, stops=False)

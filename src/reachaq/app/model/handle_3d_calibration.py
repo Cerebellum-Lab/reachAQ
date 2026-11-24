@@ -46,6 +46,7 @@ from reachaq.inference.multires_calibration.scout import (
     Travel,
     bounds_from_plan,
     choose_move_list,
+    configured_board,
     configured_bounds,
     diagnose,
     load_move_list,
@@ -562,10 +563,13 @@ def calibrate_waypoint_capture(
     presets: Sequence[PresetGeometry],
     previous_dir: Optional[Path],
     live_geometries: Optional[Mapping[str, PresetGeometry]] = None,
+    board: Optional[BoardSpec] = None,
 ) -> Tuple[Path, CalibrationIndex, QualityReport]:
     """Write `log` as the capture's waypoints.yaml beside its source_videos, then calibrate
     every preset into <session_dir>/<DEFAULT_3D_CALIB_DIR_NAME>.new. With `live_geometries`
-    (capture_live_geometries), the preset sets are each calibrated camera's own.
+    (capture_live_geometries), the preset sets are each calibrated camera's own. `board` is
+    the calibration board (scout.configured_board); None leaves calibrate_capture's default,
+    the checkerboard.
 
     Returns (that folder, the calibration's index, its quality report). The folder is
     named here only, and its installer takes it from the return value.
@@ -574,6 +578,8 @@ def calibrate_waypoint_capture(
     write_waypoint_log(Path(capture_dir, WAYPOINT_LOG), log)
     output_dir = Path(session_dir, f"{DEFAULT_3D_CALIB_DIR_NAME}.new")
     extra = {} if live_geometries is None else {"live_geometries": dict(live_geometries)}
+    if board is not None:
+        extra["board"] = board
     index, report = calibrate_capture(
         Path(capture_dir),
         output_dir=output_dir,
@@ -1102,8 +1108,15 @@ def make_3d_calib(
     src_dir = Path(
         calibration_FLIR.make_new_calibration(square_size, row_ct, col_ct, oversample, sess_path.location))
 
+    # The board from the library settings (default: the 4 mm checkerboard), read before any
+    # motion so a malformed setting stops the calibration before it starts.
+    root = getattr(app_model, "calibration_library_root", None)
+    board = configured_board({} if root is None else read_settings(root))
+    if board.kind != BoardSpec().kind:
+        logger.notice("Calibration board: %s, %d x %d inner corners, %g mm squares, %g mm %s markers",
+                      board.kind, board.rows, board.cols, board.square_mm, board.marker_mm, board.dictionary)
+
     if move_list == SCOUT:
-        root = getattr(app_model, "calibration_library_root", None)
         identities = [camera.serial or camera.name for camera in capture_list]
         configured = None if root is None else configured_bounds(read_settings(root))
         targets = [motor for *_, motor in plan]
@@ -1117,7 +1130,7 @@ def make_3d_calib(
         else:
             scout = run_scout(app_model, cameras, targets, project=project, session_dir=Path(sess_path.location),
                               cams_before_cfg=cams_before_cfg, capture_list=capture_list, cam_params=cam_params,
-                              record_mode=record_mode, configured=configured, travel=travel)
+                              record_mode=record_mode, configured=configured, travel=travel, board=board)
             plan, used = choose_plan(SCOUT, diamond_triangle_cfg, scout)
             check_plan_in_travel(plan, travel, used)  # a hand-written fallback is first checked here
             # The rule is checked on the list that will be used, too: the 60-waypoint cap can
@@ -1152,6 +1165,7 @@ def make_3d_calib(
         presets=presets,
         previous_dir=app_model.active_calibration_dir,
         live_geometries=live_geometries,
+        board=board,
     )
 
     logger.success("Successfully calibrated the capture: %s, verdict %s", index.id, report.verdict)

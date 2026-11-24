@@ -69,7 +69,13 @@ from reachaq.core.logging import get_verbose_logger
 from reachaq.core.project.project_info import DATE_TIME_FORMAT
 from reachaq.inference.calibration_FLIR import write_pickle
 from reachaq.inference.config import StereoParams, load_calib_stereo_params
-from reachaq.inference.multires_calibration.fit import BoardSpec, CameraModel, CaptureCamera, MotorFrameFit
+from reachaq.inference.multires_calibration.fit import (
+    CHECKERBOARD,
+    BoardSpec,
+    CameraModel,
+    CaptureCamera,
+    MotorFrameFit,
+)
 from reachaq.inference.multires_calibration.geometry import PresetGeometry, PresetSet
 from reachaq.inference.multires_calibration.products import (
     STEREO_KEY,
@@ -348,7 +354,7 @@ def _index_from_data(data: dict) -> CalibrationIndex:
     return CalibrationIndex(
         id=calibration_id,
         created=created,
-        board=BoardSpec(square_mm=float(board["square_mm"]), rows=int(board["rows"]), cols=int(board["cols"])),
+        board=_board_from_plain(board),
         presets=presets,
         verdict=str(data["verdict"]),
         override=data.get("override"),
@@ -771,11 +777,7 @@ def _index_to_plain(index: CalibrationIndex) -> dict:
         "id": index.id,
         # A string, so the file reads the same whatever YAML loader opens it.
         "created": index.created.isoformat(timespec="seconds"),
-        "board": {
-            "square_mm": float(index.board.square_mm),
-            "rows": int(index.board.rows),
-            "cols": int(index.board.cols),
-        },
+        "board": _board_to_plain(index.board),
         "cameras": [dict(c) for c in index.cameras],
         "preset_sets": [dict(s) for s in index.preset_sets],
         "verdict": index.verdict,
@@ -783,6 +785,24 @@ def _index_to_plain(index: CalibrationIndex) -> dict:
         "motor_scale": index.motor_scale,
         "capture": index.capture,
     }
+
+
+def _board_to_plain(board: BoardSpec) -> dict:
+    """The board as calibration.yaml records it. kind, marker_mm and dictionary are written
+    for a ChArUco board only, so a checkerboard's entry is what it always was."""
+    plain = {"square_mm": float(board.square_mm), "rows": int(board.rows), "cols": int(board.cols)}
+    if board.kind != CHECKERBOARD:
+        plain.update(kind=str(board.kind), marker_mm=float(board.marker_mm), dictionary=str(board.dictionary))
+    return plain
+
+
+def _board_from_plain(board: dict) -> BoardSpec:
+    """_board_to_plain's inverse; an entry without a kind, as every file before ChArUco, is a checkerboard."""
+    kind = str(board.get("kind") or CHECKERBOARD)
+    if kind == CHECKERBOARD:
+        return BoardSpec(square_mm=float(board["square_mm"]), rows=int(board["rows"]), cols=int(board["cols"]))
+    return BoardSpec(square_mm=float(board["square_mm"]), rows=int(board["rows"]), cols=int(board["cols"]),
+                     kind=kind, marker_mm=float(board["marker_mm"]), dictionary=str(board["dictionary"]))
 
 
 def _fit_to_plain(fit: MotorFrameFit) -> dict:
