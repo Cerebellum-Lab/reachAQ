@@ -2011,6 +2011,38 @@ def test_a_start_that_raises_tears_down_and_can_run_again(
         app_model.capture_stop()
 
 
+def test_a_camera_brought_back_by_retry_is_supervised_again(
+    app_model, system_config, trainer_config_dir,
+):
+    # The watchdog that timed out unregistered the camera; Refresh Hardware
+    # brought it back READY with none, so a later stall went undetected.
+    for camera in system_config.cameras:
+        if camera.id in (CameraId.Left, CameraId.Right):
+            camera.is_enabled = True
+            camera.is_record_enabled = True
+    system_config.save_default(trainer_config_dir)
+    assert app_model.load_configuration() is True
+    assert app_model.capture_start() is True
+    try:
+        watchdogs = app_model._analysis.watchdog_monitor
+        camera = next(
+            camera for camera in app_model._ordered_reach_cameras(enabled_only=True)
+            if f"camera.{camera.name}" in watchdogs.registered_watchdogs
+        )
+        key = f"camera.{camera.name}"
+
+        app_model._handle_watchdog_timeout(key)
+        assert key not in watchdogs.registered_watchdogs
+        assert app_model.subsystem_statuses[key].state is SubsystemState.FAILED
+
+        app_model.retry_failed_subsystems()
+
+        assert app_model.subsystem_statuses[key].state is SubsystemState.READY
+        assert key in watchdogs.registered_watchdogs
+    finally:
+        app_model.capture_stop()
+
+
 def test_periodic_command_producers_stop_without_touching_can():
     events = []
     app_model = object.__new__(AppModel)

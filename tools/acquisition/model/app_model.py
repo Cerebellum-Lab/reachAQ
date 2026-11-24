@@ -9548,6 +9548,9 @@ class AppModel(ObservableObject):
         if reach_failed:
             if self._retry_reach_camera_domains():
                 retried.append("reach cameras")
+            # Also after a partial retry: each camera it brought back needs
+            # supervising, as at Run.
+            self._register_ready_camera_watchdogs()
         if SubsystemId.CAN_PELLET.value in failed:
             if self._start_can_domain(wait_connected=True):
                 retried.append("CAN/pellet")
@@ -9575,6 +9578,10 @@ class AppModel(ObservableObject):
                 preflight_error=None,
             )
         ):
+            self._analysis.watchdog_monitor.register_watchdog(
+                WatchdogItems.POSE_DATA_MONITOR_PROC,
+                lambda: self._inference.watchdog_monitor_data_proc_perf_c,
+            )
             retried.append("live inference")
         remaining = self._acquisition.subsystems.recording_blockers()
         if remaining:
@@ -9587,6 +9594,21 @@ class AppModel(ObservableObject):
             if retried
             else "All required subsystems are already ready"
         )
+
+    def _register_ready_camera_watchdogs(self) -> None:
+        """Supervise every camera whose domain is READY.
+
+        Run and a subsystem retry both call this. A camera brought back by a
+        retry had no watchdog, so a later stall in it was never detected and
+        the session finalized with its video cut short.
+        """
+        register = self._analysis.watchdog_monitor.register_watchdog
+        for cam in self._cameras:
+            status = self._acquisition.subsystems.get(
+                SubsystemId.camera(cam.name)
+            )
+            if status is not None and status.is_ready:
+                register(f"camera.{cam.name}", lambda cam=cam: cam.watchdog_capture_perf_c)
 
     def _retry_reach_camera_domains(self) -> bool:
         all_cameras = self._ordered_reach_cameras(enabled_only=True)
@@ -9943,12 +9965,7 @@ class AppModel(ObservableObject):
                 lambda: self._hardware.watchdog_writer_perf_c,
             )
 
-        for cam in self._cameras:
-            status = self._acquisition.subsystems.get(
-                SubsystemId.camera(cam.name)
-            )
-            if status is not None and status.is_ready:
-                watchdog_mon_register(f"camera.{cam.name}", lambda cam=cam: cam.watchdog_capture_perf_c)
+        self._register_ready_camera_watchdogs()
 
         if __debug__ and os.getenv("_AUTOTRAINER_TEST_WATCHDOG") == "1":
             def fake_watchdog(t_end):
