@@ -87,6 +87,13 @@ class PelletHardwareProtocol(Protocol):
         :return: A token to expect from the device message handler when the request is complete.
         """
 
+    def refuse_shift_outside_travel(self, delta: Offset3DTuple) -> bool:
+        """
+        True, after logging why, when relative SETs of `delta` (motor mm per axis, 0 for an
+        axis left alone) would take any axis outside the configured travel. False when every
+        shifted axis stays inside it, or no travel is configured.
+        """
+
     def set_dcs_x(self, value: float, *, absolute: bool = True, sender: str = "NA") -> Optional[UUID]:
         """
         Change the DCS-X stepper location and set it as the X-axis pellet release location.

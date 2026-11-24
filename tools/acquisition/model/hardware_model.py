@@ -437,6 +437,20 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 refused = True
         return refused
 
+    def refuse_shift_outside_travel(self, delta) -> bool:
+        """True, after logging an error per axis, when the relative SETs that the
+        intersession shift sends (`delta`, motor mm per axis; 0 sends nothing) would be
+        refused on any axis: the caller then shifts none of them. Each target is the
+        requested position plus the delta, with the SET's clamp to 0, as _set_axis computes it."""
+        refused = False
+        for coord_idx, value in enumerate(delta):
+            if value == 0:
+                continue
+            target = self._last_requested_set_coordinates[coord_idx] + value
+            if self._refuse_outside_travel(coord_idx, 0 if target < 0 else target):
+                refused = True
+        return refused
+
     def block_presentation(self, reason: str) -> None:
         """Refuse send_pellet, logging `reason`, until each of x, y and z has been SET again,
         by anything but a protocol target or the intersession shift. Called after the

@@ -576,6 +576,13 @@ class SystemMachine(StateMachine):
         cfg = algo.diamond_triangle_config
         if cfg is None:
             cfg = DiamondTriangleOffsetConfig
+        # All axes or none: a shift applied on some axes only would present at a position
+        # neither the old one nor the shifted one.
+        delta = Offset3DTuple(*(val * flip for val, flip in zip(shift, cfg.flips_motor_diamond)))
+        if dev.refuse_shift_outside_travel(delta):
+            logger.error("Not applying the pellet send_position shift %s: a shifted axis would leave "
+                         "the configured travel, so no axis is shifted", shift.round(1))
+            return
         logger.notice("applying pellet send_position shift: %s", shift.round(1))
         # NB: dev.set_x/y/z is in motor coordinate system,
         # but we want the shifts to be in inference system :

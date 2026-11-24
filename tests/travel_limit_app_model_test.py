@@ -114,3 +114,17 @@ def test_the_operator_setting_every_axis_clears_the_block_and_a_protocol_target_
     hardware.set_z(7.0, sender="UI-Set-Button")
     hardware._send_with_token.reset_mock()
     assert hardware.send_pellet() is mock.sentinel.token
+
+
+def test_the_shift_is_refused_whole_when_one_shifted_axis_leaves_the_travel(caplog):
+    hardware = _hardware()
+    hardware._last_requested_set_coordinates = Offset3DTuple(10.0, 31.0, 10.0)
+    with caplog.at_level(logging.ERROR):
+        assert hardware.refuse_shift_outside_travel(Offset3DTuple(1.0, 6.0, 0.0)) is True
+    assert "Axis-Y: move to 37.000 refused" in caplog.text
+    assert hardware.refuse_shift_outside_travel(Offset3DTuple(1.0, 4.0, 0.0)) is False
+    # An axis the shift leaves alone is not checked, even when its SET is not known.
+    hardware._last_requested_set_coordinates = Offset3DTuple(10.0, 31.0, math.nan)
+    assert hardware.refuse_shift_outside_travel(Offset3DTuple(1.0, 0.0, 0.0)) is False
+    # The SET's clamp to 0 applies.
+    assert hardware.refuse_shift_outside_travel(Offset3DTuple(-20.0, 0.0, 0.0)) is False
