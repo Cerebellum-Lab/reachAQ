@@ -190,7 +190,16 @@ ReachAQ checks each stage target against the travel before it sends anything:
   all three axes before any is SET. One axis out of range sends none of them,
   so the stage never mixes the new position with the previous one. The base
   position logs `Not sending <animal>'s pellet position ...: it lies outside
-  the configured travel`; a protocol presentation stops with an error.
+  the configured travel` and shows a "Pellet position refused" error. The
+  previous animal's position is still SET on the board, so **no pellet is
+  presented** (`Pellet presentation refused: ...` in the log) until X, Y and Z
+  have each been SET again: an animal whose position is inside the travel is
+  selected, or the operator sets all three in Hardware Control. A protocol
+  target or the intersession shift does not lift the block. A protocol
+  presentation stops with an error.
+- **The intersession shift** is checked on every axis it shifts before any is
+  SET. One shifted axis out of range shifts none of them and logs `Not
+  applying the pellet send_position shift ...`.
 - **The `move_config.yaml` sequences** (`load_pellet`, `send_pellet`,
   `cover_pellet`, `release_pellet`, `move_retract`, or their built-in
   defaults). Every stepper step is checked before the sequence starts, as
@@ -216,18 +225,30 @@ An unset side prints as `-inf` or `inf`. A refused sequence also logs
 `Pellet sequence load_pellet refused: a step lies outside the configured
 travel`. Without `min_pos` and `max_pos`, behaviour is as before.
 
-When the board refuses a SET, the host puts that axis's requested send
-position back to the one the board reports, so later checks use the base the
-board really has.
+When the board refuses a SET on an axis with travel, the host puts that axis's
+requested send position back to the one the board reports, so later checks use
+the base the board really has. It does so silently (the animal's saved position
+is not changed), and not when a newer SET of that axis was queued since or the
+refusal's outcome is unknown (`-EBUSY` on a resend). Without travel, a refused
+SET leaves the requested position as before.
+
+Right after an in-range SET, a `send_pellet` can be refused once if the
+send position the board still reports is outside the travel (left there by a
+maintenance tool, for example). It clears with the board's next status.
 
 Not checked:
 
 - **Homing** (`send_home`, `send_to_limits` and home steps in a sequence). The
   firmware stops at the switch.
 - **A target the host does not know**: a relative sequence step from a
-  position the board has not reported. The host sends nothing for it.
-- **Turning drift correction off**. That re-sends the last SET, which was
-  checked when it was made.
+  position the board has not reported. The host sends nothing for it. In the
+  moment after a connect, before the first status reaches the host, a
+  `send_*_rel` step is not checked either, while the board side may already
+  hold a send position. Neither built-in sequence uses `send_*_rel`.
+- **Turning drift correction off**. That sends a SET of 0 relative to the
+  send position the board last reported, not the last requested SET. Right
+  after a new SET it can therefore bring back the previous send position. It
+  never saves a position the board has not held already.
 - **The maintenance tools that bypass the acquisition app**: the pellet
   delivery tool (`tools/pellet_delivery`), `scripts/can_console.py` and
   `tools/hardware/validate_can_hardware.py`. They command the board directly
