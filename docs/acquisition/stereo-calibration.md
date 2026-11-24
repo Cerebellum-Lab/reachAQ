@@ -364,6 +364,33 @@ coverage images and every pair check use only the corners found.
 for a ChArUco board only; a checkerboard calibration's `board` entry is as before.
 The capture folder keeps its name, `4mm_6r_8c_4x`.
 
+### The fit: per_view or motor_frame
+
+The stage does not only translate the board: on christielab10's session010
+(2026-11-23) the board turned slightly between waypoints, and at z 35 it stood
+about 3 mm short of where it was commanded. The `motor_frame` fit assumes a
+pure translation to the commanded position and sat at 15-20 px RMS there. The
+`per_view` fit (`multires_calibration/per_view.py`) gives each waypoint its own
+board rotation, shared by every camera, and holds the board's position to the
+commanded one through a fitted similarity `s R m + t` with a robust slack of
+0.4 mm (soft-L1). A waypoint whose slack is an outlier (more than 3 MADs, and at
+least 1.2 mm, above the median) loses that hold and is listed; its corners
+still count. The commanded positions are what fix the focal length: every view
+is the same plane orientation, so with the positions left free the focal length
+is undetermined.
+
+`calibrations/settings.yaml` picks the fit with `fit: per_view` or
+`fit: motor_frame`. Unset, it is `per_view` for a ChArUco board and
+`motor_frame` for the checkerboard, whose cross-camera corner order depends on
+the motor-frame model. `calibration.yaml` records `fit: per_view` under
+`capture` for a per-view calibration only.
+
+The per-view fit adds stage-accuracy notes to the report: the similarity's scale
+and RMS, each waypoint more than 1 mm from its commanded position by name (for
+example `waypoint 13: board 3.3 mm short of commanded z`), each waypoint's board
+tilt and its axis in the motor frame, and every waypoint's residual. They are
+warnings about the stage, not the calibration; `motor_scale_dev` stays a warning.
+
 ### The calibration library
 
 **Tools → Calibration library…** lists every calibration in the library, newest
