@@ -6,6 +6,7 @@ replaced by fakes in a scratch directory; nothing is installed.
 """
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -28,7 +29,9 @@ PRELUDE = (
 def _run(script, env, *, functions=(), conda=None):
     text = (
         (f'CONDA_BIN="{conda}"\n' if conda else 'CONDA_BIN=""\n')
-        + f'INSTALL_REPO="{REPO_ROOT}"\nINSTALL_ENV=reachaq\nINSTALL_PYTHON=3.10\n'
+        # The fake conda's python is this one, so the wanted Python is too.
+        + f'INSTALL_REPO="{REPO_ROOT}"\nINSTALL_ENV=reachaq\n'
+        + f'INSTALL_PYTHON={sys.version_info.major}.{sys.version_info.minor}\n'
         + f'. "{PLUGIN_LIB}" || exit 99\n'
         + PRELUDE
         + "".join(_function(name) for name in functions)
@@ -43,8 +46,10 @@ def _fake_script_dir(tmp_path, **exit_codes):
     script_dir = tmp_path / "script_dir"
     script_dir.mkdir()
     for name, code in exit_codes.items():
+        marker = tmp_path / f"{name}.ran"
         (script_dir / f"{name}.py").write_text(
-            f"import sys\nprint('{name}', *sys.argv[1:])\nsys.exit({code})\n")
+            f"import sys\nopen({str(marker)!r}, 'w').close()\n"
+            f"print('{name}', *sys.argv[1:])\nsys.exit({code})\n")
     return script_dir
 
 
@@ -172,7 +177,7 @@ def test_the_binding_check_needs_no_download_on_a_rerun(tmp_path):
                         "check_spinnaker_binding_available"))
 
     assert "status=0" in completed.stdout, completed.stdout + completed.stderr
-    assert "spinnaker_download" not in completed.stdout
+    assert not (tmp_path / "spinnaker_download.ran").exists()
 
 
 def test_the_binding_check_asks_the_download_on_a_fresh_host(tmp_path):
@@ -188,6 +193,7 @@ def test_the_binding_check_asks_the_download_on_a_fresh_host(tmp_path):
                         "check_spinnaker_binding_available"))
 
     assert "status=1" in completed.stdout, completed.stdout + completed.stderr
+    assert (tmp_path / "spinnaker_download.ran").exists()
 
 
 def test_the_installer_refuses_to_run_under_sudo():

@@ -530,10 +530,12 @@ install_spinnaker_sdk() {
     deb_dir=$(python3 "$SCRIPT_DIR/spinnaker_download.py" extract-sdk \
         --dir "$SPINNAKER_DOWNLOADS" --dest "$work" --ubuntu "$ubuntu" --arch "$arch")
     result=$?
-    if [ "$result" -eq 0 ] && ! { [ -t 0 ] && [ -t 1 ]; }; then
+    # stdin only: `... 2>&1 | tee install.log` still answers from the terminal.
+    if [ "$result" -eq 0 ] && [ ! -t 0 ]; then
         printf '%s\n' \
             'Installing the Spinnaker SDK shows the FLIR licence agreement, which the operator' \
-            'must read and accept, so it needs a terminal. Run the installer from a terminal.' >&2
+            'must read and accept, so it needs input from a terminal. Run the installer from a' \
+            'terminal, without redirecting its input.' >&2
         result=1
     fi
     if [ "$result" -eq 0 ]; then

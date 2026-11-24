@@ -121,7 +121,7 @@ def test_spinnaker_sdk_licence_is_left_to_the_operator():
     # An inherited DEBIAN_FRONTEND=noninteractive would answer the prompt, and
     # without a terminal it cannot be shown at all.
     assert 'run_as_root env -u DEBIAN_FRONTEND apt-get install -y "$deb_dir"/*.deb' in install
-    assert "[ -t 0 ] && [ -t 1 ]" in install
+    assert "[ ! -t 0 ]" in install
     # The FLIR packages ask for their licence through debconf; a
     # noninteractive frontend would decline it, or a preseed accept it, on
     # the operator's behalf.
