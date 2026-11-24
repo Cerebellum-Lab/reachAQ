@@ -11013,6 +11013,9 @@ class AppModel(ObservableObject):
 
     def on_close(self):
         logger.debug("AppModel.on_close")
+        # A stage still moving is stopped first, before the session save below can wait:
+        # nothing on a v1.2 pellet board stops a stepper once the host is gone.
+        self._hardware.estop_if_moving("reachAQ is closing")
         # Closing saves a running session first, as a stop does, while it can
         # still finish. The window has already stopped acquisition, asking and
         # waiting, so this is for a headless close. The stop below does not
@@ -12059,6 +12062,15 @@ class AppModel(ObservableObject):
             },
         ):
             return
+        estop = self._hardware.pellet_estop
+        if estop is not None:
+            self._recording_session.finish_end_action(
+                "pellet_home",
+                status="skipped",
+                error=f"the pellet stage was stopped ({estop['reason']}); home it with Hardware Control",
+            )
+            logger.warning("Session-end pellet home skipped: the stage was stopped (%s)", estop["reason"])
+            return
         status = self._acquisition.subsystems.get(SubsystemId.CAN_PELLET)
         if status is None or not status.is_ready or not self._hardware.connected:
             self._recording_session.finish_end_action(
@@ -12225,6 +12237,10 @@ class AppModel(ObservableObject):
         hard = self._hardware
         if name == hard.CAN_CONNECTION_STATE_PROPERTY:
             self._on_can_connection_state_changed(value)
+        elif name == hard.PELLET_ESTOP_PROPERTY:
+            if value is not None:
+                # Kept with the session the stop happened in; Record resets them.
+                self._recording_session.add_estop(value)
         elif name in {
             hard.FIRMWARE_COMPATIBILITY_PROPERTY,
             hard.PELLET_NEEDS_HOME_PROPERTY,
@@ -13075,6 +13091,10 @@ class AppModel(ObservableObject):
                     "endActions": [
                         dict(action)
                         for action in self._recording_session.end_actions
+                    ],
+                    "estops": [
+                        dict(estop)
+                        for estop in self._recording_session.estops
                     ],
                     "storage": dict(
                         self._recording_session.storage_telemetry
