@@ -257,6 +257,7 @@ class ShiftXYZHandler(ObservableObject):
             func = self._processed_shift_handler
             if func is None:
                 logger.debug("handle_processed_shift_func undefined")
+                refusal = "no processed-shift handler"  # nothing was sent to the board
             else:
                 func: ProcessedShiftXYZCallbackHandler
                 try:

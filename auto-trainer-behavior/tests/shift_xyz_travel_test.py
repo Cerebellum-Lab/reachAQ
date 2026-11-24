@@ -131,3 +131,40 @@ def test_a_raising_shift_handler_posts_not_applied_and_leaves_no_pending_y_limit
         handler.put_intersession_response(_project(20.0), _tongue_eaten())
     tongue_shift = ShiftXYZHandlerConfig().tongue_eaten_shift
     assert algo.pellet_shift_y_limit == 20.0 + tongue_shift.y  # not the failed shift's 35.3
+
+
+# N-14 (Ben, 2026-11-23): applied is true only when every shifted axis was sent to the board.
+
+def test_a_disabled_shift_or_no_device_is_not_applied():
+    machine, device = _machine(refused=False)
+    machine._algorithm.intersession_pellet_shift_enabled = False
+    assert "disabled" in SystemMachine._apply_processed_shift_xyz(machine, Offset3DTuple(1.0, 6.0, 0.0))
+    device.set_x.assert_not_called()
+    device.set_y.assert_not_called()
+    machine._algorithm.intersession_pellet_shift_enabled = True
+    machine._pellet_device = None
+    assert "no pellet device" in SystemMachine._apply_processed_shift_xyz(machine, Offset3DTuple(1.0, 6.0, 0.0))
+
+
+def test_a_shift_with_a_set_not_queued_is_not_applied():
+    machine, device = _machine(refused=False)
+    device.set_y.return_value = None
+    refusal = SystemMachine._apply_processed_shift_xyz(machine, Offset3DTuple(1.0, 6.0, 0.0))
+    assert "shift-Y was not queued" in refusal
+    device.set_x.assert_called_once()  # the other axes are still sent, as before
+
+
+def test_a_disabled_tongue_eaten_shift_records_nothing_and_keeps_the_y_limit():
+    machine, device = _machine(refused=False)
+    machine._algorithm.intersession_pellet_shift_enabled = False
+    algo = SimpleNamespace(active_config=SimpleNamespace(shift_xyz_handler=ShiftXYZHandlerConfig()),
+                           pellet_shift_y_limit=None)
+    handler = ShiftXYZHandler(algo=algo)
+    handler.set_processed_handler(
+        lambda project, shift: SystemMachine._apply_processed_shift_xyz(machine, shift))
+    with mock.patch("autotrainer.behavior.pellet_shift.post_api_event_content") as post:
+        handler.put_intersession_response(_project(20.0), _tongue_eaten())
+    assert algo.pellet_shift_y_limit is None
+    assert all(map(math.isnan, handler.last_processed_shift_xyz))
+    data = post.call_args.kwargs["data"]
+    assert data["applied"] is False and "disabled" in data["refusal"]

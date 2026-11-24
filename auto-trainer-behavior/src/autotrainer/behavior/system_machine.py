@@ -567,14 +567,18 @@ class SystemMachine(StateMachine):
         return self._apply_processed_shift_xyz(shift)
 
     def _apply_processed_shift_xyz(self, shift: Offset3DTuple) -> Optional[str]:
-        """Shift the send position by `shift`. Returns why when the shift is refused (a
-        shifted axis would leave the configured travel), so the caller records it as not
-        applied; None otherwise."""
+        """Shift the send position by `shift`. Returns None only when every shifted axis was
+        sent to the board; otherwise why not (no pellet device, the shift is disabled, a
+        shifted axis would leave the configured travel, or a SET was not queued), so the
+        caller records the shift as not applied."""
         algo = self._algorithm
         dev = self._pellet_device
-        if dev is None or not algo.intersession_pellet_shift_enabled:
-            logger.debug("intersession_pellet_shift_enabled False or pellet_device None")
-            return
+        if dev is None:
+            logger.debug("pellet_device None")
+            return "no pellet device"
+        if not algo.intersession_pellet_shift_enabled:
+            logger.debug("intersession_pellet_shift_enabled False")
+            return "the intersession shift is disabled"
         # flips are at the moment statics, but handle possible custom flips ; defensive:
         cfg = algo.diamond_triangle_config
         if cfg is None:
@@ -587,6 +591,7 @@ class SystemMachine(StateMachine):
                          "the configured travel, so no axis is shifted", shift.round(1))
             return "a shifted axis would leave the configured travel"
         logger.notice("applying pellet send_position shift: %s", shift.round(1))
+        not_queued = []
         # NB: dev.set_x/y/z is in motor coordinate system,
         # but we want the shifts to be in inference system :
         for idx, (val, meth) in enumerate((
@@ -601,9 +606,12 @@ class SystemMachine(StateMachine):
                 token = meth(val, absolute=False, sender="processed_shift_xyz")
                 if token is None:
                     logger.error("Could not apply shift-%s ; command not successfully sent", coord)
-                    # TODO: what todo ?
+                    not_queued.append(coord)
             else:
                 logger.debug("%s == 0 ; skip", coord)
+        if not_queued:
+            return ", ".join(f"shift-{coord}" for coord in not_queued) + " was not queued"
+        return None
 
     # region State Machine Requirements
     # Methods required for model_override=True to work.
