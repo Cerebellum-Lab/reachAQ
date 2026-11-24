@@ -221,6 +221,23 @@ def test_installed_pose_plugins_lists_known_entry_points(tmp_path):
     assert "missing: " in lines
 
 
+def test_installed_pose_plugins_reads_the_v3_group_too(tmp_path):
+    """v3 registered its plugins under autotrainer.pose_backends; the first update
+    after the rename must still restore them."""
+    conda, envs, env = _fake_conda(tmp_path)
+    dist = _make_env(envs, "v3") / "auto_trainer_pose_deeplabcut-1.0.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: auto-trainer-pose-deeplabcut\nVersion: 1.0\n")
+    (dist / "entry_points.txt").write_text(
+        "[autotrainer.pose_backends]\ndeeplabcut = fake_module:THING\n")
+
+    completed = _source_lib('echo "v3: $(installed_pose_plugins v3 | tr "\\n" " ")"\n', env, conda)
+
+    assert completed.returncode == 0, completed.stderr
+    assert "v3: deeplabcut " in completed.stdout.splitlines()
+
+
 def test_legacy_pose_engines_infers_plugins_from_old_packages(tmp_path):
     conda, envs, env = _fake_conda(tmp_path)
     _make_env(envs, "dlc-only", packages=("deeplabcut",))

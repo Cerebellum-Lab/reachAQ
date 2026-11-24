@@ -78,6 +78,19 @@ def test_portable_installer_builds_python_310_with_both_pose_engines():
     assert 'run_step "Install Spinnaker Python binding" install_spinnaker_binding' in source
 
 
+def test_portable_installer_upgrades_a_v3_install():
+    source = INSTALL_SCRIPT.read_text()
+
+    # Before the settings directory is created: an empty ~/reachAQ would block the move.
+    migrate = source.index('run_step "Migrate v3 settings" migrate_v3_settings')
+    assert migrate < source.index('run_step "Create runtime directories" make_runtime_directories')
+    assert 'python3 "$INSTALL_REPO/src/reachaq/core/settings_migration.py"' in source
+    # Before anything is installed into the environment, so no old finder or script survives it.
+    uninstall = source.index('run_step "Uninstall v3 auto-trainer distributions" uninstall_v3_distributions')
+    assert uninstall < source.index('run_step "Install PyTorch pose engine" install_torch_engine')
+    assert 'run_step "Refresh installed SoftMouse units" refresh_installed_user_units' in source
+
+
 def test_portable_installer_archives_an_environment_on_another_python():
     source = INSTALL_SCRIPT.read_text()
 

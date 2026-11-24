@@ -190,16 +190,19 @@ probe_pose_env() {
     printf '%s\n' "$output" | known_plugins_in
 }
 
-# Plugin names registered in <env>'s reachaq.pose_backends group. The
-# archived environment of an update can be on an older Python, where
-# entry_points() returns a dict, hence both lookups.
+# Plugin names registered in <env>'s reachaq.pose_backends group, or in
+# autotrainer.pose_backends, v3's name for it, so the first update after the
+# rename restores what v3 had. The archived environment of an update can be on
+# an older Python, where entry_points() returns a dict, hence both lookups.
 installed_pose_plugins() {
     probe_pose_env "$1" '
 from importlib.metadata import entry_points
 found = entry_points()
-group = (found.select(group="reachaq.pose_backends") if hasattr(found, "select")
-         else found.get("reachaq.pose_backends", ()))
-print("\n".join(sorted({entry.name for entry in group})))
+names = set()
+for name in ("reachaq.pose_backends", "autotrainer.pose_backends"):
+    group = found.select(group=name) if hasattr(found, "select") else found.get(name, ())
+    names.update(entry.name for entry in group)
+print("\n".join(sorted(names)))
 '
 }
 

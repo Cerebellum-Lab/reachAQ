@@ -125,6 +125,21 @@ check_repo() {
         && test -d "$INSTALL_REPO/src/reachaq/app"
 }
 
+# v3 kept its settings in ~/Autotrainer and ~/.config/Colorado. Moved before
+# make_runtime_directories, which would otherwise create an empty ~/reachAQ the
+# migration then refuses to move onto. It runs from the checkout with the
+# host's python3: the module needs only the standard library, and the reachaq
+# environment may not exist yet. A settings directory named by
+# REACHAQ_CONFIG_DIR or REACHAQ_INSTALL_CONFIG_DIR is the operator's choice
+# and is left alone.
+migrate_v3_settings() {
+    if [ "$INSTALL_CONFIG_DIR" != "$HOME/reachAQ" ]; then
+        printf 'Settings directory is %s; nothing to migrate.\n' "$INSTALL_CONFIG_DIR"
+        return 0
+    fi
+    python3 "$INSTALL_REPO/src/reachaq/core/settings_migration.py"
+}
+
 make_runtime_directories() {
     mkdir -p "$INSTALL_CONFIG_DIR" "$INSTALL_DATA_DIR"
 }
@@ -303,6 +318,29 @@ find_plugins_to_restore() {
 # anywhere else, this step failed with "does not appear to be a Python project".
 install_python_requirements() {
     (cd "$INSTALL_REPO" && conda_run python -m pip install -r requirements.txt)
+}
+
+# v3 installed reachAQ as auto-trainer* distributions (eight, plus the
+# auto-trainer-pose-* plugins); some rigs also have upstream's
+# auto-trainer-api and auto-trainer-training. reachaq replaces them all. Left
+# installed, their editable finders would keep importing the old autotrainer.*
+# tree and their console scripts would shadow the new ones.
+uninstall_v3_distributions() {
+    local names
+    names=$(conda_run python - <<'PY'
+from importlib.metadata import distributions
+
+names = {dist.metadata["Name"] for dist in distributions() if dist.metadata["Name"]}
+print("\n".join(sorted(n for n in names if n.lower().replace("_", "-").startswith("auto-trainer"))))
+PY
+) || return
+    if [ -z "$names" ]; then
+        printf 'No auto-trainer distributions installed.\n'
+        return 0
+    fi
+    printf 'Uninstalling: %s\n' "$(printf '%s ' $names)"
+    # shellcheck disable=SC2086 # one distribution name per word
+    conda_run python -m pip uninstall -y $names
 }
 
 install_editable_package() {
@@ -533,6 +571,33 @@ else:
 PY
 }
 
+# The SoftMouse units are installed by hand (docs/acquisition/animal-metadata-sources.md)
+# as copies, which keep running whatever module they name. Those already
+# installed are replaced with the checkout's, the old ones kept as .bak, so an
+# update cannot leave a unit starting a module that no longer exists (v3's ran
+# python -m tools.acquisition...). Drop-ins (*.service.d) are the operator's
+# and are kept. Units not installed stay uninstalled.
+refresh_installed_user_units() {
+    local unit_dir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+    local source name replaced=0
+    for source in "$INSTALL_REPO"/src/reachaq/softmouse_sync/systemd/*.service \
+                  "$INSTALL_REPO"/src/reachaq/softmouse_sync/systemd/*.timer; do
+        [ -f "$source" ] || continue
+        name=${source##*/}
+        [ -f "$unit_dir/$name" ] || continue
+        if ! cmp -s "$source" "$unit_dir/$name"; then
+            cp -p "$unit_dir/$name" "$unit_dir/$name.bak" || return
+            cp "$source" "$unit_dir/$name" || return
+            printf 'Replaced %s (old one kept as %s.bak)\n' "$unit_dir/$name" "$name"
+            replaced=1
+        fi
+    done
+    if [ "$replaced" = 1 ] && have_command systemctl; then
+        systemctl --user daemon-reload
+    fi
+    return 0
+}
+
 verify_softmouse_systemd_units() {
     systemd-analyze --user verify \
         "$INSTALL_REPO/src/reachaq/softmouse_sync/systemd/reachaq-softmouse-publisher.service" \
@@ -580,6 +645,7 @@ run_focused_tests() {
 
 begin_category "Preflight"
 run_step "Validate repository checkout" check_repo
+run_step "Migrate v3 settings" migrate_v3_settings
 run_step "Create runtime directories" make_runtime_directories
 
 SYSTEM_SKIPPED="REACHAQ_INSTALL_SYSTEM=0; needs root, assumed already in place"
@@ -635,6 +701,7 @@ else
     # Python 3.10 has no tomllib, and relying on build to pull it in would break
     # silently the day build stops needing it.
     run_step "Upgrade Python packaging tools" conda_run python -m pip install --upgrade pip setuptools wheel build tomli
+    run_step "Uninstall v3 auto-trainer distributions" uninstall_v3_distributions
     run_step "Install PyTorch pose engine" install_torch_engine
     run_step "Install Python requirements" install_python_requirements
     run_step "Install reachAQ editable package" install_editable_package
@@ -705,6 +772,7 @@ else
     run_step "Verify headless CLI" conda_run reachaq-headless -h
 fi
 run_step "Verify SoftMouse systemd units" verify_softmouse_systemd_units
+run_step "Refresh installed SoftMouse units" refresh_installed_user_units
 
 if [ -z "$CONDA_BIN" ]; then
     skip_step "Run focused non-hardware tests" "conda unavailable"
