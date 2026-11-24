@@ -101,7 +101,8 @@ class _Harness:
         return self.timers[-1]
 
 
-def _recipe(cue_interval_ms=400, cue_tone=True, tone_phase="pellet_presentation"):
+def _recipe(cue_interval_ms=400, cue_tone=True, tone_phase="pellet_presentation",
+            lock_timing=True, post_clear_delay_ms=0):
     compiler = TrialActionCompiler(
         tone_profiles={
             "tone1": ToneProfile("tone1", 1, 6000, 100),
@@ -121,6 +122,8 @@ def _recipe(cue_interval_ms=400, cue_tone=True, tone_phase="pellet_presentation"
     if cue_tone:
         updates["cue_tone_profile_id"] = "tone2"
         updates["cue_interval_fixed_ms"] = cue_interval_ms
+        updates["cue_lock_timing"] = lock_timing
+        updates["cue_post_clear_delay_ms"] = post_clear_delay_ms
     row = TrialProtocolRow(trial_id=1).with_updates(updates)
     context = TrialCompileContext(
         session_id="s1", session_generation=1, protocol_id="p", protocol_revision=1,
@@ -318,9 +321,8 @@ def test_an_unlocked_trial_waits_for_the_block_then_fires():
     presence = {"value": (False, 100.39)}
     harness = _Harness(
         pellet_presence_provider=lambda: presence["value"],
-        cue_timing_configuration=CueTimingConfiguration(lock_timing=False),
     )
-    _prepare(harness, _recipe())
+    _prepare(harness, _recipe(lock_timing=False))
 
     harness.now = 100.4
     harness.timer.fire(at=100.4)
@@ -337,10 +339,9 @@ def test_an_unlocked_wait_is_bounded():
     """A stuck gate must not hold the pellet cycle open indefinitely."""
     harness = _Harness(
         pellet_presence_provider=lambda: (False, 200.0),
-        cue_timing_configuration=CueTimingConfiguration(lock_timing=False),
         cue_max_wait_seconds=1.0,
     )
-    operation = _prepare(harness, _recipe())
+    operation = _prepare(harness, _recipe(lock_timing=False))
 
     harness.now = 200.0
     harness.timer.fire(at=200.0)
@@ -407,3 +408,88 @@ def test_a_failing_tone_send_is_recorded_and_does_not_raise():
     harness.timer.fire(at=100.4)
 
     assert any("Tone 2 send failed after" in detail for detail in _details(operation))
+
+
+def test_tone_2_skipped_for_want_of_pellet_evidence_is_a_warning(caplog):
+    # Unknown presence skipped Tone 2 on every trial, and only an observation
+    # string in the operation record said so (audit prod41-02).
+    import logging
+
+    harness = _Harness(pellet_presence_provider=lambda: None)
+    operation = _prepare(harness, _recipe(cue_interval_ms=400))
+
+    with caplog.at_level(logging.WARNING):
+        harness.timer.fire()
+
+    assert ("tone2", "tone_2") not in harness.tones
+    assert any("lock_deadline_gate_state_stale" in detail for detail in _details(operation))
+    warnings = [record.getMessage() for record in caplog.records
+                if record.levelno == logging.WARNING]
+    assert any("Tone 2 was skipped" in message and "pellet" in message
+               for message in warnings)
+
+
+
+@pytest.mark.parametrize("present, fires", [(True, True), (False, False)])
+def test_a_pellet_roi_answers_the_gate(present, fires):
+    from tools.acquisition.model.reach_state_source import RoiPelletPresenceProvider
+
+    class _State:
+        def latest(self):
+            return present, 100.35, 150.0
+
+    harness = _Harness(pellet_presence_provider=RoiPelletPresenceProvider(lambda: (_State(),)))
+    operation = _prepare(harness, _recipe(cue_interval_ms=400))
+
+    harness.timer.fire()
+
+    assert (("tone2", "tone_2") in harness.tones) is fires
+    if not fires:
+        assert any("pellet_missing" in detail for detail in _details(operation))
+
+
+
+def test_the_rows_lock_timing_and_post_clear_delay_reach_the_policy():
+    # The row's Lock timing and post-clear delay were validated, saved and
+    # shown, but the policy was always the executor's default: locked, no
+    # delay. An unlocked row skipped on an early reach instead of waiting it
+    # out, while the record said it was unlocked (audit prod41-03).
+    reach = {"value": (True, 100.39)}
+    resolver = ReachStateResolver(
+        ReachStateConfiguration(source=ReachStateSource.LIVE_TRACKING),
+        live_tracking_provider=lambda: reach["value"],
+    )
+    harness = _Harness(
+        pellet_presence_provider=lambda: (True, harness.now),
+        reach_state_resolver=resolver,
+    )
+    operation = _prepare(harness, _recipe(lock_timing=False, post_clear_delay_ms=300))
+
+    harness.now = 100.4
+    harness.timer.fire(at=100.4)
+    assert ("tone2", "tone_2") not in harness.tones
+    assert not any("skipped and reset" in detail for detail in _details(operation))
+    assert len(harness.timers) == 2, "an unlocked row waits out the reach"
+
+    reach["value"] = (False, 100.5)
+    harness.now = 100.5
+    harness.timer.fire(at=100.5)
+    assert ("tone2", "tone_2") not in harness.tones, "the post-clear delay still runs"
+
+    reach["value"] = (False, 100.81)
+    harness.now = 100.81
+    harness.timer.fire(at=100.81)
+    assert ("tone2", "tone_2") in harness.tones
+
+
+def test_a_locked_row_keeps_the_executors_staleness_limit():
+    harness = _Harness(
+        pellet_presence_provider=lambda: (True, 99.0),
+        cue_timing_configuration=CueTimingConfiguration(gate_staleness_ms=2000),
+    )
+    _prepare(harness, _recipe())
+    harness.now = 100.4
+    harness.timer.fire(at=100.4)
+
+    # 1.4 s old evidence is inside the configured 2 s limit.
+    assert ("tone2", "tone_2") in harness.tones

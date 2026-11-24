@@ -842,3 +842,101 @@ def test_direct_trigger_records_when_validation_finished():
                 <= result["daqmx_start_entry_perf_time"])
     finally:
         model.stop_direct_trigger_receiver()
+
+
+@pytest.mark.parametrize("firing", [BOARD, SOFTWARE], ids=["board", "direct"])
+def test_a_protocol_arm_stays_armed_for_the_window_it_is_given(firing):
+    # A trial is armed before its SEND and triggered on a reach that can come
+    # many seconds later. With no bound given, the controller's own applied:
+    # waveform + 5 s from the arm, after which the trigger found it failed
+    # and the trial was filed as a hardware error (audit lensA01-04).
+    controller = _Controller()
+    model = LaserModel(controller)
+    profile = LaserPulseProfile("pulse", 1, 2.5, 5)
+
+    model.prepare_pulse_profile(profile, firing, _recipe(), armed_window_seconds=120.0)
+
+    if firing is SOFTWARE:
+        assert controller.pulse.start_wait_seconds == 120.0
+        assert controller.pulse.timeout_seconds is None
+    else:
+        assert controller.pulse.timeout_seconds == pytest.approx(
+            120.0 + profile.waveform_seconds + 5.0)
+
+
+def test_an_arm_with_no_window_keeps_the_controllers_bound():
+    controller = _Controller()
+    model = LaserModel(controller)
+
+    model.prepare_pulse_profile(LaserPulseProfile("pulse", 1, 2.5, 5), SOFTWARE, _recipe())
+
+    assert controller.pulse.start_wait_seconds is None
+    assert controller.pulse.timeout_seconds is None
+
+
+def test_the_app_arms_protocol_lasers_for_the_whole_trial(app_model, monkeypatch):
+    from tools.acquisition.model.laser_model import PROTOCOL_LASER_ARM_WINDOW_S
+
+    seen = {}
+
+    def prepare(profile, firing, recipe, **kwargs):
+        seen.update(kwargs)
+        return "handle"
+
+    monkeypatch.setattr(app_model._laser, "prepare_pulse_profile", prepare)
+    recipe = SimpleNamespace(laser_firing=SOFTWARE)
+
+    assert app_model._prepare_protocol_laser(LaserPulseProfile("pulse", 1, 2.5, 5), recipe) == "handle"
+    assert seen == {"armed_window_seconds": PROTOCOL_LASER_ARM_WINDOW_S}
+    assert PROTOCOL_LASER_ARM_WINDOW_S == 120.0
+
+
+def _direct_trigger(model, results, ready):
+    trigger_queue = queue.Queue(maxsize=1)
+    model.start_direct_trigger_receiver(
+        trigger_queue, lambda result: (results.append(result), ready.set()))
+    return lambda: trigger_queue.put_nowait({
+        "operation_id": "trial-op",
+        "session_generation": 3,
+        "logical_trial_id": 4,
+        "attempt_id": 1,
+        "nonce": "once",
+        "stim_frame_id": 9,
+        "ipc_send_perf_time": time.perf_counter(),
+    })
+
+
+def test_a_withdrawn_direct_trigger_was_not_taken_and_refuses_a_late_one():
+    # The cycle's end asks whether First Reach reached the laser before it
+    # cancels an arm as not triggered; once asked, a late trigger must not
+    # start what is being cancelled (audit prod41-05).
+    controller = _Controller()
+    model = LaserModel(controller)
+    operation = model.prepare_pulse_profile(LaserPulseProfile("pulse", 1, 2.5, 5), SOFTWARE, _recipe())
+    model.bind_direct_trigger_nonce("trial-op", "once")
+    results, ready = [], threading.Event()
+    send = _direct_trigger(model, results, ready)
+    try:
+        assert model.withdraw_direct_trigger(operation) is False
+        send()
+        assert ready.wait(1)
+        assert not results[0]["accepted"]
+        assert controller.operation.trigger_count == 0
+    finally:
+        model.stop_direct_trigger_receiver()
+
+
+def test_a_direct_trigger_taken_before_the_withdrawal_is_reported():
+    controller = _Controller()
+    model = LaserModel(controller)
+    operation = model.prepare_pulse_profile(LaserPulseProfile("pulse", 1, 2.5, 5), SOFTWARE, _recipe())
+    model.bind_direct_trigger_nonce("trial-op", "once")
+    results, ready = [], threading.Event()
+    send = _direct_trigger(model, results, ready)
+    try:
+        send()
+        assert ready.wait(1)
+        assert results[0]["accepted"]
+        assert model.withdraw_direct_trigger(operation) is True
+    finally:
+        model.stop_direct_trigger_receiver()

@@ -106,3 +106,34 @@ def test_entries_can_be_cleared(stocked):
     saved = stocked.save_experiment_entries("day3", ())
 
     assert saved.entries == ()
+
+
+def test_recompiling_the_selected_experiment_reselects_its_new_revision(stocked):
+    # The compile overwrote the selected protocol's id with a new revision
+    # but left the selection and schedule on the old one: the sidebar showed
+    # revision N+1 while Record ran revision N (audit prod25-01).
+    stocked.create_experiment("day3", "Day 3")
+    stocked.save_experiment_entries(
+        "day3", (ExperimentSetEntry(set_id="baseline", set_revision=1, repeat=3),))
+    stocked.compile_and_save_experiment("day3")
+    stocked.select_ordered_protocol("day3")
+    stocked.save_experiment_entries(
+        "day3", (ExperimentSetEntry(set_id="baseline", set_revision=1, repeat=1),))
+
+    recompiled = stocked.compile_and_save_experiment("day3")
+
+    assert stocked._selected_ordered_protocol.revision == recompiled.revision
+    assert stocked._trial_protocol_schedule.document.revision == recompiled.revision
+
+
+def test_compiling_is_refused_while_a_session_records(stocked):
+    from tools.acquisition.model.app_model_status import SessionRecordingStatus
+
+    stocked.create_experiment("day3", "Day 3")
+    stocked.save_experiment_entries(
+        "day3", (ExperimentSetEntry(set_id="baseline", set_revision=1),))
+    stocked._recording_session.status = SessionRecordingStatus.RECORDING
+
+    with pytest.raises(RuntimeError):
+        stocked.compile_and_save_experiment("day3")
+    assert stocked._trial_protocol_repository.get("day3") is None

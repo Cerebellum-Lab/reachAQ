@@ -203,6 +203,119 @@ class LiveTrackingReachProvider:
             logger.exception("reach observation could not be recorded")
 
 
+class LiveTrackingPelletPresenceProvider:
+    """Answer the cue gate's pellet question from the most recent pose sample.
+
+    Lives beside the reach provider because both read the same buffer for the
+    same gate. The criterion is the pose response's own ``pellet_seen``.
+    Freshness is not judged here: the cue policy's gate staleness limit already
+    applies to the oldest evidence in the gate. None means unknown, never
+    "absent" and never "present".
+    """
+
+    def __init__(self, live_tracking):
+        self._live_tracking = live_tracking
+
+    def __call__(self):
+        try:
+            sample = self._live_tracking.latest()
+        except Exception as err:
+            logger.warning("live tracking buffer failed: %s", err)
+            return None
+        if sample is None:
+            return None
+        try:
+            return bool(sample.pellet_seen), float(sample.source_perf)
+        except Exception as err:
+            logger.warning("live tracking sample is unusable: %s", err)
+            return None
+
+
+PELLET_PRESENCE_SOURCE_ENV_VAR = "REACHAQ_PELLET_PRESENCE_SOURCE"
+
+
+class PelletPresenceSource(str, enum.Enum):
+    """Which evidence answers the cue gate's "is the pellet there?"."""
+
+    NONE = "none"
+    LIVE_TRACKING = "live_tracking"
+    ROI = "roi"
+
+
+_PRESENCE_ALIASES = {
+    "none": PelletPresenceSource.NONE,
+    "off": PelletPresenceSource.NONE,
+    "live_tracking": PelletPresenceSource.LIVE_TRACKING,
+    "live-tracking": PelletPresenceSource.LIVE_TRACKING,
+    "live": PelletPresenceSource.LIVE_TRACKING,
+    "pose": PelletPresenceSource.LIVE_TRACKING,
+    "live_3d": PelletPresenceSource.LIVE_TRACKING,
+    "roi": PelletPresenceSource.ROI,
+}
+
+
+def pellet_presence_source_from_environment(environ=None) -> PelletPresenceSource:
+    """The configured source; live pose when unset or unusable, with a warning.
+
+    Environment, like the reach state source, until the next configuration
+    version. ``none`` leaves presence unknown, so a cued Tone 2 is skipped.
+    """
+    source_map = os.environ if environ is None else environ
+    raw = (source_map.get(PELLET_PRESENCE_SOURCE_ENV_VAR) or "").strip().lower()
+    if not raw:
+        return PelletPresenceSource.LIVE_TRACKING
+    source = _PRESENCE_ALIASES.get(raw)
+    if source is None:
+        logger.warning("%s=%r is not one of %s; using live tracking",
+                       PELLET_PRESENCE_SOURCE_ENV_VAR, raw,
+                       [item.value for item in PelletPresenceSource])
+        return PelletPresenceSource.LIVE_TRACKING
+    return source
+
+
+class RoiPelletPresenceProvider:
+    """Answer the cue gate's pellet question from a camera's pellet ROI.
+
+    ``states`` returns the ROI states of the cameras that have one; the first
+    is read. Its answer carries the frame's capture time, so the cue policy's
+    staleness limit applies as for pose. None means unknown: no camera with a
+    pellet ROI, no frame judged yet, or a state that fails to read.
+    """
+
+    def __init__(self, states):
+        self._states = states
+        self._warned = False
+
+    def __call__(self):
+        try:
+            states = tuple(state for state in self._states() if state is not None)
+            if not states:
+                if not self._warned:
+                    self._warned = True
+                    logger.warning(
+                        "Pellet presence source is the ROI, but no camera has a "
+                        "pellet ROI (pellet_roi_* params)")
+                return None
+            latest = states[0].latest()
+        except Exception as err:
+            logger.warning("pellet ROI state failed: %s", err)
+            return None
+        if latest is None:
+            return None
+        present, observed_at, _value = latest
+        return bool(present), float(observed_at)
+
+
+def make_pellet_presence_provider(source, *, live_tracking, roi_states):
+    """The cue gate's pellet presence provider for `source`; None for none."""
+    source = PelletPresenceSource(source)
+    if source is PelletPresenceSource.LIVE_TRACKING:
+        return LiveTrackingPelletPresenceProvider(live_tracking)
+    if source is PelletPresenceSource.ROI:
+        return RoiPelletPresenceProvider(roi_states)
+    return None
+
+
 class ReachStateResolver:
     """
     Read reach state from the configured source, or report that it is unknown.
