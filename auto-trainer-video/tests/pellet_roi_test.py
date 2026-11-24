@@ -96,3 +96,46 @@ def test_the_state_crosses_into_a_spawned_process():
 
 def _publish_present(state):
     PelletRoiDetector(ROI, state).process(_frame(150), 3.0)
+
+
+def test_a_lock_left_held_by_a_dead_child_reads_unknown_without_blocking():
+    # A capture child killed while it held the lock left the cue gate, and
+    # the trial executor's lock with it, blocked for good (review I1).
+    import threading
+    import time
+
+    state = _state()
+    state.publish(True, 1.0, 150.0)
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with state._values.get_lock():
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert held.wait(5)
+    started = time.monotonic()
+    try:
+        assert state.latest() is None
+        state.publish(False, 2.0, 10.0)     # dropped, not blocked
+        assert time.monotonic() - started < 1.0
+    finally:
+        release.set()
+        holder.join(5)
+    assert state.latest() == (True, 1.0, 150.0)
+
+
+def test_an_roi_partly_outside_the_frame_is_unknown_not_clipped():
+    state = _state()
+    detector = PelletRoiDetector(
+        PelletRoiConfiguration(x=15, y=15, width=10, height=10, threshold=1), state)
+
+    assert detector.process(_frame(150), 1.0) is None
+    assert state.latest() is None
+
+
+def test_an_roi_too_large_to_read_every_frame_is_refused():
+    with pytest.raises(ValueError, match="pixels"):
+        PelletRoiConfiguration(x=0, y=0, width=1440, height=1080, threshold=1)

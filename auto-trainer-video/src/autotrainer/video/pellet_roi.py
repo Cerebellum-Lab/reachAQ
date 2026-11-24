@@ -29,6 +29,14 @@ logger = logging.getLogger(__name__)
 #: Published states. Unknown until the detector has judged a frame.
 _UNKNOWN, _ABSENT, _PRESENT = -1.0, 0.0, 1.0
 
+#: Largest ROI, in pixels: its mean is taken on every frame, up to 900 Hz.
+MAX_PELLET_ROI_PIXELS = 256 * 256
+#: Bounds on the shared lock. A capture child killed while it held it would
+#: otherwise block the cue gate, and the trial executor's lock with it, for
+#: good: Stop could then not reach the laser.
+_PUBLISH_LOCK_TIMEOUT_S = 0.005
+_READ_LOCK_TIMEOUT_S = 0.05
+
 
 @dataclasses.dataclass(frozen=True)
 class PelletRoiConfiguration:
@@ -56,6 +64,10 @@ class PelletRoiConfiguration:
             raise ValueError("Pellet ROI coordinates cannot be negative")
         if self.width <= 0 or self.height <= 0:
             raise ValueError("Pellet ROI width and height must be positive")
+        if self.width * self.height > MAX_PELLET_ROI_PIXELS:
+            raise ValueError(
+                f"Pellet ROI is {self.width}x{self.height}; at most "
+                f"{MAX_PELLET_ROI_PIXELS} pixels are read per frame")
         object.__setattr__(self, "threshold", float(self.threshold))
         object.__setattr__(self, "hysteresis", float(self.hysteresis))
         if not math.isfinite(self.threshold) or not math.isfinite(self.hysteresis):
@@ -102,15 +114,26 @@ class PelletRoiState:
 
     def publish(self, present: Optional[bool], frame_perf_time: float, value: float) -> None:
         state = _UNKNOWN if present is None else (_PRESENT if present else _ABSENT)
-        with self._values.get_lock():
+        lock = self._values.get_lock()
+        if not lock.acquire(timeout=_PUBLISH_LOCK_TIMEOUT_S):
+            return  # this frame's answer is dropped; the next one is published
+        try:
             self._values[0] = state
             self._values[1] = float(frame_perf_time)
             self._values[2] = float(value)
+        finally:
+            lock.release()
 
     def latest(self) -> Optional[Tuple[bool, float, float]]:
-        """(present, frame perf time, value); None while unknown."""
-        with self._values.get_lock():
+        """(present, frame perf time, value); None while unknown or unreadable."""
+        lock = self._values.get_lock()
+        if not lock.acquire(timeout=_READ_LOCK_TIMEOUT_S):
+            logger.warning("Pellet ROI state is locked; presence is unknown")
+            return None
+        try:
             state, perf, value = self._values[0], self._values[1], self._values[2]
+        finally:
+            lock.release()
         if state == _UNKNOWN or not math.isfinite(perf):
             return None
         return state == _PRESENT, perf, value
@@ -129,10 +152,14 @@ class PelletRoiDetector:
         roi = self.configuration
         array = numpy.asarray(frame)
         if array.ndim == 3:
+            # The cameras are monochrome; a colour frame's first channel.
             array = array[:, :, 0]
+        if roi.y + roi.height > array.shape[0] or roi.x + roi.width > array.shape[1]:
+            # Not clipped: a smaller rectangle is not the one calibrated.
+            raise ValueError(
+                f"The pellet ROI ({roi.x}, {roi.y}, {roi.width}x{roi.height}) does not "
+                f"fit the {array.shape[1]}x{array.shape[0]} frame")
         array = array[roi.y:roi.y + roi.height, roi.x:roi.x + roi.width]
-        if array.size == 0:
-            raise ValueError("The pellet ROI lies outside the frame")
         return float(array.mean())
 
     def process(self, frame, frame_perf_time: float) -> Optional[bool]:
