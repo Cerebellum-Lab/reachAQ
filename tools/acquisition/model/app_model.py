@@ -6971,6 +6971,12 @@ class AppModel(ObservableObject):
         return controller
 
     def _move_protocol_motor_target(self, target) -> None:
+        # All three axes or none: a refusal after x was set would leave a mixed position.
+        if self._hardware.refuse_xyz_outside_travel(tuple(target)):
+            raise RuntimeError(
+                f"Pellet target {tuple(round(float(v), 3) for v in target)} lies outside the "
+                "configured travel; no axis was moved"
+            )
         self._protocol_positioning_active = True
         try:
             for axis, value in zip("xyz", target):
@@ -11064,6 +11070,11 @@ class AppModel(ObservableObject):
         hardware = self._hardware
         if not hardware.connected:
             logger.notice("Not setting animal base positions on hardware given not connected (yet?)")
+        elif hardware.refuse_xyz_outside_travel(xyz):
+            # All three axes or none: setting the others would present at a mix of this
+            # animal's position and the previous one.
+            logger.error("Not sending %s's pellet position %s: it lies outside the configured travel",
+                         animal.name, xyz.humanize(n_digits=3))
         else:
             hardware.set_x(xyz.x)
             hardware.set_y(xyz.y)

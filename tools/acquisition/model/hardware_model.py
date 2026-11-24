@@ -414,6 +414,18 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         return (getattr(config, "minimum_position", None) is not None
                 or getattr(config, "maximum_position", None) is not None)
 
+    def refuse_xyz_outside_travel(self, xyz) -> bool:
+        """True, after logging an error per axis, when an absolute SET of `xyz` (motor mm)
+        would be refused on any axis: the caller then sets none of them, so the stage is never
+        left with some axes at the new position and the others at the previous one. The SET's
+        clamp to 0 applies first, as in _set_axis."""
+        refused = False
+        for coord_idx, value in enumerate(xyz):
+            target = 0 if value < 0 else value
+            if self._refuse_outside_travel(coord_idx, target):
+                refused = True
+        return refused
+
     def _set_axis(self, value: float, *, absolute: bool = True,
                   system_set_cmd: SystemCommandKind, coord_idx: int, sender: str="NA") -> Optional[UUID]:
         coord = "xyz"[coord_idx]

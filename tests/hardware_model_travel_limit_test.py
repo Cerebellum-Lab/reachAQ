@@ -119,6 +119,18 @@ def test_predefined_send_to_an_unknown_send_position_is_refused_with_travel(capl
     assert hardware.send_pellet() is mock.sentinel.token
 
 
+def test_an_xyz_outside_the_travel_is_refused_whole_before_any_set(caplog):
+    hardware = _hardware(TRAVEL)
+    with caplog.at_level(logging.ERROR):
+        assert hardware.refuse_xyz_outside_travel(Offset3DTuple(5.0, 36.2, 40.0)) is True
+    assert "Axis-Y: move to 36.200 refused" in caplog.text
+    assert "Axis-Z: move to 40.000 refused" in caplog.text
+    hardware._send_with_token.assert_not_called()
+    # The SET's clamp to 0 applies: -2 is a SET of 0, inside the travel.
+    assert hardware.refuse_xyz_outside_travel(Offset3DTuple(-2.0, 35.0, 0.0)) is False
+    assert _hardware(None).refuse_xyz_outside_travel(Offset3DTuple(99.0, 99.0, 99.0)) is False
+
+
 def test_a_clamped_set_still_below_a_positive_min_is_refused(caplog):
     hardware = _hardware({"x": {"min_pos": 2.5, "max_pos": 35}})
     with caplog.at_level(logging.ERROR):
