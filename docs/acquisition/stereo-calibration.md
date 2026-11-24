@@ -323,13 +323,39 @@ A corner whose detections disagree by more than 1 px is dropped, not the view.
 The board's corner order is fixed by the markers, so no camera's corners are
 ever reversed. Only the `subpix` corner refinement applies.
 
-**Printing it.** Generate the image with
-`board.generateImage((w, h), marginSize=0, borderBits=1)` (OpenCV 4.11, legacy
-pattern off) at a size proportional to 9 x 7, and print it at **100 %**, with
-any "fit to page" or scaling turned off. Measure a run of squares with calipers
-after printing: 9 squares must be 36.0 mm. The fit measures the motor scale
-against the board's squares, so a board printed 1 % large reads as a 1 % motor
-scale error (`motor_scale_dev`). Mount it flat on a rigid backing.
+**Making and printing a board.** A replacement board must be identical to the
+rig's: `cv2.aruco.CharucoBoard((9, 7), 4.0, 3.0, DICT_4X4_50)`, drawn by
+`generateImage((w, h), marginSize=0, borderBits=1)` with the legacy pattern off
+(the OpenCV 4.11 default, which `BoardSpec.charuco_board()` also sets
+explicitly): 9 x 7 squares of 4.0 mm, 36 x 28 mm overall, the top-left square
+black, a 3.0 mm marker (4 x 4 bits plus a 1-bit border) in each white square,
+markers 0 to 30. Generate it with the tool rather than by hand, from the
+reachAQ environment at the repository root:
+
+```bash
+python -m reachaq.calibration.make_charuco_board ~/charuco_board
+# or, for the board a library's settings.yaml names:
+python -m reachaq.calibration.make_charuco_board ~/charuco_board --library ~/reachAQ/calibrations
+```
+
+It writes `charuco_9x7_4mm_3mm_DICT_4X4_50_2400dpi.png`, one board at 2400 dpi
+(3402 x 2646 px), and `charuco_9x7_4mm_3mm_DICT_4X4_50_letter.pdf`, a US-letter
+page at 1200 dpi with 24 boards in a 4 x 6 grid, 8 mm apart with dashed cut
+lines midway, the spec on a header line, and a 50 mm ruler with 1 mm ticks. The
+page is black and white only, stored losslessly, so the marker edges stay sharp.
+
+1. Print the PDF at **100 % / Actual size**. Turn off "fit to page", "shrink
+   to fit" and any scaling in the print dialog. Use **matte** paper: a gloss
+   finish throws specular highlights that hide markers.
+2. Before cutting, measure the **50 mm ruler** with calipers. It must read
+   50.0 mm (within about 0.1 mm); if not, the printer scaled the page, so fix
+   the print settings and print again. Then check one board: 9 squares across
+   must measure 36.0 mm.
+3. Cut out the best-printed board along the dashed lines, leaving the white
+   margin, and mount it flat on a rigid backing.
+
+The fit measures the motor scale against the board's squares, so a board
+printed 1 % large reads as a 1 % motor scale error (`motor_scale_dev`).
 
 The report gives one line per camera with a ChArUco board, `views used N of M
 waypoints, median K corners per view`, so partial coverage is visible; the
