@@ -78,6 +78,13 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     # Per axis x, y, z: the token of the latest SET queued, so a refusal of an older SET does
     # not roll back a newer one (_forget_refused_set).
     _latest_set_tokens: Tuple[Optional[UUID], Optional[UUID], Optional[UUID]] = (None, None, None)
+    # After a refused base position (block_presentation): the axes not SET since, and why.
+    # send_pellet is refused until none is left.
+    _presentation_blocked_axes: frozenset = frozenset()
+    _presentation_block_reason: str = ""
+    # SETs that only move the stage for a while, or shift it from where it is: they do not
+    # stand in for the refused base position.
+    _SENDERS_NOT_CLEARING_THE_BLOCK = frozenset({"ordered_protocol", "processed_shift_xyz"})
 
     DEVICE_ACK_TIMEOUT_ENGAGED = "device_ack_timeout_engaged"
     DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED = "device_pellet_status_timeout_engaged"
@@ -430,6 +437,17 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 refused = True
         return refused
 
+    def block_presentation(self, reason: str) -> None:
+        """Refuse send_pellet, logging `reason`, until each of x, y and z has been SET again,
+        by anything but a protocol target or the intersession shift. Called after the
+        animal's base position was refused, so the previous animal's position is not used."""
+        self._presentation_blocked_axes = frozenset(range(3))
+        self._presentation_block_reason = str(reason)
+
+    @property
+    def presentation_blocked(self) -> bool:
+        return bool(self._presentation_blocked_axes)
+
     def _set_axis(self, value: float, *, absolute: bool = True,
                   system_set_cmd: SystemCommandKind, coord_idx: int, sender: str="NA") -> Optional[UUID]:
         coord = "xyz"[coord_idx]
@@ -464,6 +482,10 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             tokens = list(self._latest_set_tokens)
             tokens[coord_idx] = res
             self._latest_set_tokens = tuple(tokens)
+            if sender not in self._SENDERS_NOT_CLEARING_THE_BLOCK and coord_idx in self._presentation_blocked_axes:
+                self._presentation_blocked_axes = self._presentation_blocked_axes - {coord_idx}
+                if not self._presentation_blocked_axes:
+                    logger.notice("Pellet presentation allowed again: x, y and z have been SET")
             self._last_requested_set_coordinates = self._last_requested_set_coordinates.replace(**{coord: new_value})
             self._on_property_changed(f"set_{coord}", new_value, prev_value)
         return res
@@ -596,6 +618,9 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             data["embedded_tone"] = embedded_tone
         if pre_reveal_stimulus is not None:
             data["pre_reveal_stimulus"] = pre_reveal_stimulus
+        if self._presentation_blocked_axes:
+            logger.error("Pellet presentation refused: %s", self._presentation_block_reason)
+            return None
         if self._refuse_sequence_outside_travel("send_pellet"):
             return None
         return self._send_with_token(

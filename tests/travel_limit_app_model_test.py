@@ -36,6 +36,7 @@ def _app_model(hardware):
         _behavior=SimpleNamespace(algorithm=SimpleNamespace(diamond_triangle_config=None)),
         _dcs_held_off=False,
         _protocol_positioning_active=False,
+        on_error=mock.Mock(),
     )
 
 
@@ -75,3 +76,41 @@ def test_a_protocol_target_inside_the_travel_sets_and_acks_every_axis():
     AppModel._move_protocol_motor_target(_app_model(hardware), Offset3DTuple(5.0, 35.0, 7.0))
     assert hardware._send_with_token.call_count == 3
     assert hardware.wait_pending_command_acked.call_count == 3
+
+
+def test_a_refused_base_position_blocks_presentation_and_tells_the_operator(caplog):
+    hardware = _hardware()
+    app_model = _app_model(hardware)
+    AppModel._set_animal_base_positions(app_model, _animal(5.0, 36.2, 7.0))
+
+    (title, message), _ = app_model.on_error.call_args
+    assert "refused" in title.lower()
+    assert "m1" in message and "outside the configured travel" in message
+    with caplog.at_level(logging.ERROR):
+        assert hardware.send_pellet() is None
+    hardware._send_with_token.assert_not_called()
+    assert "Pellet presentation refused" in caplog.text
+    assert "m1" in caplog.text
+
+
+def test_an_accepted_base_position_clears_the_block():
+    hardware = _hardware()
+    app_model = _app_model(hardware)
+    AppModel._set_animal_base_positions(app_model, _animal(5.0, 36.2, 7.0))
+    AppModel._set_animal_base_positions(app_model, _animal(5.0, 30.0, 7.0))
+    hardware._send_with_token.reset_mock()
+    assert hardware.send_pellet() is mock.sentinel.token
+
+
+def test_the_operator_setting_every_axis_clears_the_block_and_a_protocol_target_does_not():
+    hardware = _hardware()
+    app_model = _app_model(hardware)
+    AppModel._set_animal_base_positions(app_model, _animal(5.0, 36.2, 7.0))
+    AppModel._move_protocol_motor_target(app_model, Offset3DTuple(5.0, 30.0, 7.0))
+    assert hardware.send_pellet() is None
+    hardware.set_x(5.0, sender="UI-Set-Button")
+    hardware.set_y(30.0, sender="UI-Set-Button")
+    assert hardware.send_pellet() is None  # z not set yet
+    hardware.set_z(7.0, sender="UI-Set-Button")
+    hardware._send_with_token.reset_mock()
+    assert hardware.send_pellet() is mock.sentinel.token

@@ -11072,9 +11072,19 @@ class AppModel(ObservableObject):
             logger.notice("Not setting animal base positions on hardware given not connected (yet?)")
         elif hardware.refuse_xyz_outside_travel(xyz):
             # All three axes or none: setting the others would present at a mix of this
-            # animal's position and the previous one.
+            # animal's position and the previous one. The previous animal's position stays
+            # SET, so presentation is blocked until x, y and z are SET again.
             logger.error("Not sending %s's pellet position %s: it lies outside the configured travel",
                          animal.name, xyz.humanize(n_digits=3))
+            hardware.block_presentation(
+                f"{animal.name}'s pellet position {xyz.humanize(n_digits=3)} lies outside the "
+                "configured travel; set X, Y and Z, or select an animal whose position is inside it")
+            self.on_error(
+                "Pellet position refused",
+                f"{animal.name}'s pellet position {xyz.humanize(n_digits=3)} (motor mm) lies outside "
+                "the configured travel (min_pos / max_pos in motor_config.yaml), so it was not sent. "
+                "No pellet is presented until a position inside the travel is set: set X, Y and Z "
+                "in Hardware Control, or select an animal whose position is inside the travel.")
         else:
             hardware.set_x(xyz.x)
             hardware.set_y(xyz.y)
