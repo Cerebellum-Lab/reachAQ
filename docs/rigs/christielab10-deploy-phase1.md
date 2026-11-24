@@ -432,6 +432,12 @@ are already in place, hence `REACHAQ_INSTALL_SYSTEM=0`):
    `launcher.conf`, and replaces the installed SoftMouse unit (kept as
    `reachaq-softmouse-publisher.service.bak`; its drop-in stays). It must end with no
    FAIL; it is safe to rerun.
+   It stops at the first failed step and names it. Besides the steps above it now
+   checks the platform list (Ubuntu 22.04, driver 570.26+; `REACHAQ_INSTALL_UNSUPPORTED=1`
+   overrides), that the installed Spinnaker SDK and binding are 3.2, and that the
+   environment carries one CUDA runtime per engine. A stop after the migration leaves
+   `~/reachAQ` in place with the `auto-trainer*` distributions possibly still installed;
+   fix the cause and rerun, and the migration then reports nothing to migrate.
 7. Check:
    - only `~/reachAQ` exists;
    - `grep -c Autotrainer ~/.config/reachaq/launcher.conf` gives 0;

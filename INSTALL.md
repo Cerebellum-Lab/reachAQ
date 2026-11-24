@@ -131,7 +131,8 @@ Pull the new checkout with `reachaq-sync`, then run the installer once:
 ./tools/install/reachaq-linux-install.sh
 ```
 
-Before anything else it runs `reachaq-migrate-settings`, which
+Right after the platform and checkout checks, before anything is installed, it
+runs `reachaq-migrate-settings`, which
 
 - renames `~/Autotrainer` to `~/reachAQ` (one filesystem, so nothing is copied);
 - rewrites the old directory in the live yaml files there (DeepLabCut project

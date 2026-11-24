@@ -167,7 +167,11 @@ def test_portable_installer_upgrades_a_v3_install():
     # Before anything is installed into the environment, so no old finder or script survives it.
     uninstall = source.index('run_step "Uninstall v3 auto-trainer distributions" uninstall_v3_distributions')
     assert uninstall < source.index('run_step "Install PyTorch pose engine" install_torch_engine')
-    assert 'run_step "Refresh installed SoftMouse units" refresh_installed_user_units' in source
+    # Right after the package the units start: a later stop must not leave a
+    # unit naming a v3 module.
+    refresh = source.index('run_step "Refresh installed SoftMouse units" refresh_installed_user_units')
+    editable = source.index('run_step "Install reachAQ editable package" install_editable_package')
+    assert editable < refresh < source.index('run_step "Restore $name pose plugin"')
 
 
 def test_portable_installer_archives_an_environment_on_another_python():

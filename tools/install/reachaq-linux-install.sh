@@ -956,6 +956,10 @@ run_step "Uninstall v3 auto-trainer distributions" uninstall_v3_distributions
 run_step "Install PyTorch pose engine" install_torch_engine
 run_step "Install Python requirements" install_python_requirements
 run_step "Install reachAQ editable package" install_editable_package
+# Right after the package that the units start, not at the end: any later
+# stop would otherwise leave an installed unit naming a v3 module that no
+# longer exists, and the nightly publish failing until a rerun got that far.
+run_step "Refresh installed SoftMouse units" refresh_installed_user_units
 # No plugin is installed by default; only those the environment had. The
 # DeepLabCut plugin brings the TensorFlow engine, its CUDA runtime and the
 # both-engines check as steps of their own.
@@ -1002,7 +1006,6 @@ run_step "Verify RFID runtime" verify_rfid_runtime
 run_step "Verify GUI CLI" conda_run python -m reachaq.app -h
 run_step "Verify headless CLI" conda_run reachaq-headless -h
 run_step "Verify SoftMouse systemd units" verify_softmouse_systemd_units
-run_step "Refresh installed SoftMouse units" refresh_installed_user_units
 run_step "Run focused non-hardware tests" run_focused_tests
 
 print_report
