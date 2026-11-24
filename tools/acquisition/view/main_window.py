@@ -1289,6 +1289,7 @@ class MainWindow(QMainWindow):
         self._open_dialogs = []
         for dialog in dialogs:
             dialog.close()
+        self._close_finishing = True
         super().close()
 
     def _confirm_close_with_session(self) -> bool:
@@ -1367,7 +1368,13 @@ class MainWindow(QMainWindow):
             event = self._close_event
             if self._closing:
                 if event is not None:
-                    event.accept()
+                    # Only the close _finish_close makes is accepted: one
+                    # made while the close thread still saves a session would
+                    # take the window, and its error dialogs, away early.
+                    if getattr(self, "_close_finishing", False):
+                        event.accept()
+                    else:
+                        event.ignore()
                     self._close_event = None
                 else:
                     logger.warning("already closing")

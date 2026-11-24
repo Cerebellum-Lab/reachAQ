@@ -167,3 +167,20 @@ def test_an_abort_in_progress_is_waited_for(box):
 
     assert MainWindow._confirm_close_with_session(window) is True
     assert "being aborted" in box.shown[-1]._text
+
+
+def test_a_second_close_while_saving_keeps_the_window_until_the_close_finishes(box):
+    window = _window(SessionRecordingStatus.RECORDING)
+    window._app_model.app_lock = mock.MagicMock()
+    window._closing = True
+    early, final = mock.Mock(), mock.Mock()
+
+    window._close_event = early
+    MainWindow.close(window)
+    window._close_finishing = True
+    window._close_event = final
+    MainWindow.close(window)
+
+    early.ignore.assert_called_once_with()
+    early.accept.assert_not_called()
+    final.accept.assert_called_once_with()
