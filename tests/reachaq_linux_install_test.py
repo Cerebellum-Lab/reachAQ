@@ -78,6 +78,23 @@ def test_portable_installer_builds_python_310_with_both_pose_engines():
     assert 'run_step "Install Spinnaker Python binding" install_spinnaker_binding' in source
 
 
+def test_generic_import_check_names_only_modules_in_the_checkout():
+    """After the 1.4 rename it still imported reachAQ and checked tools, which
+    no longer exist, so every install stopped at Verify generic imports."""
+    source = INSTALL_SCRIPT.read_text()
+    block = source[source.index("verify_imports() {"):]
+    block = block[:block.index("\nPY\n")]
+    imported = re.findall(r"^import (reachaq(?:\.\w+)+)$", block, re.M)
+    assert imported, "no reachaq imports found"
+    for name in imported:
+        package = REPO_ROOT / "src" / Path(*name.split("."))
+        assert package.is_dir() or package.with_suffix(".py").is_file(), name
+    assert not re.search(r"^import (reachAQ|tools)\b", block, re.M)
+    checked = re.search(r"for module in \(([^)]*)\):", block).group(1)
+    for name in (part.strip() for part in checked.split(",")):
+        assert name == "*plugins" or name in imported, name
+
+
 def test_portable_installer_upgrades_a_v3_install():
     source = INSTALL_SCRIPT.read_text()
 

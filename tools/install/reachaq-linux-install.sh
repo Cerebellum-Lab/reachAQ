@@ -499,14 +499,13 @@ import torch
 import reachaq.core
 import reachaq.device
 import reachaq.video
-import reachAQ
 import reachaq.app
 
 plugins = [importlib.import_module(f"reachaq.pose_plugins.{name}.plugin")
            for name in sys.argv[2:]]
 
 repository = Path(sys.argv[1]).resolve()
-for module in (reachaq.core, reachaq.device, reachaq.video, reachAQ, tools, *plugins):
+for module in (reachaq.core, reachaq.device, reachaq.video, reachaq.app, *plugins):
     module_file = getattr(module, "__file__", None)
     locations = [Path(module_file).resolve()] if module_file else [
         Path(value).resolve() for value in module.__path__ if Path(value).exists()
