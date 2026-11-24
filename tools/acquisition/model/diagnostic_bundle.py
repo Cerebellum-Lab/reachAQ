@@ -47,7 +47,11 @@ SECRET_FIELD_PATTERN = (
 _FIELD_RE = re.compile(
     r"(?P<lead>(?:^|[\s,{(\"'?&;\\])(?:[\w.\-/]*?)(?:" + SECRET_FIELD_PATTERN + r")[\w.\-]*(?:\\?[\"'])?)"
     r"(?P<sep>\s*[:=]\s*)"
-    r"(?P<value>\\\"[^\"\\]*\\\"|\"[^\"]*\"|'[^']*'|[^\s,;&}\])\\]+)",
+    # An unquoted value ends at a separator. "&" ends it only before the next
+    # query parameter and "\" only before an escaped quote, so a secret that
+    # contains either is not cut short.
+    r"(?P<value>\\\"(?:[^\"\\]|\\(?!\"))*\\\"|\"(?:[^\"\\]|\\.)*\"|'[^']*'"
+    r"|(?:[^\s,;&}\])\\]|&(?!\w+=)|\\(?!\"))+)",
     re.IGNORECASE,
 )
 # Every cookie on a Cookie or Set-Cookie line, whatever its name.

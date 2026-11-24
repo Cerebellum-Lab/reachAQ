@@ -160,6 +160,9 @@ def test_a_secret_that_escapes_redaction_fails_the_export(rig, monkeypatch):
     ("Cookie: a=1; sessionid=zzz", f"Cookie: {REDACTED}"),
     ('{\\"password\\": \\"x1\\"}', '{\\"password\\": \\"' + REDACTED + '\\"}'),
     ("Authorization: Bearer abcdefghijklmnop", f"Authorization: {REDACTED} {REDACTED}"),
+    ("password=ab\\cd done", f"password={REDACTED} done"),
+    ("password=p&ss done", f"password={REDACTED} done"),
+    ('"password": "a\\"b" done', f'"password": "{REDACTED}" done'),
 ])
 
 def test_redact_text(line, expected):

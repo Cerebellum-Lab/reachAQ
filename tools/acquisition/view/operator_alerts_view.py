@@ -434,6 +434,8 @@ class OperatorAlertsUi:
                         f"exit {completed.returncode}")
                     raise RuntimeError(error)
             except Exception as error:
+                # A child killed by the timeout leaves its partial file behind.
+                path.with_name(path.name + ".partial").unlink(missing_ok=True)
                 logger.warning("Diagnostic bundle failed: %s", error)
                 self._relay.export_finished.emit(None, str(error) or type(error).__name__)
             else:
