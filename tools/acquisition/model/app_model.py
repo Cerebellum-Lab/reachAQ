@@ -9751,6 +9751,33 @@ class AppModel(ObservableObject):
             self._session_invariant_unknown = False
             self._start_count += 1
             is_first_start = self._start_count == 1
+        try:
+            return self._capture_start_begun(
+                target_status=target_status,
+                wait_connected=wait_connected,
+                hardware_init_started=hardware_init_started,
+                previous_internal_error=previous_internal_error,
+            )
+        except BaseException:
+            # The start flag is cleared only by mark_started or a stop; left
+            # set, Run and Stop both refused for the rest of the run and
+            # whatever had opened stayed open. Tear down what started.
+            logger.exception("Acquisition start failed; stopping what it started")
+            try:
+                self.capture_stop(force=True)
+            except Exception:
+                logger.exception("Stopping a failed acquisition start also failed")
+            raise
+
+    def _capture_start_begun(
+        self,
+        *,
+        target_status: AppModelStatus,
+        wait_connected: bool,
+        hardware_init_started: float,
+        previous_internal_error,
+    ) -> bool:
+        """The rest of capture_start, once its start flag is set."""
         if previous_internal_error is not None:
             self._on_property_changed(
                 self.Props.INTERNAL_ERROR_DIAGNOSTIC,

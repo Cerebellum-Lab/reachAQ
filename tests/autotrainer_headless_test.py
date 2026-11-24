@@ -1981,6 +1981,36 @@ def test_hardware_start_failure_performs_can_safety_shutdown(
     assert app_model._acquisition.starting is False
 
 
+def test_a_start_that_raises_tears_down_and_can_run_again(
+    app_model,
+    monkeypatch,
+):
+    # An unwritable output path made the start-up metadata save raise after
+    # the hardware had opened. The start flag stayed set: Run said
+    # "already starting" and Stop did nothing until a restart.
+    assert app_model.load_configuration() is True
+    save = app_model._save_project_metadata
+    failure = FileNotFoundError("output drive unwritable")
+    monkeypatch.setattr(app_model, "_save_project_metadata", mock.Mock(side_effect=failure))
+    capture_stop = mock.Mock(wraps=app_model._capture_stop)
+    monkeypatch.setattr(app_model, "_capture_stop", capture_stop)
+
+    with pytest.raises(FileNotFoundError):
+        app_model.capture_start()
+
+    assert capture_stop.called
+    assert app_model._acquisition.starting is False
+    assert app_model.acquisition_started is False
+    assert app_model.status is AppModelStatus.IDLE
+
+    monkeypatch.setattr(app_model, "_save_project_metadata", save)
+    try:
+        assert app_model.capture_start() is True
+        assert app_model.acquisition_started is True
+    finally:
+        app_model.capture_stop()
+
+
 def test_periodic_command_producers_stop_without_touching_can():
     events = []
     app_model = object.__new__(AppModel)
