@@ -105,7 +105,7 @@ def _make_separator():
 
 
 def _make_window_title(prefs):
-    return f"{prefs.serial_number} - Auto Trainer - Acquisition v{app_version}"
+    return f"{prefs.serial_number} - reachAQ - Acquisition v{app_version}"
 
 
 def _allow_bidirectional_window_resizing(window: QMainWindow) -> None:

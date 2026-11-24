@@ -42,7 +42,7 @@ def make_reachaq_parser(
     default_start_mode: AppModelStatus = AppModelStatus.IDLE,
 ):
     parser = argparse.ArgumentParser(
-        prog="Autotrainer",
+        prog="reachaq",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("-c", "--configuration", help="configuration file", default=None, type=Path)

@@ -16,7 +16,7 @@ class DebugView(QDialog):
     
     def __init__(self, main_window):
         super().__init__()
-        self.setWindowTitle("AutoTrainer Debug View")
+        self.setWindowTitle("reachAQ Debug View")
         self._main_window = main_window
         layout = QVBoxLayout()
         vlayout = QHBoxLayout()

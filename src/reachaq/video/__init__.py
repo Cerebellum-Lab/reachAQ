@@ -1,4 +1,4 @@
-"""AutoTrainer Video"""
+"""reachAQ video library"""
 
 from .video_capture import VideoCapture, CaptureCommandKind
 from .video_capture import CaptureAttrs, CaptureCameraAttrs, CaptureInferenceAttrs
