@@ -247,17 +247,24 @@ class ShiftXYZHandler(ObservableObject):
             self.last_shift_xyz = trial_shift
         # The shift is applied first: a refused one (outside the configured travel) is not
         # recorded as applied, and its tongue-eaten y-limit is not committed to the animal.
+        # The pending limit is taken first, so a handler that raises cannot leave it for the
+        # next shift to commit; that shift is posted as not applied, then the error re-raised.
+        new_y_limit = self._new_shift_y_limit
+        self._new_shift_y_limit = None
         refusal = None
+        error = None
         if processed_shift is not None:
             func = self._processed_shift_handler
             if func is None:
                 logger.debug("handle_processed_shift_func undefined")
             else:
                 func: ProcessedShiftXYZCallbackHandler
-                result = func(project, processed_shift)
+                try:
+                    result = func(project, processed_shift)
+                except Exception as exc:
+                    error = exc
+                    result = f"{type(exc).__name__}: {exc}"
                 refusal = result if isinstance(result, str) else None
-        new_y_limit = self._new_shift_y_limit
-        self._new_shift_y_limit = None
         if new_y_limit is not None:
             if refusal is None:
                 logger.notice("Setting new pellet_shift_y_limit: %s", new_y_limit)
@@ -279,6 +286,8 @@ class ShiftXYZHandler(ObservableObject):
                     refusal=refusal,
                 )
             )
+        if error is not None:
+            raise error
 
 
 class ShiftRecommendationController(ShiftXYZHandler):

@@ -5,6 +5,8 @@ import math
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from autotrainer.behavior import SystemMachine, PelletDeviceProtocol
 from autotrainer.core import Offset3DTuple
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
@@ -101,3 +103,31 @@ def test_after_a_refused_shift_a_later_shift_inside_the_travel_is_applied():
     assert algo.pellet_shift_y_limit == 20.0 + tongue_shift.y
     data = post.call_args.kwargs["data"]
     assert data["applied"] is True and data["refusal"] is None
+
+
+def test_a_raising_shift_handler_posts_not_applied_and_leaves_no_pending_y_limit():
+    """N-13: a relative SET on an unknown base raises (no travel needed). The shift is posted as
+    not applied, with the error, and its tongue-eaten y-limit is dropped, not committed by
+    the next shift."""
+    handler, algo, applied = _handler([None])
+    calls = {"n": 0}
+    inner = handler._processed_shift_handler
+
+    def processed(project, shift):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("Cannot SET axis with relative value")
+        return inner(project, shift)
+
+    handler.set_processed_handler(processed)
+    with mock.patch("autotrainer.behavior.pellet_shift.post_api_event_content") as post:
+        with pytest.raises(ValueError):
+            handler.put_intersession_response(_project(34.8), _tongue_eaten())
+        data = post.call_args.kwargs["data"]
+        assert data["applied"] is False and "Cannot SET axis" in data["refusal"]
+        assert algo.pellet_shift_y_limit is None
+        assert all(map(math.isnan, handler.last_processed_shift_xyz))
+
+        handler.put_intersession_response(_project(20.0), _tongue_eaten())
+    tongue_shift = ShiftXYZHandlerConfig().tongue_eaten_shift
+    assert algo.pellet_shift_y_limit == 20.0 + tongue_shift.y  # not the failed shift's 35.3
