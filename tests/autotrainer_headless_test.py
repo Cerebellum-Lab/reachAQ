@@ -2011,6 +2011,27 @@ def test_a_start_that_raises_tears_down_and_can_run_again(
         app_model.capture_stop()
 
 
+def test_a_failure_after_the_start_completed_leaves_acquisition_running(
+    app_model,
+    monkeypatch,
+):
+    assert app_model.load_configuration() is True
+    monkeypatch.setattr(
+        app_model, "_log_acquisition_startup_summary",
+        mock.Mock(side_effect=RuntimeError("summary failed")),
+    )
+    capture_stop = mock.Mock(wraps=app_model.capture_stop)
+    monkeypatch.setattr(app_model, "capture_stop", capture_stop)
+    try:
+        with pytest.raises(RuntimeError, match="summary failed"):
+            app_model.capture_start()
+
+        capture_stop.assert_not_called()
+        assert app_model.acquisition_started is True
+    finally:
+        app_model.capture_stop()
+
+
 def test_a_camera_brought_back_by_retry_is_supervised_again(
     app_model, system_config, trainer_config_dir,
 ):

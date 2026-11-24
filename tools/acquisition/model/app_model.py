@@ -9792,12 +9792,15 @@ class AppModel(ObservableObject):
         except BaseException:
             # The start flag is cleared only by mark_started or a stop; left
             # set, Run and Stop both refused for the rest of the run and
-            # whatever had opened stayed open. Tear down what started.
-            logger.exception("Acquisition start failed; stopping what it started")
-            try:
-                self.capture_stop(force=True)
-            except Exception:
-                logger.exception("Stopping a failed acquisition start also failed")
+            # whatever had opened stayed open. Tear down what started. Once
+            # marked started, Stop works and what failed was a notification
+            # after it: acquisition stays running, as before.
+            if not self._acquisition.started:
+                logger.exception("Acquisition start failed; stopping what it started")
+                try:
+                    self.capture_stop(force=True)
+                except Exception:
+                    logger.exception("Stopping a failed acquisition start also failed")
             raise
 
     def _capture_start_begun(
@@ -12829,6 +12832,12 @@ class AppModel(ObservableObject):
         ):
             out = {**previous, "notes": self.notes or ""}
         else:
+            if notes_only and session is not None:
+                logger.warning(
+                    "No published document for %s; its notes save rebuilds it "
+                    "from the current state",
+                    project.short_id,
+                )
             out = self._metadata_document(project, when, file_name, session)
         if session is not None:
             self._session_metadata_document = out
