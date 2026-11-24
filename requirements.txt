@@ -1,7 +1,6 @@
 # Local development/runtime install for reachAQ.
 #
-# Runtime dependencies are declared in pyproject.toml and the embedded
-# reachaq subproject pyproject files. Installing the local package pulls
+# Runtime dependencies are declared in pyproject.toml. Installing the local package pulls
 # all portable application dependencies, including the PySide6 6.6.x cap,
 # Requests/OpenPyXL/keyring for SoftMouse, and pyserial for the RFID reader.
 # Linux keyring/Qt system libraries and serial permissions are installed by

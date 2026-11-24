@@ -219,9 +219,8 @@ if find_spec("ultralytics") is not None:
 '
 }
 
-# The lines of one optional-dependencies extra of a pyproject.toml. setup.py
-# merges only base dependencies, so the pins are read from where they are
-# declared rather than copied here.
+# The lines of one optional-dependencies extra of a pyproject.toml. The pins
+# are read from where they are declared rather than copied here.
 pyproject_extra() {
     conda_run python - "$1" "$2" <<'PY'
 import sys

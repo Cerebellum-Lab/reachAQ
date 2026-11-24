@@ -18,8 +18,7 @@ requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
 
-    # The installed application; reachaq is folded into it by
-    # its setup.py and is never installed on its own.
+    # The installed application.
     "reachaq",
 
     'deeplabcut >= 3.0, < 4',  # famous deeplab; 3.x carries both engines

@@ -395,3 +395,28 @@ After the new build has run a study:
 Keep the live DLC model's dataset directory (the path in its `test/pose_cfg.yaml`) and
 `~/reachaq_probe` (see the rig clean-up keep list). `~/p1val` was already removed on
 2026-11-19.
+
+## Addendum: the v4 rename
+
+This runbook describes the v3.1 deploy and is kept as it was. Deploying v4 on
+christielab10 is: reachAQ closed, `reachaq-sync`, then the installer, which
+does the settings move before anything else (see "Upgrading from v3" in
+[INSTALL.md](../../INSTALL.md)).
+
+A dry run against the rig's own settings on 2026-11-23
+(`python3 - --dry-run < src/reachaq/core/settings_migration.py` over ssh, which
+writes nothing) planned:
+
+- the rename `~/Autotrainer` -> `~/reachAQ`;
+- 6 rewrites: `demo/demo_sources.yaml`, the mouseGYM DeepLabCut `config.yaml` and
+  its `dlc-models-pytorch/.../train/pytorch_config.yaml`, and the three versioned
+  `system_configuration_v5x_*.yaml` snapshots;
+- 1 copy: `~/.config/Colorado/Auto Trainer.conf` -> `~/.config/reachAQ/reachAQ.conf`.
+
+The JetNet1 project names `/home/agx004/Autotrainer` (another machine) and is
+left alone. The installed `reachaq-softmouse-publisher.service` runs
+`python -m tools.acquisition.model.animal_sources.cli` and is replaced (its
+drop-in stays). `~/Documents/rawdatalocal` holds 2026 sessions only, so
+`reachaq-convert-pose-h5` is not needed there.
+
+Rollback: `reachaq-migrate-settings --reverse`, then the v3.2.2 checkout (the last v3 release) and its installer.

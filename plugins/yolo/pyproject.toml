@@ -20,8 +20,7 @@ requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
 
-    # The installed application; reachaq is folded into it by
-    # its setup.py and is never installed on its own.
+    # The installed application.
     "reachaq",
 
     'ultralytics >= 8.4, < 9',  # AGPL-3.0; brings torch

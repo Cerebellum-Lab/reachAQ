@@ -1,4 +1,4 @@
-# Autotrainer / reachAQ
+# reachAQ
 
 
 * [Overview](#overview)
@@ -11,20 +11,23 @@
 * [Additional Tools](#additional-tools)
 * [Testing](#testing)
 * [Modules](#modules)
-  * [reachaq.core](#autotrainercore)
-  * [reachaq.video](#autotrainervideo)
-  * [reachaq.device](#autotrainerdevice)
-  * [reachaq.inference](#autotrainerinference)
-  * [reachaq.behavior](#autotrainerbehavior)
-  * [reachaq.model](#autotrainermodel)
-  * [reachaq.pyside](#autotrainerpyside)
+  * [reachaq.core](#reachaqcore)
+  * [reachaq.video](#reachaqvideo)
+  * [reachaq.device](#reachaqdevice)
+  * [reachaq.inference](#reachaqinference)
+  * [reachaq.behavior](#reachaqbehavior)
+  * [reachaq.model](#reachaqmodel)
+  * [reachaq.pyside](#reachaqpyside)
 * [Code Guidelines](#code-guidelines)
 
 ## Overview
-This repository contains the Autotrainer modules and reachAQ applications that are primarily used on-device.  A monorepo
-is used here primarily as a development convenience.  Individual modules and applications can and are installed
-in on devices independently.  This loose-coupling should be assumed when managing dependencies or refactoring
-common code.
+This repository contains reachAQ, installed as one distribution, `reachaq`, from `pyproject.toml`. Its
+packages live under `src/reachaq/` (`reachaq.core`, `.video`, `.device`, `.inference`, `.behavior`, `.model`,
+`.pyside`, the acquisition application `reachaq.app`, and the hardware and analysis tools beside it). The pose
+backends that bring heavy or AGPL-licensed engines are separate plugin distributions under
+[`plugins/`](plugins/README.md). Keep the lower-level packages loosely coupled, as listed under [Modules](#modules),
+when managing dependencies or refactoring common code. reachAQ grew out of upstream Autotrainer; see
+[CHANGELOG.md](CHANGELOG.md) for the 4.0 rename.
 
 For the current reachAQ Dell/Ubuntu runtime, use
 [linux-install-instructions.md](linux-install-instructions.md). The expected
@@ -153,8 +156,8 @@ and current invocation examples.
 
 PyTest testing is supported and configured via `./conftest.py`.
 
-Individual namespace packages (*e.g,* `reachaq`) contain a `tests` directory.  There are also unit and functional
-tests for high-level functionality in the applications and that combine elements of multiple packages.
+Each package's tests are in `tests/<package>` (`tests/core`, `tests/device`, ...); the tests of the applications
+and of anything that combines several packages are directly in `tests/`.
 
 Tests that are longer or require additional configuration are marked as `@pytest.mark.functional` and are not run
 by default.
@@ -186,7 +189,7 @@ To limit testing to an individual namespace package, issue still from the base r
 
 `pytest ./tests/device ./tests/video`
 
-for instance. Alternatively you can `cd` into the subdir, and execute `pytest ./tests` too.
+for instance.
 
 To list all test cases, from repo base/root dir:
 
@@ -201,13 +204,13 @@ You can also give many at once.
 
 [Core](src/reachaq/core/README.md) is base module for functions and objects that used across most or all modules and applications.
 
-**Autotrainer Dependencies**
+**Depends on**
 * None
 
 ### reachaq.video
 [Video](src/reachaq/video/README.md) implements the camera interfaces for all supported cameras.
 
-**Autotrainer Dependencies**
+**Depends on**
 * Core
 
 
@@ -218,7 +221,7 @@ pellet-board, NI-DAQ, laser, and related non-camera hardware. The primary
 purpose is to provide a consistent interface to applications.
 
 
-**Autotrainer Dependencies**
+**Depends on**
 * Core
 
 ### reachaq.inference
@@ -227,28 +230,28 @@ purpose is to provide a consistent interface to applications.
 Its primary purpose is to provide a implementation-agnostic interface to inference, such as the current dependency
 on DeepLapCut.
 
-**Autotrainer Dependencies**
+**Depends on**
 * Core
 
 ### reachaq.behavior
 [Behavior](src/reachaq/behavior/README.md) implements the behavior training state machine, algorithm, and real-time analysis.
 
-**Autotrainer Dependencies**
+**Depends on**
 * Core
 
 ### reachaq.pyside
 [PySide](src/reachaq/pyside/README.md) provides convenience classes on top of PySide.
 
-**Autotrainer Dependencies**
+**Depends on**
 * Inference
 
 ### reachaq.model
 
 [Model](src/reachaq/model/README.md) is a collection of models and providers that simplify common elements of
-Autotrainer applications.  Generally, common code that bridges across multiple Autotrainer modules is contained
+reachAQ applications.  Generally, common code that bridges across multiple reachAQ packages is contained
 here, rather than creating additional hard-coupling between the lower-level modules.
 
-**Autotrainer Dependencies**
+**Depends on**
 * Core
 * Device
 
@@ -259,7 +262,8 @@ guidelines are in place for future additions and changes to help with and improv
 
 * Style generally follows PEP8.  This is the default in most editors or lint tools.
   * An exception is made for `reachaq.pyside`.  Classes derived from PySide follow PySide conventions.
-* All modules are defined as namespace packages to allow for separation of modules under the same `autotrainer` namespace.
+* `reachaq` is a namespace package (there is no `src/reachaq/__init__.py`), so the pose plugins add
+  `reachaq.pose_plugins.*` from their own distributions.
 * Code, particularly in modules, should be as platform-agnostic as possible despite having a current reachAQ target of Ubuntu 22.04 on x86_64.
   * Fallback support does not need to match the target platform behavior where is can not (e.g. CUDA), but allow the code to run as correctly as possible.
   * This is primarily for automated testing in other environments such as GitHub Actions.

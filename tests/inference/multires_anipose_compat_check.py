@@ -9,7 +9,7 @@ aniposelib. It has two steps, each in its own environment:
    each of its TOMLs, a JSON of the motor-frame points and the pixels the fit puts them at
    in that file's geometry:
 
-       PYTHONPATH=<the repo's package src dirs> python multires_anipose_compat_check.py --write-inputs OUT
+       PYTHONPATH=src python multires_anipose_compat_check.py --write-inputs OUT
 
 2. In the check virtualenv (aniposelib==0.8.0 and toml, the reachaq
    "anipose-check" extra), for each pair:
