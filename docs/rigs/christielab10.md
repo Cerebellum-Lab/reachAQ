@@ -75,3 +75,30 @@ run without `SUDO_USER`, so run it with `sudo` from the operator account.
 The rig boots with `intel_iommu=off`. The
 [NI-DAQ guide](../linux-install/ni-daq-pxi.md#iommu-and-dma-boot-with-intel_iommuoff)
 explains why and how to check it.
+
+## Pellet z: intermittent lost steps (disputed, under review)
+
+Two z moves where the board did not end up where it was commanded were measured
+model-free, from the board's position in the 3D calibration cameras. The camera
+analysis and an independent re-analysis of the raw captures
+(stage-z-independent-check) both measured them. Ben, watching the stage, has not
+seen a stall. The matter stays open until the z tuning tests or his own
+measurement settle it.
+
+- **session004.** A 30 to 1 mm descent measured about 7 mm short of the
+  commanded travel. Mid-descent, at about 85 mm/s, the board measured about 1 mm
+  back up before it continued. The offset persisted until the top stop.
+- **session006.** A 5 to 2 mm move measured -0.08 mm against -3 mm commanded,
+  and the motor buzzed during the command. The +3 mm offset persisted.
+
+The same moves measured correctly most of the time.
+
+The host cannot see such an offset. The board reports its commanded position,
+so `waypoints_unreached` stays 0. christielab10 has a v1.2 board, which has no
+DIAG line, and StallGuard is disabled in firmware 2.4.0.
+
+The calibration report's stage-accuracy block (`stage_slack_rms_mm`,
+`stage_repeat_mm`) shows the measured offsets.
+
+The z speed and acceleration are being retuned. The chosen values will be
+recorded here.
