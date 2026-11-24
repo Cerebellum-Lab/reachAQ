@@ -161,6 +161,20 @@ def test_the_scout_box_keeps_clear_of_the_home_stop():
     assert (near.lo[0], near.hi[0]) == (0.4, 0.6)
 
 
+def test_the_home_margin_never_takes_the_box_outside_scout_bounds():
+    # scoutBounds y 0.5-0.8 with the travel's min_pos 0: putting y on the stop (0) would leave
+    # the operator's bounds, so the box stays as configured.
+    plan = [(0.0, 0.0, 20.0), (17.7, 25.1, 32.8)]
+    configured = Bounds((0.0, 0.5, 0.0), (35.0, 0.8, 35.0))
+    box = bounds_from_plan(plan, configured, ((0.0, 35.0),) * 3)
+    assert (box.lo[1], box.hi[1]) == (0.5, 0.8)
+    for k in range(3):
+        assert configured.lo[k] <= box.lo[k] <= box.hi[k] <= configured.hi[k], (k, box)
+    # scoutBounds that reach 0 still allow the stop.
+    on_stop = bounds_from_plan(plan, Bounds((0.0, 0.0, 0.0), (35.0, 0.8, 35.0)), ((0.0, 35.0),) * 3)
+    assert (on_stop.lo[1], on_stop.hi[1]) == (0.0, 0.0)
+
+
 def test_grid_moves_one_axis_at_a_time():
     grid = scout_grid(BOX)
     assert len(grid) == 4 * 4 * 3 == len(set(grid))

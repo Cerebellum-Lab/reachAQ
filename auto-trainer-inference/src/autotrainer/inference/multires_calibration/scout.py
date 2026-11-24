@@ -169,7 +169,8 @@ def bounds_from_plan(
     commanded targets span; then intersected with `configured` (scoutBounds) when given.
     Last, a low edge below SCOUT_HOME_MARGIN_MM is raised to it; an axis whose whole box lies
     below the margin is put on the home stop (0, 0) instead, a move the stage does make,
-    unless a configured min_pos above 0 rules the stop out (it is then left as it is).
+    unless a configured min_pos above 0, or scoutBounds above 0, rules the stop out (it is
+    then left as it is).
 
     Never wider than the travel or `configured`. Without travel it is the plan's box, never
     wider. Raises ValueError when there are no targets or the boxes do not overlap on some axis.
@@ -195,7 +196,8 @@ def bounds_from_plan(
         if lo[k] < SCOUT_HOME_MARGIN_MM:
             if hi[k] >= SCOUT_HOME_MARGIN_MM:
                 lo[k] = SCOUT_HOME_MARGIN_MM
-            elif minima[k] is None or minima[k] <= 0.0:  # never onto a stop below a configured min
+            elif ((minima[k] is None or minima[k] <= 0.0)  # never onto a stop below a configured min
+                  and (configured is None or configured.lo[k] <= 0.0)):  # nor outside scoutBounds
                 lo[k] = hi[k] = 0.0
     return Bounds(tuple(float(v) for v in lo), tuple(float(v) for v in hi))
 
