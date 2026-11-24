@@ -1270,47 +1270,58 @@ def test_can_connect_twice(device, caplog):
     assert device.device_interface.is_open is True
 
 
-def test_rel_move_succeed_after_uuid_ack_timeout(
-    expected_tok,
-    expected_tok_event,
+def _record_refusals(device):
+    """Also hand COMMAND_REFUSED to a list: token -> refusal."""
+    refusals = {}
+    acks = device.api.message_callback
+
+    def callback(kind, data):
+        if kind == SystemStatusMessageKind.COMMAND_REFUSED:
+            refusals[data[0]] = data[2]
+        acks(kind, data)
+
+    device.api.message_callback = callback
+    return refusals
+
+
+def _wait_for(predicate, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_a_lost_retract_move_ack_stops_the_stage_and_is_not_resent(
     tokens_acked,
     device,
     device_conn,
-    monkeypatch,
-    caplog,
 ):
-    orig_move_y = device.device_interface.move_motor_y
-    def ret_move(*args, **kwargs):
-        # consume one uuid, but don't insert ack into return messages as with emulation iface
-        device.device_interface.next_uuid()
-        # restore orig move:
-        device.device_interface.move_motor_y = orig_move_y
-        # return True to fake command written to CAN bus ok:
+    # A retract step is a stepper move: its lost ack is stopped with an ESTOP,
+    # never re-sent (the resend is answered -EBUSY while the axis runs on).
+    moves = []
+
+    def lost_move(*args, **kwargs):
+        moves.append(args)
+        device.device_interface.next_uuid()  # the frame went out; its ack is lost
         return True
-    m = mock.MagicMock()
-    m.side_effect = ret_move
-    device.device_interface.move_motor_y = m
+
+    device.device_interface.move_motor_y = lost_move
+    refusals = _record_refusals(device)
     ctx = uuid.uuid4()
-    expected_tok.value = ctx
     device.default_command_ack_timeout_duration = 0.5
-
-    ack_timeout_engaged = False
-    ack_timeout_engaged_count = 0
-    def dev_prop_changed(name, value, old):
-        if name == device.UUID_ACK_TIMEOUT_ENGAGED:
-            nonlocal ack_timeout_engaged, ack_timeout_engaged_count
-            ack_timeout_engaged = value
-            if value:
-                ack_timeout_engaged_count += 1
-
-    device.property_changed += dev_prop_changed
+    engaged = []
+    device.property_changed += (
+        lambda name, value, old: engaged.append(value) if name == device.UUID_ACK_TIMEOUT_ENGAGED else None)
 
     device.notify_message(SystemCommandKind.SEND_RETRACT, None, context=ctx)
 
-    expected_tok_event.wait(3)
-    assert ctx in tokens_acked
-    assert not ack_timeout_engaged
-    assert ack_timeout_engaged_count == 1
+    assert _wait_for(lambda: ctx in refusals)
+    time.sleep(0.6)
+    assert refusals[ctx].stopped_by_estop
+    assert ctx not in tokens_acked
+    assert len(moves) == 1
+    assert device.device_interface.estop_frames == [True]
+    assert engaged == [True, False]
     assert device._commands_handler_thread.is_alive()
 
 
@@ -1401,12 +1412,13 @@ def test_a_stim_step_arms_the_short_no_retry_timeout(step, timeout, skips):
     assert device._prev_command_skips_retry is skips
 
 
-def test_a_move_sent_after_a_stim_with_a_lost_ack_still_retries_on_its_own_lost_ack(
-    expected_tok, expected_tok_event, tokens_acked, device, device_conn,
+def test_a_lost_release_ack_after_a_lost_stim_ack_stops_the_send(
+    tokens_acked, device, device_conn,
 ):
-    """The no-retry policy belongs to the stimulus command alone. The release
-    sent after a stim whose ack was lost must still be re-sent, after its own
-    timeout, when its own ack is lost: it is what reveals the pellet."""
+    """The skip belongs to the stimulus command alone: the release sent after a
+    stim whose ack was lost has its own timeout, 0.5 s here, not the stim's 0.25 s.
+    A lost ack in a pellet send, a sequence that drives the steppers, stops the
+    stage with an ESTOP and is not re-sent (it was, before the ESTOP hotfix)."""
     interface = device.device_interface
     real_release = interface.release_pellet
     pulses, releases = [], []
@@ -1426,18 +1438,22 @@ def test_a_move_sent_after_a_stim_with_a_lost_ack_still_retries_on_its_own_lost_
     interface.pulse_digital_output = pulse_without_ack
     interface.release_pellet = release_without_ack_once
     device.default_command_ack_timeout_duration = 0.5
+    refusals = _record_refusals(device)
     ctx = uuid.uuid4()
-    expected_tok.value = ctx
 
     device.notify_message(
         SystemCommandKind.SEND_PELLET, {"pre_reveal_stimulus": (200, 1000, 2)}, context=ctx)
-    assert expected_tok_event.wait(5)
+    assert _wait_for(lambda: ctx in refusals, timeout=5)
+    stopped_after = time.perf_counter() - releases[0]
+    time.sleep(0.6)
 
-    assert ctx in tokens_acked
+    assert ctx not in tokens_acked
     assert len(pulses) == 1, "the stim is still never re-sent"
-    assert len(releases) == 2, "the release must be retried on its own lost ack"
-    # The retry waited the release's own 0.5 s timeout, not the stim's 0.25 s.
-    assert releases[1] - releases[0] >= 0.45
+    assert len(releases) == 1, "the release is not re-sent either: the send was stopped"
+    assert refusals[ctx].stopped_by_estop
+    assert "0.5 s" in refusals[ctx].estop_reason, "the release's own timeout, not the stim's"
+    assert stopped_after >= 0.45
+    assert interface.estop_frames == [True]
 
 
 def test_pyjerrycan_interface_keeps_the_configured_transport():

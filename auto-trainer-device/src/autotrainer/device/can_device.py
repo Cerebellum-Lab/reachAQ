@@ -30,7 +30,7 @@ from .device_api import DeviceApi
 from .can_interface import CanInterface, Target, target_of_motor, _STEPPER_MAX_POS
 from .can_transport import CanTransportConfiguration, CanTransportKind
 from .can_failure import CanFailure, CanFailureKind
-from .board_refusal import CommandRefusal, RefusedCommandClass, is_refusal
+from .board_refusal import EPERM, CommandRefusal, RefusedCommandClass, is_refusal
 from .device_interface import (
     Acknowledge,
     AnalogOutput,
@@ -96,6 +96,12 @@ _retry_compound = _Sentinel(role="retry_compound")
 _retry_full = _Sentinel(role="retry_full")
 _shutdown_requested = _Sentinel(role="shutdown_requested")
 
+# ESTOP bookkeeping for the command loop. The frame itself never goes through
+# the queue (CanDevice.estop writes it at once); these end what it stopped, and
+# put the release on the bus in order, before the home queued after it.
+_estop_abort = _Sentinel(role="estop_abort")
+_estop_release = _Sentinel(role="estop_release")
+
 # A stimulus pulse is never re-sent after a lost ack (the board has most likely
 # pulsed: a second GPIO_PULSE is a second STIM edge), so there is no reason to
 # wait the default 3 s for an ack that is not coming. The board acks at assert,
@@ -117,6 +123,31 @@ _COMMAND_STEPPER = {
 }
 _SERVOS = (Motor.PELLET_COVER_SERVO, Motor.PELLET_LOAD_SERVO)
 _XYZ = (Motor.PELLET_X_MOTOR, Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR)
+
+# SET_X/Y/Z only store the send position on the board; they move nothing.
+_SET_COMMANDS = frozenset({SystemCommandKind.SET_X, SystemCommandKind.SET_Y, SystemCommandKind.SET_Z})
+# Sequences that drive the steppers, directly or through SEND_TO_FIXED_XYZ (which
+# runs the same firmware motion engine). Any of their frames whose ack times out
+# stops the stage: a lost ack can be an axis that never finished (firmware 2.3.1
+# has no motion timeout, and a free-running step timer answers -EBUSY for ever).
+_STEPPER_SEQUENCES = frozenset({
+    SystemCommandKind.SEND_HOME,
+    SystemCommandKind.SEND_TO_LIMITS,
+    SystemCommandKind.LOAD_PELLET,
+    SystemCommandKind.SEND_PELLET,
+    SystemCommandKind.SEND_RETRACT,
+})
+# Commands that would move something on the pellet board: an ESTOP drops the
+# ones still queued, so none goes out once the latch is released.
+_MOTION_COMMANDS = _STEPPER_SEQUENCES | {
+    SystemCommandKind.MOVE_X, SystemCommandKind.MOVE_Y, SystemCommandKind.MOVE_Z,
+    SystemCommandKind.SEND_FIXED_XYZ,
+    SystemCommandKind.RELEASE_PELLET, SystemCommandKind.COVER_PELLET,
+    SystemCommandKind.MOVE_LOAD_SERVO, SystemCommandKind.MOVE_COVER_SERVO,
+}
+_STEPPER_FRAME_CLASSES = frozenset({
+    RefusedCommandClass.STEPPER_MOVE, RefusedCommandClass.STEPPER_HOME, RefusedCommandClass.FIXED_XYZ,
+})
 
 
 def _classify_sent_frame(prev_command) -> Tuple[RefusedCommandClass, Tuple[Motor, ...], str]:
@@ -157,6 +188,23 @@ def _classify_sent_frame(prev_command) -> Tuple[RefusedCommandClass, Tuple[Motor
     if kind is SystemCommandKind.PULSE_DIGITAL_OUTPUT:
         return RefusedCommandClass.PULSE, (), description
     return RefusedCommandClass.OTHER, (), description
+
+
+def _is_stepper_motion(prev_command, command_kind) -> bool:
+    """Whether the frame a board context awaits the ack of may have set a stepper moving.
+
+    True for a stepper move or home, SEND_TO_FIXED_XYZ, and any frame of a
+    sequence that drives the steppers (_STEPPER_SEQUENCES). False for SET_X/Y/Z,
+    which only store a position, and for everything else.
+    """
+    if prev_command is None:
+        return False
+    if command_kind in _STEPPER_SEQUENCES:
+        return True
+    if prev_command[0] is _retry_full and prev_command[1][0] in _SET_COMMANDS:
+        return False
+    command_class, _motors, _step = _classify_sent_frame(prev_command)
+    return command_class in _STEPPER_FRAME_CLASSES
 
 
 def _no_op():
@@ -212,6 +260,8 @@ class _BoardPendingContext:
     uuid_ack_timeout_engaged: bool = False
     repeated_command_count: int = 0
     compound_steps: Optional[List[Dict[str, Any]]] = None
+    # The frame awaiting its ack (uuid) may have set a stepper moving (_is_stepper_motion).
+    stepper_motion: bool = False
 
     def is_available(self):
         return (
@@ -260,7 +310,8 @@ class CanDevice(Device):
                  required_targets: Optional[Iterable[Target]] = None,
                  shutdown_callback: Optional[Callable[[str], None]] = None,
                  failure_callback: Optional[Callable[[CanFailure], None]] = None,
-                 operation_callback: Optional[Callable[..., None]] = None):
+                 operation_callback: Optional[Callable[..., None]] = None,
+                 estop_callback: Optional[Callable[[str, Tuple[Motor, ...], bool], None]] = None):
         """
         Initialize the CANbus device interface.
 
@@ -270,6 +321,8 @@ class CanDevice(Device):
             force_emulation: Whether to force using emulation mode even if hardware is available
             can_transport: CAN backend selection. Defaults to the existing pyjerrycan path.
             required_targets: CAN boards that must be present for this runtime.
+            estop_callback: Called as (reason, axes, sent) after every ESTOP this
+                device sends, or fails to send (sent False), from the thread that sent it.
         """
         self._can_transport_configuration = can_transport or CanTransportConfiguration.from_environment()
         self._required_targets = tuple(required_targets or (Target.PELLET_DEVICE,))
@@ -283,6 +336,7 @@ class CanDevice(Device):
         self._shutdown_callback = shutdown_callback
         self._failure_callback = failure_callback
         self._operation_callback = operation_callback
+        self._estop_callback = estop_callback
 
         self._init_default_move_configs()
         self._compound_movement: Optional[List[Dict[str, Any]]] = None
@@ -633,6 +687,132 @@ class CanDevice(Device):
     def writer_watchdog_perf_c(self) -> float:
         return self._commands_handler_watchdog_perf_c
 
+    @property
+    def motion_possibly_in_flight(self) -> bool:
+        """A frame that may have set a stepper moving is awaiting its ack.
+
+        Set when the frame is sent, cleared when its ack (or refusal) arrives,
+        when an ESTOP ends it, and on disconnect. Between two steps of a sequence
+        it is False: the board acknowledges a move when it is done.
+        """
+        return any(
+            board.uuid is not None and board.stepper_motion
+            for board in tuple(self._boards_pending_ctx.values())
+        )
+
+    def estop(self, reason: str) -> bool:
+        """Stop every pellet stepper now: one ESTOP frame, written from the calling thread.
+
+        Fire and forget: the frame has no uuid, is never acknowledged and is
+        never re-sent, and it does not wait behind the command awaiting its ack
+        (it is not queued at all). A dead bus is logged and swallowed. Then the
+        command loop ends what was stopped: the command in flight and every
+        queued motion command are refused with the ESTOP's reason, so their
+        waiters and tokens end. Returns whether the frame reached the bus.
+        """
+        sent = self._write_estop(True, reason)
+        try:
+            # Not _put_to_cmd_queue: no shutdown check and no liveness raise.
+            # A disconnect clears what is pending anyway.
+            self._commands_queue.put((_estop_abort, str(reason), None))
+        except Exception:
+            logger.exception("Could not queue the ESTOP's clean-up")
+        self._notify_estop(reason, sent)
+        return sent
+
+    def release_estop(self) -> None:
+        """Queue the ESTOP release frame, so it goes out after everything queued before it.
+
+        The board refuses every move and home with -EPERM while latched, so a
+        home must follow a release. Queued, not written at once: the loop has
+        then dropped what the ESTOP stopped before the latch comes off.
+        """
+        self._put_to_cmd_queue((_estop_release, None, None))
+
+    def _write_estop(self, asserted: bool, reason: str) -> bool:
+        estop = getattr(self._interface, "estop", None)
+        sent = False
+        try:
+            if estop is None:
+                raise RuntimeError(f"{type(self._interface).__name__} cannot send an ESTOP")
+            sent = bool(estop(asserted))
+        except Exception as err:
+            logger.error("Could not write the pellet ESTOP %s frame: %s",
+                         "assert" if asserted else "release", err)
+        if asserted:
+            logger.error("Pellet ESTOP %s: %s", "sent" if sent else "NOT SENT (bus write failed)", reason)
+        elif sent:
+            logger.notice("Pellet ESTOP released: %s", reason)
+        else:
+            logger.error("Pellet ESTOP release NOT SENT (bus write failed): %s", reason)
+        return sent
+
+    def _notify_estop(self, reason: str, sent: bool) -> None:
+        callback = self._estop_callback
+        if callback is None:
+            return
+        try:
+            callback(str(reason), _XYZ, bool(sent))
+        except Exception:
+            logger.exception("ESTOP listener failed")
+
+    def _estop_in_loop(self, reason: str, cur_commands: list) -> None:
+        """An ESTOP the command loop itself decided on: write it, then end what it stopped."""
+        sent = self._write_estop(True, reason)
+        self._end_stopped_commands(reason, cur_commands)
+        self._notify_estop(reason, sent)
+
+    def _end_stopped_commands(self, reason: str, cur_commands: list) -> None:
+        """End, with the ESTOP's reason, the pellet command in flight and every queued motion command.
+
+        Runs on the command loop. Each command that has a token is refused
+        (COMMAND_REFUSED, error -EPERM, estop_reason set): never acknowledged,
+        never re-sent, its remaining steps dropped. Commands that move nothing
+        (SETs, tones, LEDs) stay queued.
+        """
+        board = self._boards_pending_ctx[Target.PELLET_DEVICE]
+        token = board.ctx
+        command_class, motors, step = _classify_sent_frame(board.prev_command)
+        kind = board.kind
+        dropped = len(board.compound_steps or [])
+        was_engaged = board.uuid_ack_timeout_engaged
+        board.ctx = None
+        board.kind = None
+        board.uuid = None
+        board.prev_command = None
+        board.prev_command_relative = False
+        board.prev_command_skips_retry = False
+        board.last_stim_output = None
+        board.repeated_command_count = 0
+        board.compound_steps = None
+        board.stepper_motion = False
+        board.uuid_ack_timeout_engaged = False
+        if was_engaged and not any(b.uuid_ack_timeout_engaged for b in self._boards_pending_ctx.values()):
+            self.property_changed(self.UUID_ACK_TIMEOUT_ENGAGED, False, True)
+        if token is not None:
+            logger.error("ESTOP ended %s (context=%s), dropping %s remaining step(s)", kind, token, dropped)
+            self._refuse_command(CommandRefusal(
+                token=token, error=EPERM, command=kind, step=step,
+                command_class=command_class, motors=motors, perf_c=get_perf_now(),
+                estop_reason=str(reason),
+            ))
+        kept = []
+        for entry in cur_commands:
+            entry_kind, data, ctx = entry[0], entry[1], entry[2]
+            inner = data[0] if entry_kind in (_next_compound, _retry_compound, _retry_full) else entry_kind
+            moves = entry_kind in (_next_compound, _retry_compound) or inner in _MOTION_COMMANDS
+            if not moves:
+                kept.append(entry)
+                continue
+            logger.error("ESTOP dropped queued %s (context=%s)", getattr(inner, "name", inner), ctx)
+            if ctx is not None:
+                self._refuse_command(CommandRefusal(
+                    token=ctx, error=EPERM, command=inner, step=getattr(inner, "name", str(inner)),
+                    command_class=RefusedCommandClass.OTHER, perf_c=get_perf_now(),
+                    estop_reason=str(reason),
+                ))
+        cur_commands[:] = kept
+
     def _put_to_cmd_queue(self, obj):
         if self._want_exit.is_set():
             logger.warning("Ignoring CAN command while device is shutting down")
@@ -752,6 +932,13 @@ class CanDevice(Device):
                 logger.verbose("received exit sentinel, exiting main loop ..")
                 break
             kind, data, ctx = raw
+            if kind is _estop_abort:
+                # The frame went out from the thread that called estop().
+                self._end_stopped_commands(data, cur_commands)
+                continue
+            if kind is _estop_release:
+                self._write_estop(False, "released before a home")
+                continue
             raw = kind, data, ctx, p_now
             if ctx is not None and p_now is not None:
                 self._latency("dequeue", token=str(ctx), perf=p_now)
@@ -792,6 +979,12 @@ class CanDevice(Device):
                     continue
                 if refusal is not None:
                     self._stop_refused_command(found_board_with_uuid_ack, refusal)
+                    if refusal.motion_may_continue:
+                        self._estop_in_loop(
+                            f"the board answered {refusal.error_name} to {refusal.step}"
+                            " (an axis may still be moving)",
+                            cur_commands,
+                        )
                     continue
             else:
                 if kind is not None:
@@ -849,6 +1042,16 @@ class CanDevice(Device):
                 if board_ctx.prev_command_skips_retry:
                     self._skip_lost_ack(board_ctx, p_now)
                     break  # only one board per pass, as for a retry
+                if board_ctx.stepper_motion:
+                    # Never re-sent: a stepper that has not acknowledged may still be
+                    # moving, and the resend is answered -EBUSY while it runs on.
+                    # Pellet firmware 2.3.1 has no motion timeout of its own.
+                    kind_name = getattr(board_ctx.kind, "name", str(board_ctx.kind))
+                    self._estop_in_loop(
+                        f"{kind_name} was not acknowledged within {board_ctx.ack_timeout_used:g} s",
+                        cur_commands,
+                    )
+                    break
                 if board_ctx.prev_command_relative:
                     # TODO: should/could simply continue, probably, although surely only for retract command
                     err = RuntimeError(
@@ -1054,6 +1257,10 @@ class CanDevice(Device):
                 target_board.ack_timeout_used = command_timeout_delay
                 self._prev_command_timeout = self.default_command_ack_timeout_duration
                 target_board.prev_command = tuple(prev_command)
+                target_board.stepper_motion = (
+                    _is_stepper_motion(target_board.prev_command, target_board.kind)
+                    and not target_board.prev_command_skips_retry
+                )
             else:
                 # no uuid generated
                 compound_steps = target_board.compound_steps
@@ -1256,6 +1463,7 @@ class CanDevice(Device):
             board.uuid_ack_timeout_engaged = False
             board.repeated_command_count = 0
             board.compound_steps = None
+            board.stepper_motion = False
 
     def disconnect(self):
         with self._disconnect_lock:
