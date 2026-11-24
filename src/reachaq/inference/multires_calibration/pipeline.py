@@ -102,6 +102,7 @@ from reachaq.inference.multires_calibration.geometry import (
 from reachaq.inference.multires_calibration.per_view import (
     FIT_MODES,
     FIT_MOTOR_FRAME,
+    FIT_PER_VIEW,
     default_fit_mode,
     fit_per_view,
 )
@@ -559,10 +560,12 @@ def calibrated_preset_sets(live: Mapping[str, PresetGeometry], calibrated: Seque
 
 
 def _fit(mode: str, *args, **kwargs) -> MotorFrameFit:
-    """fit_motor_frame or fit_per_view, by `mode` (per_view.fit_cameras, through this module's names)."""
+    """fit_motor_frame or fit_per_view, by `mode`, through this module's names (tests patch them)."""
     if mode == FIT_MOTOR_FRAME:
         return fit_motor_frame(*args, **kwargs)
-    return fit_per_view(*args, **kwargs)
+    if mode == FIT_PER_VIEW:
+        return fit_per_view(*args, **kwargs)
+    raise ValueError(f"fit mode must be one of {FIT_MODES}, got {mode!r}")
 
 
 def _cross_checks(

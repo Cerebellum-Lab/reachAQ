@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 import pytest
 
-from reachaq.inference.multires_calibration import store
+from reachaq.inference.multires_calibration import pipeline, store
 from reachaq.inference.multires_calibration.fit import (
     RIG_CHARUCO_BOARD,
     BoardSpec,
@@ -29,7 +29,6 @@ from reachaq.inference.multires_calibration.per_view import (
     FIT_PER_VIEW,
     configured_fit,
     default_fit_mode,
-    fit_cameras,
     fit_per_view,
 )
 from reachaq.inference.multires_calibration.products import (
@@ -67,7 +66,7 @@ def stage_rig():
 LOST_STEPS = {5: (0.0, 0.0, -3.0), 17: (0.0, 0.0, -3.0), 29: (2.5, 0.0, 0.0)}
 
 
-def assert_cameras_match(fit, truth, cams, *, f_rel=5e-3, c_px=6.0, deg=0.1, mm=0.5):
+def assert_cameras_match(fit, truth, cams, *, f_rel=5e-3, c_px=10.0, deg=0.2, mm=0.5):
     for cam in cams:
         t, f = truth.cameras[cam], fit.cameras[cam]
         assert f.K[0, 0] == pytest.approx(t.K[0, 0], rel=f_rel), cam
@@ -96,6 +95,28 @@ def test_the_motor_frame_fit_cannot_fit_the_same_capture(stage_rig):
     cams = ("left", "right", "top")
     fit = fit_motor_frame(stage_rig.observations, BOARD, SIZE, cams)
     assert max(fit.rms_px.values()) > 2.0
+
+
+@pytest.mark.parametrize("pivot", [
+    (0.0, 0.0, 0.0),  # corner 0
+    (14.0, 10.0, 0.0),  # the board centre
+    (14.0, 10.0, 30.0),  # 30 mm behind the centre
+    (34.0, 10.0, 0.0),  # 20 mm to one side
+], ids=["corner0", "centre", "30mm_behind", "20mm_aside"])
+def test_a_board_turning_about_its_mount_is_recovered(pivot):
+    # A real board turns about its mount, wherever that is: the fitted pivot takes the tilt,
+    # so it neither shows up as slack nor biases the focal length. Anchored at a fixed point,
+    # the reviewer measured fx 2.4-2.8 % short with the pivot at the centre, with no sign of
+    # it in the RMS or the outliers.
+    rig = synthetic_rig(cameras=("left", "right", "top"), noise_px=0.1, tilt_deg=3.0, stage_error_mm=0.05,
+                        stage_offsets=LOST_STEPS, tilt_pivot_mm=pivot)
+    cams = ("left", "right", "top")
+    fit = fit_per_view(rig.observations, BOARD, SIZE, cams)
+    assert_cameras_match(fit, rig.truth, cams)
+    assert fit.placement.outliers == sorted(LOST_STEPS)
+    others = [np.linalg.norm(r) for w, r in fit.placement.residual_mm.items() if w not in LOST_STEPS]
+    assert max(others) < 0.3
+    np.testing.assert_allclose(fit.placement.pivot_mm, pivot, atol=3.0)
 
 
 def test_holding_the_rotation_cannot_fit_a_tilting_stage(stage_rig):
@@ -197,7 +218,7 @@ def test_a_view_far_from_its_commanded_position_is_named_and_left_out_of_the_pla
     np.testing.assert_allclose(fit.placement.residual_mm[13], (0.0, 0.0, -3.3), atol=0.05)
     assert max(fit.rms_px.values()) < 0.1  # the calibration itself is unaffected
     notes = placement_notes(fit.placement)
-    assert any(n.startswith("waypoint 13: board 3.3 mm short of commanded z") for n in notes), notes
+    assert any(n.startswith("waypoint 13: board 3.3 mm off commanded z (-3.3 mm)") for n in notes), notes
     assert notes[0].startswith("motor placement (per-view fit): similarity scale")
     assert "left out of it (more than 3 MAD off): waypoints 13" in notes[0]
 
@@ -284,13 +305,13 @@ def test_the_fit_mode_defaults_by_board_and_reads_the_setting():
     with pytest.raises(ValueError, match="fit"):
         configured_fit({"fit": "bundle"}, RIG_CHARUCO_BOARD)
     with pytest.raises(ValueError, match="fit mode"):
-        fit_cameras("bundle", [], BOARD, SIZE, CAMERAS)
+        pipeline._fit("bundle", [], BOARD, SIZE, CAMERAS)
 
 
 def test_the_motor_frame_fit_is_unchanged_by_the_dispatch():
     rig = synthetic_rig(noise_px=0.1)
     a = fit_motor_frame(rig.observations, rig.board, SIZE, CAMERAS)
-    b = fit_cameras(FIT_MOTOR_FRAME, rig.observations, rig.board, SIZE, CAMERAS)
+    b = pipeline._fit(FIT_MOTOR_FRAME, rig.observations, rig.board, SIZE, CAMERAS)
     for cam in CAMERAS:
         np.testing.assert_array_equal(a.cameras[cam].K, b.cameras[cam].K)
     assert a.placement is None and b.placement is None

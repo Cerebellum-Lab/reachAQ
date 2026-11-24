@@ -466,9 +466,9 @@ def placement_notes(placement) -> List[str]:
     for w, r in residual.items():
         if math.hypot(*r) > PLACEMENT_FLAG_MM:
             axis = int(np.argmax(np.abs(r)))
-            side = "short of" if r[axis] < 0 else "past"
+            # By sign along the motor axis, not "short" or "past": the move may have run either way.
             notes.append(
-                f"waypoint {w}: board {abs(r[axis]):.1f} mm {side} commanded {'xyz'[axis]}"
+                f"waypoint {w}: board {abs(r[axis]):.1f} mm off commanded {'xyz'[axis]} ({r[axis]:+.1f} mm)"
                 f" (x {r[0]:+.2f}, y {r[1]:+.2f}, z {r[2]:+.2f} mm; tilt {placement.tilt_deg.get(w, 0.0):.2f} deg)"
             )
     if placement.tilt_deg:

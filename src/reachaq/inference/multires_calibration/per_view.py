@@ -70,10 +70,18 @@ PRINCIPAL_POINT_SETTING = "fit_principal_point"
 PRINCIPAL_POINT_MODES = ("free", "centre")
 
 _N_INTRINSICS = 8
-# The scale of the soft-L1 residual that holds each view's board origin to the motor
+# The scale of the soft-L1 residual that holds each view's board centre to the motor
 # similarity (fit_per_view's prior_mm), per axis. None frees the views' translations entirely,
 # which leaves the focal length undetermined on a stage that never tilts the board.
+# UNFINALIZED, and a relative weight, not a stage sigma: the prior residual is slack / prior_mm,
+# beside reprojection residuals in px, so prior_mm of slack weighs as much as 1 px of
+# reprojection error whatever the corner noise is. With real corner noise of 0.1-0.3 px the
+# hold is therefore tighter than a 0.4 mm stage sigma would be, and the intrinsics' std
+# (focal_rel_std) depends on this weight.
 MOTOR_PRIOR_MM: Optional[float] = 0.4
+# The fitted pivot is held to the board centre by a residual of this scale per axis (mm), so a
+# capture whose board never turns, which says nothing about the pivot, still determines it.
+_PIVOT_PRIOR_MM = 50.0
 # The first pass's slack scale: the views held to the similarity almost exactly.
 _TIGHT_PRIOR_MM = 0.01
 # How many times the outlying views are re-chosen and the fit repeated.
@@ -121,23 +129,6 @@ def configured_principal_point(settings) -> bool:
     if value not in PRINCIPAL_POINT_MODES:
         raise ValueError(f"{PRINCIPAL_POINT_SETTING}: {value!r} is not one of {', '.join(PRINCIPAL_POINT_MODES)}")
     return value == "centre"
-
-
-def fit_cameras(
-    mode: str,
-    observations: Sequence[WaypointObservation],
-    board: BoardSpec,
-    image_size: Tuple[int, int],
-    camera_names: Sequence[str],
-    *,
-    initial: Optional[MotorFrameFit] = None,
-) -> MotorFrameFit:
-    """fit_per_view or fit.fit_motor_frame, by `mode`."""
-    if mode == FIT_PER_VIEW:
-        return fit_per_view(observations, board, image_size, camera_names, initial=initial)
-    if mode == FIT_MOTOR_FRAME:
-        return fit_motor_frame(observations, board, image_size, camera_names, initial=initial)
-    raise ValueError(f"fit mode must be one of {FIT_MODES}, got {mode!r}")
 
 
 def fit_per_view(
@@ -232,8 +223,8 @@ def fit_per_view(
         attempt(f"fx0 = fy0 = {f0:g} px ({factor:g} x width)", lambda K0=K0: problem.start_planar(image_size, K0))
     if not converged:
         raise RuntimeError("the per-view fit did not converge from any start: " + "; ".join(attempts))
-    best = min(converged, key=lambda r: r.cost)
-    logger.info("per-view fit retried from a focal grid; kept the lowest cost %.6g of: %s", best.cost, "; ".join(attempts))
+    best = min(converged, key=problem.common_cost(converged))
+    logger.info("per-view fit retried from a focal grid; kept the lowest cost of: %s", "; ".join(attempts))
     return problem.to_fit(best, image_size)
 
 
@@ -247,6 +238,13 @@ class _Problem:
     def __init__(self, obj, data: Dict[str, _CameraData], names, ref, observations, prior_mm=None, tilt=True):
         self.obj, self.data, self.names, self.ref = obj, data, names, ref
         self.prior_mm = prior_mm
+        # The board point the prior holds to the motor similarity: the point the board turns
+        # about, its mount, which is fitted (3 parameters shared by every view, in the board's
+        # frame, started at the centre of the inner corners) when the views may tilt. Anchored
+        # at a fixed point instead, every tilt about any other point turns into slack: at corner
+        # 0, a 3 degree tilt about a mount 30 mm behind the board's centre moves the anchor 1.6
+        # mm; at the centre, a tilt about corner 0 moved fx 1.7 % on the synthetic stage.
+        self.anchor = np.asarray(obj, float).mean(axis=0)
         # The prior's loss and scale for the pass being solved (solve): soft-L1 at prior_mm
         # for the result.
         self.robust = True
@@ -278,6 +276,8 @@ class _Problem:
         self.n_params = _N_INTRINSICS * len(names) + 6 * len(self.posed) + 6 * len(self.views)
         if prior_mm is not None:
             self.n_params += 7  # the similarity: rvec, t, s
+            if tilt:
+                self.n_params += 3  # the pivot, in the board's frame
         self.observed = np.concatenate([px.ravel() for cam in names for _, _, px in self.blocks[cam]])
         # Per camera, every corner row's view position and board point, in block order.
         self._rows = {
@@ -300,7 +300,16 @@ class _Problem:
         return slice(start, start + 6)
 
     def _sim(self):
-        return slice(self.n_params - 7, self.n_params)
+        start = _N_INTRINSICS * len(self.names) + 6 * len(self.posed) + 6 * len(self.views)
+        return slice(start, start + 7)
+
+    def _pivot(self):
+        """The pivot's 3 parameters (prior and tilt only)."""
+        return slice(self._sim().stop, self._sim().stop + 3)
+
+    def pivot(self, x) -> np.ndarray:
+        """The board point held to the similarity: the fitted pivot, or the board centre."""
+        return x[self._pivot()] if self.prior_mm is not None and self.tilt else self.anchor
 
     def _intrinsics(self, x, c, cam) -> np.ndarray:
         """Camera c's 8 intrinsics from x, with its principal point held where fixed_pp says."""
@@ -342,16 +351,22 @@ class _Problem:
             return reprojection
         sim = x[self._sim()]
         predicted = sim[6] * self.motor @ _rodrigues(sim[None, :3])[0].T + sim[3:6]
-        e = (views[:, 3:] - predicted) / self.scale_mm
+        e = (self._centres(views, R_views, self.pivot(x)) - predicted) / self.scale_mm
         e[self.prior_off] = 0.0
         if not self.robust:
-            return np.concatenate([reprojection, e.ravel()])
+            return np.concatenate([reprojection, e.ravel(), self._pivot_residual(x)])
         # soft-L1: the squared residual is 2 (sqrt(1 + e^2) - 1), quadratic near 0, linear far out.
         prior = np.sign(e) * np.sqrt(2.0 * (np.sqrt(1.0 + e * e) - 1.0))
-        return np.concatenate([reprojection, prior.ravel()])
+        return np.concatenate([reprojection, prior.ravel(), self._pivot_residual(x)])
+
+    def _pivot_residual(self, x) -> np.ndarray:
+        """The pivot's pull to the board centre, 3 rows (none without a fitted pivot)."""
+        if self.prior_mm is None or not self.tilt:
+            return np.zeros(0)
+        return (x[self._pivot()] - self.anchor) / _PIVOT_PRIOR_MM
 
     def sparsity(self):
-        n_prior = 0 if self.prior_mm is None else 3 * len(self.views)
+        n_prior = 0 if self.prior_mm is None else 3 * len(self.views) + (3 if self.tilt else 0)
         S = lil_matrix((len(self.observed) + n_prior, self.n_params), dtype=int)
         row = 0
         for c, cam in enumerate(self.names):
@@ -371,10 +386,28 @@ class _Problem:
         if self.prior_mm is not None:
             for p in range(len(self.views)):
                 view = self._view(p)
-                S[row:row + 3, slice(view.start + 3, view.stop)] = 1
+                S[row:row + 3, view] = 1  # the centre moves with the view's rotation too
+                if not self.tilt:
+                    rotation = self._view(0)
+                    S[row:row + 3, slice(rotation.start, rotation.start + 3)] = 1
                 S[row:row + 3, self._sim()] = 1
+                if self.tilt:
+                    S[row:row + 3, self._pivot()] = 1
                 row += 3
+            if self.tilt:
+                S[row:row + 3, self._pivot()] = 1
         return S
+
+    def _centres(self, views: np.ndarray, R_views: np.ndarray, pivot: np.ndarray) -> np.ndarray:
+        """(views, 3) each view's `pivot` (a point in the board's frame) in the reference frame."""
+        return views[:, 3:] + R_views @ pivot
+
+    def _views(self, x) -> Tuple[np.ndarray, np.ndarray]:
+        """(views (n, 6), their rotation matrices (n, 3, 3)) from x."""
+        start = _N_INTRINSICS * len(self.names) + 6 * len(self.posed)
+        views = x[start:start + 6 * len(self.views)].reshape(-1, 6)
+        R_views = _rodrigues(views[:, :3]) if self.tilt else np.repeat(_rodrigues(views[:1, :3]), len(views), axis=0)
+        return views, R_views
 
     def jacobian(self, x, *_):
         """The dense Jacobian by finite differences, perturbing the columns that share no
@@ -408,6 +441,9 @@ class _Problem:
                     self.robust, self.scale_mm = True, self.prior_mm
                 if step.status > 0:
                     x0 = step.x
+                else:
+                    logger.info("per-view fit: the pass at slack scale %g mm did not converge (%s);"
+                                " the next pass starts where it began", scale, step.message)
         result = least_squares(
             self.residuals, x0, jac=self.jacobian, method="trf", x_scale="jac", loss="linear",
             ftol=1e-10, xtol=1e-10, gtol=1e-10, max_nfev=_MAX_EVALUATIONS,
@@ -425,11 +461,18 @@ class _Problem:
             off = slack > median + _OUTLIER_MADS * max(mad, self.prior_mm)
             if np.array_equal(off, self.prior_off) or (~off).sum() < 3:
                 break
+            previous, previous_off = result, self.prior_off
             self.prior_off = off
             result = least_squares(
                 self.residuals, result.x, jac=self.jacobian, method="trf", x_scale="jac", loss="linear",
                 ftol=1e-10, xtol=1e-10, gtol=1e-10, max_nfev=_MAX_EVALUATIONS,
             )
+            if result.status <= 0:
+                # Keep the converged fit this refit started from, with its outlier set.
+                logger.warning("per-view fit: the refit without the outlying views' prior did not converge"
+                               " (%s); keeping the fit before it", result.message)
+                result, self.prior_off = previous, previous_off
+                break
         if result.status <= 0:
             return None, f"least_squares status {result.status} after {result.nfev} evaluations ({result.message})"
         result.prior_off = self.prior_off.copy()
@@ -437,11 +480,27 @@ class _Problem:
         return result, f"converged in {result.nfev} evaluations, cost {result.cost:.6g}, rms px {rms}"
 
     def slack_mm(self, x) -> np.ndarray:
-        """(views, 3) each view's board origin minus s R m + t, in the reference frame, mm."""
-        start = _N_INTRINSICS * len(self.names) + 6 * len(self.posed)
-        views = x[start:start + 6 * len(self.views)].reshape(-1, 6)
+        """(views, 3) each view's board centre minus s R m + t, in the reference frame, mm."""
+        views, R_views = self._views(x)
         sim = x[self._sim()]
-        return views[:, 3:] - (sim[6] * self.motor @ _rodrigues(sim[None, :3])[0].T + sim[3:6])
+        return self._centres(views, R_views, self.pivot(x)) - (sim[6] * self.motor @ _rodrigues(sim[None, :3])[0].T + sim[3:6])
+
+    def common_cost(self, results):
+        """A key that scores each converged result over the same outlier set, the union of
+        theirs: a start that freed more views would otherwise score lower for that alone."""
+        off = np.zeros(len(self.views), bool)
+        for result in results:
+            off |= getattr(result, "prior_off", np.zeros(len(self.views), bool))
+
+        def cost(result):
+            saved, self.prior_off = self.prior_off, off
+            try:
+                r = self.residuals(result.x)
+            finally:
+                self.prior_off = saved
+            return 0.5 * float(r @ r)
+
+        return cost
 
     def _per_camera_squares(self, r) -> Dict[str, List[np.ndarray]]:
         sq = (r[:len(self.observed)].reshape(-1, 2) ** 2).sum(axis=1)
@@ -481,23 +540,30 @@ class _Problem:
         return self._pack(intrinsics, self._relative_poses(view_poses), view_poses)
 
     def start_from(self, initial: MotorFrameFit) -> np.ndarray:
-        """The start a motor-frame fit (or a fit of this model) gives: its intrinsics and
-        camera poses, and each view where that model puts it, the board at board_rvec and
-        motor_scale x its commanded position in the motor frame; the similarity is the
-        reference camera's pose. Its tilts and slack are zero."""
-        intrinsics, cameras = {}, {}
+        """The start a given fit gives (the motor-frame fit's, or the cross-check's mapped
+        sensor fit): its intrinsics and relative camera poses, each view's pose from solvePnP
+        with those intrinsics (the reference camera's, else the first camera that saw it,
+        mapped through its pose), so the views keep their tilts; and the similarity the fit
+        implies, its reference camera's pose and motor_scale."""
+        intrinsics, cameras, view_poses = {}, {}, {}
         R_ref = cv2.Rodrigues(np.asarray(initial.cameras[self.ref].rvec, float))[0]
         t_ref = np.asarray(initial.cameras[self.ref].tvec, float).reshape(3)
         for cam in self.names:
             m = initial.cameras[cam]
-            intrinsics[cam] = (np.asarray(m.K, float), np.asarray(m.dist, float).ravel())
+            K, dist = np.asarray(m.K, float), np.asarray(m.dist, float).ravel()
+            intrinsics[cam] = (K, dist)
             R = cv2.Rodrigues(np.asarray(m.rvec, float))[0] @ R_ref.T
             cameras[cam] = (R, np.asarray(m.tvec, float).reshape(3) - R @ t_ref)
-        R_board = R_ref @ cv2.Rodrigues(np.asarray(initial.board_rvec, float))[0]
+            view_poses[cam] = {}
+            for p, ids, px in self.blocks[cam]:
+                _, rvec, tvec = cv2.solvePnP(self.obj[ids].astype(np.float32),
+                                             px.reshape(-1, 1, 2).astype(np.float32), K, dist)
+                view_poses[cam][p] = (cv2.Rodrigues(rvec)[0], tvec.ravel())
+        # The given fit puts the board centre at R_ref (R_b c + s m) + t_ref.
+        R_board = cv2.Rodrigues(np.asarray(initial.board_rvec, float))[0]
         s = float(initial.motor_scale)
-        views = {p: (R_board, R_ref @ (s * self.motor[p]) + t_ref) for p in range(len(self.views))}
-        view_poses = {self.ref: views, **{cam: {} for cam in self.posed}}
-        return self._pack(intrinsics, cameras, view_poses, similarity=(R_ref, s, t_ref))
+        return self._pack(intrinsics, cameras, view_poses,
+                          similarity=(R_ref, s, t_ref + R_ref @ R_board @ self.anchor))
 
     def _relative_poses(self, view_poses) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
         """Each camera's (R, t) from the reference camera's frame: BFS from the reference, each
@@ -543,9 +609,10 @@ class _Problem:
                     x[self._view(p)] = np.concatenate([cv2.Rodrigues(R_v)[0].ravel(), t_v])
                     break
         if self.prior_mm is not None:
+            if self.tilt:
+                x[self._pivot()] = self.anchor
             if similarity is None:
-                origins = np.array([x[self._view(p)][3:] for p in range(len(self.views))])
-                similarity = _similarity(self.motor, origins)
+                similarity = _similarity(self.motor, self._centres(*self._views(x), self.anchor))
             R, s, t = similarity
             x[self._sim()] = np.concatenate([cv2.Rodrigues(R)[0].ravel(), t, [s]])
         return x
@@ -556,15 +623,27 @@ class _Problem:
         J = result.jac.toarray() if hasattr(result.jac, "toarray") else np.asarray(result.jac)
         # The residual variance from the reprojections alone: the prior's residuals are in
         # its own units, and would otherwise inflate every sigma.
+        # _parameter_std divides by len(r) - parameters; padding the prior rows with zeros would
+        # count them as degrees of freedom, so the reprojection residuals are scaled to give
+        # their own variance, r @ r / (n - parameters).
         n = len(self.observed)
-        std = _parameter_std(J, np.concatenate([result.fun[:n], np.zeros(len(result.fun) - n)]))
-        views_R = [cv2.Rodrigues(x[self._view(p if self.tilt else 0)][:3])[0] for p in range(len(self.views))]
-        views_t = np.array([x[self._view(p)][3:] for p in range(len(self.views))])
+        n_params = J.shape[1]
+        scale = math.sqrt(max(len(result.fun) - n_params, 1) / max(n - n_params, 1))
+        std = _parameter_std(J, np.concatenate([result.fun[:n] * scale, np.zeros(len(result.fun) - n)]))
+        views, R_all = self._views(x)
+        views_R = list(R_all)
+        pivot = self.pivot(x)
+        centres = self._centres(views, R_all, pivot)
         fixed = None
         if self.prior_mm is not None:
             sim = x[self._sim()]
             fixed = (cv2.Rodrigues(sim[:3])[0], float(sim[6]), sim[3:6].copy())
-        R, s, t, placement = _place(self.views, views_R, views_t, self.motor, fixed)
+        R, s, t_centre, placement = _place(self.views, views_R, centres, self.motor, fixed)
+        # The similarity holds the pivot; the motor frame's origin is corner 0 at motor
+        # position 0 (fit.py), so X_ref = R @ X_motor + t with t = t_centre - R @ R_b @ pivot.
+        board_motor = _mean_rotation(np.array([R.T @ Rv for Rv in views_R]))
+        t = t_centre - R @ board_motor @ pivot
+        placement.pivot_mm = tuple(float(v) for v in pivot)
         off = getattr(result, "prior_off", None)
         if fixed is not None and off is not None:
             # The views the fit freed are the outliers, and the RMS is over the others.
@@ -589,7 +668,6 @@ class _Problem:
                 fitted.pop("cy")
             param_std[cam] = {name: float(fitted.get(name, 0.0)) for name in INTRINSIC_NAMES}
         partial = any(d.valid is not None for d in self.data.values())
-        board_motor = _mean_rotation(np.array([R.T @ Rv for Rv in views_R]))
         return MotorFrameFit(
             cameras=cameras,
             board_rvec=cv2.Rodrigues(board_motor)[0].ravel(),
@@ -629,7 +707,7 @@ def _project(X: np.ndarray, intrinsics: np.ndarray) -> np.ndarray:
 
 
 def _place(views, views_R, views_t, motor, fixed=None) -> Tuple[np.ndarray, float, np.ndarray, MotorPlacement]:
-    """(R, s, t) with board origin o_v ~ s R m_v + t, robust to outlying views, and the
+    """(R, s, t) with board centre o_v ~ s R m_v + t, robust to outlying views, and the
     MotorPlacement: per-view residuals in motor mm, tilts, scale, inlier RMS, outliers.
     `fixed`, an (R, s, t) the fit already solved, is used as it is; the outliers are then
     only those more than 3 MAD off it."""

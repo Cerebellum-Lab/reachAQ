@@ -94,6 +94,7 @@ def synthetic_rig(
     stage_error_mm: float = 0.0,
     stage_seed: int = 7,
     stage_offsets: Optional[Mapping[int, Sequence[float]]] = None,
+    tilt_pivot_mm: Sequence[float] = (0.0, 0.0, 0.0),
 ) -> SyntheticRig:
     """`cameras` (up to 6, left and right by default), 37 waypoints, and Gaussian corner
     noise of `noise_px` per coordinate.
@@ -163,7 +164,11 @@ def synthetic_rig(
             R_tilt = cv2.Rodrigues(np.array([np.cos(phi), np.sin(phi), 0.0]) * angle)[0]
             # `stage_offsets` adds a fixed error at named waypoints, such as lost steps at one z.
             error = stage.uniform(-stage_error_mm, stage_error_mm, 3) + offsets.get(w, 0.0)
-            view_poses[w] = (R_b @ R_tilt, motor_scale * (np.asarray(m, float) + error))
+            # The board turns about `tilt_pivot_mm`, a point in the board's frame (corner 0 by
+            # default): its mount, wherever that is, stays put.
+            pivot = np.asarray(tilt_pivot_mm, float)
+            R_v = R_b @ R_tilt
+            view_poses[w] = (R_v, motor_scale * (np.asarray(m, float) + error) + R_b @ pivot - R_v @ pivot)
     rng = np.random.default_rng(seed)
     observations, sq_err = [], {cam: {} for cam in models}
     for w, m in enumerate(motor):

@@ -934,6 +934,24 @@ def test_the_fit_setting_reaches_the_calibration(tmp_path, monkeypatch, settings
     assert modes == [expected]
 
 
+@pytest.mark.parametrize("settings, key", [
+    ({"fit": "bundle"}, "fit"),
+    ({"fit_principal_point": "middle"}, "fit_principal_point"),
+])
+def test_a_bad_fit_setting_stops_the_calibration_before_any_motion(tmp_path, monkeypatch, settings, key):
+    from reachaq.inference.multires_calibration import library
+
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.calibration_library_root = tmp_path / "calibrations"
+    library.update_settings(app_model.calibration_library_root, **settings)
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: calls.append(("run_waypoints",)))
+
+    with pytest.raises(ValueError, match=key):
+        make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert not [call for call in calls if call[0] == "motor"] and ("run_waypoints",) not in calls
+
+
 def test_a_bad_board_setting_stops_the_calibration_before_any_motion(tmp_path, monkeypatch):
     from reachaq.inference.multires_calibration import library
 

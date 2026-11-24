@@ -247,6 +247,9 @@ class MotorPlacement:
     outliers: List[int]  # waypoints left out of the similarity (more than 3 MAD off)
     # waypoint index -> the unit axis of that rotation in the motor frame (zero for none)
     tilt_axis: Dict[int, Tuple[float, float, float]] = field(default_factory=dict)
+    # The board point the similarity holds (the fitted pivot, or the board centre), in the
+    # board's frame, mm
+    pivot_mm: Optional[Tuple[float, float, float]] = None
 
 
 @dataclass
