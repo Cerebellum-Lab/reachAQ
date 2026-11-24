@@ -60,6 +60,7 @@ from tools.acquisition.model.handle_3d_calibration import capture_reference_entr
 from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
 from tools.acquisition.model.rfid_resolution import RfidResolutionKind
 from tools.acquisition.model.subsystem_status import SubsystemState
+from tools.acquisition.view.operator_alerts_view import install_operator_alerts
 from tools.acquisition.model.training_plan import get_plan_id
 from tools.acquisition.model.user_preferences import UserPreferences
 from tools.acquisition.view.calibration_dialog import (CalibrationDialog, CalibrationRequest, camera_unavailable_reason,
@@ -250,6 +251,8 @@ class MainWindow(QMainWindow):
             raise RuntimeError(f"Error setting up UI: {err}") from err
 
         app_model.on_error += self._show_message
+        # Before the configuration load below, so a load error is an alert too.
+        self.operator_alerts = install_operator_alerts(self, app_model, user_preferences)
         app_model.configuration_loaded_event += self._on_app_model_configuration_loaded
         app_model.training_plan_deserialized += self._on_training_plan_deserialized
 
