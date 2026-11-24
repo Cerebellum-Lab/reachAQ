@@ -215,3 +215,97 @@ def test_tracking_record_round_trip_retains_generation_and_frame_identity():
             record,
             expected_metadata_generation_id="session001-g2",
         )
+
+
+def _live_sample(frame_id, hand_x, *, pellet_seen=True):
+    """As the live path makes them: an unseen pellet has no 3D location."""
+    full = sample(frame_id, hand_x, pellet_seen=pellet_seen)
+    if pellet_seen:
+        return full
+    return LiveTrackingSample(**{
+        **full.__dict__,
+        "locations_3d": tuple(
+            item for item in full.locations_3d if item.name != str(SceneElement.Pellet)),
+    })
+
+
+def test_a_dropout_inside_a_reach_is_not_consumption_once_the_pellet_is_seen_again():
+    # Three unseen samples latched consumption for the rest of the reach,
+    # though the pellet was seen again afterwards: the trial became a
+    # SUCCESS (audit prod32-01).
+    distances = (30, 18, 10, 6, 5, 5, 5, 5, 6, 5, 12, 20, 30)
+    unseen = {4, 5, 6}
+    samples = [
+        sample(index, distance, pellet_seen=index not in unseen)
+        for index, distance in enumerate(distances)
+    ]
+
+    result = analyze_tracking_window(request(samples))
+
+    assert result.outcome is TrialOutcome.FAILURE
+    assert result.consumption_count == 0
+
+
+def test_a_reach_closed_as_the_pellet_reappears_is_not_consumption():
+    # Live tracking gives an unseen pellet no location, so the reach can only
+    # close on the first sample that sees the pellet again: the latch had to
+    # be judged after the reach, not at its close.
+    distances = (30, 18, 10, 5, 5, 5, 5, 30, 31, 32, 33, 34)
+    unseen = {4, 5, 6}
+    samples = [
+        _live_sample(index, distance, pellet_seen=index not in unseen)
+        for index, distance in enumerate(distances)
+    ]
+
+    result = analyze_tracking_window(request(samples))
+
+    assert result.outcome is TrialOutcome.FAILURE
+    assert result.consumption_count == 0
+
+
+def test_a_pellet_seen_again_too_briefly_is_still_consumed():
+    # Fewer re-detections than the rule asks for, then gone to the end.
+    distances = (30, 18, 10, 5, 5, 5, 5, 30, 31, 32, 33, 34)
+    seen = {0, 1, 2, 3, 7, 8}
+    samples = [
+        _live_sample(index, distance, pellet_seen=index in seen)
+        for index, distance in enumerate(distances)
+    ]
+
+    result = analyze_tracking_window(request(samples))
+
+    assert result.outcome is TrialOutcome.SUCCESS
+    assert result.consumption_count == 1
+
+
+def test_the_consumption_rule_counts_are_configurable():
+    from tools.acquisition.model.intertrial_analysis import ConsumptionRule
+
+    distances = (30, 18, 10, 6, 5, 5, 5, 5, 6, 5, 12, 20, 30)
+    unseen = {4, 5, 6}
+    samples = [
+        sample(index, distance, pellet_seen=index not in unseen)
+        for index, distance in enumerate(distances)
+    ]
+
+    stricter = analyze_tracking_window(
+        request(samples), consumption_rule=ConsumptionRule(missing_samples=4))
+    lenient = analyze_tracking_window(
+        request(samples), consumption_rule=ConsumptionRule(reseen_samples=10))
+
+    assert stricter.consumption_count == 0
+    assert lenient.consumption_count == 1
+
+
+def test_the_consumption_rule_reads_the_environment_and_refuses_bad_values():
+    from tools.acquisition.model.intertrial_analysis import ConsumptionRule
+
+    assert ConsumptionRule.from_environment({}) == ConsumptionRule(3, 3)
+    assert ConsumptionRule.from_environment({
+        "REACHAQ_CONSUMPTION_MISSING_SAMPLES": "5",
+        "REACHAQ_CONSUMPTION_RESEEN_SAMPLES": "2",
+    }) == ConsumptionRule(5, 2)
+    assert ConsumptionRule.from_environment({
+        "REACHAQ_CONSUMPTION_MISSING_SAMPLES": "zero",
+        "REACHAQ_CONSUMPTION_RESEEN_SAMPLES": "0",
+    }) == ConsumptionRule(3, 3)

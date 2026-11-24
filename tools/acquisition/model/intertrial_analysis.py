@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import logging
 import math
+import os
 import queue
 import threading
 import time
@@ -26,6 +28,58 @@ logger = logging.getLogger(__name__)
 
 class AnalysisCancelled(RuntimeError):
     pass
+
+
+CONSUMPTION_MISSING_SAMPLES_ENV_VAR = "REACHAQ_CONSUMPTION_MISSING_SAMPLES"
+CONSUMPTION_RESEEN_SAMPLES_ENV_VAR = "REACHAQ_CONSUMPTION_RESEEN_SAMPLES"
+MAX_CONSUMPTION_SAMPLES = 1000
+
+
+@dataclass(frozen=True)
+class ConsumptionRule:
+    """When a reach counts as having taken the pellet.
+
+    ``missing_samples`` consecutive samples without the pellet during a reach
+    mark it taken; ``reseen_samples`` consecutive samples that see it again,
+    during the reach or after it, take that back. Both depend on how often
+    the pose model loses a pellet it can still see, so they are settings
+    rather than constants (Ben, 2026-11-23). Environment, like the reach state
+    source, until the next configuration version.
+    """
+
+    missing_samples: int = 3
+    reseen_samples: int = 3
+
+    def __post_init__(self):
+        for name in ("missing_samples", "reseen_samples"):
+            value = int(getattr(self, name))
+            if not 1 <= value <= MAX_CONSUMPTION_SAMPLES:
+                raise ValueError(
+                    f"{name} must be between 1 and {MAX_CONSUMPTION_SAMPLES}, found {value}")
+            object.__setattr__(self, name, value)
+
+    @classmethod
+    def from_environment(cls, environ=None) -> "ConsumptionRule":
+        """Read the rule; an unusable value keeps its default, with a warning."""
+        source = os.environ if environ is None else environ
+        values = {}
+        for name, variable in (
+            ("missing_samples", CONSUMPTION_MISSING_SAMPLES_ENV_VAR),
+            ("reseen_samples", CONSUMPTION_RESEEN_SAMPLES_ENV_VAR),
+        ):
+            raw = (source.get(variable) or "").strip()
+            if not raw:
+                continue
+            try:
+                value = int(raw)
+            except ValueError:
+                value = None
+            if value is None or not 1 <= value <= MAX_CONSUMPTION_SAMPLES:
+                logger.warning("%s=%r is not a count from 1 to %d; using the default",
+                               variable, raw, MAX_CONSUMPTION_SAMPLES)
+                continue
+            values[name] = value
+        return cls(**values)
 
 
 class AnalysisProgressionMode(str, enum.Enum):
@@ -187,10 +241,12 @@ def analyze_tracking_window(
     *,
     hand_distance_threshold_mm: float = 15.0,
     max_interpolation_gap_seconds: float = 0.1,
-    minimum_consumption_missing_samples: int = 3,
+    consumption_rule: Optional[ConsumptionRule] = None,
     cancellation_event: Optional[threading.Event] = None,
 ) -> IntertrialAnalysisResult:
     """Classify reaches from existing live tracking; no frame inference occurs."""
+
+    rule = ConsumptionRule.from_environment() if consumption_rule is None else consumption_rule
 
     started = time.perf_counter()
     if cancellation_event is not None and cancellation_event.is_set():
@@ -207,6 +263,12 @@ def analyze_tracking_window(
     pellet_was_seen = False
     pellet_lost = False
     pellet_missing_run = 0
+    pellet_seen_run = 0
+    # Reaches that closed with the pellet lost, until it is seen again for
+    # long enough or the window ends. Live tracking gives an unseen pellet
+    # no location, so a reach can only close on the sample that sees it
+    # again: judged at the close, every dropout would stay a consumption.
+    pending = []
 
     def finish_active():
         nonlocal active, approached, pellet_lost, pellet_missing_run
@@ -224,6 +286,8 @@ def analyze_tracking_window(
             closest_offset=closest[2],
             consumed=pellet_lost,
         ))
+        if pellet_lost:
+            pending.append(len(trajectories) - 1)
         active = []
         approached = False
         pellet_lost = False
@@ -237,11 +301,20 @@ def analyze_tracking_window(
         if sample.pellet_seen:
             pellet_was_seen = True
             pellet_missing_run = 0
-        elif pellet_was_seen and active:
-            pellet_missing_run += 1
-            pellet_lost = (
-                pellet_missing_run >= minimum_consumption_missing_samples
-            )
+            pellet_seen_run += 1
+            if pellet_seen_run >= rule.reseen_samples:
+                # Seen again for long enough: the dropout took nothing.
+                pellet_lost = False
+                for index in pending:
+                    trajectories[index] = dataclasses.replace(
+                        trajectories[index], consumed=False)
+                pending = []
+        else:
+            pellet_seen_run = 0
+            if pellet_was_seen and active:
+                pellet_missing_run += 1
+                if pellet_missing_run >= rule.missing_samples:
+                    pellet_lost = True
         if pellet is None or hand is None:
             continue
         offset = (hand.x - pellet.x, hand.y - pellet.y, hand.z - pellet.z)

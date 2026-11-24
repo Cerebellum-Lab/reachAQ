@@ -279,6 +279,14 @@ The worker consumes existing live pose/tracking data; it does not reopen video
 and does not run a second inference pass. Results update the ledger atomically
 while cameras and every other session stream continue.
 
+A reach counts as a consumption when the pellet goes unseen for
+`REACHAQ_CONSUMPTION_MISSING_SAMPLES` consecutive live samples during it
+(default 3), unless it is then seen again for
+`REACHAQ_CONSUMPTION_RESEEN_SAMPLES` consecutive samples (default 3), during the
+reach or after it, before the window ends. Both depend on how often the pose
+model loses a pellet that is still there; an unusable value keeps its default
+with a warning.
+
 Stop marks an active, not-yet-completed physical attempt `incomplete`, drains
 only already-closed windows, and performs a final repair from the stored
 tracking JSON if needed. An attempt left without a usable result is explicitly
