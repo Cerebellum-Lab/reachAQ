@@ -64,6 +64,41 @@ def test_charuco_ids_are_object_points_order():
     np.testing.assert_allclose(CHARUCO_BOARD.object_points()[:, :2], np.column_stack([k % 8, k // 8]) * 4.0)
 
 
+def test_charuco_board_is_the_generator_board():
+    # The rig's board was made with exactly this, and generateImage((w, h), marginSize=0,
+    # borderBits=1), at OpenCV 4.11's default legacy pattern (off).
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    generator = cv2.aruco.CharucoBoard((9, 7), 4.0, 3.0, dictionary)
+    spec = BoardSpec(kind=CHARUCO, rows=6, cols=8, square_mm=4.0, marker_mm=3.0, dictionary="DICT_4X4_50")
+    ours = spec.charuco_board()
+    assert tuple(ours.getChessboardSize()) == tuple(generator.getChessboardSize()) == (9, 7)
+    assert ours.getSquareLength() == generator.getSquareLength() == 4.0
+    assert ours.getMarkerLength() == generator.getMarkerLength() == 3.0
+    np.testing.assert_array_equal(np.asarray(ours.getIds()), np.asarray(generator.getIds()))
+    ours_obj, generator_obj = ours.getObjPoints(), generator.getObjPoints()
+    assert len(ours_obj) == len(generator_obj) == 31
+    for a, b in zip(ours_obj, generator_obj):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    assert ours.getLegacyPattern() is False
+    image = ours.generateImage((900, 700), marginSize=0, borderBits=1)
+    expected = generator.generateImage((900, 700), marginSize=0, borderBits=1)
+    assert image.dtype == expected.dtype and image.shape == expected.shape
+    assert image.tobytes() == expected.tobytes()
+
+
+def test_charuco_board_pins_the_legacy_pattern_off(monkeypatch):
+    # A future OpenCV whose CharucoBoard defaults to the legacy pattern must not change the board.
+    real = cv2.aruco.CharucoBoard
+
+    def legacy_by_default(*args, **kwargs):
+        board = real(*args, **kwargs)
+        board.setLegacyPattern(True)
+        return board
+
+    monkeypatch.setattr(cv2.aruco, "CharucoBoard", legacy_by_default)
+    assert CHARUCO_BOARD.charuco_board().getLegacyPattern() is False
+
+
 def test_the_rig_board_has_the_checkerboard_geometry():
     assert (CHARUCO_BOARD.rows, CHARUCO_BOARD.cols, CHARUCO_BOARD.square_mm) == (6, 8, 4.0)
     np.testing.assert_array_equal(CHARUCO_BOARD.object_points(), BoardSpec().object_points())

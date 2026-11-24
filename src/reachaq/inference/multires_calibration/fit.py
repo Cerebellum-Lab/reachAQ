@@ -135,12 +135,18 @@ class BoardSpec:
         return np.column_stack([col.ravel(), row.ravel(), np.zeros(row.size)]).astype(float) * self.square_mm
 
     def charuco_board(self):
-        """The cv2.aruco.CharucoBoard this board is (CHARUCO only)."""
+        """The cv2.aruco.CharucoBoard this board is (CHARUCO only), with the legacy pattern off.
+
+        The rig's board was generated at OpenCV 4.11's default, legacy pattern off; it is set
+        here so a later default cannot change which squares hold markers.
+        """
         if self.kind != CHARUCO:
             raise ValueError(f"a {self.kind} board is not a ChArUco board")
         dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, self.dictionary))
-        return cv2.aruco.CharucoBoard(
+        board = cv2.aruco.CharucoBoard(
             (self.cols + 1, self.rows + 1), float(self.square_mm), float(self.marker_mm), dictionary)
+        board.setLegacyPattern(False)
+        return board
 
 
 def valid_corners(corners: np.ndarray) -> np.ndarray:
