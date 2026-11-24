@@ -6841,6 +6841,15 @@ class AppModel(ObservableObject):
             # before a later motor or laser step failed. Never let those
             # actions leak into the next manual or protocol SEND.
             self._behavior.system_machine.pellet.cancel_prepared_cover_policy()
+            current = self._trial_action_executor.operation
+            if (
+                current is not None
+                and current.recipe.session_generation == token.generation
+                and current.state is PreparedState.CANCELLED
+            ):
+                # Stop or Abort cancelled it mid-preparation: not a failure.
+                logger.info("Pellet-trial preparation stopped: %s", error)
+                return
             logger.exception("Pellet-trial preparation failed")
             self.on_error(
                 "Pellet trial was not sent",

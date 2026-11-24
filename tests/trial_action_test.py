@@ -686,3 +686,76 @@ def test_a_direct_ni_first_reach_laser_is_not_started_by_its_phase(monkeypatch, 
     finally:
         executor.cancel(reason="test ended")
         model.close()
+
+
+def test_a_cancel_during_preparation_stops_every_later_hardware_step():
+    # prepare() checked nothing between its steps: a Stop that cancelled it
+    # while the pellet axes moved still let the tone play, the laser arm and
+    # the detector prepare, none of it for a recorded trial (audit prod26-01).
+    calls = []
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "tone_profile_id": "cue",
+        "tone_phase": "before_send",
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 1,
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "first_reach",
+    })
+    recipe = _compiler().compile(row, _context())
+    executor = None
+
+    def move(target):
+        calls.append("move")
+        executor.cancel(reason="stop")
+
+    executor = TrialActionExecutor(
+        move_absolute=move,
+        configure_cover=lambda policy, recipe: calls.append("cover"),
+        play_tone=lambda profile, phase: calls.append("tone"),
+        prepare_laser=lambda profile, recipe: calls.append("laser"),
+        cancel_laser=lambda handle: calls.append("cancel_laser"),
+        prepare_detector=lambda recipe: calls.append("detector"),
+    )
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        executor.prepare(recipe)
+
+    assert calls == ["move"]
+    assert executor.operation.state is PreparedState.CANCELLED
+
+
+def test_a_laser_armed_as_the_cancel_lands_is_cancelled_by_preparation():
+    calls = []
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 1,
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "first_reach",
+    })
+    recipe = _compiler().compile(row, _context())
+    executor = None
+
+    def arm(profile, recipe):
+        executor.cancel(reason="stop")
+        return "handle"
+
+    executor = TrialActionExecutor(
+        move_absolute=lambda target: None,
+        configure_cover=lambda policy, recipe: None,
+        play_tone=lambda profile, phase: None,
+        prepare_laser=arm,
+        cancel_laser=lambda handle: calls.append(("cancel_laser", handle)),
+        prepare_detector=lambda recipe: calls.append("detector"),
+    )
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        executor.prepare(recipe)
+
+    assert calls == [("cancel_laser", "handle")]
+    assert executor.operation.state is PreparedState.CANCELLED

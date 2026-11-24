@@ -757,6 +757,7 @@ class TrialActionExecutor:
         try:
             self._move_absolute(recipe.resolved_motor_target)
             self._observe("motor target acknowledged")
+            self._require_preparing(operation)
             cover = recipe.requested_row["cover_policy"]
             self._configure_cover(str(cover), recipe)
             self._observe(f"cover policy prepared: {cover}")
@@ -765,11 +766,19 @@ class TrialActionExecutor:
                 recipe.tone_profile is not None
                 and row["tone_phase"] in {"before_send", "embedded_in_sequence"}
             ):
+                self._require_preparing(operation)
                 phase = row["tone_phase"]
                 self._play_tone(recipe.tone_profile, phase)
                 self._observe(f"{phase} tone prepared/acknowledged")
             if recipe.laser_profile is not None:
-                self._laser_handle = self._prepare_laser(recipe.laser_profile, recipe)
+                self._require_preparing(operation)
+                handle = self._prepare_laser(recipe.laser_profile, recipe)
+                with self._lock:
+                    # A cancel that landed during the arm found no handle to
+                    # cancel; the check below then raises, and the except
+                    # cancels this one.
+                    self._laser_handle = handle
+                self._require_preparing(operation)
                 self._snapshot_laser_action()
                 self._observe(
                     "laser prepared: " + recipe.laser_firing.trigger_route.value
@@ -782,14 +791,40 @@ class TrialActionExecutor:
                 elif row["laser_phase"] == "before_send":
                     self._observe("before_send laser trigger enabled")
             if recipe.stimulus_selected and row["stimulus_trigger"] == "first_reach":
-                self._detector_handle = self._prepare_detector(recipe)
+                self._require_preparing(operation)
+                handle = self._prepare_detector(recipe)
+                with self._lock:
+                    self._detector_handle = handle
                 self._observe("stim-camera First Reach detector prepared")
-            operation.transition(PreparedState.PREPARED)
+            with self._lock:
+                self._require_preparing(operation)
+                operation.transition(PreparedState.PREPARED)
             return operation
         except Exception as error:
-            self._cancel_laser_safely()
-            operation.transition(PreparedState.FAILED, f"{type(error).__name__}: {error}")
+            with self._lock:
+                if self._operation is operation:
+                    self._cancel_laser_safely()
+                    self._cancel_detector_safely()
+                if operation.state not in PreparedTrialOperation.TERMINAL:
+                    operation.transition(
+                        PreparedState.FAILED, f"{type(error).__name__}: {error}")
             raise
+
+    def _require_preparing(self, operation) -> None:
+        """Refuse the next preparation step once a cancel or fail has landed.
+
+        Stop cancels the executor while prepare() runs on its worker: without
+        this the motor wait finished and the tone, the laser arm and the
+        detector still followed, for a trial that would never be sent.
+        """
+        with self._lock:
+            if self._operation is not operation:
+                raise RuntimeError("Pellet-trial preparation was replaced")
+            if operation.state is not PreparedState.PREPARING:
+                raise RuntimeError(
+                    f"Pellet-trial preparation was {operation.state.value} "
+                    "before it finished"
+                )
 
     def require_send_permission(self, operation_id: str, generation: int):
         with self._lock:
