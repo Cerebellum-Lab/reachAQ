@@ -627,15 +627,14 @@ def _in_thread(function, *args):
     return thread, outcome
 
 
-@pytest.mark.parametrize("phase", ["pellet_presentation", "retract"])
-def test_a_stop_reaches_the_lasers_cancel_while_a_phases_start_is_held(monkeypatch, phase):
-    # trigger() starts a direct NI laser on its caller's thread (D2.3). A
-    # phase called it holding the executor's lock, so a start hung in the
-    # driver held Stop's executor.cancel() on that lock before it reached
-    # the laser's cancel: the shutter, opened at arm, stayed open (the review
-    # of tasks 7-8, M2). The start is now made after the lock is let go, as
-    # prepare's before_send start is, and the operation's own claim and
-    # cancel protect it.
+@pytest.mark.parametrize("phase", ["before_send", "pellet_presentation", "retract"])
+def test_a_direct_ni_first_reach_laser_is_not_started_by_its_phase(monkeypatch, phase):
+    # A runnable Direct NI row is always First Reach (schedule validation).
+    # Its laser phase started the output, so the pulse fired at presentation
+    # (the editor's default phase) on every stim trial whether or not the
+    # animal reached, and the stim camera's start was then refused as not
+    # armed. The phase only records the trigger point; First Reach starts it,
+    # through the laser model's direct trigger receiver (audit prod41-01).
     from laser_model_test import _nidaq_model
     from tools.acquisition.model.laser_model import wait_until_cancelled_ends
 
@@ -652,8 +651,6 @@ def test_a_stop_reaches_the_lasers_cancel_while_a_phases_start_is_held(monkeypat
     recipe = _compiler().compile(row, _context())
 
     def cancel_as_the_app_does(handle):
-        # AppModel._cancel_protocol_laser: the cancel, then a bounded wait for
-        # the operation to end.
         handle.cancel()
         wait_until_cancelled_ends(handle)
 
@@ -665,46 +662,27 @@ def test_a_stop_reaches_the_lasers_cancel_while_a_phases_start_is_held(monkeypat
             profile, recipe.laser_firing, recipe),
         cancel_laser=cancel_as_the_app_does,
     )
-    starting, release = threading.Event(), threading.Event()
 
-    def held_in_the_driver(task):
-        if task.label == "laser_sync_pulse_ao":
-            starting.set()
-            release.wait(10.0)
+    def started():
+        return any(task.label == "laser_sync_pulse_ao" and task.started
+                   for task in daq.tasks)
 
     try:
         executor.prepare(recipe)
         laser = executor._laser_handle
         executor.bind_send(recipe.operation_id, 4, "can-context")
-        daq.before_start = held_in_the_driver
-        if phase == "pellet_presentation":
-            phase_thread, _outcome = _in_thread(
-                executor.acknowledge_presentation, "can-context")
-        else:
-            executor.acknowledge_presentation("can-context")
-            phase_thread, _outcome = _in_thread(executor.execute_phase, phase)
-        try:
-            assert starting.wait(5.0)
-            canceller, _cancelled = _in_thread(lambda: executor.cancel(reason="stop"))
-            deadline = time.monotonic() + 3.0
-            while daq.writes_to("PXI1Slot5/port0/line4")[-1] is not False:
-                assert time.monotonic() < deadline, "the cancel never closed the shutter"
-                time.sleep(0.005)
-            canceller.join(5.0)
+        executor.acknowledge_presentation("can-context")
+        executor.execute_phase("retract")
 
-            assert not canceller.is_alive()
-            assert not release.is_set()
-            assert executor.operation.state is PreparedState.CANCELLED
-        finally:
-            release.set()
-        phase_thread.join(5.0)
+        assert laser.state.value == "armed"
+        assert not started()
+        observed = [item["detail"] for item in executor.operation_record()["observations"]]
+        assert f"{phase} laser trigger enabled" in observed
 
-        assert not phase_thread.is_alive()
+        # The First Reach start, as the direct trigger receiver makes it.
+        laser.trigger()
         assert laser.wait_until_finished(5.0)
-        assert laser.state.value == "cancelled"
-        assert daq.writes_to("PXI1Slot5/port0/line4")[-1] is False
-        assert daq.writes_to("PXI1Slot4/ao0")[-1] == 0.0
-        assert daq.reserved == {}
+        assert laser.state.value == "completed"
     finally:
-        release.set()
+        executor.cancel(reason="test ended")
         model.close()

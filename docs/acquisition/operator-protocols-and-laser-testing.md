@@ -78,6 +78,11 @@ qualifies). Change any of those cells afterward as needed. Clearing **Laser
 profile** clears the whole action. **Laser** itself lists every configured
 channel (`Laser 1`, `Laser 2`, ...) or `None`.
 
+A **Trigger** of `first_reach` is started by the stim camera's First Reach
+detector and nothing else. **Laser phase** then only records when in the cycle
+the trigger point was reached; it does not start the laser. A `direct_ni_software`
+row must use `first_reach`.
+
 A **Trigger** of `pre_reveal` is timed by the pellet board. It pulses the
 laser's board STIM line (STIM2 or STIM3; on christielab10, STIM3 for laser 1
 and STIM2 for laser 2), waits **Pre-reveal (ms)** from that pulse's rising

@@ -774,8 +774,13 @@ class TrialActionExecutor:
                 self._observe(
                     "laser prepared: " + recipe.laser_firing.trigger_route.value
                 )
-                if row["laser_phase"] == "before_send":
+                if (
+                    row["laser_phase"] == "before_send"
+                    and _phase_starts_laser(row)
+                ):
                     self._trigger_laser_if_direct("before_send")
+                elif row["laser_phase"] == "before_send":
+                    self._observe("before_send laser trigger enabled")
             if recipe.stimulus_selected and row["stimulus_trigger"] == "first_reach":
                 self._detector_handle = self._prepare_detector(recipe)
                 self._observe("stim-camera First Reach detector prepared")
@@ -841,10 +846,13 @@ class TrialActionExecutor:
             self._arm_cue_pair(recipe, phase)
         # A laser is already armed. Phase execution records the semantic
         # trigger point; the configured board STIM/NI route owns physical
-        # start.
+        # start. A First Reach row is started by its detector alone: on the
+        # Direct NI route, by the laser model's direct trigger receiver.
         if recipe.laser_profile is not None and row["laser_phase"] == phase:
             observation = f"{phase} laser trigger enabled"
-            handle = self._direct_laser_handle()
+            handle = (
+                self._direct_laser_handle() if _phase_starts_laser(row) else None
+            )
             if handle is None:
                 self._observe(observation)
                 return None
@@ -1224,6 +1232,18 @@ class TrialActionExecutor:
         if self._operation is None:
             raise RuntimeError("No prepared pellet-trial operation exists")
         return self._operation
+
+
+def _phase_starts_laser(row) -> bool:
+    """Whether reaching the row's laser phase starts a Direct NI output.
+
+    Not for a detector-driven trigger: the phase then only records when the
+    trigger point was reached, and the detector's start is the only one.
+    Schedule validation makes every runnable Direct NI row First Reach, so
+    today no phase starts one; the protocol document says First Reach (Ben,
+    2026-11-23).
+    """
+    return row.get("stimulus_trigger") != "first_reach"
 
 
 def _finite_vector(values, name):
