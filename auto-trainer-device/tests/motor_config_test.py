@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from autotrainer.core import Motor
-from autotrainer.device import MotorConfigurationFile, StepperConfig, ServoConfig
+from autotrainer.device import MotorConfigurationFile, StepperConfig, ServoConfig, stepper_travel_refusal
 
 
 @pytest.fixture
@@ -103,3 +103,12 @@ def test_christielab10_motor_config_loads_with_its_travel():
     assert configs.y_config[1].flip_limit_orientation is False
     # The servos keep their own limits, as before.
     assert (configs.load_config[1].minimum_position, configs.load_config[1].maximum_position) == (0, 120)
+
+
+def test_a_target_a_rounding_error_past_a_limit_is_inside():
+    # A DCS conversion of a nominal 35.0 can come out as 35.0000000001.
+    config = StepperConfig.from_dict({"min_pos": 0, "max_pos": 35})
+    assert stepper_travel_refusal("x", 35.0000000001, config) is None
+    assert stepper_travel_refusal("x", -1e-9, config) is None
+    assert stepper_travel_refusal("x", 35.00001, config) is not None
+    assert stepper_travel_refusal("x", -0.00001, config) is not None

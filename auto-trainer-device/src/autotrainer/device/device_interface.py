@@ -423,18 +423,23 @@ class StepperConfig(MotorSource):
         self._maximum_position = value
 
 
+#: How far past a travel limit (mm) a target may lie and still be sent: a DCS conversion of a
+#: nominal 35.0 can come out as 35.0000000001. Far below a microstep (about 1e-3 mm).
+TRAVEL_TOLERANCE_MM = 1e-6
+
+
 def stepper_travel_refusal(axis: str, target: float, config) -> Optional[str]:
     """The error to log when `target` (mm) lies outside the travel of the stepper `config`
     (StepperConfig.minimum_position / maximum_position), else None. An unset side is not
     limited, so a config without travel never refuses. A non-finite target is refused once
-    any side is set."""
+    any side is set. A target within TRAVEL_TOLERANCE_MM of a limit is inside."""
     minimum = getattr(config, "minimum_position", None)
     maximum = getattr(config, "maximum_position", None)
     if minimum is None and maximum is None:
         return None
     low = -math.inf if minimum is None else minimum
     high = math.inf if maximum is None else maximum
-    if low <= target <= high:
+    if low - TRAVEL_TOLERANCE_MM <= target <= high + TRAVEL_TOLERANCE_MM:
         return None
     return (f"Axis-{axis.upper()}: move to {target:.3f} refused: "
             f"outside the configured travel {low:g}-{high:g} mm")
