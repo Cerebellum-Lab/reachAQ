@@ -407,3 +407,22 @@ def test_a_failing_tone_send_is_recorded_and_does_not_raise():
     harness.timer.fire(at=100.4)
 
     assert any("Tone 2 send failed after" in detail for detail in _details(operation))
+
+
+def test_tone_2_skipped_for_want_of_pellet_evidence_is_a_warning(caplog):
+    # Unknown presence skipped Tone 2 on every trial, and only an observation
+    # string in the operation record said so (audit prod41-02).
+    import logging
+
+    harness = _Harness(pellet_presence_provider=lambda: None)
+    operation = _prepare(harness, _recipe(cue_interval_ms=400))
+
+    with caplog.at_level(logging.WARNING):
+        harness.timer.fire()
+
+    assert ("tone2", "tone_2") not in harness.tones
+    assert any("lock_deadline_gate_state_stale" in detail for detail in _details(operation))
+    warnings = [record.getMessage() for record in caplog.records
+                if record.levelno == logging.WARNING]
+    assert any("Tone 2 was skipped" in message and "pellet" in message
+               for message in warnings)

@@ -357,6 +357,7 @@ from tools.acquisition.model.intertrial_analysis import (
     classify_pellet_state,
 )
 from tools.acquisition.model.reach_state_source import (
+    LiveTrackingPelletPresenceProvider,
     LiveTrackingReachProvider,
     ReachStateConfiguration,
     ReachStateResolver,
@@ -1350,6 +1351,9 @@ class AppModel(ObservableObject):
             trigger_hardware_stimulus=self._trigger_protocol_stim3,
             withdraw_laser_trigger=self._withdraw_protocol_laser_trigger,
             reach_state_resolver=self._reach_state_resolver,
+            # Without it presence is unknown on every evaluation, which the cue
+            # policy reads as stale, so no cued Tone 2 could ever fire.
+            pellet_presence_provider=LiveTrackingPelletPresenceProvider(self._live_tracking),
         )
         # One holder, several holders-of-holds. intertrial analysis and
         # inter-trial timing both block the send, and BehaviorAlgorithm reads

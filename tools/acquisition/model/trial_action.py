@@ -1142,6 +1142,13 @@ class TrialActionExecutor:
                 self._observe_safely(
                     f"Tone 2 skipped and reset: {evaluation.reason.value}"
                 )
+                if gate.pellet_present is None:
+                    # The operator's only sign otherwise was this record:
+                    # every cue trial skipped, and nothing on screen.
+                    logger.warning(
+                        "Tone 2 was skipped: no fresh pellet presence evidence "
+                        "at its deadline (%s). Check that the pellet presence "
+                        "source is running.", evaluation.reason.value)
                 self._cancel_cue_pair()
                 return
 
