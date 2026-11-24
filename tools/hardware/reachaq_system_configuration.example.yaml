@@ -103,6 +103,17 @@ cameras:
     stim_pre_event_frames: 450
     stim_post_event_frames: 450
     stim_preview_fps: 15
+    # Optional, on any one camera: Tone 2's pellet gate from this camera's
+    # image, read when REACHAQ_PELLET_PRESENCE_SOURCE=roi. The mean pixel
+    # value in the rectangle is compared with the threshold; calibrate all
+    # of it on the rig with a pellet on and off the post.
+    # pellet_roi_x: 0
+    # pellet_roi_y: 0
+    # pellet_roi_width: 16
+    # pellet_roi_height: 16
+    # pellet_roi_threshold: 100
+    # pellet_roi_hysteresis: 10
+    # pellet_roi_present_when: above   # or below, for a pellet darker than its post
 hardware: !HardwareConfiguration
   pelletIdentifier: CAN
   # Rig-level hardware availability switches are intentionally grouped here.

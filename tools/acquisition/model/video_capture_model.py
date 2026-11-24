@@ -27,7 +27,7 @@ from autotrainer.core.logging import log_hardware_initialization
 from autotrainer.core.project import ProjectInfo, ProjectDependentProtocol
 from autotrainer.video import VideoCapture, VideoRecordProperties, VideoRecordMode, VideoManager, \
     VideoReader, CaptureCommandKind, CaptureCameraAttrs, CaptureInferenceAttrs, CaptureAttrs, \
-    StimCameraDetectionConfiguration, StimRoiDefinition
+    StimCameraDetectionConfiguration, StimRoiDefinition, PelletRoiConfiguration, PelletRoiState
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.video.camera_discovery import (
     DEFAULT_CAMERA_DISCOVERY_TIMEOUT_SECONDS,
@@ -223,6 +223,10 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
 
         self._display_update_fcn = None
         self._stim_detection_configuration = None
+        #: Pellet presence from this camera's frames (params pellet_roi_*);
+        #: the state is shared with the capture child, so made here, once.
+        self._pellet_roi_configuration: Optional[PelletRoiConfiguration] = None
+        self._pellet_roi_state = PelletRoiState(get_mp_ctx())
 
         self._frame_count = 0
         self._start = 0
@@ -248,6 +252,13 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
     @property
     def camera_id(self) -> CameraId:
         return self._id
+
+    @property
+    def pellet_roi_state(self) -> Optional[PelletRoiState]:
+        """The pellet ROI's latest answer; None when this camera has none."""
+        if self._pellet_roi_configuration is None:
+            return None
+        return self._pellet_roi_state
 
     @property
     def video_status(self) -> CaptureProcessStatus:
@@ -605,7 +616,11 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
                 record_stop_sema=self._record_stop_sema,
                 stim_detection=self._stim_detection_configuration,
                 stim_trigger_queue=self._stim_trigger_queue,
+                pellet_roi=self._pellet_roi_configuration,
+                pellet_roi_state=self._pellet_roi_state,
             )
+            # Nothing from an earlier capture is evidence for this one.
+            self._pellet_roi_state.reset()
 
             rotate_interval = self._record_rotate_interval if self._is_recording_enabled else -1
             image_interval = self._still_image_capture_interval if self._is_still_capture_enabled else 0
@@ -703,6 +718,12 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
         )
         self._is_primary = self._configured_is_primary
         self._stim_detection_configuration = self._stim_configuration_from_camera(conf)
+        try:
+            self._pellet_roi_configuration = PelletRoiConfiguration.from_params(conf.params)
+        except (TypeError, ValueError) as error:
+            # Refused rather than guessed; the cue gate then has no ROI evidence.
+            logger.error("%s: the pellet ROI configuration is unusable: %s", conf.name, error)
+            self._pellet_roi_configuration = None
 
         url = f"{conf.scheme}://{conf.host}"
 

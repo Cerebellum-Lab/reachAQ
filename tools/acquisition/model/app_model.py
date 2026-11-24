@@ -211,7 +211,11 @@ from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.helpers import first_line, get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.inference_model import InferenceModel
-from tools.acquisition.model.laser_model import LaserModel, wait_until_cancelled_ends
+from tools.acquisition.model.laser_model import (
+    PROTOCOL_LASER_ARM_WINDOW_S,
+    LaserModel,
+    wait_until_cancelled_ends,
+)
 from autotrainer.device import (
     CanFailure,
     CanTransportConfiguration,
@@ -354,6 +358,8 @@ from tools.acquisition.model.intertrial_analysis import (
 )
 from tools.acquisition.model.reach_state_source import (
     LiveTrackingReachProvider,
+    make_pellet_presence_provider,
+    pellet_presence_source_from_environment,
     ReachStateConfiguration,
     ReachStateResolver,
 )
@@ -529,6 +535,22 @@ def _serialized_session_configuration(method):
             return method(self, *args, **kwargs)
 
     return wrapped
+
+
+def _preparation_was_cancelled(executor, token) -> bool:
+    """Whether Stop or Abort cancelled this generation's trial preparation.
+
+    Never raises: it decides only how a failed preparation is reported.
+    """
+    try:
+        current = executor.operation
+        return (
+            current is not None
+            and current.state is PreparedState.CANCELLED
+            and current.recipe.session_generation == token.generation
+        )
+    except Exception:
+        return False
 
 
 def _metadata_without_nonfinite_numbers(value):
@@ -1342,6 +1364,8 @@ class AppModel(ObservableObject):
                 on_observe=self._session_data_recorder.latency_events.record_gate_observation,
             ),
         )
+        # Tone 2's pellet gate: live pose, a camera's pellet ROI, or none.
+        self._pellet_presence_source = pellet_presence_source_from_environment()
         self._trial_action_executor = TrialActionExecutor(
             move_absolute=self._move_protocol_motor_target,
             configure_cover=self._configure_protocol_cover,
@@ -1353,7 +1377,15 @@ class AppModel(ObservableObject):
             activate_detector=self._arm_protocol_stim_detector,
             cancel_detector=self._cancel_protocol_stim_detector,
             trigger_hardware_stimulus=self._trigger_protocol_stim3,
+            withdraw_laser_trigger=self._withdraw_protocol_laser_trigger,
             reach_state_resolver=self._reach_state_resolver,
+            # Without it presence is unknown on every evaluation, which the cue
+            # policy reads as stale, so no cued Tone 2 could ever fire.
+            pellet_presence_provider=make_pellet_presence_provider(
+                self._pellet_presence_source,
+                live_tracking=self._live_tracking,
+                roi_states=self._pellet_roi_states,
+            ),
         )
         # One holder, several holders-of-holds. intertrial analysis and
         # inter-trial timing both block the send, and BehaviorAlgorithm reads
@@ -6283,8 +6315,11 @@ class AppModel(ObservableObject):
                 composition.with_entries(tuple(entries))
             )
 
+    @_serialized_session_configuration
     def compile_and_save_experiment(self, experiment_id: str):
         """Compile an experiment and publish it as a selectable protocol."""
+        # It overwrites a protocol a session may be running.
+        self._require_session_ready_for_configuration("Compiling an experiment")
         with self._trial_protocol_lock:
             composition = self._experiment_repository.get(experiment_id)
             if composition is None:
@@ -6295,7 +6330,22 @@ class AppModel(ObservableObject):
             # Persist any seed the compiler drew before publishing the protocol
             # it produced, so the compile can always be reproduced.
             self._experiment_repository.save(compiled.composition)
-            return self._trial_protocol_repository.save(compiled.document)
+            saved = self._trial_protocol_repository.save(compiled.document)
+        self._published_protocol_revision(saved)
+        return saved
+
+    def _published_protocol_revision(self, saved) -> None:
+        """Follow a new revision of the selected protocol, published by id.
+
+        A compile or a set opened as a protocol saves over an existing id.
+        Left alone, the selection and schedule stayed on the old revision:
+        the sidebar named the new one while Record ran the old (prod25-01).
+        """
+        selected = self._selected_ordered_protocol
+        if selected is not None and selected.protocol_id == saved.protocol_id:
+            self._select_ordered_protocol_internal(saved.protocol_id, persist_animal=False)
+        else:
+            self._notify_trial_protocol_state()
 
     def save_protocol_as_set(self, protocol_id: str, set_id: str, name: str):
         """Capture a protocol you have built in the editor as a reusable set."""
@@ -6307,15 +6357,19 @@ class AppModel(ObservableObject):
                 set_from_document(document, set_id=set_id, name=name)
             )
 
+    @_serialized_session_configuration
     def open_set_as_protocol(self, set_id: str, protocol_id: str, name: str):
         """Publish a set as an editable protocol, to revise and capture again."""
+        self._require_session_ready_for_configuration("Opening a set as a protocol")
         with self._trial_protocol_lock:
             protocol_set = self._trial_protocol_set_repository.get(set_id)
             if protocol_set is None:
                 raise ValueError("Unknown set {!r}".format(set_id))
-            return self._trial_protocol_repository.save(
+            saved = self._trial_protocol_repository.save(
                 document_from_set(protocol_set, protocol_id=protocol_id, name=name)
             )
+        self._published_protocol_revision(saved)
+        return saved
 
     @property
     def trial_protocol_state(self) -> dict:
@@ -6865,6 +6919,10 @@ class AppModel(ObservableObject):
             # before a later motor or laser step failed. Never let those
             # actions leak into the next manual or protocol SEND.
             self._behavior.system_machine.pellet.cancel_prepared_cover_policy()
+            if _preparation_was_cancelled(self._trial_action_executor, token):
+                # Stop or Abort cancelled it mid-preparation: not a failure.
+                logger.info("Pellet-trial preparation stopped: %s", error)
+                return
             logger.exception("Pellet-trial preparation failed")
             self.on_error(
                 "Pellet trial was not sent",
@@ -7062,7 +7120,25 @@ class AppModel(ObservableObject):
                     self._nidaq_signal_monitor.runtime_device_aliases,
                 ),
             )
-        return prepare(profile, firing, recipe)
+        # Armed for the whole trial: it is made before the SEND, and a First
+        # Reach can come long after the controller's own waveform + 5 s.
+        return prepare(
+            profile, firing, recipe, armed_window_seconds=PROTOCOL_LASER_ARM_WINDOW_S)
+
+    def _pellet_roi_states(self):
+        """Pellet ROI states of the enabled cameras that have one, in camera order."""
+        return tuple(
+            camera.pellet_roi_state
+            for camera in self._reach_cameras
+            if camera.is_enabled and camera.pellet_roi_state is not None
+        )
+
+    def _withdraw_protocol_laser_trigger(self, handle) -> bool:
+        withdraw = getattr(self._laser, "withdraw_direct_trigger", None)
+        if withdraw is None:
+            # Cannot say whether a start was taken: the cycle waits for it.
+            return True
+        return withdraw(handle)
 
     def _prepare_protocol_stim_detector(self, recipe):
         camera = self._stim_camera
@@ -7166,6 +7242,10 @@ class AppModel(ObservableObject):
                 self._hardware.wait_pending_command_acked(token, timeout=timeout)
             completed = finished.wait(bench_wait_seconds(profile, firing))
             elapsed_ms = (time.perf_counter() - started) * 1000.0
+            if not completed:
+                # Not ended: on the board route the output is still armed on
+                # its trigger terminal, and a later edge there would fire it.
+                self._cancel_protocol_laser(prepared)
         except Exception:
             # Never leave an armed analog output behind on a failed test.
             cancel = getattr(prepared, "cancel", None)

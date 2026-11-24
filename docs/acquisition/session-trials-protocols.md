@@ -113,6 +113,29 @@ board before cover release; Direct NI is rejected for that phase. First Reach
 uses the 900 Hz stim-camera transition detector, not pose inference. ROI1/ROI2
 remain schema/UI framework only and are rejected as runnable.
 
+Tone 2 of a cue pair is gated on the pellet still being there at its
+deadline. `REACHAQ_PELLET_PRESENCE_SOURCE` picks the evidence: `live_tracking`
+(the default; live pose's own `pellet_seen`, so live inference must run),
+`roi` (the mean pixel value in a rectangle of one camera's image, set by that
+camera's `pellet_roi_*` params, see the example system configuration), or
+`none`. The answer carries its frame's capture time and is refused once older
+than the cue policy's gate staleness limit (500 ms). With no fresh answer at
+the deadline Tone 2 is skipped and reset, and a warning is logged. The ROI's
+rectangle, threshold, hysteresis and polarity are rig calibration: nothing
+sets them for you.
+
+Each row's **Lock timing** and post-clear delay are applied to that trial's
+Tone 2. Locked, a blocked or stale gate at the deadline skips Tone 2 and
+resets. Unlocked, Tone 2 waits for the gate to clear, then for the post-clear
+delay, bounded by the executor's maximum wait.
+
+A trial's laser is armed at preparation, before SEND, and stays armed for the
+whole trial, up to 120 s (`PROTOCOL_LASER_ARM_WINDOW_S`). A First Reach laser
+that no reach triggered by the end of the pellet cycle is cancelled and the
+operation records "laser not triggered"; the trial keeps its own outcome and
+is not a hardware error. A laser that was triggered and did not complete
+still is.
+
 The operator selects hardware trigger terminals from NI discovery/configuration;
 normal protocol editing does not accept an arbitrary raw DAQmx terminal. Advanced
 NI timing declarations remain preserved when the port dialog saves ordinary
@@ -271,6 +294,14 @@ persisted below `streams/tracking/` and sent to one bounded background worker.
 The worker consumes existing live pose/tracking data; it does not reopen video
 and does not run a second inference pass. Results update the ledger atomically
 while cameras and every other session stream continue.
+
+A reach counts as a consumption when the pellet goes unseen for
+`REACHAQ_CONSUMPTION_MISSING_SAMPLES` consecutive live samples during it
+(default 3), unless it is then seen again for
+`REACHAQ_CONSUMPTION_RESEEN_SAMPLES` consecutive samples (default 3), during the
+reach or after it, before the window ends. Both depend on how often the pose
+model loses a pellet that is still there; an unusable value keeps its default
+with a warning.
 
 Stop marks an active, not-yet-completed physical attempt `incomplete`, drains
 only already-closed windows, and performs a final repair from the stored

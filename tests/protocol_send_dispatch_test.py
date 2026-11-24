@@ -123,3 +123,27 @@ def test_a_refused_protocol_send_is_still_failed_and_reported(algorithm_thread):
     assert executor.operation.state is PreparedState.FAILED
     assert executor.failures == ["pellet state machine did not accept SEND"]
     assert [title for title, _ in errors] == ["Pellet trial was not sent"]
+
+
+
+def test_a_preparation_stop_cancelled_is_not_reported_as_an_error():
+    # Stop cancels the executor while prepare() runs; prepare then raises at
+    # its next step. That is a stop, not "Pellet trial was not sent"
+    # (audit prod26-01).
+    model, executor, errors, _ran_on = _dispatcher(accept=True)
+    token = SimpleNamespace(generation=7)
+
+    def prepare_stopped(_recipe):
+        executor.operation = SimpleNamespace(
+            state=PreparedState.CANCELLED,
+            recipe=SimpleNamespace(session_generation=7))
+        raise RuntimeError("Pellet-trial preparation was cancelled before it finished")
+
+    executor.prepare = prepare_stopped
+    thread = threading.Thread(
+        target=AppModel._prepare_and_dispatch_protocol_send, args=(model, token, 3, True))
+    thread.start()
+    thread.join(5.0)
+
+    assert not thread.is_alive()
+    assert errors == []

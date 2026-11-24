@@ -5,6 +5,7 @@ from .video_capture import CaptureAttrs, CaptureCameraAttrs, CaptureInferenceAtt
 from .video_manager import VideoManager
 from .video_reader import VideoReader
 from .video_record import VideoRecord, VideoRecordProperties, VideoRecordMode
+from .pellet_roi import PelletRoiConfiguration, PelletRoiDetector, PelletRoiState
 from .stim_camera import (
     StimCameraDetectionConfiguration,
     StimCameraDetector,

@@ -468,22 +468,48 @@ class NidaqMonitorSession(ObservableObject):
             self._set_error(f"laser channel {channel_number}: {error}")
             return False
         resting = self._resting_volts(channel_number)
+        problems = []
         try:
             if open_shutter:
                 laser.set_shutter_open(channel, True)
             laser.set_command_voltage(channel, float(volts))
             time.sleep(max(0.05, min(float(seconds), 5.0)))
         except Exception as error:
-            self._set_error(f"laser {channel_number}: {error}")
-            return False
+            problems.append(f"laser {channel_number}: {error}")
         finally:
-            try:
-                laser.set_command_voltage(channel, resting)
-                if open_shutter:
-                    laser.set_shutter_open(channel, False)
-            except Exception:
-                logger.exception("laser %s did not return to rest", channel_number)
+            problems.extend(self._return_laser_to_rest(
+                laser, channel, channel_number, resting, open_shutter))
+        if problems:
+            self._set_error("; ".join(problems))
+            return False
         return True
+
+    @staticmethod
+    def _return_laser_to_rest(laser, channel, channel_number, resting, open_shutter):
+        """The shutter closed, then the command at rest, each on its own.
+
+        One try for both let a refused restore skip the shutter close, which
+        left the laser on the held level with its shutter open, and the hold
+        then reported success. A shutter that will not close falls back to
+        closing every shutter. Returns what failed, for the operator.
+        """
+        problems = []
+        if open_shutter:
+            try:
+                laser.set_shutter_open(channel, False)
+            except Exception as error:
+                logger.exception("laser %s shutter did not close", channel_number)
+                problems.append(f"laser {channel_number} shutter did not close: {error}")
+                try:
+                    laser.close_all_shutters()
+                except Exception:
+                    logger.exception("closing every laser shutter failed")
+        try:
+            laser.set_command_voltage(channel, resting)
+        except Exception as error:
+            logger.exception("laser %s did not return to rest", channel_number)
+            problems.append(f"laser {channel_number} did not return to rest: {error}")
+        return problems
 
     def _resting_volts(self, channel_number: int) -> float:
         """Where this channel sits when it is not being driven.

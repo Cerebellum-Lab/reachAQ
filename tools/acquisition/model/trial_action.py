@@ -694,6 +694,7 @@ class TrialActionExecutor:
         trigger_hardware_stimulus: Callable[
             [LaserPulseProfile, CompiledTrialRecipe, str], object
         ] = lambda _profile, _recipe, _detail: None,
+        withdraw_laser_trigger: Optional[Callable[[object], bool]] = None,
         cue_timing_configuration: Optional[CueTimingConfiguration] = None,
         reach_state_resolver: Optional[ReachStateResolver] = None,
         pellet_presence_provider: Optional[Callable[[], object]] = None,
@@ -713,16 +714,25 @@ class TrialActionExecutor:
         self._activate_detector = activate_detector
         self._cancel_detector = cancel_detector
         self._trigger_hardware_stimulus = trigger_hardware_stimulus
+        # Closes a Direct NI arm's trigger window, returning whether a start
+        # was taken; None when the caller cannot say (then it is waited for).
+        self._withdraw_laser_trigger = withdraw_laser_trigger
         self._lock = threading.RLock()
         self._operation: Optional[PreparedTrialOperation] = None
         self._laser_handle = None
         self._detector_handle = None
         self._send_context: Optional[str] = None
+        #: Whether this operation's stimulus trigger was asked for (board route).
+        self._stimulus_triggered = False
 
         # Cue pair. The policy owns the decision, the timer owns the deadline,
         # and this owner only routes between them. All of it is inert unless a
         # recipe carries both a cue tone and a drawn cue interval.
-        self._cue_policy = CueTimingPolicy(cue_timing_configuration)
+        # The executor's configuration gives the gate staleness limit; each
+        # row's own Lock timing and post-clear delay are applied at its arm.
+        self._cue_base_configuration = (
+            cue_timing_configuration or CueTimingConfiguration())
+        self._cue_policy = CueTimingPolicy(self._cue_base_configuration)
         self._reach_state = reach_state_resolver
         self._pellet_presence_provider = pellet_presence_provider
         self._cue_timer_factory = cue_timer_factory or CueTimer
@@ -754,9 +764,11 @@ class TrialActionExecutor:
             self._laser_handle = None
             self._detector_handle = None
             self._send_context = None
+            self._stimulus_triggered = False
         try:
             self._move_absolute(recipe.resolved_motor_target)
             self._observe("motor target acknowledged")
+            self._require_preparing(operation)
             cover = recipe.requested_row["cover_policy"]
             self._configure_cover(str(cover), recipe)
             self._observe(f"cover policy prepared: {cover}")
@@ -765,26 +777,65 @@ class TrialActionExecutor:
                 recipe.tone_profile is not None
                 and row["tone_phase"] in {"before_send", "embedded_in_sequence"}
             ):
+                self._require_preparing(operation)
                 phase = row["tone_phase"]
                 self._play_tone(recipe.tone_profile, phase)
                 self._observe(f"{phase} tone prepared/acknowledged")
             if recipe.laser_profile is not None:
-                self._laser_handle = self._prepare_laser(recipe.laser_profile, recipe)
+                self._require_preparing(operation)
+                handle = self._prepare_laser(recipe.laser_profile, recipe)
+                with self._lock:
+                    # A cancel that landed during the arm found no handle to
+                    # cancel; the check below then raises, and the except
+                    # cancels this one.
+                    self._laser_handle = handle
+                self._require_preparing(operation)
                 self._snapshot_laser_action()
                 self._observe(
                     "laser prepared: " + recipe.laser_firing.trigger_route.value
                 )
-                if row["laser_phase"] == "before_send":
+                if (
+                    row["laser_phase"] == "before_send"
+                    and _phase_starts_laser(row)
+                ):
                     self._trigger_laser_if_direct("before_send")
+                elif row["laser_phase"] == "before_send":
+                    self._observe("before_send laser trigger enabled")
             if recipe.stimulus_selected and row["stimulus_trigger"] == "first_reach":
-                self._detector_handle = self._prepare_detector(recipe)
+                self._require_preparing(operation)
+                handle = self._prepare_detector(recipe)
+                with self._lock:
+                    self._detector_handle = handle
                 self._observe("stim-camera First Reach detector prepared")
-            operation.transition(PreparedState.PREPARED)
+            with self._lock:
+                self._require_preparing(operation)
+                operation.transition(PreparedState.PREPARED)
             return operation
         except Exception as error:
-            self._cancel_laser_safely()
-            operation.transition(PreparedState.FAILED, f"{type(error).__name__}: {error}")
+            with self._lock:
+                if self._operation is operation:
+                    self._cancel_laser_safely()
+                    self._cancel_detector_safely()
+                if operation.state not in PreparedTrialOperation.TERMINAL:
+                    operation.transition(
+                        PreparedState.FAILED, f"{type(error).__name__}: {error}")
             raise
+
+    def _require_preparing(self, operation) -> None:
+        """Refuse the next preparation step once a cancel or fail has landed.
+
+        Stop cancels the executor while prepare() runs on its worker: without
+        this the motor wait finished and the tone, the laser arm and the
+        detector still followed, for a trial that would never be sent.
+        """
+        with self._lock:
+            if self._operation is not operation:
+                raise RuntimeError("Pellet-trial preparation was replaced")
+            if operation.state is not PreparedState.PREPARING:
+                raise RuntimeError(
+                    f"Pellet-trial preparation was {operation.state.value} "
+                    "before it finished"
+                )
 
     def require_send_permission(self, operation_id: str, generation: int):
         with self._lock:
@@ -841,10 +892,13 @@ class TrialActionExecutor:
             self._arm_cue_pair(recipe, phase)
         # A laser is already armed. Phase execution records the semantic
         # trigger point; the configured board STIM/NI route owns physical
-        # start.
+        # start. A First Reach row is started by its detector alone: on the
+        # Direct NI route, by the laser model's direct trigger receiver.
         if recipe.laser_profile is not None and row["laser_phase"] == phase:
             observation = f"{phase} laser trigger enabled"
-            handle = self._direct_laser_handle()
+            handle = (
+                self._direct_laser_handle() if _phase_starts_laser(row) else None
+            )
             if handle is None:
                 self._observe(observation)
                 return None
@@ -882,6 +936,13 @@ class TrialActionExecutor:
             firing = operation.recipe.laser_firing
             if profile is None or firing is None:
                 raise RuntimeError("Stimulus trigger has no prepared laser profile")
+            if self._laser_handle is None or operation.state in operation.TERMINAL:
+                # Cancelled (as not triggered, or by Stop) or ended: nothing
+                # is armed for the board's STIM pulse to start.
+                raise RuntimeError(
+                    "Stimulus trigger arrived after the prepared laser was "
+                    f"released ({operation.state.value})")
+            self._stimulus_triggered = True
             if firing.trigger_route is LaserTriggerRoute.DIRECT_NI_SOFTWARE:
                 self._trigger_laser_if_direct(detail)
                 self._observe(f"{detail} direct NI trigger accepted")
@@ -916,7 +977,26 @@ class TrialActionExecutor:
         with self._lock:
             operation = self._require_current()
             self._cancel_cue_pair()
-            self._await_laser_terminal_for_cycle()
+            if self._laser_not_triggered(operation):
+                # No First Reach: no light was due. Not a hardware error
+                # (prod41-05), which the runner would not count.
+                self._cancel_laser_safely()
+                self._observe("laser not triggered: no First Reach before the cycle ended")
+            handle = self._laser_handle
+            wait_seconds = self._laser_cycle_wait_seconds(operation, handle)
+        if wait_seconds:
+            # With the lock let go of: Stop's cancel() needs it before it
+            # reaches the laser's cancel and its shutter close, and a train
+            # still running would otherwise run on to its end (prod41-06).
+            try:
+                handle.wait(timeout=wait_seconds)
+            except Exception:
+                pass
+        with self._lock:
+            if self._operation is not operation or operation.state in operation.TERMINAL:
+                # Cancelled or failed while this waited, which also cleaned up.
+                return operation
+            self._require_laser_completed(operation, handle)
             if operation.state is PreparedState.SEND_ACCEPTED:
                 operation.transition(PreparedState.ACTIVE, "cycle completion")
             operation.transition(PreparedState.COMPLETED, detail)
@@ -975,6 +1055,19 @@ class TrialActionExecutor:
             return
 
         self._cancel_cue_pair()
+        row = recipe.requested_row
+        try:
+            # The row's Lock timing and post-clear delay, which are what the
+            # trial record says was applied (prod41-03).
+            configuration = dataclasses.replace(
+                self._cue_base_configuration,
+                lock_timing=bool(row.get("cue_lock_timing", True)),
+                post_clear_delay_ms=int(row.get("cue_post_clear_delay_ms") or 0),
+            )
+        except (TypeError, ValueError) as error:
+            self._observe(f"cue pair not armed: {error}")
+            return
+        self._cue_policy = CueTimingPolicy(configuration)
         tone_1_perf_time = self._clock()
         deadline = self._cue_policy.start(tone_1_perf_time, interval_ms)
         self._cue_recipe = recipe
@@ -1072,6 +1165,13 @@ class TrialActionExecutor:
                 self._observe_safely(
                     f"Tone 2 skipped and reset: {evaluation.reason.value}"
                 )
+                if gate.pellet_present is None:
+                    # The operator's only sign otherwise was this record:
+                    # every cue trial skipped, and nothing on screen.
+                    logger.warning(
+                        "Tone 2 was skipped: no fresh pellet presence evidence "
+                        "at its deadline (%s). Check that the pellet presence "
+                        "source is running.", evaluation.reason.value)
                 self._cancel_cue_pair()
                 return
 
@@ -1178,21 +1278,51 @@ class TrialActionExecutor:
         if to_record is not None:
             operation.set_action_record("laser", to_record())
 
-    def _await_laser_terminal_for_cycle(self):
+    def _laser_not_triggered(self, operation) -> bool:
+        """Whether a First Reach laser is still armed with no trigger taken.
+
+        Board route: the executor makes the trigger itself. Direct NI: the
+        laser model's receiver does, so its window is closed first; after
+        that no start can race the cancel that follows.
+        """
         handle = self._laser_handle
+        recipe = operation.recipe
+        if (
+            handle is None
+            or not recipe.stimulus_selected
+            or recipe.requested_row.get("stimulus_trigger") != "first_reach"
+            or recipe.laser_firing is None
+        ):
+            return False
+        route = recipe.laser_firing.trigger_route
+        if route is LaserTriggerRoute.HARDWARE_STIM3:
+            taken = self._stimulus_triggered
+        elif route is LaserTriggerRoute.DIRECT_NI_SOFTWARE:
+            if self._withdraw_laser_trigger is None:
+                return False
+            taken = bool(self._withdraw_laser_trigger(handle))
+        else:
+            return False
+        state = getattr(getattr(handle, "state", None), "value", None)
+        return not taken and state == "armed"
+
+    @staticmethod
+    def _laser_cycle_wait_seconds(operation, handle) -> float:
+        """How long the cycle's end waits for its laser; 0 for no wait."""
+        if handle is None or getattr(handle, "wait", None) is None:
+            return 0.0
+        state = getattr(getattr(handle, "state", None), "value", None)
+        if state not in {"armed", "triggered"}:
+            return 0.0
+        profile = operation.recipe.laser_profile
+        duration = 0.0 if profile is None else profile.waveform_seconds
+        return max(1.0, duration + 1.0)
+
+    def _require_laser_completed(self, operation, handle):
+        """Fail the operation, and raise, unless its laser completed."""
         if handle is None:
             return
-        state = getattr(getattr(handle, "state", None), "value", None)
-        if state in {"armed", "triggered"}:
-            profile = self._require_current().recipe.laser_profile
-            duration = 0.0 if profile is None else profile.waveform_seconds
-            wait = getattr(handle, "wait", None)
-            if wait is not None:
-                try:
-                    wait(timeout=max(1.0, duration + 1.0))
-                except Exception:
-                    self._snapshot_laser_action()
-        self._snapshot_laser_action()
+        self._snapshot_laser_action(handle)
         state = getattr(getattr(handle, "state", None), "value", None)
         if state not in {None, "completed"}:
             error = getattr(handle, "error", None)
@@ -1224,6 +1354,18 @@ class TrialActionExecutor:
         if self._operation is None:
             raise RuntimeError("No prepared pellet-trial operation exists")
         return self._operation
+
+
+def _phase_starts_laser(row) -> bool:
+    """Whether reaching the row's laser phase starts a Direct NI output.
+
+    Not for a detector-driven trigger: the phase then only records when the
+    trigger point was reached, and the detector's start is the only one.
+    Schedule validation makes every runnable Direct NI row First Reach, so
+    today no phase starts one; the protocol document says First Reach (Ben,
+    2026-11-23).
+    """
+    return row.get("stimulus_trigger") != "first_reach"
 
 
 def _finite_vector(values, name):

@@ -108,7 +108,9 @@ def _ramp_in_thread(controller):
         except Exception as error:
             outcome.append(error)
 
-    thread = threading.Thread(target=ramp)
+    # A daemon: a ramp the driver never lets go of must not hold the test
+    # process open.
+    thread = threading.Thread(target=ramp, daemon=True)
     thread.start()
     return thread, outcome
 
@@ -386,20 +388,6 @@ def test_a_ramp_on_one_board_needs_no_route(daq):
 
 
 # ------------------------------------------- close()'s abort and the ramp's own
-
-
-def _ramp_in_thread(controller):
-    outcome = []
-
-    def ramp():
-        try:
-            outcome.append(controller.run_calibration_ramp(RAMP))
-        except Exception as error:
-            outcome.append(error)
-
-    thread = threading.Thread(target=ramp, daemon=True)
-    thread.start()
-    return thread, outcome
 
 
 def _wait_until_ramping(daq):

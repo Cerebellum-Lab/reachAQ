@@ -71,6 +71,13 @@ class _ManualPulse:
     wall_time: float
 
 
+#: How long a protocol trial's laser stays armed for its trigger, from the
+#: arm made at preparation, before the SEND. The trial ends it before then:
+#: complete() or a cancel. The bound only stops an arm whose end was lost
+#: from holding its laser, shutter open, for good (Ben, 2026-11-23).
+PROTOCOL_LASER_ARM_WINDOW_S = 120.0
+
+
 def wait_until_cancelled_ends(operation, timeout: float = CANCELLED_OPERATION_WAIT_S) -> bool:
     """Wait, bounded, for a cancelled operation to end; whether it did.
 
@@ -811,8 +818,14 @@ class LaserModel(ObservableObject):
                 laser, getattr(profile, "profile_id", "?"), lead_ms, lag_ms)
         return False
 
-    def prepare_pulse_profile(self, profile, firing, recipe):
-        """Resolve a frozen protocol profile into one pre-armed finite output."""
+    def prepare_pulse_profile(self, profile, firing, recipe, *, armed_window_seconds=None):
+        """Resolve a frozen protocol profile into one pre-armed finite output.
+
+        `armed_window_seconds` is how long it stays armed for its trigger:
+        the start wait of a Direct NI arm, or, on the board route, the wait
+        for its edge and the waveform. None leaves the controller's own
+        bound, the waveform and 5 s from the arm.
+        """
         route = firing.trigger_route.value
         hardware_trigger = route == "hardware_stim3"
         direct_start = route == "direct_ni_software"
@@ -849,11 +862,21 @@ class LaserModel(ObservableObject):
             # How the operation is named where it holds the board: Test stim's
             # recipe numbers its trial 0.
             operation_context["operation_label"] = label
+        timeout_seconds = start_wait_seconds = None
+        if armed_window_seconds is not None:
+            if direct_start:
+                start_wait_seconds = float(armed_window_seconds)
+            else:
+                # Started at the arm, it waits for its edge, then runs.
+                timeout_seconds = (
+                    float(armed_window_seconds) + float(profile.waveform_seconds) + 5.0)
         synchronized = LaserSynchronizedPulseTrain(
             pulse_trains=(pulse,),
             trigger_source=(firing.trigger_terminal if hardware_trigger else None),
             wait=False,
             defer_start=direct_start,
+            timeout_seconds=timeout_seconds,
+            start_wait_seconds=start_wait_seconds,
             operation_context=operation_context,
         )
         # Preparing an asynchronous task is not a physical output. Do not use
@@ -951,6 +974,21 @@ class LaserModel(ObservableObject):
             prepared["nonce"] = str(nonce)
             prepared["enabled"] = True
 
+    def withdraw_direct_trigger(self, operation) -> bool:
+        """Close `operation`'s Direct NI trigger window; whether one was taken.
+
+        For the cycle's end: after this no trigger can reach the operation,
+        so False means it may be cancelled as not triggered, with no start
+        racing the cancel. True means a First Reach started it.
+        """
+        with self._prepared_profiles_lock:
+            taken = False
+            for operation_id, prepared in tuple(self._prepared_profiles.items()):
+                if prepared["operation"] is operation:
+                    taken = taken or bool(prepared.get("triggered"))
+                    self._prepared_profiles.pop(operation_id, None)
+            return taken
+
     def release_prepared_profile(self, operation) -> None:
         with self._prepared_profiles_lock:
             for operation_id, prepared in tuple(self._prepared_profiles.items()):
@@ -1005,6 +1043,9 @@ class LaserModel(ObservableObject):
                     if not prepared["enabled"]:
                         raise RuntimeError("direct trigger arrived before pellet presentation")
                     operation = prepared["operation"]
+                    # Under the lock that withdraw_direct_trigger takes: the
+                    # cycle's end then knows this start was taken.
+                    prepared["triggered"] = True
                 result["validated_perf_time"] = time.perf_counter()
                 result["daqmx_start_entry_perf_time"] = time.perf_counter()
                 operation.trigger()
