@@ -226,6 +226,11 @@ class InferenceMonitorDataProc(multiprocessing.Process):
         self._live_generation_renew_age = LIVE_WORKERS_RENEW_TIMER_DELAY
 
     @property
+    def camera_names(self) -> Tuple[str, ...]:
+        """The queue cameras this monitor splits batches by, fixed at construction."""
+        return self._camera_names
+
+    @property
     def stop_recorded(self) -> synchronize.Event:
         return self._stop_recorded
 

@@ -370,6 +370,15 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         if data_monitor_proc is not None and not data_monitor_proc.is_alive():
             data_monitor_proc.join(3)
             data_monitor_proc = None
+        elif data_monitor_proc is not None and data_monitor_proc.camera_names != tuple(camera_names):
+            # Its camera order is fixed when it is built: reused, it would split this
+            # queue's batches by the previous cameras.
+            logger.info("rebuilding the pose data monitor: live queue cameras %s -> %s",
+                        data_monitor_proc.camera_names, tuple(camera_names))
+            self._stop_data_monitor_proc()
+            # As stop() does: the old monitor's exit sentinel must not reach the new one.
+            clear_queue(self._data_monitor_cmd_queue, name="data_monitor_cmd_queue")
+            data_monitor_proc = None
 
         if data_monitor_proc is None:
             self._data_monitor_watchdog_perf_c.value = time.perf_counter()

@@ -3308,6 +3308,19 @@ class AppModel(ObservableObject):
         primary = next((camera for camera in cameras if camera.is_primary), cameras[0])
         return (primary, *(camera for camera in cameras if camera is not primary))
 
+    def _select_inference_cameras(self) -> Tuple[VideoCaptureModel, ...]:
+        """The live inference queue's cameras, in queue order: enabled reach cameras, primary first.
+
+        Not the stimulation-mode stimCam, which runs at its own frame size and is
+        never posed: counting it refused Record as a size mismatch, and at the
+        reach size it would have been fed to pose. Live pose names its cameras by
+        this order, not by project.camera_names.
+        """
+        return tuple(
+            camera for camera in self._ordered_reach_cameras(enabled_only=True)
+            if not self._is_independent_stim_camera(camera)
+        )
+
     @staticmethod
     def _is_independent_stim_camera(camera) -> bool:
         """stimCam in stimulation mode: its own free-running 900 Hz domain, never posed."""
@@ -9808,13 +9821,7 @@ class AppModel(ObservableObject):
         inference_camera_indices = {}
 
         if self._inference.is_enabled and inference_preflight_error is None:
-            # Not the stimulation-mode stimCam, which runs at its own frame size
-            # and is never posed: counting it refused Record here as a size
-            # mismatch, and at the reach size it would have been fed to pose.
-            inference_cameras = tuple(
-                camera for camera in self._ordered_reach_cameras(enabled_only=True)
-                if not self._is_independent_stim_camera(camera)
-            )
+            inference_cameras = self._select_inference_cameras()
             inference_error = None
             if len(inference_cameras) < 2:
                 inference_error = (
