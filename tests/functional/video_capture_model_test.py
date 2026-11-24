@@ -10,7 +10,7 @@ from reachaq.app.model.video_capture_model import VideoCaptureModel
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger('reachaq').setLevel(logging.DEBUG)
-logging.getLogger('tools').setLevel(logging.DEBUG)
+logging.getLogger('reachaq.app').setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
