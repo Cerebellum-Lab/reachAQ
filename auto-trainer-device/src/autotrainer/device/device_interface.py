@@ -306,11 +306,32 @@ class StepperConfig(MotorSource):
     _maximum_acceleration: float = 244  # mm/sec^2
     _flip_limit_orientation: bool = False
     _homing_velocity: float = 60  # mm/sec
+    # Travel limits (mm), min_pos / max_pos in motor_config.yaml. None: that side is not limited.
+    _minimum_position: Optional[float] = None
+    _maximum_position: Optional[float] = None
     uuid_ack_timeout: Optional[float] = None
+
+    @staticmethod
+    def _travel_value(data: dict, key: str) -> Optional[float]:
+        if key not in data:
+            return None
+        value = data[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{key} must be a number of mm, got {value!r}")
+        if not math.isfinite(value):
+            raise ValueError(f"{key} must be finite, got {value!r}")
+        return float(value)
 
     @classmethod
     def from_dict(cls, data: dict):
         config = StepperConfig()
+
+        minimum = cls._travel_value(data, "min_pos")
+        maximum = cls._travel_value(data, "max_pos")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise ValueError(f"min_pos {minimum:g} is above max_pos {maximum:g}")
+        config.minimum_position = minimum
+        config.maximum_position = maximum
 
         if "microsteps" in data:
             config.microsteps = data["microsteps"]
@@ -382,6 +403,24 @@ class StepperConfig(MotorSource):
     @flip_limit_orientation.setter
     def flip_limit_orientation(self, value: bool):
         self._flip_limit_orientation = value
+
+    @property
+    def minimum_position(self) -> Optional[float]:
+        """Lowest allowed target (mm), or None when not limited."""
+        return self._minimum_position
+
+    @minimum_position.setter
+    def minimum_position(self, value: Optional[float]):
+        self._minimum_position = value
+
+    @property
+    def maximum_position(self) -> Optional[float]:
+        """Highest allowed target (mm), or None when not limited."""
+        return self._maximum_position
+
+    @maximum_position.setter
+    def maximum_position(self, value: Optional[float]):
+        self._maximum_position = value
 
 
 #: STEPPER_STATUS.status bits (pellet firmware 2.3.1). A v1.2 board always sends 0.

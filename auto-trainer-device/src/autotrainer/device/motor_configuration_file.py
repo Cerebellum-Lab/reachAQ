@@ -117,7 +117,10 @@ class MotorConfigurationFile(MotorConfigurations):
             if dct is None:
                 cfg = config_cls()
             else:
-                cfg = config_cls.from_dict(dct)
+                try:
+                    cfg = config_cls.from_dict(dct)
+                except ValueError as err:
+                    raise ValueError(f"{item}: {err}") from err
                 if source is not None:
                     logger.info("%s configuration: %s", item, cfg)
                 items_loaded.append(item)
