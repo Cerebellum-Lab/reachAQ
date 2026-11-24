@@ -78,9 +78,11 @@ from reachaq.inference.multires_calibration.extract import (
     MIN_CAMERAS,
     detect_board,
     extract_observations,
+    median_corners,
     normalize_corner_order,
 )
 from reachaq.inference.multires_calibration.fit import (
+    CHARUCO,
     BoardSpec,
     CaptureCamera,
     MotorFrameFit,
@@ -575,8 +577,12 @@ def _cross_checks(
             for g in binned:
                 corners = detect_board(_preset_frame(gray, g), board, refine=refine)
                 if corners is not None:
-                    reference = sensor_to_preset_points(observations[i].corners[cam], g)
-                    ordered = normalize_corner_order(corners, board, reference=reference)
+                    if board.kind == CHARUCO:
+                        # The corner ids fix the order; a partial board is kept as found.
+                        ordered = corners
+                    else:
+                        reference = sensor_to_preset_points(observations[i].corners[cam], g)
+                        ordered = normalize_corner_order(corners, board, reference=reference)
                     found[g.name][i].setdefault(cam, []).append(ordered)
 
     checks = []
@@ -585,7 +591,7 @@ def _cross_checks(
             WaypointObservation(
                 index=o.index,
                 motor_mm=np.array(o.motor_mm, dtype=float),
-                corners={cam: np.median(np.stack(c), axis=0) for cam, c in found[g.name][i].items()},
+                corners={cam: median_corners(np.stack(c), board) for cam, c in found[g.name][i].items()},
             )
             for i, o in enumerate(observations)
         ]
@@ -653,7 +659,12 @@ def _corner_offset(
     ]
     if not differences:
         return math.nan
-    return float(np.linalg.norm(np.concatenate(differences).mean(axis=0)))
+    # A ChArUco corner found in only one of the two is NaN and left out.
+    stacked = np.concatenate(differences)
+    stacked = stacked[np.all(np.isfinite(stacked), axis=1)]
+    if not len(stacked):
+        return math.nan
+    return float(np.linalg.norm(stacked.mean(axis=0)))
 
 
 def _mapped_fit(fit: MotorFrameFit, g: PresetGeometry) -> MotorFrameFit:

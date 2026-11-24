@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 
 from reachaq.inference.multires_calibration.fit import (
+    CHARUCO,
     INTRINSIC_NAMES,
     BoardSpec,
     CameraModel,
@@ -61,6 +62,8 @@ _FIXED_SLOTS = {"left": 0, "right": 1}
 _TEXTURE_PX_PER_MM = 50
 _SUPERSAMPLE = 3
 _BLACK, _WHITE, _BACKGROUND = 20, 235, 100
+# The rig's ChArUco board: 9 x 7 squares of 4 mm, 3 mm DICT_4X4_50 markers, 8 x 6 inner corners.
+CHARUCO_BOARD = BoardSpec(kind=CHARUCO, marker_mm=3.0, dictionary="DICT_4X4_50")
 
 
 @dataclass
@@ -177,7 +180,8 @@ def render_board_frame(
     `X_board_world` is the board's (rows*cols, 3) inner corners in the motor frame, in
     object_points order (SyntheticRig.world_corners gives them). The image is the full
     chessboard: (cols+1) x (rows+1) squares, reaching one square beyond the inner
-    corners on every side, inside a one-square white margin, on a grey background.
+    corners on every side, inside a one-square white margin, on a grey background. A
+    ChArUco `board` is drawn as cv2's generateImage draws it (marginSize 0, borderBits 1).
 
     The board plane maps to the image by the homography fitted from
     board.object_points()[:, :2] to cv2.projectPoints(X_board_world, model.rvec,
@@ -219,6 +223,15 @@ def _board_texture(board: BoardSpec) -> Tuple[np.ndarray, np.ndarray]:
     x0 = y0 = -2.0 * sq
     nx = int(round((board.cols + 3) * sq * ppm))
     ny = int(round((board.rows + 3) * sq * ppm))
+    texture_to_mm = np.array([[1.0 / ppm, 0.0, x0 + 0.5 / ppm], [0.0, 1.0 / ppm, y0 + 0.5 / ppm], [0.0, 0.0, 1.0]])
+    if board.kind == CHARUCO:
+        # generateImage's pixel (0, 0) is the board's outer corner, one square before inner corner 0.
+        margin = int(round(sq * ppm))
+        size = (nx - 2 * margin, ny - 2 * margin)
+        drawn = board.charuco_board().generateImage(size, marginSize=0, borderBits=1)
+        drawn = np.where(drawn < 128, _BLACK, _WHITE).astype(np.uint8)
+        texture = cv2.copyMakeBorder(drawn, margin, margin, margin, margin, cv2.BORDER_CONSTANT, value=_WHITE)
+        return texture, texture_to_mm
     # Texel i is centred half a texel in from its left edge, so every square edge falls
     # exactly between two texels and no texel straddles one.
     x = x0 + (np.arange(nx) + 0.5) / ppm
@@ -229,7 +242,6 @@ def _board_texture(board: BoardSpec) -> Tuple[np.ndarray, np.ndarray]:
     # looks the same turned 180 degrees, like the real one.
     black = on_board & ((a + b) % 2 == 0)
     texture = np.where(black, _BLACK, _WHITE).astype(np.uint8)
-    texture_to_mm = np.array([[1.0 / ppm, 0.0, x0 + 0.5 / ppm], [0.0, 1.0 / ppm, y0 + 0.5 / ppm], [0.0, 0.0, 1.0]])
     return texture, texture_to_mm
 
 
