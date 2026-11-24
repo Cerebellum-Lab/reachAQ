@@ -160,12 +160,12 @@ software implementation gaps.
     tools/acquisition/tests/live_tracking_buffer_test.py \
     tests/inference_recording_ack_test.py
   ```
-- [ ] Confirm the Spinnaker resolver selects the bundled Linux x86-64, Linux
-      aarch64, and Windows x86-64 artifacts and reports an actionable error for
-      an unsupported platform/ABI tuple:
+- [ ] Confirm the installer finds the Spinnaker SDK and binding in the FLIR
+      download and reports an actionable error for an unsupported platform or
+      release (reachAQ no longer bundles Spinnaker wheels):
 
   ```bash
-  conda run -n reachaq python -m pytest -q tests/platform_support_test.py
+  conda run -n reachaq python -m pytest -q tests/install_preflight_test.py
   ```
 
 ## Configuration and enabled-source reporting
