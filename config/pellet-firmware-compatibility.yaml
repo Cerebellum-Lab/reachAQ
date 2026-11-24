@@ -1,6 +1,43 @@
 schema_version: 1
 board_type: pellet_module
 versions:
+  - version: 2.4.0
+    wire_schema_version: 1
+    required_capabilities:
+      - finite_stim3_pulse
+      - timing_trailer
+      - time_sync
+    optional_capabilities:
+      - sync_listener
+      - stepper_driver_fault
+    hardware_release: v2.4.0
+    tested_reachaq_release: pre-release-devel
+    qualification_status: rollout_pending
+    qualification_date: null
+    limitations:
+      - >-
+        Rollout pending: not yet qualified on a rig. 2.4.0 is v2.3.1 plus the
+        board-time work (timing trailer, TIME_SYNC, clap listener, DWT clock)
+        and the v2.3.2 fixes. A pellet v1.2 board reports capabilities
+        0x00000017 and a v1.3 board 0x00000057. stepper_driver_fault is
+        optional for the same reason as on 2.3.1, and sync_listener because
+        claps are consumed only by hosts with the board-clock fix.
+      - >-
+        Needs reachAQ v3.0.1 or later. The board advertises time_sync, so
+        open() runs four back-to-back time syncs, and v3.0.0's board-clock
+        fit aborts on them.
+      - >-
+        Signed with the new pellet-k2 key (reachAQ-hardware
+        docs/firmware-signing-keys.md). A board still running a pellet-k1
+        MCUboot refuses this image, so a CAN update cannot install it: each
+        board needs one SWD visit to flash this release's MCUboot and
+        application together (docs/pellet-rekey-reflash-plan.md). After that
+        visit the board accepts only pellet-k2 images.
+      - >-
+        A board coming from 2.3.0 or older loses its stored motor
+        configuration and FIXED_XYZ positions once (storage-partition fix).
+        reachAQ rewrites the motor configuration at connect; re-save the
+        FIXED_XYZ positions and home each axis.
   - version: 2.3.1
     wire_schema_version: 1
     required_capabilities:
