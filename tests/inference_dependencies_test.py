@@ -61,7 +61,7 @@ def test_deeplabcut_is_not_a_hard_dependency():
 
 def test_core_pandas_and_numpy_stay_required():
     block = _dependencies_block(_text())
-    for package in ("reachaq", "pandas", "numpy"):
+    for package in ("pandas", "numpy"):
         assert package in block, f"{package} should remain a hard dependency"
 
 

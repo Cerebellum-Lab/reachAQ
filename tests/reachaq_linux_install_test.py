@@ -8,8 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SCRIPT = REPO_ROOT / "tools" / "install" / "reachaq-linux-install.sh"
 PLUGIN_LIB = REPO_ROOT / "tools" / "install" / "plugin-install-lib.sh"
 DESKTOP_INSTALL_SCRIPT = REPO_ROOT / "tools" / "install" / "install-reachaq-desktop.sh"
-TOOLS_PROJECT = REPO_ROOT / "tools" / "pyproject.toml"
-DEVICE_PROJECT = REPO_ROOT / "pyproject.toml"
+PROJECT = REPO_ROOT / "pyproject.toml"
 SOFTMOUSE_SERVICE = (
     REPO_ROOT
     / "src"
@@ -267,12 +266,10 @@ def test_desktop_launcher_installer_creates_terminal_entry(tmp_path):
 
 
 def test_softmouse_rfid_python_dependencies_are_packaged():
-    tools_project = TOOLS_PROJECT.read_text()
-    device_project = DEVICE_PROJECT.read_text()
+    project = PROJECT.read_text()
 
-    for dependency in ("openpyxl", "requests", "keyring"):
-        assert dependency in tools_project
-    assert "pyserial" in device_project
+    for dependency in ("openpyxl", "requests", "keyring", "pyserial"):
+        assert dependency in project
 
 
 def test_softmouse_service_supports_installer_conda_locations():
