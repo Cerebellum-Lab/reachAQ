@@ -57,6 +57,7 @@ from reachaq.inference.multires_calibration.scout import (
     scout_views_from_capture,
     video_sizes,
 )
+from reachaq.inference.multires_calibration.per_view import configured_fit
 from reachaq.inference.multires_calibration.store import INDEX_FILE, CalibrationIndex, load_index
 
 from reachaq.app.model.app_model import AppModel
@@ -564,6 +565,7 @@ def calibrate_waypoint_capture(
     previous_dir: Optional[Path],
     live_geometries: Optional[Mapping[str, PresetGeometry]] = None,
     board: Optional[BoardSpec] = None,
+    fit_mode: Optional[str] = None,
 ) -> Tuple[Path, CalibrationIndex, QualityReport]:
     """Write `log` as the capture's waypoints.yaml beside its source_videos, then calibrate
     every preset into <session_dir>/<DEFAULT_3D_CALIB_DIR_NAME>.new. With `live_geometries`
@@ -580,6 +582,8 @@ def calibrate_waypoint_capture(
     extra = {} if live_geometries is None else {"live_geometries": dict(live_geometries)}
     if board is not None:
         extra["board"] = board
+    if fit_mode is not None:
+        extra["fit_mode"] = fit_mode
     index, report = calibrate_capture(
         Path(capture_dir),
         output_dir=output_dir,
@@ -1111,13 +1115,16 @@ def make_3d_calib(
     # The board from the library settings (default: the rig's ChArUco board), read before any
     # motion so a malformed setting stops the calibration before it starts.
     root = getattr(app_model, "calibration_library_root", None)
-    board = configured_board({} if root is None else read_settings(root))
+    library_settings = {} if root is None else read_settings(root)
+    board = configured_board(library_settings)
+    fit_mode = configured_fit(library_settings, board)
     if board.kind == BoardSpec().kind:
         logger.notice("Calibration board: checkerboard, %d x %d inner corners, %g mm squares",
                       board.rows, board.cols, board.square_mm)
     else:
         logger.notice("Calibration board: %s, %d x %d inner corners, %g mm squares, %g mm %s markers",
                       board.kind, board.rows, board.cols, board.square_mm, board.marker_mm, board.dictionary)
+    logger.notice("Calibration fit: %s", fit_mode)
 
     if move_list == SCOUT:
         identities = [camera.serial or camera.name for camera in capture_list]
@@ -1169,6 +1176,7 @@ def make_3d_calib(
         previous_dir=app_model.active_calibration_dir,
         live_geometries=live_geometries,
         board=board,
+        fit_mode=fit_mode,
     )
 
     logger.success("Successfully calibrated the capture: %s, verdict %s", index.id, report.verdict)

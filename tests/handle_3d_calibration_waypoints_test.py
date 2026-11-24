@@ -908,6 +908,32 @@ def test_without_a_board_setting_the_calibration_uses_the_rig_charuco_board(tmp_
     assert boards == [BoardSpec(kind="charuco", marker_mm=3.0, dictionary="DICT_4X4_50")]
 
 
+@pytest.mark.parametrize("settings, expected", [
+    ({}, "per_view"),
+    ({"fit": "motor_frame"}, "motor_frame"),
+    ({"board": {"kind": "checkerboard"}}, "motor_frame"),
+])
+def test_the_fit_setting_reaches_the_calibration(tmp_path, monkeypatch, settings, expected):
+    from reachaq.inference.multires_calibration import library
+
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.calibration_library_root = tmp_path / "calibrations"
+    if settings:
+        library.update_settings(app_model.calibration_library_root, **settings)
+    modes = []
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: SimpleNamespace(verified=[True]))
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture",
+                        lambda *a, **k: modes.append(k["fit_mode"]) or (None, SimpleNamespace(id="cal"),
+                                                                        SimpleNamespace(verdict="pass")))
+    for name in ("left", "right"):
+        (tmp_path / "session" / f"{name}_recording.mp4").write_bytes(b"")
+        (tmp_path / "session" / f"{name}_recording_timestamps.txt").write_text("")
+
+    make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert modes == [expected]
+
+
 def test_a_bad_board_setting_stops_the_calibration_before_any_motion(tmp_path, monkeypatch):
     from reachaq.inference.multires_calibration import library
 
