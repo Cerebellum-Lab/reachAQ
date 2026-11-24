@@ -38,7 +38,7 @@ def _get_from_setuptools_scm():
 
 def _get_from_version_file():
     # The file sits next to this module, so resolve it directly first.
-    # importlib.resources cannot be relied on here: "tools" has no
+    # importlib.resources cannot be relied on here: "reachaq" has no
     # __init__.py, so it is a namespace package, and an editable install can
     # leave reachaq.__path__ holding more than one entry. files("reachaq") then
     # builds a MultiplexedPath, whose constructor raises NotADirectoryError
