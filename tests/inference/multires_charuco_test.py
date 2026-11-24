@@ -9,6 +9,7 @@ scout, the store and the library setting on views that hold only some of the cor
 
 import dataclasses
 import math
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -113,6 +114,23 @@ def test_detect_board_finds_every_charuco_corner(cam):
     assert corners is not None and corners.shape == (48, 2)
     assert np.all(np.isfinite(corners))
     assert np.max(np.linalg.norm(corners - truth_px(model, motor), axis=1)) < 0.1
+
+
+# A real frame of the rig's ChArUco board: christielab10 session010's scout, left camera,
+# frame 1080 (2026-11-23). It is dim (mean grey 58); the checkerboard's contrast stretch
+# erases its markers, so the board is found in it only on the raw grey (48 corners there,
+# none after the stretch).
+REAL_FRAME = Path(__file__).parent / "data" / "charuco" / "session010_left_scout_frame1080.png"
+
+
+def test_detect_board_finds_the_charuco_board_on_a_real_dim_frame():
+    gray = cv2.imread(str(REAL_FRAME), cv2.IMREAD_GRAYSCALE)
+    assert gray is not None and gray.shape == (1080, 1440), "is the LFS object checked out?"
+    corners = detect_board(gray, RIG_CHARUCO_BOARD)
+    assert corners is not None
+    assert int(np.isfinite(corners).all(axis=1).sum()) >= MIN_CHARUCO_CORNERS
+    view = scout_view("left", gray, RIG_CHARUCO_BOARD)
+    assert view.found
 
 
 def test_a_cropped_board_gives_nan_for_the_hidden_corners():

@@ -288,19 +288,21 @@ def detect_board(gray: np.ndarray, board: BoardSpec, *, refine: str = "subpix") 
     "legacy" refines on the image the legacy calibration refines on: the stretched copy after
     adjust_gamma(gamma=2), for which refine_corners' fixed Canny thresholds were tuned.
 
-    A ChArUco board is found by cv2.aruco.CharucoDetector on the same stretched copy, and
-    row k is corner id k. Corners it did not find are NaN rows, and None is returned when
+    A ChArUco board is found by cv2.aruco.CharucoDetector on the raw grey, not the stretched
+    copy, and row k is corner id k. The stretch erases its markers on the rig's dim frames:
+    on christielab10's session010 scout (mean grey 41-75), the frames with 12 or more corners
+    were 119 raw against 30 stretched for the left camera, and 120 against 19 for camera4. Corners it did not find are NaN rows, and None is returned when
     the found corners are not a usable view (fit.usable_view: fewer than 12, or within one
     row or one column). Only "subpix" refinement applies to it.
     """
     _check_refine(refine, board)
     if gray.ndim == 3:
         gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+    if board.kind == CHARUCO:
+        return _detect_charuco(gray, board)
     stretched = _detection_image(gray)
     if stretched is None:
         return None
-    if board.kind == CHARUCO:
-        return _detect_charuco(gray, stretched, board)
     found, corners = cv2.findChessboardCorners(stretched, (board.cols, board.rows))
     if not found:
         return None
@@ -321,9 +323,12 @@ def detect_board(gray: np.ndarray, board: BoardSpec, *, refine: str = "subpix") 
     return normalize_corner_order(np.array(refined), board)
 
 
-def _detect_charuco(gray: np.ndarray, stretched: np.ndarray, board: BoardSpec) -> Optional[np.ndarray]:
-    """detect_board for a ChArUco board, refined with cornerSubPix on `gray`."""
-    corners, ids, _, _ = _charuco_detector(board).detectBoard(stretched)
+def _detect_charuco(gray: np.ndarray, board: BoardSpec) -> Optional[np.ndarray]:
+    """detect_board for a ChArUco board: detected on the raw `gray` and refined with
+    cornerSubPix on it."""
+    if gray.dtype != np.uint8:
+        gray = np.clip(gray, 0, 255).astype(np.uint8)
+    corners, ids, _, _ = _charuco_detector(board).detectBoard(gray)
     if ids is None or corners is None or len(ids) == 0:
         return None
     ids = ids.ravel().astype(int)
