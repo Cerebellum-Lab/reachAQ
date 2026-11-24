@@ -173,6 +173,40 @@ def test_2_3_1_names_stepper_driver_fault_for_a_v1_3_board_reporting_0x44():
     assert "stepper_driver_fault" in result.optional_capabilities
 
 
+def test_2_4_0_accepts_a_v1_2_board_reporting_0x17():
+    """Pellet 2.4.0 on a v1.2 board: timing bits, pulse and clap listener."""
+    result = FirmwareCompatibilityPolicy.load().evaluate(
+        "Pellet: 2.4.0", wire_schema_version=1, capabilities=0x17,
+    )
+
+    assert result.supported
+    assert result.commands_allowed
+    assert result.reported_capabilities == (
+        "timing_trailer", "time_sync", "finite_stim3_pulse", "sync_listener",
+    )
+    assert set(result.required_capabilities) == {
+        "finite_stim3_pulse", "timing_trailer", "time_sync",
+    }
+
+
+def test_2_4_0_accepts_a_v1_3_board_reporting_0x57():
+    result = FirmwareCompatibilityPolicy.load().evaluate(
+        "Pellet: 2.4.0", wire_schema_version=1, capabilities=0x57,
+    )
+
+    assert result.commands_allowed
+    assert "stepper_driver_fault" in result.reported_capabilities
+
+
+def test_2_4_0_refuses_a_board_without_time_sync():
+    result = FirmwareCompatibilityPolicy.load().evaluate(
+        "Pellet: 2.4.0", wire_schema_version=1, capabilities=0x15,
+    )
+
+    assert not result.commands_allowed
+    assert result.missing_capabilities == ("time_sync",)
+
+
 def test_every_capability_name_in_the_shipped_policy_is_known():
     """A name missing from CAPABILITY_BITS makes load() reject every version."""
     import yaml
