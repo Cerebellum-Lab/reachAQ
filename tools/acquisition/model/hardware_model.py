@@ -84,6 +84,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     _presentation_block_reason: str = ""
     # token -> axis of each queued SET that lifts the block once the board acknowledges it.
     _block_lifting_sets: Dict[UUID, int] = {}  # replaced, never mutated in place
+    # Incremented by every block_presentation: a SET sent under one block cannot lift another.
+    _block_generation: int = 0
     # SETs that only move the stage for a while, or shift it from where it is: they do not
     # stand in for the refused base position.
     _SENDERS_NOT_CLEARING_THE_BLOCK = frozenset({"ordered_protocol", "processed_shift_xyz"})
@@ -461,11 +463,15 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
         The block state is read and written under _lock here, in _lift_presentation_block and
         where _set_axis records a lifting SET, so an ack handled on the reader thread cannot
-        lift an axis of a block raised while it ran. Those sections call nothing back."""
+        lift an axis of a block raised while it ran. Each call starts a new block generation:
+        _set_axis records a SET only when the generation it read before sending is still
+        current, so a SET sent under an earlier block lifts nothing of this one, whether its
+        ack arrives before or after the record. Those sections call nothing back."""
         with self._lock:
             self._presentation_blocked_axes = frozenset(range(3))
             self._presentation_block_reason = str(reason)
             self._block_lifting_sets = {}
+            self._block_generation += 1
 
     def _lift_presentation_block(self, token) -> None:
         """The board acknowledged `token`: when it is a SET that lifts the block, its axis is
@@ -515,6 +521,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             data = SystemDataArgsKwargs(new_value, relative=False)
         else:
             data = SystemDataArgsKwargs(value, relative=not absolute)
+        block_generation = self._block_generation  # read before the send: see block_presentation
         res = self._send_with_token(self._device_conn, system_set_cmd, data)
         if res is not None:
             tokens = list(self._latest_set_tokens)
@@ -524,12 +531,15 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 # Lifted on the board's ack (_lift_presentation_block), not here. The ack can be
                 # handled before this records the token (_send_with_token's listeners run in
                 # between): _ack_received writes the outcome under _lock before it lifts, so
-                # either it finds the token here or this finds the outcome. (A block raised
-                # after the unlocked check above leaves this axis blocked: it fails safe.)
+                # either it finds the token here or this finds the outcome. The token is
+                # recorded only under the block it was sent under: a block raised during or
+                # after the send (a new generation) is not lifted by it, early ack or late.
                 with self._lock:
-                    if coord_idx in self._presentation_blocked_axes:
+                    recorded = (block_generation == self._block_generation
+                                and coord_idx in self._presentation_blocked_axes)
+                    if recorded:
                         self._block_lifting_sets = {**self._block_lifting_sets, res: coord_idx}
-                    acked = self._command_outcomes.get(res, ("",))[0] == "acknowledged"
+                    acked = recorded and self._command_outcomes.get(res, ("",))[0] == "acknowledged"
                 if acked:
                     self._lift_presentation_block(res)
             self._last_requested_set_coordinates = self._last_requested_set_coordinates.replace(**{coord: new_value})

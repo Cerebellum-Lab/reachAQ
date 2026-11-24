@@ -577,6 +577,32 @@ def test_the_ack_time_lift_waits_for_the_model_lock(hardware_model):
     assert hardware_model._presentation_blocked_axes == frozenset({0, 1, 2})
 
 
+@pytest.mark.parametrize("ack", ["early", "late"])
+def test_a_set_sent_under_one_block_cannot_lift_a_block_raised_during_its_send(hardware_model, ack):
+    """N-15: Set Y is pressed under block 1; while it is being sent, another out-of-travel
+    animal raises block 2. Whether the board's ack is handled during the send or after,
+    that SET belongs to block 1 and must leave block 2's Y blocked."""
+    _set_y_refused_setup(hardware_model)
+    hardware_model.block_presentation("block 1")
+    sent = []
+
+    def send_while_a_new_block_is_raised(_device, command, _data=None):
+        token = _pending(hardware_model, command)
+        hardware_model.block_presentation("block 2")
+        if ack == "early":
+            hardware_model._ack_received(token)
+        sent.append(token)
+        return token
+
+    hardware_model._send_with_token = send_while_a_new_block_is_raised
+    hardware_model.set_y(25.0, sender="UI-Set-Button")
+    if ack == "late":
+        hardware_model._ack_received(sent[0])
+
+    assert 1 in hardware_model._presentation_blocked_axes
+    assert hardware_model._block_lifting_sets == {}
+
+
 class _ConnectionWhoseHomeIsRefused:
     """Stands in for DeviceConnection: version and configuration succeed, the home is refused.
 
