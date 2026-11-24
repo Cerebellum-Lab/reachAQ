@@ -6264,8 +6264,11 @@ class AppModel(ObservableObject):
                 composition.with_entries(tuple(entries))
             )
 
+    @_serialized_session_configuration
     def compile_and_save_experiment(self, experiment_id: str):
         """Compile an experiment and publish it as a selectable protocol."""
+        # It overwrites a protocol a session may be running.
+        self._require_session_ready_for_configuration("Compiling an experiment")
         with self._trial_protocol_lock:
             composition = self._experiment_repository.get(experiment_id)
             if composition is None:
@@ -6276,7 +6279,22 @@ class AppModel(ObservableObject):
             # Persist any seed the compiler drew before publishing the protocol
             # it produced, so the compile can always be reproduced.
             self._experiment_repository.save(compiled.composition)
-            return self._trial_protocol_repository.save(compiled.document)
+            saved = self._trial_protocol_repository.save(compiled.document)
+        self._published_protocol_revision(saved)
+        return saved
+
+    def _published_protocol_revision(self, saved) -> None:
+        """Follow a new revision of the selected protocol, published by id.
+
+        A compile or a set opened as a protocol saves over an existing id.
+        Left alone, the selection and schedule stayed on the old revision:
+        the sidebar named the new one while Record ran the old (prod25-01).
+        """
+        selected = self._selected_ordered_protocol
+        if selected is not None and selected.protocol_id == saved.protocol_id:
+            self._select_ordered_protocol_internal(saved.protocol_id, persist_animal=False)
+        else:
+            self._notify_trial_protocol_state()
 
     def save_protocol_as_set(self, protocol_id: str, set_id: str, name: str):
         """Capture a protocol you have built in the editor as a reusable set."""
@@ -6288,15 +6306,19 @@ class AppModel(ObservableObject):
                 set_from_document(document, set_id=set_id, name=name)
             )
 
+    @_serialized_session_configuration
     def open_set_as_protocol(self, set_id: str, protocol_id: str, name: str):
         """Publish a set as an editable protocol, to revise and capture again."""
+        self._require_session_ready_for_configuration("Opening a set as a protocol")
         with self._trial_protocol_lock:
             protocol_set = self._trial_protocol_set_repository.get(set_id)
             if protocol_set is None:
                 raise ValueError("Unknown set {!r}".format(set_id))
-            return self._trial_protocol_repository.save(
+            saved = self._trial_protocol_repository.save(
                 document_from_set(protocol_set, protocol_id=protocol_id, name=name)
             )
+        self._published_protocol_revision(saved)
+        return saved
 
     @property
     def trial_protocol_state(self) -> dict:
