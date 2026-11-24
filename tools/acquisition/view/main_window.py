@@ -1291,8 +1291,60 @@ class MainWindow(QMainWindow):
             dialog.close()
         super().close()
 
+    def _confirm_close_with_session(self) -> bool:
+        """Ask before closing over a session; True to go on closing.
+
+        Closing stops acquisition, which once aborted a recording and deleted
+        the session with no prompt. It now stops and saves; deleting is the
+        operator's explicit choice here, as with Abort.
+        """
+        app_model = self._app_model
+        status = app_model.session_recording_status
+        if status is SessionRecordingStatus.READY:
+            return True
+        project = app_model.project
+        session = "The session" if project is None else project.short_id
+        box = QMessageBox(self)
+        box.setWindowTitle("Session in progress")
+        box.setIcon(QMessageBox.Icon.Warning)
+        abort = None
+        if status in {SessionRecordingStatus.ARMING, SessionRecordingStatus.RECORDING}:
+            box.setText(
+                f"{session} is recording. Closing stops the recording and "
+                "saves it first."
+            )
+            proceed = box.addButton("Stop, save and close", QMessageBox.ButtonRole.AcceptRole)
+            abort = box.addButton(
+                "Abort (delete session) and close", QMessageBox.ButtonRole.DestructiveRole)
+        else:
+            box.setText(
+                f"{session} is still being saved. Close when saving finishes?"
+            )
+            proceed = box.addButton("Close when saved", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if abort is not None and clicked == abort:
+            if not app_model.abort_recording():
+                self._show_msg_box(
+                    "Abort refused",
+                    f"{session} could not be aborted; it was not closed.",
+                    QMessageBox.Icon.Warning,
+                )
+                return False
+            return True
+        return clicked == proceed
+
     def close(self):
         logger.debug("received close")
+        with self._app_model.app_lock:
+            closing = self._closing
+        if not closing and not self._confirm_close_with_session():
+            event = self._close_event
+            if event is not None:
+                event.ignore()
+                self._close_event = None
+            return
         with self._app_model.app_lock:
             event = self._close_event
             if self._closing:

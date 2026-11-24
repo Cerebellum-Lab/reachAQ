@@ -2043,6 +2043,82 @@ def test_a_camera_brought_back_by_retry_is_supervised_again(
         app_model.capture_stop()
 
 
+def _record_left_and_right(app_model, system_config, trainer_config_dir, animal):
+    for camera in system_config.cameras:
+        if camera.id in (CameraId.Left, CameraId.Right):
+            camera.is_enabled = True
+            camera.is_record_enabled = True
+    system_config.save_default(trainer_config_dir)
+    assert app_model.load_configuration() is True
+    app_model.set_runtime_live_inference_override(
+        not system_config.inference.is_enabled)
+    assert app_model.capture_start() is True
+    assert app_model.add_animal(animal, select=True) is not None
+    assert app_model.start_recording() is True
+    _wait_until(lambda: app_model.session_recording_status
+                is SessionRecordingStatus.RECORDING, timeout=30)
+    return Path(app_model.project.get_session_path(skip_ensure=True).location)
+
+
+def test_stopping_acquisition_during_a_recording_saves_the_session(
+    app_model, system_config, trainer_config_dir,
+):
+    # Closing the window stops acquisition, and a stop during a recording
+    # aborted it: the session directory was deleted with no prompt.
+    session_path = _record_left_and_right(
+        app_model, system_config, trainer_config_dir, "stop-saves")
+    abort = mock.Mock(wraps=app_model.abort_recording)
+    with mock.patch.object(app_model, "abort_recording", abort):
+        app_model.capture_stop()
+
+    abort.assert_not_called()
+    assert app_model.session_recording_status is SessionRecordingStatus.READY
+    assert session_path.is_dir()
+    assert (session_path / "manifest.json").is_file()
+    assert app_model.acquisition_started is False
+
+
+def test_a_session_not_saved_within_the_bound_is_left_on_disk(
+    app_model, system_config, trainer_config_dir, monkeypatch,
+):
+    from tools.acquisition.model import app_model as app_model_module
+
+    session_path = _record_left_and_right(
+        app_model, system_config, trainer_config_dir, "stop-bound")
+    monkeypatch.setattr(app_model_module, "SESSION_SAVE_BEFORE_STOP_TIMEOUT_S", 0.2)
+    # The writers never report closure: the session stays STOPPING.
+    monkeypatch.setattr(app_model, "_complete_stopped_recording", lambda *_a, **_k: None)
+    errors = []
+    monkeypatch.setattr(app_model, "on_error", lambda *args: errors.append(args))
+    recorder_abort = mock.Mock(wraps=app_model._session_data_recorder.abort)
+    monkeypatch.setattr(app_model._session_data_recorder, "abort", recorder_abort)
+
+    app_model.capture_stop()
+
+    assert session_path.is_dir()
+    recorder_abort.assert_not_called()
+    assert app_model._session_left_unsaved is True
+    assert any(title == "Session not finalized" for title, *_ in errors), errors
+    assert app_model.acquisition_started is False
+
+
+def test_the_api_refuses_to_stop_acquisition_while_a_session_runs(app_model):
+    from autotrainer.core.api.commands import (
+        ApiCommand,
+        ApiCommandRequest,
+        ApiCommandRequestResult,
+    )
+
+    app_model._recording_session.begin_record(app_model.project.short_id, {})
+    with mock.patch.object(app_model, "capture_stop") as capture_stop:
+        response = app_model._handle_rpc_service_command(
+            ApiCommandRequest(command=ApiCommand.STOP_ACQUISITION, nonce="n1"))
+
+    capture_stop.assert_not_called()
+    assert response.result is ApiCommandRequestResult.FAILED
+    assert "a session is arming" in response.error_message.lower()
+
+
 def test_periodic_command_producers_stop_without_touching_can():
     events = []
     app_model = object.__new__(AppModel)

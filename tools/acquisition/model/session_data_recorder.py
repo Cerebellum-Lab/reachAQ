@@ -691,7 +691,8 @@ class SessionDataRecorder:
             "snapshot were retained for retry"
         ) from first_error
 
-    def abort(self) -> None:
+    def abort(self, *, keep_spool: bool = False) -> None:
+        """Clear the recorder; keep_spool keeps an unfinished recording's spool."""
         with self._event_capture_lock:
             self._event_capture_enabled = False
             self._drain_event_queue()
@@ -708,7 +709,11 @@ class SessionDataRecorder:
             # its spool, as it keeps its other staged files; v3.0.1 deleted it
             # as the app closed and the session's NI data was lost for good.
             # Only an unfinished recording's spool is removed.
-            retained = pending is not None or self._pending_stop_end_perf is not None
+            retained = (
+                keep_spool
+                or pending is not None
+                or self._pending_stop_end_perf is not None
+            )
             project = (None if pending is None else pending.get("project")) or self._project
             self._pending_finalization = None
             self._pending_stop_end_perf = None
@@ -728,8 +733,8 @@ class SessionDataRecorder:
         """Request recorder shutdown without blocking the operator/UI thread."""
         self._nidaq_stop.set()
 
-    def close(self) -> None:
-        self.abort()
+    def close(self, *, keep_spool: bool = False) -> None:
+        self.abort(keep_spool=keep_spool)
         if self._system_message_handler is not None:
             self._system_message_handler.decoded_message_received -= self._on_device_message
         if self._hardware_model is not None:

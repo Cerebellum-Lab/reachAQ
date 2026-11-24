@@ -2094,6 +2094,16 @@ def test_aborting_a_recording_that_never_stopped_still_removes_its_spool(tmp_pat
     assert not snapshot.path.exists()
 
 
+def test_closing_over_a_session_not_saved_in_time_keeps_its_spool(tmp_path):
+    # Closing gives up on a session that is not saved within its bound; the
+    # session's files stay on disk, and its spool must stay with them.
+    project, ring, recorder = _spool_recorder(tmp_path, 16)
+    snapshot = _spool_with_two_reads(recorder, project, ring, raw=True)
+    recorder.close(keep_spool=True)
+
+    assert snapshot.path.is_file()
+
+
 def test_the_spool_and_the_published_nidaq_are_marked_close_on_exec(tmp_path, monkeypatch):
     # Both are written in the app's process, where NI-DAQmx's CEIP client starts processes.
     real_mark = session_data_recorder.mark_close_on_exec
