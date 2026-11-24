@@ -2,6 +2,7 @@ import multiprocessing
 import os
 import sys
 import faulthandler
+import signal
 
 # NB: do not put any imports of autotrainer* or any module not part from standard python lib.
 
@@ -14,8 +15,17 @@ def _exec_main(args, logger):
     return exit_val
 
 
-def main():
+def enable_fault_dumps():
+    """Crash tracebacks, and every thread's stack on SIGUSR1."""
     faulthandler.enable()
+    # A frozen app can be diagnosed without a debugger: `kill -USR1 <pid>`
+    # prints every thread's stack to stderr (the launcher's terminal).
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+
+
+def main():
+    enable_fault_dumps()
     fork_method = "spawn"  # please check python multiprocessing fork method documentation
     multiprocessing.set_start_method(fork_method)  # MUST BE SET VERY EARLY BEFORE MOST IMPORTS
 
