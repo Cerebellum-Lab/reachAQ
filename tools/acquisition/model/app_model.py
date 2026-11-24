@@ -211,7 +211,11 @@ from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.helpers import first_line, get_config_location
 from tools.acquisition.model.hardware_model import HardwareModel
 from tools.acquisition.model.inference_model import InferenceModel
-from tools.acquisition.model.laser_model import LaserModel, wait_until_cancelled_ends
+from tools.acquisition.model.laser_model import (
+    PROTOCOL_LASER_ARM_WINDOW_S,
+    LaserModel,
+    wait_until_cancelled_ends,
+)
 from autotrainer.device import (
     CanFailure,
     CanTransportConfiguration,
@@ -7041,7 +7045,10 @@ class AppModel(ObservableObject):
                     self._nidaq_signal_monitor.runtime_device_aliases,
                 ),
             )
-        return prepare(profile, firing, recipe)
+        # Armed for the whole trial: it is made before the SEND, and a First
+        # Reach can come long after the controller's own waveform + 5 s.
+        return prepare(
+            profile, firing, recipe, armed_window_seconds=PROTOCOL_LASER_ARM_WINDOW_S)
 
     def _prepare_protocol_stim_detector(self, recipe):
         camera = self._stim_camera
