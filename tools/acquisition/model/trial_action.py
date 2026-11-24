@@ -932,6 +932,12 @@ class TrialActionExecutor:
             firing = operation.recipe.laser_firing
             if profile is None or firing is None:
                 raise RuntimeError("Stimulus trigger has no prepared laser profile")
+            if self._laser_handle is None or operation.state in operation.TERMINAL:
+                # Cancelled (as not triggered, or by Stop) or ended: nothing
+                # is armed for the board's STIM pulse to start.
+                raise RuntimeError(
+                    "Stimulus trigger arrived after the prepared laser was "
+                    f"released ({operation.state.value})")
             self._stimulus_triggered = True
             if firing.trigger_route is LaserTriggerRoute.DIRECT_NI_SOFTWARE:
                 self._trigger_laser_if_direct(detail)

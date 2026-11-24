@@ -904,3 +904,18 @@ def test_a_direct_trigger_that_reached_the_laser_is_waited_for():
 
     assert executor.complete("pellet cycle completed").state is PreparedState.COMPLETED
     assert laser.timeouts
+
+
+def test_a_board_trigger_after_the_laser_was_cancelled_as_not_triggered_is_refused():
+    # Between complete()'s two lock blocks a late First Reach still pulsed
+    # the board STIM line for a laser already cancelled (review, 8fb14f02).
+    pulses = []
+    laser = _UntriggeredLaser()
+    executor, recipe = _first_reach_executor(
+        "hardware_stim3", laser,
+        trigger_hardware_stimulus=lambda *_args: pulses.append("stim"))
+    executor.complete("pellet cycle completed")
+
+    with pytest.raises(RuntimeError):
+        executor.trigger_stimulus(recipe.operation_id, 4, detail="late first reach")
+    assert pulses == []
