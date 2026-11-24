@@ -86,6 +86,18 @@ def run_acquisition(
     logging.info("Set log level to %s", preferences.log_level)
     get_console_handler().setLevel(preferences.log_level)
 
+    # A new install, or a data folder that cannot be written: ask before the
+    # main window loads, which would otherwise write a default configuration.
+    # The simulation brings its own configuration and data folder.
+    if not args.simulate:
+        from tools.acquisition.model.helpers import get_config_location
+        from tools.acquisition.view.first_run_dialog import run_first_run_if_needed
+        config_location = get_config_location(
+            preferences, None if args.configuration is None else str(args.configuration))
+        if not run_first_run_if_needed(config_location, log_location=preferences.log_location):
+            logger.notice("First-run step closed without a configuration; exiting")
+            return 0
+
     event_manager = EventManager.default()
     plugin = try_register_api_event_plugin()
 

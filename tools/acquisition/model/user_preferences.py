@@ -127,6 +127,11 @@ class UserPreferences(ObservableObject):
 
         self._pellet_port = None
 
+    @property
+    def settings_file_name(self) -> str:
+        """The file these preferences are read from and saved to."""
+        return self._settings.fileName()
+
     def save(self):
         logger.verbose("Saving ini config to %s", self._settings.fileName())
         self._settings.sync()

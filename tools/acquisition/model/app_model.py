@@ -1641,6 +1641,11 @@ class AppModel(ObservableObject):
         return self._acquisition.started
 
     @property
+    def recording_ending_reason(self) -> RecordingEndingReason:
+        """Why the current or last recording ended; NA until it does."""
+        return self._recording_ending_reason
+
+    @property
     def session_recording_status(self) -> SessionRecordingStatus:
         return self._recording_session.status
 
