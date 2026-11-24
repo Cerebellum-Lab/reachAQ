@@ -39,7 +39,7 @@ def test_portable_installer_is_executable_and_rejects_options():
     assert "Run it with no options" in completed.stderr
 
 
-def test_portable_installer_always_attempts_complete_workflow():
+def test_portable_installer_runs_one_complete_workflow():
     source = INSTALL_SCRIPT.read_text()
 
     assert 'run_step "Install Miniconda" install_miniconda' in source
@@ -76,6 +76,65 @@ def test_portable_installer_builds_python_310_with_both_pose_engines():
     assert '--target "$runtime_dir"' in library
     assert 'run_step "Verify Python dependencies" verify_python_dependencies' in source
     assert 'run_step "Install Spinnaker Python binding" install_spinnaker_binding' in source
+    # One CUDA runtime: checked once the plugins are back, before the GPU runs.
+    single = source.index('run_step "Verify one CUDA runtime per engine" verify_single_cuda_runtime')
+    assert source.index('run_step "Restore $name pose plugin"') < single
+    assert single < source.index('run_step "Verify PyTorch GPU preflight"')
+
+
+def test_portable_installer_checks_the_platform_before_changing_anything():
+    source = INSTALL_SCRIPT.read_text()
+    flow = source[source.index('begin_category "Preflight"'):]
+
+    first_step = flow.index("run_step ")
+    assert flow[first_step:].startswith('run_step "Check supported platform" check_supported_platform')
+    check = source[source.index("check_supported_platform() {"):]
+    check = check[:check.index("\n}\n")]
+    assert 'python3 "$SCRIPT_DIR/platform_check.py"' in check
+    assert 'if [ "$INSTALL_UNSUPPORTED" = "1" ]; then' in check
+    assert "warn_step" in check
+    assert "INSTALL_UNSUPPORTED=${REACHAQ_INSTALL_UNSUPPORTED:-0}" in source
+
+
+def test_portable_installer_ships_no_flir_software():
+    source = INSTALL_SCRIPT.read_text()
+
+    assert not (REPO_ROOT / "vendor" / "spinnaker").exists()
+    assert "vendor/spinnaker" not in source
+    assert "SPINNAKER_DOWNLOADS=${REACHAQ_SPINNAKER_DOWNLOADS:-$HOME/Downloads}" in source
+    assert "INSTALL_SPINNAKER=${REACHAQ_INSTALL_SPINNAKER:-1}" in source
+    # The SDK is found before the long conda build, the binding after it.
+    sdk = source.index('run_step "Install Spinnaker SDK" install_spinnaker_sdk')
+    assert sdk < source.index('run_step "Create conda environment"')
+    assert source.index('run_step "Install Spinnaker Python binding"') > source.index(
+        'run_step "Create conda environment"')
+    for step in ("Install Spinnaker SDK", "Configure FLIR camera access",
+                 "Install Spinnaker Python binding", "Verify Spinnaker cameras"):
+        assert f'skip_step "{step}" "$SPINNAKER_SKIPPED"' in source, step
+
+
+def test_spinnaker_sdk_licence_is_left_to_the_operator():
+    source = INSTALL_SCRIPT.read_text()
+    install = source[source.index("install_spinnaker_sdk() {"):]
+    install = install[:install.index("\n}\n")]
+
+    assert 'run_as_root apt-get install -y "$deb_dir"/*.deb' in install
+    # The FLIR packages ask for their licence through debconf; a
+    # noninteractive frontend would decline it, or a preseed accept it, on
+    # the operator's behalf.
+    assert "noninteractive" not in install.replace("Not DEBIAN_FRONTEND=noninteractive", "")
+    assert "accepted-flir-eula" not in source
+    assert "debconf-set-selections" not in source
+
+
+def test_usbfs_memory_unit_is_tracked_and_reversible():
+    unit = (REPO_ROOT / "src" / "reachaq" / "hardware" / "reachaq-usbfs-memory.service").read_text()
+
+    assert "Type=oneshot" in unit and "RemainAfterExit=yes" in unit
+    commands = [line for line in unit.splitlines() if line.startswith("Exec")]
+    assert any(line.startswith("ExecStart") and "echo 1000 >" in line for line in commands)
+    assert any(line.startswith("ExecStop") and "echo 16 >" in line for line in commands)
+    assert "WantedBy=multi-user.target" in unit
 
 
 def test_generic_import_check_names_only_modules_in_the_checkout():

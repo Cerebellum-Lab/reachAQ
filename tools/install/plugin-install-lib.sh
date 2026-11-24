@@ -5,7 +5,14 @@
 # Definitions only: sourcing this file runs nothing. The caller sets
 # INSTALL_REPO, INSTALL_ENV and CONDA_BIN, initialises the RESULT_* arrays and
 # counters, and installs the on_exit / on_interrupt traps. REPORT_TITLE and
-# REPORT_FOOTER, when set, label the final report.
+# REPORT_FOOTER, when set, label the final report; RERUN_HINT, when set, says
+# what to rerun after a failure.
+#
+# A failed step stops the install: run_step prints the report, names the step
+# and its command, and exits 1. Later steps mostly depend on earlier ones, and
+# carrying on buried the first error under the ones it caused. A step left out
+# on purpose is a SKIP with its reason; something the operator must know about
+# that does not stop the install is a WARN.
 
 # Pose backend plugins this checkout carries, each a distribution under
 # plugins/<name> that registers <name> in the reachaq.pose_backends
@@ -23,6 +30,7 @@ record_result() {
         PASS) PASS_COUNT=$((PASS_COUNT + 1)) ;;
         FAIL) FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
         SKIP) SKIP_COUNT=$((SKIP_COUNT + 1)) ;;
+        WARN) WARN_COUNT=$((${WARN_COUNT:-0} + 1)) ;;
     esac
 }
 
@@ -49,11 +57,30 @@ run_step() {
     if [ "$result" -eq 0 ]; then
         record_result PASS "$name"
         printf '[PASS] %s\n' "$name"
-    else
-        record_result FAIL "$name" "exit $result"
-        printf '[FAIL] %s (exit %d); continuing\n' "$name" "$result" >&2
+        return 0
     fi
-    return 0
+    record_result FAIL "$name" "exit $result"
+    printf '[FAIL] %s (exit %d)\n' "$name" "$result" >&2
+    stop_install "$name" "$@"
+}
+
+# stop_install <step> [command...]: prints the report, which ends with the
+# step that stopped the install and how to go on, then exits 1.
+stop_install() {
+    local name=$1
+    shift
+    STOPPED_STEP="$CURRENT_CATEGORY | $name"
+    if [ "$#" -gt 0 ]; then
+        STOPPED_COMMAND=$(printf ' %q' "$@")
+    fi
+    print_report
+    exit 1
+}
+
+# warn_step <name> <detail>: recorded and shown; does not stop the install.
+warn_step() {
+    record_result WARN "$1" "$2"
+    printf '\n[WARN] %s: %s\n' "$1" "$2" >&2
 }
 
 skip_step() {
@@ -80,8 +107,8 @@ print_report() {
         printf '\n'
     done
     printf '%s\n' '------------------------------------------------------------'
-    printf 'PASS=%d FAIL=%d SKIP=%d\n' \
-        "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
+    printf 'PASS=%d FAIL=%d SKIP=%d WARN=%d\n' \
+        "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT" "${WARN_COUNT:-0}"
     printf 'Repository: %s\n' "$INSTALL_REPO"
     if [ -n "${INSTALL_PYTHON:-}" ]; then
         printf 'Conda environment: %s (Python %s)\n' "$INSTALL_ENV" "$INSTALL_PYTHON"
@@ -94,8 +121,18 @@ print_report() {
     if [ -n "${INSTALL_DATA_DIR:-}" ]; then
         printf 'Data directory: %s\n' "$INSTALL_DATA_DIR"
     fi
-    if [ "$FAIL_COUNT" -gt 0 ]; then
-        printf 'Completed with failures. Review every FAIL entry above.\n'
+    if [ -n "${STOPPED_STEP:-}" ]; then
+        printf '\nSTOPPED at step: %s\n' "$STOPPED_STEP"
+        if [ -n "${STOPPED_COMMAND:-}" ]; then
+            printf 'Failed command:%s\n' "$STOPPED_COMMAND"
+        fi
+        printf '%s\n' \
+            'Nothing after this step was run. Its output, above this report, says why.' \
+            "Fix the cause and rerun ${RERUN_HINT:-the installer}; steps that already passed are safe to repeat."
+    elif [ "$FAIL_COUNT" -gt 0 ]; then
+        printf 'Stopped by a failure. Review the FAIL entry above.\n'
+    elif [ "${WARN_COUNT:-0}" -gt 0 ]; then
+        printf 'Installation and verification completed with warnings. Review every WARN entry above.\n'
     else
         printf 'Installation and verification completed without reported failures.\n'
     fi
@@ -272,15 +309,7 @@ install_pose_plugin() {
             'To remove it: python -m pip uninstall reachaq-pose-yolo ultralytics' \
             'Continuing.'
     fi
-    if ! conda_run python -m pip install -e "$INSTALL_REPO/plugins/$name"; then
-        if [ "$name" = deeplabcut ]; then
-            skip_step "Install TensorFlow pose engine" "DeepLabCut plugin install failed"
-            skip_step "Install TensorFlow CUDA runtime" "DeepLabCut plugin install failed"
-            skip_step "Verify TensorFlow GPU preflight" "DeepLabCut plugin install failed"
-            skip_step "Verify both engines in one process" "DeepLabCut plugin install failed"
-        fi
-        return 1
-    fi
+    conda_run python -m pip install -e "$INSTALL_REPO/plugins/$name" || return
     if [ "$name" = deeplabcut ]; then
         run_step "Install TensorFlow pose engine" install_tensorflow_engine
         run_step "Install TensorFlow CUDA runtime" install_tensorflow_gpu_runtime
@@ -385,7 +414,22 @@ install_tensorflow_gpu_runtime() {
         fi
     fi
     "$CONDA_BIN" env config vars set -n "$INSTALL_ENV" \
-        "LD_LIBRARY_PATH=$tensorflow_library_path"
+        "LD_LIBRARY_PATH=$tensorflow_library_path" || return
+
+    # The environment's second CUDA runtime, and the only one
+    # tools/install/cuda_runtime_check.py allows: say so where it lives and here.
+    printf '%s\n' \
+        "reachAQ: CUDA 11.8 and cuDNN 8.6 for TensorFlow $tensorflow_version, installed with the" \
+        'DeepLabCut pose plugin (install_tensorflow_gpu_runtime in tools/install/plugin-install-lib.sh).' \
+        'PyTorch uses its own CUDA 12.8 runtime in site-packages/nvidia. This directory is reached' \
+        "only through the LD_LIBRARY_PATH of conda environment $INSTALL_ENV." \
+        'Removing it with the plugin: docs/linux-install/nvidia-inference.md.' \
+        > "$runtime_dir/README-reachaq.txt" || return
+    printf '%s\n' \
+        "Second CUDA runtime, for the DeepLabCut plugin's TensorFlow engine only:" \
+        "  CUDA 11.8 / cuDNN 8.6 in $runtime_dir," \
+        "  on the LD_LIBRARY_PATH of conda environment $INSTALL_ENV (conda env config vars list -n $INSTALL_ENV)." \
+        'PyTorch and the base install use CUDA 12.8 only.'
 }
 
 verify_tensorflow_gpu_runtime() {

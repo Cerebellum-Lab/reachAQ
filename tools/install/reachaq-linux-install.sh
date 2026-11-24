@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 
-# Portable reachAQ Linux host setup.
+# reachAQ Linux host setup.
 #
-# This script intentionally excludes hardware/model-specific drivers and
-# configuration (FLIR Spinnaker, NI-DAQ/PXI, PEAK CAN, NVIDIA kernel drivers,
-# and channel mappings). The single no-argument workflow installs every
+# It first checks the host against tools/install/supported-platforms.json
+# (docs/linux-install/supported-platforms.md) and refuses an unsupported one;
+# REACHAQ_INSTALL_UNSUPPORTED=1 installs anyway, with a WARN in the report.
+#
+# This script excludes the NI-DAQ/PXI and PEAK CAN drivers, NVIDIA kernel
+# drivers and channel mappings. The single no-argument workflow installs every
 # portable component into a Python 3.10 Conda environment: the application,
-# PyTorch for the built-in keypoint backend, and all tracked verification. It
-# installs no pose plugin: tools/install/reachaq-plugin-install.sh adds the
-# DeepLabCut plugin (with its TensorFlow engine and that engine's CUDA
-# user-space runtime, kept apart from PyTorch's) or the YOLO plugin on demand.
+# PyTorch for the built-in keypoint backend (the environment's one CUDA
+# runtime, CUDA 12.8), and all tracked verification. It installs the FLIR
+# Spinnaker SDK and its Python binding from the operator's own download
+# (REACHAQ_SPINNAKER_DOWNLOADS, default ~/Downloads; reachAQ ships no FLIR
+# software); REACHAQ_INSTALL_SPINNAKER=0 leaves them out on a host without
+# FLIR cameras. It installs no pose plugin:
+# tools/install/reachaq-plugin-install.sh adds the DeepLabCut plugin (with its
+# TensorFlow engine and that engine's CUDA 11.8 runtime, kept apart from
+# PyTorch's) or the YOLO plugin on demand.
 #
 # Rerunning it is the update path. An existing environment on another Python
 # version is kept, renamed <env>-py<version>-<date>, and a fresh one is built.
@@ -17,10 +25,12 @@
 # checkout; on the first update after the plugins existed, an environment with
 # deeplabcut or ultralytics installed gets the matching plugin.
 # REACHAQ_INSTALL_SYSTEM=0 skips the steps that need root (apt packages, groups,
-# limits, systemd), for rerunning on a host that already has them.
+# limits, systemd, the Spinnaker SDK), for rerunning on a host that already
+# has them.
 #
-# Do not enable `set -e`: every step must be attempted independently and the
-# complete pass/fail/skip report must be printed at the end.
+# The first failed step stops the install, and the report names it and its
+# command (run_step in plugin-install-lib.sh). `set -e` is not used, so the
+# report is always printed.
 
 set -o pipefail
 
@@ -36,6 +46,9 @@ INSTALL_PYTHON=${REACHAQ_INSTALL_PYTHON:-3.10}
 INSTALL_SYSTEM=${REACHAQ_INSTALL_SYSTEM:-1}
 INSTALL_CONFIG_DIR=${REACHAQ_INSTALL_CONFIG_DIR:-${REACHAQ_CONFIG_DIR:-$HOME/reachAQ}}
 INSTALL_DATA_DIR=${REACHAQ_INSTALL_DATA_DIR:-$HOME/Documents/rawdatalocal}
+INSTALL_UNSUPPORTED=${REACHAQ_INSTALL_UNSUPPORTED:-0}
+INSTALL_SPINNAKER=${REACHAQ_INSTALL_SPINNAKER:-1}
+SPINNAKER_DOWNLOADS=${REACHAQ_SPINNAKER_DOWNLOADS:-$HOME/Downloads}
 INSTALL_OPERATOR=${SUDO_USER:-${USER:-$(id -un)}}
 REALTIME_GROUP=${REACHAQ_INSTALL_REALTIME_GROUP:-reachaq-rt}
 REALTIME_LIMITS_FILE=/etc/security/limits.d/90-reachaq-rtprio.conf
@@ -47,9 +60,11 @@ RESULT_DETAILS=()
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
+WARN_COUNT=0
 REPORT_PRINTED=false
-REPORT_TITLE="reachAQ portable install report"
-REPORT_FOOTER="Hardware-specific kernel drivers/configuration are not installed by this script."
+REPORT_TITLE="reachAQ install report"
+REPORT_FOOTER="NI-DAQ, PEAK CAN and NVIDIA kernel drivers are not installed by this script."
+RERUN_HINT="tools/install/reachaq-linux-install.sh"
 CONDA_BIN=""
 # Pose plugins the environment had before this run, reinstalled after it.
 PLUGINS_TO_RESTORE=()
@@ -79,6 +94,32 @@ run_as_root() {
         printf 'Root privileges are required, but sudo is unavailable.\n' >&2
         return 127
     fi
+}
+
+# The list is data (supported-platforms.json), read with the host's python3
+# because nothing else is installed yet. Exit 1 from the check means the host
+# is not on the list; anything else means the check itself broke.
+check_supported_platform() {
+    if ! have_command python3; then
+        printf 'python3 is required to check the platform (Ubuntu ships it: apt install python3).\n' >&2
+        return 127
+    fi
+    python3 "$SCRIPT_DIR/platform_check.py"
+    local result=$?
+    if [ "$result" -ne 1 ]; then
+        return "$result"
+    fi
+    if [ "$INSTALL_UNSUPPORTED" = "1" ]; then
+        warn_step "Install on an unsupported platform" \
+            "REACHAQ_INSTALL_UNSUPPORTED=1; see the unsupported lines above"
+        return 0
+    fi
+    printf '%s\n' \
+        '' \
+        'This host is not on the supported platform list (tools/install/supported-platforms.json,' \
+        'explained in docs/linux-install/supported-platforms.md); nothing has been changed.' \
+        'To install anyway, untested, rerun with REACHAQ_INSTALL_UNSUPPORTED=1.' >&2
+    return 1
 }
 
 apt_update() {
@@ -287,9 +328,11 @@ archive_conda_environment() {
         "$archive_name"
     # The new environment is built from nothing; it gets the plugins the one
     # it replaces had. A failed probe must not stop the new environment being
-    # built: it is reported, and the list read before archiving is kept.
+    # built: stopping here would leave no environment named $INSTALL_ENV, and
+    # the rerun would then restore nothing. It is a WARN, and the list read
+    # before archiving is kept.
     if ! find_plugins_to_restore "$archive_name"; then
-        record_result FAIL "Find pose plugins to restore from $archive_name" \
+        warn_step "Find pose plugins to restore from $archive_name" \
             "probe failed; kept: ${PLUGINS_TO_RESTORE[*]:-none}"
     fi
 }
@@ -419,28 +462,145 @@ print("PyTorch GPU convolution device:", result.device,
 PY
 }
 
-# The Spinnaker SDK itself is a vendor install (docs/linux-install/flir-spinnaker.md);
-# its Python binding is bundled here per interpreter and architecture, so once
-# the SDK is present the matching wheel is installed automatically.
-install_spinnaker_binding() {
-    conda_run python - "$INSTALL_REPO/vendor/spinnaker" <<'PY'
-import json
-import pathlib
-import platform
-import subprocess
-import sys
+# Exactly one CUDA runtime per engine: torch's CUDA 12.8 for the base install,
+# plus the DeepLabCut plugin's isolated CUDA 11.8 only when that plugin is in.
+verify_single_cuda_runtime() {
+    conda_run python "$SCRIPT_DIR/cuda_runtime_check.py"
+}
 
-root = pathlib.Path(sys.argv[1])
-tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
-manifest = json.loads((root / "manifest.json").read_text())
-match = [artifact for artifact in manifest["artifacts"]
-         if artifact["system"] == "linux"
-         and artifact["machine"] == platform.machine()
-         and artifact["python"] == tag]
-if not match:
-    raise SystemExit(f"no bundled Spinnaker wheel for {tag} on {platform.machine()}")
-subprocess.check_call([sys.executable, "-m", "pip", "install", str(root / match[0]["path"])])
-PY
+# reachAQ ships no FLIR software. The SDK and its Python binding come from the
+# operator's own download from Teledyne FLIR (docs/linux-install/flir-spinnaker.md),
+# found in $SPINNAKER_DOWNLOADS by spinnaker_download.py.
+
+# The installed libspinnaker version, or nothing.
+spinnaker_sdk_version() {
+    dpkg-query -W -f='${Status} ${Version}\n' libspinnaker 2>/dev/null \
+        | sed -n 's/^install ok installed //p'
+}
+
+install_spinnaker_sdk() {
+    local installed
+    installed=$(spinnaker_sdk_version)
+    if [ -n "$installed" ]; then
+        if ! python3 "$SCRIPT_DIR/spinnaker_download.py" supported "$installed"; then
+            printf '%s\n' \
+                "Remove Spinnaker $installed with the remove_spinnaker.sh of its own download," \
+                'then rerun, and the installer installs a supported release from the download.' >&2
+            return 1
+        fi
+        printf 'Spinnaker SDK %s is already installed.\n' "$installed"
+        return 0
+    fi
+    if [ "$INSTALL_SYSTEM" = "0" ]; then
+        printf '%s\n' \
+            'The Spinnaker SDK is not installed, and installing it needs root, which' \
+            'REACHAQ_INSTALL_SYSTEM=0 rules out. Rerun without REACHAQ_INSTALL_SYSTEM=0, or with' \
+            'REACHAQ_INSTALL_SPINNAKER=0 on a host without FLIR cameras.' >&2
+        return 1
+    fi
+    if ! have_command apt-get || ! have_command dpkg; then
+        printf 'apt-get and dpkg are required to install the Spinnaker SDK packages.\n' >&2
+        return 127
+    fi
+    local ubuntu arch work deb_dir result
+    ubuntu=$(. /etc/os-release && printf '%s' "$VERSION_ID")
+    arch=$(dpkg --print-architecture)
+    work=$(mktemp -d) || return
+    deb_dir=$(python3 "$SCRIPT_DIR/spinnaker_download.py" extract-sdk \
+        --dir "$SPINNAKER_DOWNLOADS" --dest "$work" --ubuntu "$ubuntu" --arch "$arch")
+    result=$?
+    if [ "$result" -eq 0 ]; then
+        # Not DEBIAN_FRONTEND=noninteractive: the FLIR packages ask, through
+        # debconf, for the FLIR Spinnaker SDK licence to be accepted, and that
+        # is the operator's decision. Declining it fails this step.
+        printf '%s\n' \
+            '' \
+            'The FLIR packages now show the FLIR Spinnaker SDK licence agreement.' \
+            'Read it and accept it to continue; declining stops the install.' \
+            'Note: the libspinnaker package reports the install to FLIR (Google Analytics).' \
+            ''
+        run_as_root apt-get install -y "$deb_dir"/*.deb
+        result=$?
+        if [ "$result" -ne 0 ]; then
+            printf '%s\n' \
+                'Installing the Spinnaker packages failed. If the licence agreement was declined, or' \
+                'could not be shown because the installer is not running in a terminal, rerun it from' \
+                'a terminal and accept it.' >&2
+        fi
+    fi
+    rm -rf "$work"
+    return "$result"
+}
+
+# What FLIR's interactive install_spinnaker.sh offers, done without its
+# prompts: camera access through the flirimaging group (and plugdev), and
+# 1000 MB of USB-FS buffer memory (the kernel's 16 MB starves USB3 cameras).
+# The udev rule is rewritten rather than appended to, so reruns do not repeat
+# its lines. FLIR's GenTL and example PATH settings are not needed by PySpin
+# and are left out.
+configure_flir_camera_access() {
+    run_as_root groupadd -f flirimaging || return
+    local group added=0
+    for group in flirimaging plugdev; do
+        getent group "$group" >/dev/null 2>&1 || continue
+        if ! id -nG "$INSTALL_OPERATOR" | tr ' ' '\n' | grep -qx "$group"; then
+            run_as_root usermod --append --groups "$group" "$INSTALL_OPERATOR" || return
+            added=1
+        fi
+    done
+    printf '%s\n' \
+        'SUBSYSTEM=="usb", ATTRS{idVendor}=="1e10", GROUP="flirimaging"' \
+        'SUBSYSTEM=="usb", ATTRS{idVendor}=="1724", GROUP="flirimaging"' \
+        | run_as_root tee /etc/udev/rules.d/40-flir-spinnaker.rules >/dev/null || return
+    run_as_root udevadm control --reload-rules || return
+    run_as_root udevadm trigger --subsystem-match=usb || return
+    if ! have_command systemctl; then
+        printf 'systemd is unavailable; set /sys/module/usbcore/parameters/usbfs_memory_mb to 1000 at boot.\n' >&2
+        return 1
+    fi
+    run_as_root install -m 0644 \
+        "$INSTALL_REPO/src/reachaq/hardware/reachaq-usbfs-memory.service" \
+        /etc/systemd/system/reachaq-usbfs-memory.service || return
+    run_as_root systemctl daemon-reload || return
+    run_as_root systemctl enable --now reachaq-usbfs-memory.service || return
+    printf 'USB-FS memory is now %s MB\n' \
+        "$(cat /sys/module/usbcore/parameters/usbfs_memory_mb 2>/dev/null || echo unknown)"
+    if [ "$added" = 1 ]; then
+        printf '%s\n' \
+            "$INSTALL_OPERATOR was added to flirimaging/plugdev. Log out and back in before using the cameras."
+    fi
+}
+
+# The binding must match the SDK's major.minor; an installed one that does is
+# kept, so a rerun needs no download.
+install_spinnaker_binding() {
+    local sdk
+    sdk=$(spinnaker_sdk_version)
+    if [ -z "$sdk" ]; then
+        printf 'The Spinnaker SDK is not installed; see the Install Spinnaker SDK step.\n' >&2
+        return 1
+    fi
+    local have
+    have=$(conda_run python -c \
+        'from importlib.metadata import version; print(version("spinnaker-python"))' \
+        2>/dev/null | tail -n 1)
+    if [ -n "$have" ] && [ "${have%.*.*}" = "${sdk%.*.*}" ]; then
+        printf 'Spinnaker Python binding %s is already installed for SDK %s.\n' "$have" "$sdk"
+        return 0
+    fi
+    local python_tag work wheel result
+    python_tag="cp$(printf '%s' "$INSTALL_PYTHON" | cut -d. -f1-2 | tr -d .)"
+    work=$(mktemp -d) || return
+    wheel=$(python3 "$SCRIPT_DIR/spinnaker_download.py" extract-python \
+        --dir "$SPINNAKER_DOWNLOADS" --dest "$work" --sdk-version "$sdk" \
+        --python "$python_tag" --machine "$(uname -m)")
+    result=$?
+    if [ "$result" -eq 0 ]; then
+        conda_run python -m pip install "$wheel"
+        result=$?
+    fi
+    rm -rf "$work"
+    return "$result"
 }
 
 verify_spinnaker_binding() {
@@ -629,6 +789,7 @@ run_focused_tests() {
             tests/reachaq_headless_test.py::test_load_config_random_camera_override_adds_default_reach_cameras \
             tests/hardware_status_content_test.py \
             tests/inference_dependencies_test.py \
+            tests/install_preflight_test.py \
             tests/instance_lock_test.py \
             tests/nidaq_port_configuration_dialog_test.py \
             tests/reachaq_linux_install_test.py \
@@ -643,11 +804,13 @@ run_focused_tests() {
 }
 
 begin_category "Preflight"
+run_step "Check supported platform" check_supported_platform
 run_step "Validate repository checkout" check_repo
 run_step "Migrate v3 settings" migrate_v3_settings
 run_step "Create runtime directories" make_runtime_directories
 
 SYSTEM_SKIPPED="REACHAQ_INSTALL_SYSTEM=0; needs root, assumed already in place"
+SPINNAKER_SKIPPED="REACHAQ_INSTALL_SPINNAKER=0; host without FLIR cameras"
 
 begin_category "Portable Ubuntu packages"
 if [ "$INSTALL_SYSTEM" = "0" ]; then
@@ -656,12 +819,12 @@ if [ "$INSTALL_SYSTEM" = "0" ]; then
     skip_step "Configure RFID serial permissions" "$SYSTEM_SKIPPED"
 else
     if ! have_command apt-get; then
-        skip_step "Update apt metadata" "apt-get is unavailable; install equivalent packages manually"
-        skip_step "Install base packages" "apt-get is unavailable; install equivalent packages manually"
-    else
-        run_step "Update apt metadata" apt_update
-        run_step "Install base packages" apt_install_base
+        record_result FAIL "Locate apt-get" "apt-get is unavailable"
+        printf '\n[FAIL] Locate apt-get: the supported platforms are Ubuntu, which has it\n' >&2
+        stop_install "Locate apt-get"
     fi
+    run_step "Update apt metadata" apt_update
+    run_step "Install base packages" apt_install_base
     run_step "Configure RFID serial permissions" ensure_rfid_serial_group
 fi
 
@@ -674,6 +837,21 @@ else
     run_step "Install CPU governor unit" install_cpu_governor_unit
 fi
 
+# Before the conda environment, so a missing download stops the install
+# before the long environment build rather than after it.
+begin_category "FLIR Spinnaker SDK"
+if [ "$INSTALL_SPINNAKER" = "0" ]; then
+    skip_step "Install Spinnaker SDK" "$SPINNAKER_SKIPPED"
+    skip_step "Configure FLIR camera access" "$SPINNAKER_SKIPPED"
+else
+    run_step "Install Spinnaker SDK" install_spinnaker_sdk
+    if [ "$INSTALL_SYSTEM" = "0" ]; then
+        skip_step "Configure FLIR camera access" "$SYSTEM_SKIPPED"
+    else
+        run_step "Configure FLIR camera access" configure_flir_camera_access
+    fi
+fi
+
 begin_category "Conda runtime"
 CONDA_BIN=$(find_conda)
 if [ -z "$CONDA_BIN" ]; then
@@ -682,105 +860,71 @@ if [ -z "$CONDA_BIN" ]; then
 fi
 if [ -z "$CONDA_BIN" ]; then
     record_result FAIL "Locate conda" "not found after automatic Miniconda installation attempt"
-    printf '\n[FAIL] Locate conda: dependent steps will be skipped\n' >&2
-    skip_step "Find pose plugins to restore" "conda unavailable"
-    skip_step "Create conda environment" "conda unavailable"
-    skip_step "Upgrade Python packaging tools" "conda unavailable"
-    skip_step "Install Python requirements" "conda unavailable"
-    skip_step "Install PyTorch pose engine" "conda unavailable"
-    skip_step "Install reachAQ editable package" "conda unavailable"
-else
-    record_result PASS "Locate conda" "$CONDA_BIN"
-    printf '\n[PASS] Locate conda: %s\n' "$CONDA_BIN"
-    # Before the environment can be rebuilt or archived; archiving reads the
-    # archive again, which is where the plugins then are.
-    run_step "Find pose plugins to restore" find_plugins_to_restore "$INSTALL_ENV"
-    run_step "Create conda environment" ensure_conda_environment
-    # tomli explicitly: pyproject_extra reads pyproject.toml with it,
-    # Python 3.10 has no tomllib, and relying on build to pull it in would break
-    # silently the day build stops needing it.
-    run_step "Upgrade Python packaging tools" conda_run python -m pip install --upgrade pip setuptools wheel build tomli
-    run_step "Uninstall v3 auto-trainer distributions" uninstall_v3_distributions
-    run_step "Install PyTorch pose engine" install_torch_engine
-    run_step "Install Python requirements" install_python_requirements
-    run_step "Install reachAQ editable package" install_editable_package
-    # No plugin is installed by default; only those the environment had. The
-    # DeepLabCut plugin brings the TensorFlow engine, its CUDA runtime and the
-    # both-engines check as steps of their own.
-    for name in "${PLUGINS_TO_RESTORE[@]}"; do
-        run_step "Restore $name pose plugin" install_pose_plugin "$name"
-    done
-    run_step "Install reachAQ desktop launcher and terminal commands" install_desktop_launcher
-    run_step "Verify reachaq and reachaq-sync commands" verify_terminal_commands
+    printf '\n[FAIL] Locate conda: not found after installing Miniconda in %s\n' "$HOME/miniconda3" >&2
+    stop_install "Locate conda"
 fi
+record_result PASS "Locate conda" "$CONDA_BIN"
+printf '\n[PASS] Locate conda: %s\n' "$CONDA_BIN"
+# Before the environment can be rebuilt or archived; archiving reads the
+# archive again, which is where the plugins then are.
+run_step "Find pose plugins to restore" find_plugins_to_restore "$INSTALL_ENV"
+run_step "Create conda environment" ensure_conda_environment
+# tomli explicitly: pyproject_extra reads pyproject.toml with it,
+# Python 3.10 has no tomllib, and relying on build to pull it in would break
+# silently the day build stops needing it.
+run_step "Upgrade Python packaging tools" conda_run python -m pip install --upgrade pip setuptools wheel build tomli
+run_step "Uninstall v3 auto-trainer distributions" uninstall_v3_distributions
+run_step "Install PyTorch pose engine" install_torch_engine
+run_step "Install Python requirements" install_python_requirements
+run_step "Install reachAQ editable package" install_editable_package
+# No plugin is installed by default; only those the environment had. The
+# DeepLabCut plugin brings the TensorFlow engine, its CUDA runtime and the
+# both-engines check as steps of their own.
+for name in "${PLUGINS_TO_RESTORE[@]}"; do
+    run_step "Restore $name pose plugin" install_pose_plugin "$name"
+done
+run_step "Install reachAQ desktop launcher and terminal commands" install_desktop_launcher
+run_step "Verify reachaq and reachaq-sync commands" verify_terminal_commands
 
 begin_category "Pose engine GPU runtimes"
-if [ -z "$CONDA_BIN" ]; then
-    skip_step "Verify PyTorch GPU preflight" "conda unavailable"
-else
-    run_step "Verify PyTorch GPU preflight" verify_torch_gpu_runtime
-fi
+run_step "Verify one CUDA runtime per engine" verify_single_cuda_runtime
+run_step "Verify PyTorch GPU preflight" verify_torch_gpu_runtime
 
 begin_category "Git LFS"
 if ! have_command git; then
     record_result FAIL "Locate git" "git executable not found"
-    printf '\n[FAIL] Locate git: dependent Git LFS steps will be skipped\n' >&2
-    skip_step "Initialize Git LFS" "git unavailable"
-    skip_step "Pull Git LFS assets" "git unavailable"
-elif ! git lfs version >/dev/null 2>&1; then
-    record_result FAIL "Locate Git LFS" "git-lfs executable not found"
-    printf '\n[FAIL] Locate Git LFS: install git-lfs and rerun this category\n' >&2
-    skip_step "Initialize Git LFS" "git-lfs unavailable"
-    skip_step "Pull Git LFS assets" "git-lfs unavailable"
-else
-    record_result PASS "Locate Git LFS" "$(git lfs version 2>/dev/null)"
-    run_step "Initialize Git LFS" git_lfs_install
-    run_step "Pull Git LFS assets" git_lfs_pull
+    printf '\n[FAIL] Locate git: install git and rerun\n' >&2
+    stop_install "Locate git"
 fi
+if ! git lfs version >/dev/null 2>&1; then
+    record_result FAIL "Locate Git LFS" "git-lfs executable not found"
+    printf '\n[FAIL] Locate Git LFS: install git-lfs and rerun\n' >&2
+    stop_install "Locate Git LFS"
+fi
+record_result PASS "Locate Git LFS" "$(git lfs version 2>/dev/null)"
+run_step "Initialize Git LFS" git_lfs_install
+run_step "Pull Git LFS assets" git_lfs_pull
 
-# After Git LFS: the bundled wheels are LFS objects.
-begin_category "Spinnaker camera binding"
-if [ -z "$CONDA_BIN" ]; then
-    skip_step "Install Spinnaker Python binding" "conda unavailable"
-    skip_step "Verify Spinnaker cameras" "conda unavailable"
-elif ! ls /opt/spinnaker/lib/libSpinnaker.so* >/dev/null 2>&1; then
-    skip_step "Install Spinnaker Python binding" \
-        "Spinnaker SDK not installed; see docs/linux-install/flir-spinnaker.md, then rerun"
-    skip_step "Verify Spinnaker cameras" "Spinnaker SDK not installed"
+begin_category "FLIR Spinnaker Python binding"
+if [ "$INSTALL_SPINNAKER" = "0" ]; then
+    skip_step "Install Spinnaker Python binding" "$SPINNAKER_SKIPPED"
+    skip_step "Verify Spinnaker cameras" "$SPINNAKER_SKIPPED"
 else
     run_step "Install Spinnaker Python binding" install_spinnaker_binding
     run_step "Verify Spinnaker cameras" verify_spinnaker_binding
 fi
 
 begin_category "Portable verification"
-if [ -z "$CONDA_BIN" ]; then
-    skip_step "Verify Python version" "conda unavailable"
-    skip_step "Verify Python dependencies" "conda unavailable"
-    skip_step "Verify generic imports" "conda unavailable"
-    skip_step "Verify SoftMouse runtime" "conda unavailable"
-    skip_step "Verify RFID runtime" "conda unavailable"
-    skip_step "Verify GUI CLI" "conda unavailable"
-    skip_step "Verify headless CLI" "conda unavailable"
-else
-    run_step "Verify Python version" conda_run python --version
-    run_step "Verify Python dependencies" verify_python_dependencies
-    run_step "Verify generic imports" verify_imports
-    run_step "Verify SoftMouse runtime" verify_softmouse_runtime
-    run_step "Verify RFID runtime" verify_rfid_runtime
-    run_step "Verify GUI CLI" conda_run python -m reachaq.app -h
-    run_step "Verify headless CLI" conda_run reachaq-headless -h
-fi
+run_step "Verify Python version" conda_run python --version
+run_step "Verify Python dependencies" verify_python_dependencies
+run_step "Verify generic imports" verify_imports
+run_step "Verify SoftMouse runtime" verify_softmouse_runtime
+run_step "Verify RFID runtime" verify_rfid_runtime
+run_step "Verify GUI CLI" conda_run python -m reachaq.app -h
+run_step "Verify headless CLI" conda_run reachaq-headless -h
 run_step "Verify SoftMouse systemd units" verify_softmouse_systemd_units
 run_step "Refresh installed SoftMouse units" refresh_installed_user_units
-
-if [ -z "$CONDA_BIN" ]; then
-    skip_step "Run focused non-hardware tests" "conda unavailable"
-else
-    run_step "Run focused non-hardware tests" run_focused_tests
-fi
+run_step "Run focused non-hardware tests" run_focused_tests
 
 print_report
-if [ "$FAIL_COUNT" -gt 0 ]; then
-    exit 1
-fi
 exit 0
