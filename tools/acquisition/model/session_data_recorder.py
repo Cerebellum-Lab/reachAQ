@@ -314,6 +314,8 @@ class SessionDataRecorder:
         self._laser_rows = []
         self._event_queue = Queue(maxsize=max(1, int(structured_event_capacity)))
         self._structured_event_overruns = 0
+        # Rows a stop() has drained but no snapshot holds yet; see stop().
+        self._stop_event_rows = ()
         self._event_capture_lock = threading.Lock()
         self._event_capture_enabled = False
         self._event_manager = event_manager
@@ -383,6 +385,7 @@ class SessionDataRecorder:
         with self._event_capture_lock:
             self._event_capture_enabled = False
             self._drain_event_queue()
+            self._stop_event_rows = ()
             self._structured_event_overruns = 0
             self._event_capture_enabled = True
         with self._lock:
@@ -528,13 +531,18 @@ class SessionDataRecorder:
     def stop(self, end_perf: float):
         with self._event_capture_lock:
             self._event_capture_enabled = False
-            event_rows = self._drain_event_queue()
+            # A stop that raises below is retried by calling stop() again,
+            # when the queue is already empty, so what this attempt drains is
+            # kept until a snapshot holds it.
+            self._stop_event_rows += self._drain_event_queue()
+            event_rows = self._stop_event_rows
         with self._lock:
             self._pending_stop_end_perf = float(end_perf)
         self._stop_nidaq_thread()
         with self._locked_then_log() as failures:
             if not self._armed or self._project is None or self._start_perf is None:
                 self._pending_stop_end_perf = None
+                self._stop_event_rows = ()
                 self._end_latency_events(
                     failures, "the recorder is cleared without it")
                 self._clear_locked()
@@ -610,6 +618,7 @@ class SessionDataRecorder:
             }
             self._armed = False
             self._pending_stop_end_perf = None
+            self._stop_event_rows = ()
             self._pending_finalization = snapshot
         return self._publish_pending_finalization(max_attempts=2)
 
@@ -686,6 +695,7 @@ class SessionDataRecorder:
         with self._event_capture_lock:
             self._event_capture_enabled = False
             self._drain_event_queue()
+            self._stop_event_rows = ()
         self._stop_nidaq_thread()
         with self._locked_then_log() as failures:
             spool_path = self._nidaq_spool_path
