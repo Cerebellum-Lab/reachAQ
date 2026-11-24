@@ -33,7 +33,8 @@ used, see
 ## Steps
 
 1. **Mount the board on the motor.** It is the 4 mm board with 6 x 8 inner
-   corners. Mount it so it moves with the stage and every camera to be
+   corners: the plain checkerboard, or the ChArUco board if the library's
+   settings name it (see [The calibration board](#the-calibration-board)). Mount it so it moves with the stage and every camera to be
    calibrated sees it at the start position. The board is only translated, never tilted, and its
    orientation on the stage does not need to be measured: the fit solves for it.
 2. Choose **Tools → Make 3D calibration**, tick the cameras to calibrate and
@@ -275,6 +276,55 @@ cameras, ticking **Scout again**, or deleting the file, scouts again. If a camer
 being swapped, tick **Scout again** or the saved list is reused. A scout run
 with **Scout again** replaces the saved list only when it passes for every
 camera, as any scout does; otherwise the old list stays.
+
+### The calibration board
+
+The calibration uses the 4 mm checkerboard (6 x 8 inner corners) unless the
+library's `calibrations/settings.yaml` has a `board` entry. For the ChArUco board:
+
+```yaml
+board:
+  kind: charuco          # or checkerboard (the default)
+  square_mm: 4.0
+  rows: 6                # inner corners, not squares
+  cols: 8
+  marker_mm: 3.0
+  dictionary: DICT_4X4_50
+```
+
+That is `cv2.aruco.CharucoBoard((9, 7), 4.0, 3.0, cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50))`:
+9 x 7 squares of 4 mm with a 3 mm marker in each white square, 8 x 6 = 48 inner
+corners, the same corner grid as the checkerboard. A key left out takes the
+checkerboard's value. The entry is checked when **Make 3D calibration** starts,
+before the stage moves: an unknown key, kind or dictionary, a marker not smaller
+than its square, or a dictionary with fewer markers than the board needs (31
+for 9 x 7) stops it with an error naming the key. There is no switch in the
+calibration dialog for it.
+
+**Why ChArUco.** Every ChArUco corner is identified by the markers beside it,
+so a camera that sees only part of the board still uses the part it sees. A
+view counts when it holds at least 12 corners spanning at least two rows and two
+columns (`MIN_CHARUCO_CORNERS`); the checkerboard is found whole or not at all.
+At each waypoint a corner is kept when it was found in at least half of the
+frames that found the board, and its position is the median over those frames.
+A corner whose detections disagree by more than 1 px is dropped, not the view.
+The board's corner order is fixed by the markers, so no camera's corners are
+ever reversed. Only the `subpix` corner refinement applies.
+
+**Printing it.** Generate the image with
+`board.generateImage((w, h), marginSize=0, borderBits=1)` (OpenCV 4.11, legacy
+pattern off) at a size proportional to 9 x 7, and print it at **100 %**, with
+any "fit to page" or scaling turned off. Measure a run of squares with calipers
+after printing: 9 squares must be 36.0 mm. The fit measures the motor scale
+against the board's squares, so a board printed 1 % large reads as a 1 % motor
+scale error (`motor_scale_dev`). Mount it flat on a rigid backing.
+
+The report gives one line per camera with a ChArUco board, `views used N of M
+waypoints, median K corners per view`, so partial coverage is visible; the
+coverage images and every pair check use only the corners found.
+`calibration.yaml` records `kind`, `marker_mm` and `dictionary` under `board`
+for a ChArUco board only; a checkerboard calibration's `board` entry is as before.
+The capture folder keeps its name, `4mm_6r_8c_4x`.
 
 ### The calibration library
 
