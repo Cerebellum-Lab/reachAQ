@@ -1708,6 +1708,16 @@ class AppModel(ObservableObject):
             if not self._reference_check_pending:
                 self._reference_check = None
             self._reference_check_pending = False
+            if self._session_left_unsaved:
+                # The recorder still holds that session; a new arm would be
+                # refused and its cleanup would clear the old session's data.
+                self.on_error(
+                    "Recording unavailable",
+                    "A stop gave up waiting for the previous session to be "
+                    "saved; its files are kept unfinalized. Restart reachAQ "
+                    "before recording again.",
+                )
+                return False
             return self._start_recording_locked()
 
     def _start_recording_locked(self) -> bool:
@@ -10044,7 +10054,7 @@ class AppModel(ObservableObject):
         if timeout_s is None:
             timeout_s = SESSION_SAVE_BEFORE_STOP_TIMEOUT_S
         deadline = time.monotonic() + max(0.0, float(timeout_s))
-        stop_requested_for = None
+        stop_requested_at = -math.inf
         announced = False
         while True:
             status = self._recording_session.status
@@ -10056,23 +10066,24 @@ class AppModel(ObservableObject):
                     status.value,
                 )
                 announced = True
-            token = self._recording_session.token()
+            # A refused stop leaves it RECORDING; ask again, once a second.
+            now = time.monotonic()
             if (
                 status is SessionRecordingStatus.RECORDING
-                and stop_requested_for != token
+                and now - stop_requested_at >= 1.0
             ):
-                stop_requested_for = token
+                stop_requested_at = now
                 self.stop_recording()
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.05)
 
-    def capture_stop(self, force: bool = False):
+    def capture_stop(self, force: bool = False, *, save_timeout_s: Optional[float] = None):
         logger.debug("AppModel.capture_stop")
         # Before begin_stop: while the session finishes, acquisition is still
         # running, so a subsystem failure meanwhile is still handled as one.
         # A stop never deletes a session; only an operator Abort does.
-        saved = self.save_session_before_stop()
+        saved = self.save_session_before_stop(save_timeout_s)
         with self.app_lock:
             if not self._acquisition.begin_stop(force=force):
                 logger.verbose("acquisition not running or already stopping")
@@ -10081,8 +10092,7 @@ class AppModel(ObservableObject):
             session_token = self._recording_session.token()
         if not saved:
             message = (
-                f"The session was not saved within "
-                f"{SESSION_SAVE_BEFORE_STOP_TIMEOUT_S:.0f} s "
+                "The session was not saved before acquisition stopped "
                 f"(still {self._recording_session.status.value}). Its files "
                 "are kept on disk, unfinalized; nothing was deleted."
             )
@@ -10912,9 +10922,10 @@ class AppModel(ObservableObject):
 
     def on_close(self):
         logger.debug("AppModel.on_close")
-        # Closing saves a running session first, as a stop does. The window
-        # has already stopped acquisition, asking and waiting, so this is for
-        # a headless close; it does not wait out the bound a second time.
+        # Closing saves a running session first, as a stop does, while it can
+        # still finish. The window has already stopped acquisition, asking and
+        # waiting, so this is for a headless close. The stop below does not
+        # wait out the bound a second time.
         if self._acquisition.started:
             self.save_session_before_stop()
         # Stop command producers first so none can race with CAN teardown or
@@ -10954,7 +10965,7 @@ class AppModel(ObservableObject):
         self._analysis.stop()
 
         # ensure go back to IDLE mode + stop cameras & inference & analysis + hardware disconnect :
-        self.capture_stop()
+        self.capture_stop(save_timeout_s=0.0)
 
         self._close_laser_within_bound("reachAQ is closing")
 

@@ -136,3 +136,34 @@ def test_a_cancelled_close_ignores_the_close_event(box):
     event.ignore.assert_called_once_with()
     assert window._closing is False
     assert window._close_event is None
+
+
+def test_a_close_arriving_while_the_prompt_is_open_waits_for_it(box):
+    window = _window(SessionRecordingStatus.RECORDING)
+    window._app_model.app_lock = mock.MagicMock()
+    window._closing = False
+    outer, inner = mock.Mock(), mock.Mock()
+
+    def confirm():
+        # A second close (Ctrl-C, another click) lands in the prompt's loop.
+        window._close_event = inner
+        MainWindow.close(window)
+        return False
+
+    window._confirm_close_with_session = confirm
+    window._close_event = outer
+
+    MainWindow.close(window)
+
+    inner.ignore.assert_called_once_with()
+    outer.ignore.assert_called_once_with()
+    outer.accept.assert_not_called()
+    assert window._closing is False
+
+
+def test_an_abort_in_progress_is_waited_for(box):
+    window = _window(SessionRecordingStatus.ABORTING)
+    box.click = "Close when done"
+
+    assert MainWindow._confirm_close_with_session(window) is True
+    assert "being aborted" in box.shown[-1]._text

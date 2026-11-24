@@ -1316,6 +1316,11 @@ class MainWindow(QMainWindow):
             proceed = box.addButton("Stop, save and close", QMessageBox.ButtonRole.AcceptRole)
             abort = box.addButton(
                 "Abort (delete session) and close", QMessageBox.ButtonRole.DestructiveRole)
+        elif status is SessionRecordingStatus.ABORTING:
+            box.setText(
+                f"{session} is being aborted. Close when that finishes?"
+            )
+            proceed = box.addButton("Close when done", QMessageBox.ButtonRole.AcceptRole)
         else:
             box.setText(
                 f"{session} is still being saved. Close when saving finishes?"
@@ -1339,12 +1344,25 @@ class MainWindow(QMainWindow):
         logger.debug("received close")
         with self._app_model.app_lock:
             closing = self._closing
-        if not closing and not self._confirm_close_with_session():
+        if not closing:
+            # The prompt runs a nested event loop, in which a second close
+            # (another window close, Ctrl-C) can arrive: it waits for this one.
             event = self._close_event
-            if event is not None:
-                event.ignore()
-                self._close_event = None
-            return
+            self._close_event = None
+            if getattr(self, "_confirming_close", False):
+                if event is not None:
+                    event.ignore()
+                return
+            self._confirming_close = True
+            try:
+                confirmed = self._confirm_close_with_session()
+            finally:
+                self._confirming_close = False
+            if not confirmed:
+                if event is not None:
+                    event.ignore()
+                return
+            self._close_event = event
         with self._app_model.app_lock:
             event = self._close_event
             if self._closing:

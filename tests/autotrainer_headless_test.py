@@ -2119,8 +2119,27 @@ def test_a_session_not_saved_within_the_bound_is_left_on_disk(
     assert session_path.is_dir()
     recorder_abort.assert_not_called()
     assert app_model._session_left_unsaved is True
+    # The recorder still holds that session: a new Record would clear it.
+    assert app_model.start_recording() is False
+    assert errors[-1][0] == "Recording unavailable"
     assert any(title == "Session not finalized" for title, *_ in errors), errors
     assert app_model.acquisition_started is False
+
+
+def test_a_refused_stop_is_asked_again(app_model, monkeypatch):
+    statuses = iter([SessionRecordingStatus.RECORDING] * 30 + [SessionRecordingStatus.READY])
+    monkeypatch.setattr(
+        type(app_model._recording_session), "status",
+        property(lambda _self: next(statuses, SessionRecordingStatus.READY)),
+    )
+    stop = mock.Mock(return_value=False)
+    monkeypatch.setattr(app_model, "stop_recording", stop)
+    clock = iter(range(0, 1000))
+    monkeypatch.setattr(time, "monotonic", lambda: float(next(clock)))
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+    assert app_model.save_session_before_stop(timeout_s=500) is True
+    assert stop.call_count > 1
 
 
 def test_the_api_refuses_to_stop_acquisition_while_a_session_runs(app_model):
