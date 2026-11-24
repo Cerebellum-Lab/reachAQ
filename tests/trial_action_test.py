@@ -821,3 +821,86 @@ def test_a_stop_reaches_the_laser_while_the_cycle_waits_for_its_train(monkeypatc
     assert not completer.is_alive()
     assert outcome == [executor.operation]
     assert executor.operation.state is PreparedState.CANCELLED
+
+
+class _UntriggeredLaser:
+    """An armed laser no trigger reached: its wait would only time out."""
+
+    def __init__(self):
+        self.state = SimpleNamespace(value="armed")
+        self.waits = []
+        self.cancelled = False
+
+    def wait(self, timeout):
+        self.waits.append(timeout)
+        raise TimeoutError("not triggered")
+
+    def cancel(self):
+        self.cancelled = True
+        self.state = SimpleNamespace(value="cancelled")
+
+    def to_record(self):
+        return {"state": self.state.value}
+
+
+def _first_reach_executor(route, laser, **kwargs):
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": route,
+        "laser_channel_id": 1,
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "first_reach",
+    })
+    recipe = _compiler().compile(row, _context())
+    executor = TrialActionExecutor(
+        move_absolute=lambda target: None,
+        configure_cover=lambda policy, recipe: None,
+        play_tone=lambda profile, phase: None,
+        prepare_laser=lambda profile, recipe: laser,
+        cancel_laser=lambda handle: handle.cancel(),
+        **kwargs,
+    )
+    executor.prepare(recipe)
+    executor.bind_send(recipe.operation_id, 4, "can-context")
+    executor.acknowledge_presentation("can-context")
+    return executor, recipe
+
+
+@pytest.mark.parametrize("route", ["hardware_stim3", "direct_ni_software"])
+def test_a_first_reach_laser_never_triggered_is_not_a_hardware_error(route):
+    # The animal did not reach: the laser is armed by design and nothing
+    # triggered it. complete() waited a second, then failed the trial as a
+    # hardware error, which the runner does not count (audit prod41-05).
+    laser = _UntriggeredLaser()
+    executor, _recipe = _first_reach_executor(
+        route, laser, withdraw_laser_trigger=lambda handle: False)
+
+    operation = executor.complete("pellet cycle completed")
+
+    assert operation.state is PreparedState.COMPLETED
+    assert laser.cancelled
+    assert laser.waits == []
+    observed = [item["detail"] for item in executor.operation_record()["observations"]]
+    assert any(detail.startswith("laser not triggered") for detail in observed)
+
+
+def test_a_triggered_first_reach_laser_that_does_not_complete_still_fails():
+    laser = _UntriggeredLaser()
+    executor, recipe = _first_reach_executor(
+        "hardware_stim3", laser, trigger_hardware_stimulus=lambda *_args: None)
+    executor.trigger_stimulus(recipe.operation_id, 4, detail="first reach")
+
+    with pytest.raises(RuntimeError, match="did not complete"):
+        executor.complete("pellet cycle completed")
+    assert executor.operation.state is PreparedState.FAILED
+
+
+def test_a_direct_trigger_that_reached_the_laser_is_waited_for():
+    laser = _ArmedLaser()
+    executor, _recipe = _first_reach_executor(
+        "direct_ni_software", laser, withdraw_laser_trigger=lambda handle: True)
+
+    assert executor.complete("pellet cycle completed").state is PreparedState.COMPLETED
+    assert laser.timeouts

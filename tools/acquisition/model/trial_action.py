@@ -694,6 +694,7 @@ class TrialActionExecutor:
         trigger_hardware_stimulus: Callable[
             [LaserPulseProfile, CompiledTrialRecipe, str], object
         ] = lambda _profile, _recipe, _detail: None,
+        withdraw_laser_trigger: Optional[Callable[[object], bool]] = None,
         cue_timing_configuration: Optional[CueTimingConfiguration] = None,
         reach_state_resolver: Optional[ReachStateResolver] = None,
         pellet_presence_provider: Optional[Callable[[], object]] = None,
@@ -713,11 +714,16 @@ class TrialActionExecutor:
         self._activate_detector = activate_detector
         self._cancel_detector = cancel_detector
         self._trigger_hardware_stimulus = trigger_hardware_stimulus
+        # Closes a Direct NI arm's trigger window, returning whether a start
+        # was taken; None when the caller cannot say (then it is waited for).
+        self._withdraw_laser_trigger = withdraw_laser_trigger
         self._lock = threading.RLock()
         self._operation: Optional[PreparedTrialOperation] = None
         self._laser_handle = None
         self._detector_handle = None
         self._send_context: Optional[str] = None
+        #: Whether this operation's stimulus trigger was asked for (board route).
+        self._stimulus_triggered = False
 
         # Cue pair. The policy owns the decision, the timer owns the deadline,
         # and this owner only routes between them. All of it is inert unless a
@@ -754,6 +760,7 @@ class TrialActionExecutor:
             self._laser_handle = None
             self._detector_handle = None
             self._send_context = None
+            self._stimulus_triggered = False
         try:
             self._move_absolute(recipe.resolved_motor_target)
             self._observe("motor target acknowledged")
@@ -925,6 +932,7 @@ class TrialActionExecutor:
             firing = operation.recipe.laser_firing
             if profile is None or firing is None:
                 raise RuntimeError("Stimulus trigger has no prepared laser profile")
+            self._stimulus_triggered = True
             if firing.trigger_route is LaserTriggerRoute.DIRECT_NI_SOFTWARE:
                 self._trigger_laser_if_direct(detail)
                 self._observe(f"{detail} direct NI trigger accepted")
@@ -959,6 +967,11 @@ class TrialActionExecutor:
         with self._lock:
             operation = self._require_current()
             self._cancel_cue_pair()
+            if self._laser_not_triggered(operation):
+                # No First Reach: no light was due. Not a hardware error
+                # (prod41-05), which the runner would not count.
+                self._cancel_laser_safely()
+                self._observe("laser not triggered: no First Reach before the cycle ended")
             handle = self._laser_handle
             wait_seconds = self._laser_cycle_wait_seconds(operation, handle)
         if wait_seconds:
@@ -1234,6 +1247,34 @@ class TrialActionExecutor:
         to_record = getattr(handle, "to_record", None)
         if to_record is not None:
             operation.set_action_record("laser", to_record())
+
+    def _laser_not_triggered(self, operation) -> bool:
+        """Whether a First Reach laser is still armed with no trigger taken.
+
+        Board route: the executor makes the trigger itself. Direct NI: the
+        laser model's receiver does, so its window is closed first; after
+        that no start can race the cancel that follows.
+        """
+        handle = self._laser_handle
+        recipe = operation.recipe
+        if (
+            handle is None
+            or not recipe.stimulus_selected
+            or recipe.requested_row.get("stimulus_trigger") != "first_reach"
+            or recipe.laser_firing is None
+        ):
+            return False
+        route = recipe.laser_firing.trigger_route
+        if route is LaserTriggerRoute.HARDWARE_STIM3:
+            taken = self._stimulus_triggered
+        elif route is LaserTriggerRoute.DIRECT_NI_SOFTWARE:
+            if self._withdraw_laser_trigger is None:
+                return False
+            taken = bool(self._withdraw_laser_trigger(handle))
+        else:
+            return False
+        state = getattr(getattr(handle, "state", None), "value", None)
+        return not taken and state == "armed"
 
     @staticmethod
     def _laser_cycle_wait_seconds(operation, handle) -> float:

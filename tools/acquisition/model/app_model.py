@@ -1348,6 +1348,7 @@ class AppModel(ObservableObject):
             activate_detector=self._arm_protocol_stim_detector,
             cancel_detector=self._cancel_protocol_stim_detector,
             trigger_hardware_stimulus=self._trigger_protocol_stim3,
+            withdraw_laser_trigger=self._withdraw_protocol_laser_trigger,
             reach_state_resolver=self._reach_state_resolver,
         )
         # One holder, several holders-of-holds. intertrial analysis and
@@ -7049,6 +7050,13 @@ class AppModel(ObservableObject):
         # Reach can come long after the controller's own waveform + 5 s.
         return prepare(
             profile, firing, recipe, armed_window_seconds=PROTOCOL_LASER_ARM_WINDOW_S)
+
+    def _withdraw_protocol_laser_trigger(self, handle) -> bool:
+        withdraw = getattr(self._laser, "withdraw_direct_trigger", None)
+        if withdraw is None:
+            # Cannot say whether a start was taken: the cycle waits for it.
+            return True
+        return withdraw(handle)
 
     def _prepare_protocol_stim_detector(self, recipe):
         camera = self._stim_camera

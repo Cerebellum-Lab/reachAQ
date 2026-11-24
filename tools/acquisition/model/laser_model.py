@@ -974,6 +974,21 @@ class LaserModel(ObservableObject):
             prepared["nonce"] = str(nonce)
             prepared["enabled"] = True
 
+    def withdraw_direct_trigger(self, operation) -> bool:
+        """Close `operation`'s Direct NI trigger window; whether one was taken.
+
+        For the cycle's end: after this no trigger can reach the operation,
+        so False means it may be cancelled as not triggered, with no start
+        racing the cancel. True means a First Reach started it.
+        """
+        with self._prepared_profiles_lock:
+            taken = False
+            for operation_id, prepared in tuple(self._prepared_profiles.items()):
+                if prepared["operation"] is operation:
+                    taken = taken or bool(prepared.get("triggered"))
+                    self._prepared_profiles.pop(operation_id, None)
+            return taken
+
     def release_prepared_profile(self, operation) -> None:
         with self._prepared_profiles_lock:
             for operation_id, prepared in tuple(self._prepared_profiles.items()):
@@ -1028,6 +1043,9 @@ class LaserModel(ObservableObject):
                     if not prepared["enabled"]:
                         raise RuntimeError("direct trigger arrived before pellet presentation")
                     operation = prepared["operation"]
+                    # Under the lock that withdraw_direct_trigger takes: the
+                    # cycle's end then knows this start was taken.
+                    prepared["triggered"] = True
                 result["validated_perf_time"] = time.perf_counter()
                 result["daqmx_start_entry_perf_time"] = time.perf_counter()
                 operation.trigger()

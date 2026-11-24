@@ -113,6 +113,13 @@ board before cover release; Direct NI is rejected for that phase. First Reach
 uses the 900 Hz stim-camera transition detector, not pose inference. ROI1/ROI2
 remain schema/UI framework only and are rejected as runnable.
 
+A trial's laser is armed at preparation, before SEND, and stays armed for the
+whole trial, up to 120 s (`PROTOCOL_LASER_ARM_WINDOW_S`). A First Reach laser
+that no reach triggered by the end of the pellet cycle is cancelled and the
+operation records "laser not triggered"; the trial keeps its own outcome and
+is not a hardware error. A laser that was triggered and did not complete
+still is.
+
 The operator selects hardware trigger terminals from NI discovery/configuration;
 normal protocol editing does not accept an arbitrary raw DAQmx terminal. Advanced
 NI timing declarations remain preserved when the port dialog saves ordinary
