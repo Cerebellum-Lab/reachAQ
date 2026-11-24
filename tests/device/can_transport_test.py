@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -71,6 +72,25 @@ def test_can_transport_configuration_reads_environment(monkeypatch):
     assert config.data_bitrate == 2000000
     assert config.fd is True
     assert config.receive_buffer_bytes == 8388608
+
+
+def test_the_bring_up_scripts_names_mean_the_same_to_the_app(monkeypatch):
+    """The bring-up file shares the REACHAQ_CAN_ prefix. Were it ever exported to the
+    app, the names both read must agree and the rest must be ignored."""
+    default = (Path(__file__).resolve().parents[2] / "src" / "reachaq" / "hardware"
+               / "reachaq-can.default")
+    for name in ("TRANSPORT", "TYPE", "CHANNEL", "BITRATE", "DATA_BITRATE", "FD",
+                 "RECEIVE_TIMEOUT_SECONDS", "RECEIVE_BUFFER_BYTES"):
+        monkeypatch.delenv(f"REACHAQ_CAN_{name}", raising=False)
+    monkeypatch.setattr(can_transport.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(can_transport.platform, "machine", lambda: "x86_64")
+    plain = CanTransportConfiguration.from_environment()
+    for line in default.read_text().splitlines():
+        if line and not line.startswith("#"):
+            name, value = line.split("=", 1)
+            monkeypatch.setenv(name, value.strip('"'))
+
+    assert CanTransportConfiguration.from_environment() == plain
 
 
 def test_can_transport_configuration_defaults_linux_x86_to_socketcan_fd(monkeypatch):
