@@ -418,25 +418,101 @@ def test_a_refusal_of_a_token_this_model_did_not_send_still_marks_needs_home(har
     assert reported[0].command is SystemCommandKind.SEND_HOME
 
 
-def test_a_refused_set_rolls_the_requested_axis_back_to_the_reported_send_position(hardware_model):
-    """The board kept its own send position: the travel checks must use it, not the refused SET."""
-    from autotrainer.core import Offset3DTuple
+_TRAVEL = {"pellet": {a: {"min_pos": 0, "max_pos": 35} for a in "xyz"}}
 
+
+def _set_y_refused_setup(hardware_model, *, travel=True):
+    """Requested (10, 20, 12), the board reporting y 34; SETs are queued as tokens."""
+    from autotrainer.core import Offset3DTuple
+    from autotrainer.device import MotorConfigurationFile
+
+    hardware_model._motor_configurations = (
+        MotorConfigurationFile.from_yaml_dict(_TRAVEL, source=None) if travel else None)
     hardware_model._last_requested_set_coordinates = Offset3DTuple(10.0, 20.0, 12.0)
     hardware_model._last_motor_send_coordinates = Offset3DTuple(10.0, 34.0, 12.0)
-    token = _pending(hardware_model, SystemCommandKind.SET_Y)
 
+    def send_with_token(_device, command, _data=None):
+        token = _pending(hardware_model, command)
+        return token
+
+    hardware_model._send_with_token = send_with_token
+    return hardware_model
+
+
+def _refuse_set(hardware_model, token, **kwargs):
     hardware_model._command_refused(token, refusal=_refusal(
-        token, -16, command=SystemCommandKind.SET_Y,
-        command_class=RefusedCommandClass.STEPPER_MOVE, motors=(Motor.PELLET_Y_MOTOR,),
+        token, kwargs.pop("error", -16), command=SystemCommandKind.SET_Y,
+        command_class=RefusedCommandClass.STEPPER_MOVE, motors=(Motor.PELLET_Y_MOTOR,), **kwargs,
     ))
+
+
+def test_a_refused_set_rolls_the_requested_axis_back_to_the_reported_send_position(hardware_model):
+    """With travel, the board kept its own send position: the travel checks must use it."""
+    _set_y_refused_setup(hardware_model)
+    token = hardware_model.set_y(25.0)
+
+    _refuse_set(hardware_model, token)
 
     assert tuple(hardware_model._last_requested_set_coordinates) == (10.0, 34.0, 12.0)
     # Any other refused command leaves the requested position alone.
     other = _pending(hardware_model, SystemCommandKind.SEND_PELLET)
-    hardware_model._last_motor_send_coordinates = Offset3DTuple(1.0, 2.0, 3.0)
     hardware_model._command_refused(other, refusal=_refusal(other))
     assert tuple(hardware_model._last_requested_set_coordinates) == (10.0, 34.0, 12.0)
+
+
+def test_the_roll_back_is_silent_so_the_selected_animal_keeps_its_position(hardware_model):
+    """AppModel takes a set_<axis> change for an operator edit and saves it into the animal;
+    a board refusal is not one."""
+    from tools.acquisition.model.app_model import AppModel
+
+    _set_y_refused_setup(hardware_model)
+    animal = SimpleNamespace(name="m1", pellet_x=10.0, pellet_y=20.0, pellet_z=12.0, is_pellet_dcs=False)
+    app = SimpleNamespace(
+        _selected_animal=animal, _hardware=hardware_model, _attached_plan=None,
+        _protocol_positioning_active=False, _dcs_held_off=False,
+        _behavior=SimpleNamespace(algorithm=SimpleNamespace(diamond_triangle_config=None)),
+        _save_animal_metadata=mock.Mock(),
+        property_changed=mock.Mock(), recording_blockers=(), Props=AppModel.Props,
+    )
+    hardware_model.property_changed += (
+        lambda name, value, old: AppModel._on_hardware_property_changed(app, name, value, old))
+    token = hardware_model.set_y(25.0)  # an accepted operator SET is saved, as before
+    assert animal.pellet_y == 25.0
+    app._save_animal_metadata.reset_mock()
+
+    _refuse_set(hardware_model, token)
+
+    assert (animal.pellet_x, animal.pellet_y, animal.pellet_z) == (10.0, 25.0, 12.0)
+    app._save_animal_metadata.assert_not_called()
+
+
+def test_a_refused_set_is_not_rolled_back_over_a_newer_set_on_the_axis(hardware_model):
+    _set_y_refused_setup(hardware_model)
+    first = hardware_model.set_y(25.0)
+    hardware_model.set_y(27.0)
+
+    _refuse_set(hardware_model, first)
+
+    assert hardware_model._last_requested_set_coordinates.y == 27.0
+
+
+def test_a_refusal_with_an_unknown_outcome_is_not_rolled_back(hardware_model):
+    _set_y_refused_setup(hardware_model)
+    token = hardware_model.set_y(25.0)
+
+    _refuse_set(hardware_model, token, resent=True)  # -EBUSY on a resend: maybe still moving
+
+    assert hardware_model._last_requested_set_coordinates.y == 25.0
+
+
+def test_without_travel_a_refused_set_is_not_rolled_back(hardware_model):
+    """No min_pos / max_pos: the requested position is left as before this branch."""
+    _set_y_refused_setup(hardware_model, travel=False)
+    token = hardware_model.set_y(25.0)
+
+    _refuse_set(hardware_model, token)
+
+    assert hardware_model._last_requested_set_coordinates.y == 25.0
 
 
 class _ConnectionWhoseHomeIsRefused:

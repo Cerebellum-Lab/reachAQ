@@ -75,6 +75,10 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     PELLET_DRIVER_FAULT_PROPERTY = "pellet_driver_fault"
     LAST_COMMAND_REFUSAL_PROPERTY = "last_command_refusal"
 
+    # Per axis x, y, z: the token of the latest SET queued, so a refusal of an older SET does
+    # not roll back a newer one (_forget_refused_set).
+    _latest_set_tokens: Tuple[Optional[UUID], Optional[UUID], Optional[UUID]] = (None, None, None)
+
     DEVICE_ACK_TIMEOUT_ENGAGED = "device_ack_timeout_engaged"
     DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED = "device_pellet_status_timeout_engaged"
 
@@ -457,6 +461,9 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             data = SystemDataArgsKwargs(value, relative=not absolute)
         res = self._send_with_token(self._device_conn, system_set_cmd, data)
         if res is not None:
+            tokens = list(self._latest_set_tokens)
+            tokens[coord_idx] = res
+            self._latest_set_tokens = tuple(tokens)
             self._last_requested_set_coordinates = self._last_requested_set_coordinates.replace(**{coord: new_value})
             self._on_property_changed(f"set_{coord}", new_value, prev_value)
         return res
@@ -1664,7 +1671,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             commands_in_prog = list(self._pending_tokens.values())
         if popped is not None:
             self._refresh_cmd_in_progress(commands_in_prog)
-            self._forget_refused_set(popped[0])
+            self._forget_refused_set(popped[0], token, refusal)
         # Below ERROR: the device has logged it at ERROR already, and every
         # ERROR record lands in the footer, where AppModel shows the notice.
         logger.warning("Pellet board refused command %s (token=%s): %s",
@@ -1699,18 +1706,23 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             error_code=int(refusal.error),
         ))
 
-    def _forget_refused_set(self, command) -> None:
+    def _forget_refused_set(self, command, token, refusal) -> None:
         """A refused SET_X/Y/Z left the board's send position where it was: put the requested
         one back to the reported one (nan when that is not known), so the travel checks of the
-        next relative SET and sequence use the base the board really has."""
+        next relative SET and sequence use the base the board really has.
+
+        Only on an axis with travel configured; without one the requested position is left as
+        it always was. Not when the outcome is unknown (-EBUSY on a resend), nor when a newer
+        SET of the axis was queued since. Silent: set_<axis> is not notified, since AppModel
+        saves every set_<axis> change into the selected animal as an operator edit."""
         coord_idx = {SystemCommandKind.SET_X: 0, SystemCommandKind.SET_Y: 1, SystemCommandKind.SET_Z: 2}.get(command)
-        if coord_idx is None:
+        if coord_idx is None or not self._axis_has_travel(coord_idx):
+            return
+        if getattr(refusal, "outcome_unknown", False) or self._latest_set_tokens[coord_idx] != token:
             return
         coord = "xyz"[coord_idx]
-        prev = self._last_requested_set_coordinates[coord_idx]
         reported = self._last_motor_send_coordinates[coord_idx]
         self._last_requested_set_coordinates = self._last_requested_set_coordinates.replace(**{coord: reported})
-        self._on_property_changed(f"set_{coord}", reported, prev)
 
     def _set_axes_needing_home(self, axes: Tuple[str, ...]) -> None:
         prev, self._axes_needing_home = self._axes_needing_home, tuple(axes)
