@@ -29,8 +29,8 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 # Kept in step with install_tensorflow_gpu_runtime in plugin-install-lib.sh.
 TENSORFLOW_RUNTIME_DIR = "lib/reachaq-tensorflow-cuda11"
-# The plugin's entry-point group, before and after the 1.4 rename.
-POSE_BACKEND_GROUPS = ("reachaq.pose_backends", "reachaq.pose_backends")
+# The pose plugins' entry-point group.
+POSE_BACKEND_GROUP = "reachaq.pose_backends"
 _SUFFIX = re.compile(r"-cu(\d+)$")
 # NVIDIA's CUDA user-space components as pip names them (nvidia-cuda-runtime-cu12,
 # nvidia-cudnn-cu12, nvidia-nccl-cu12, ...). Other nvidia-* distributions, such
@@ -134,10 +134,9 @@ def _environment_facts() -> dict:
         if name.startswith("nvidia-"):
             names.add(name)
     found = entry_points()
-    deeplabcut = False
-    for group in POSE_BACKEND_GROUPS:
-        selected = found.select(group=group) if hasattr(found, "select") else found.get(group, ())
-        deeplabcut = deeplabcut or any(entry.name == "deeplabcut" for entry in selected)
+    group = POSE_BACKEND_GROUP
+    selected = found.select(group=group) if hasattr(found, "select") else found.get(group, ())
+    deeplabcut = any(entry.name == "deeplabcut" for entry in selected)
     return {
         "nvidia_distributions": names,
         "torch_cuda": torch.version.cuda,
