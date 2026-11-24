@@ -447,7 +447,7 @@ CHRISTIELAB10_MOTOR_CONFIG = Path(__file__).parents[1] / "tests" / "device" / "c
 
 @pytest.fixture(autouse=True)
 def _no_motor_config_file(tmp_path_factory, monkeypatch):
-    """The scout reads the stage travel from ~/Autotrainer/motor_config.yaml; these tests do
+    """The scout reads the stage travel from ~/reachAQ/motor_config.yaml; these tests do
     not see the computer's own file. A test that wants one writes it to the location."""
     location = tmp_path_factory.mktemp("reachaq") / "motor_config.yaml"
     monkeypatch.setattr(MotorConfigurationFile, "DEFAULT_LOCATION", location)
@@ -551,7 +551,7 @@ class _Subscribers:
 
 def test_the_hardware_model_keeps_the_motor_configurations_it_writes_at_connect(hardware_model, monkeypatch):
     # The capture times its settles from these, so they must be what connect sent the motors
-    # (WRITE_MOTOR_CONFIGURATION, from ~/Autotrainer/motor_config.yaml), not a package default.
+    # (WRITE_MOTOR_CONFIGURATION, from ~/reachAQ/motor_config.yaml), not a package default.
     written = _motor_configurations(x=(120.0, 600.0), y=(120.0, 600.0), z=(120.0, 600.0))
     assert hardware_model.motor_configurations is None, "nothing is written before a connect"
 
@@ -660,7 +660,7 @@ def test_the_capture_is_calibrated_into_the_session_beside_its_sources(tmp_path,
     log = run_waypoints(_Motor(clock, travel=0.0), plan_waypoints(start, moves, _dcs()),
                         sleep=clock.sleep, now=clock.now, clock=clock.now)
     presets = capture_presets(LIVE_PARAMS)
-    previous = tmp_path / "Autotrainer" / DEFAULT_3D_CALIB_DIR_NAME
+    previous = tmp_path / "reachAQ" / DEFAULT_3D_CALIB_DIR_NAME
     calls = []
 
     def fake_calibrate_capture(capture, **kwargs):

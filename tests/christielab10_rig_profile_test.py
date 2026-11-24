@@ -3,7 +3,7 @@ must resolve to exactly what was built in before, and a fresh install to none of
 
 The before values are spelled out here as they stood in shared code at
 feature-dev 95375bb0: the SoftMouse publication under /mnt/isilon, the mount
-guard on /mnt/isilon, and every settings file under ~/Autotrainer.
+guard on /mnt/isilon, and every settings file under ~/reachAQ.
 """
 import json
 import os
@@ -37,12 +37,12 @@ PROFILE = REPO_ROOT / "tests" / "christielab10_preferences.ini"
 BEFORE_PUBLICATION_DIRECTORY = Path("/mnt/isilon/Data/ReachingData/SoftMouse")
 BEFORE_MANIFEST = BEFORE_PUBLICATION_DIRECTORY / "SoftMouse-AnimalList-current.manifest.json"
 BEFORE_MOUNT = Path("/mnt/isilon")
-BEFORE_CONFIG_DIR = Path("~/Autotrainer")
+BEFORE_CONFIG_DIR = Path("~/reachAQ")
 
 
 @pytest.fixture
 def christielab10_preferences(tmp_path):
-    path = tmp_path / "Auto Trainer.conf"
+    path = tmp_path / "reachAQ.conf"
     shutil.copy(PROFILE, path)
     return path
 

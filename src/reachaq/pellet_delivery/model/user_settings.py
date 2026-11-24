@@ -3,7 +3,7 @@ from PySide6.QtCore import QCoreApplication, QSettings
 
 class UserSettings:
     def __init__(self):
-        QCoreApplication.setOrganizationName("Colorado")
+        QCoreApplication.setOrganizationName("reachAQ")
         QCoreApplication.setOrganizationDomain("colorado.edu")
         QCoreApplication.setApplicationName("PelletDeliveryUI")
 

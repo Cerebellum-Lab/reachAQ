@@ -64,7 +64,7 @@ from the core logic of the applications for two reasons:
 * Acquisition Application
   * The local user interface for integrated camera, pellet delivery, NI-DAQ,
     laser, and pose-inference modules
-  * `conda run --no-capture-output -n reachaq python -m reachaq.app -c ~/Autotrainer/system_configuration.yaml`
+  * `conda run --no-capture-output -n reachaq python -m reachaq.app -c ~/reachAQ/system_configuration.yaml`
     * The GUI starts idle by default. Use `--start-mode running` only when immediate startup is intentional.
     * Use `--no-live-inference` or `--live-inference` to override the saved inference setting for one run.
     * Hardware startup progress is written to the log and launching terminal as `HARDWARE INIT` records.
@@ -81,7 +81,7 @@ from the core logic of the applications for two reasons:
     * Use `--random-cameras` to start with software-generated frames when no physical cameras are configured.
     * Use `--simulate` to run with no hardware at all: [simulation mode](docs/acquisition/simulation-mode.md) and its [backend interfaces](docs/acquisition/backend-interfaces.md).
   * Headless implementation for command line only
-    * `reachaq-headless -c ~/Autotrainer/system_configuration.yaml`
+    * `reachaq-headless -c ~/reachAQ/system_configuration.yaml`
     * Headless mode continues to start acquisition by default because it has no UI start control.
 * Pellet Delivery Test Application
   * Standalone UI for interfacing with the pellet delivery system

@@ -10,7 +10,7 @@ Use the reachAQ entry point from the configured conda environment:
 
 ```bash
 conda run --no-capture-output -n reachaq python -m reachaq.app \
-  -c "$HOME/Autotrainer/system_configuration.yaml"
+  -c "$HOME/reachAQ/system_configuration.yaml"
 ```
 
 The `--no-capture-output` option is required for live terminal logging when the
@@ -41,7 +41,7 @@ For software-only camera testing:
 conda run --no-capture-output -n reachaq python -m reachaq.app \
   --random-cameras \
   --no-live-inference \
-  -c "$HOME/Autotrainer/system_configuration.yaml"
+  -c "$HOME/reachAQ/system_configuration.yaml"
 ```
 
 The random-camera override is in-memory for that run and does not overwrite the
@@ -70,7 +70,7 @@ laser controls, behavior, inference, and output. On Linux reachAQ rigs, the
 default local config is usually:
 
 ```text
-~/Autotrainer/system_configuration.yaml
+~/reachAQ/system_configuration.yaml
 ```
 
 The app saves configuration back to the file it loaded: the one named with

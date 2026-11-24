@@ -251,7 +251,7 @@ def test_a_start_record_stop_exit_cycle_leaves_the_configuration_byte_identical(
     app_model, system_config, trainer_config_dir, config_file_path,
 ):
     # Exit saved everything the run had changed: on christielab10 a run on a
-    # demo copy left its playback cameras in ~/Autotrainer. Nothing a run does
+    # demo copy left its playback cameras in ~/reachAQ. Nothing a run does
     # writes the file now, only an operator edit of a stored setting.
     for camera in system_config.cameras:
         if camera.id in (CameraId.Left, CameraId.Right):
@@ -545,7 +545,7 @@ def test_start_stop(app_model, settings_ini_path):
 
 def test_start_stop_keeps_the_running_status_file_out_of_home(app_model, tmp_path, tmp_path_factory, monkeypatch):
     # HOME stands in for the operator's: the status file's path is expanded at
-    # each write, and was ~/.config/Colorado/autotrainer_running_status.env.
+    # each write, and was ~/.config/reachAQ/running_status.env.
     home = tmp_path.joinpath("operator-home")
     home.mkdir()
     monkeypatch.setenv("HOME", home.as_posix())
@@ -2354,8 +2354,8 @@ def test_launch_cli(system_config, config_file_path, user_pref, calib_dir, diamo
     # the motor and move files app_launch_env put there.
     home = Path(env["HOME"])
     assert home.joinpath("Documents", "rawdatalocal").is_dir()
-    assert_is_present(f"Reading and applying default motors config: {home / 'Autotrainer' / 'motor_config.yaml'}")
-    assert_is_present(f"Reading and applying default move config: {home / 'Autotrainer' / 'move_config.yaml'}")
+    assert_is_present(f"Reading and applying default motors config: {home / 'reachAQ' / 'motor_config.yaml'}")
+    assert_is_present(f"Reading and applying default move config: {home / 'reachAQ' / 'move_config.yaml'}")
     #
     # etc...
 

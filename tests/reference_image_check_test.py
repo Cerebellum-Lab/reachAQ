@@ -307,7 +307,7 @@ def test_cant_tell_is_shown_but_does_not_ask(monkeypatch):
 
 
 def test_check_results_and_acknowledgement_reach_the_metadata(app_model, tmp_path):
-    folder = _write_multires(tmp_path / "Autotrainer-calib" / DEFAULT_3D_CALIB_DIR_NAME)
+    folder = _write_multires(tmp_path / "reachAQ-calib" / DEFAULT_3D_CALIB_DIR_NAME)
     (folder / "reference").mkdir()
     for camera in ("left", "right"):
         cv2.imwrite(str(folder / "reference" / f"{camera}.png"), REFERENCE)
@@ -345,7 +345,7 @@ def test_check_results_and_acknowledgement_reach_the_metadata(app_model, tmp_pat
 
 
 def test_a_declined_start_leaves_no_result_for_a_later_headless_start(app_model, tmp_path, monkeypatch):
-    folder = _write_multires(tmp_path / "Autotrainer-calib" / DEFAULT_3D_CALIB_DIR_NAME)
+    folder = _write_multires(tmp_path / "reachAQ-calib" / DEFAULT_3D_CALIB_DIR_NAME)
     (folder / "reference").mkdir()
     for camera in ("left", "right"):
         cv2.imwrite(str(folder / "reference" / f"{camera}.png"), REFERENCE)

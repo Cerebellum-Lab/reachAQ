@@ -306,7 +306,7 @@ holds the input lines this opens tasks on.
 ```bash
 cd "$HOME/Documents/reachAQ"
 conda run -n reachaq python src/reachaq/hardware/validate_laser_hardware.py \
-  --config "$HOME/Autotrainer/system_configuration.yaml" \
+  --config "$HOME/reachAQ/system_configuration.yaml" \
   --action connect
 ```
 
@@ -396,7 +396,7 @@ gets one status:
 The test reports what it saw, not why. A mislabelled cable, a split, and
 coupling between inputs look the same from the DAQ. **Save report...** writes
 the result as text. The result is kept in
-`~/Autotrainer/nidaq_wiring_verification.json`, and every hardware refresh
+`~/reachAQ/nidaq_wiring_verification.json`, and every hardware refresh
 compares the configuration with it. Hardware Status then shows
 `NI-DAQ wiring N/M confirmed`. When any channel is failed or unchecked, a
 warning names each one, for example:

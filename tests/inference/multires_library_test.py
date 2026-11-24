@@ -85,7 +85,7 @@ def _legacy(folder: Path, made: datetime) -> Path:
 def _config(tmp_path: Path) -> Path:
     """A configuration directory as a rig had it before the library: a format-2 active
     folder, a format-3 backup and a legacy backup."""
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     config.mkdir()
     shutil.copytree(FORMAT2_FIXTURE, config / NAME)
     _built(config / f"{NAME}_20260701_120000")
@@ -482,7 +482,7 @@ def test_import_with_nothing_to_import_makes_an_empty_library(tmp_path):
 
 
 def test_a_legacy_folder_renamed_to_a_backup_is_not_imported_twice(tmp_path):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     config.mkdir()
     _legacy(config / NAME, datetime(2026, 7, 7))
     legacy_id, = import_existing(config)
@@ -508,7 +508,7 @@ def test_a_roll_forward_import_never_sets_the_pointer(tmp_path):
 
 
 def test_the_active_folder_id_of_a_legacy_folder_is_its_content_id(tmp_path):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     config.mkdir()
     assert library.active_folder_id(config) is None
     _legacy(config / NAME, datetime(2026, 7, 7))
@@ -561,7 +561,7 @@ def test_a_discard_on_a_first_install_does_not_warn_about_the_pointer(tmp_path, 
 
 
 def test_an_imported_legacy_entry_is_dated_by_its_marker(tmp_path):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     config.mkdir()
     _legacy(config / NAME, datetime(2026, 7, 7, 8, 30))
     legacy_id, = import_existing(config)
@@ -578,7 +578,7 @@ def test_an_imported_legacy_entry_is_dated_by_its_marker(tmp_path):
 
 
 def test_a_corrupt_library_entry_does_not_shadow_an_old_folder_with_its_id(tmp_path, caplog):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     config.mkdir()
     old_id = _built(config / NAME)
     root = library_root(config)
@@ -610,7 +610,7 @@ def _write_metadata(project: ProjectInfo, start: datetime, **calibration3d) -> N
 
 
 def test_session_resolves_by_id_from_library_then_falls_back(tmp_path):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     config.mkdir()
     root = library_root(config)
     built = tmp_path / "built"
@@ -633,7 +633,7 @@ def test_session_resolves_by_id_from_library_then_falls_back(tmp_path):
 
 
 def test_a_session_without_an_id_uses_what_the_library_had_active_then(tmp_path):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     config.mkdir()
     root = library_root(config)
     built = tmp_path / "built"
@@ -652,7 +652,7 @@ def test_a_session_without_an_id_uses_what_the_library_had_active_then(tmp_path)
 
 
 def test_an_imported_legacy_entry_is_read_as_legacy_offline(tmp_path, monkeypatch):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     config.mkdir()
     _legacy(config / NAME, datetime(2026, 7, 7))
     legacy_id, = import_existing(config)

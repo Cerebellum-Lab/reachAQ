@@ -74,7 +74,7 @@ def test_prepare_writes_only_under_sim_home(home, tmp_path):
     assert run.home == home.joinpath(".reachaq-sim").resolve()
     created = _files(tmp_path) - before
     assert created and all(path.resolve().is_relative_to(run.home) for path in created), sorted(created)
-    assert not home.joinpath("Autotrainer").exists()
+    assert not home.joinpath("reachAQ").exists()
     assert run.config_path.is_file() and run.preferences_path.is_file()
     assert run.bus_path.parent.is_dir() and run.bus_path.parent.parent == run.home / "runs"
     assert run.lock_path == run.home / "app.lock"

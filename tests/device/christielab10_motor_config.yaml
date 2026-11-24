@@ -1,4 +1,4 @@
-# christielab10's ~/Autotrainer/motor_config.yaml as read on 2026-11-20, with the pellet
+# christielab10's ~/reachAQ/motor_config.yaml as read on 2026-11-20, with the pellet
 # x/y/z travel (min_pos 0 / max_pos 35 mm) added on 2026-11-23.
 tunnel:
   magnet:

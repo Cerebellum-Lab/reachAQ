@@ -164,8 +164,8 @@ queue, the right preview has nothing to display.
 Close reachAQ completely, then back up the active configuration:
 
 ```bash
-cp "$HOME/Autotrainer/system_configuration.yaml" \
-  "$HOME/Autotrainer/system_configuration.before-right-camera-test.yaml"
+cp "$HOME/reachAQ/system_configuration.yaml" \
+  "$HOME/reachAQ/system_configuration.before-right-camera-test.yaml"
 ```
 
 In **Edit Camera Settings**, temporarily:

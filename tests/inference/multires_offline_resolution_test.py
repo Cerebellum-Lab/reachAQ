@@ -116,7 +116,7 @@ def _write_legacy(folder: Path, made: datetime) -> Path:
 
 def _legacy_root(tmp_path: Path) -> Path:
     """Two legacy backups and the active legacy folder, each made when the one before it ended."""
-    root = tmp_path / "Autotrainer"
+    root = tmp_path / "reachAQ"
     _write_legacy(root / f"{NAME}_20260303_090815", datetime(2026, 1, 10))
     _write_legacy(root / f"{NAME}_20260701_120000", datetime(2026, 3, 3, 9, 8, 15))
     _write_legacy(root / NAME, datetime(2026, 7, 1, 12))
@@ -156,7 +156,7 @@ def _capture_process_raw_data(monkeypatch) -> dict:
 
 
 def test_resolves_by_id(tmp_path, caplog):
-    root = tmp_path / "Autotrainer"
+    root = tmp_path / "reachAQ"
     _write_legacy(root / f"{NAME}_20260303_090815", datetime(2026, 1, 10))
     backup = root / f"{NAME}_20260701_120000"
     backup_index = _write_format3_with_live_set(backup)
@@ -205,7 +205,7 @@ def test_resolves_legacy_by_date(tmp_path, caplog, source):
     "two backups end at once", "unknown id", "calibration changed that day", "no calibration",
 ])
 def test_ambiguous_raises_with_hint(tmp_path, case):
-    root = tmp_path / "Autotrainer"
+    root = tmp_path / "reachAQ"
     project = _project(tmp_path)
     if case == "two backups end at once":
         # DATE_TIME_FORMAT also parses an hour typed without its leading zero.
@@ -228,7 +228,7 @@ def test_ambiguous_raises_with_hint(tmp_path, case):
 
 
 def test_explicit_calib_dir_wins(tmp_path, monkeypatch):
-    root = tmp_path / "Autotrainer"
+    root = tmp_path / "reachAQ"
     index = _write_format3_with_live_set(root / NAME)
     project = _project(tmp_path)
     _write_metadata(project, _metadata(IN_SECOND_WINDOW, id=index.id, preset=BASE.name))
@@ -259,7 +259,7 @@ def test_without_a_calib_dir_the_session_resolves_under_the_root(tmp_path, monke
                         lambda project, calib_root: roots.append(calib_root) or root / NAME)
     with pytest.raises(_Stop):
         intersession_process(project)
-    assert roots == [Path.home() / "Autotrainer"]
+    assert roots == [Path.home() / "reachAQ"]
 
 
 @pytest.mark.parametrize("named, expected", [
@@ -268,7 +268,7 @@ def test_without_a_calib_dir_the_session_resolves_under_the_root(tmp_path, monke
     ("no calibration3d", BASE),
 ], ids=["named preset", "no calibration3d"])
 def test_a_format3_session_loads_its_preset(tmp_path, monkeypatch, named, expected):
-    root = tmp_path / "Autotrainer"
+    root = tmp_path / "reachAQ"
     folder = root / NAME
     # Made before the session, which the one without calibration3d is resolved against by time.
     index = _write_format3_with_live_set(folder, made=datetime(2026, 6, 1))
@@ -292,7 +292,7 @@ def test_a_true_format2_session_without_calibration3d_is_read_at_the_base_withou
         tmp_path, monkeypatch, caplog):
     # Recorded before calibration3d existed, on a format-2 calibration: its 2D points are in
     # inference space, the base preset, and nothing about it is worth a warning.
-    root = tmp_path / "Autotrainer"
+    root = tmp_path / "reachAQ"
     folder = root / NAME
     _write_true_format2(folder, made=datetime(2026, 6, 1))
     project = _project(tmp_path)
@@ -306,7 +306,7 @@ def test_a_true_format2_session_without_calibration3d_is_read_at_the_base_withou
 
 
 def test_a_session_recorded_with_live_3d_off_is_refused(tmp_path, monkeypatch):
-    root = tmp_path / "Autotrainer"
+    root = tmp_path / "reachAQ"
     folder = root / NAME
     index = _write_format3_with_live_set(folder)
     project = _project(tmp_path)
@@ -325,7 +325,7 @@ def test_a_session_recorded_with_live_3d_off_is_refused(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("route", ["explicit calib-dir", "legacy backup deleted"])
 def test_a_legacy_live_session_reaching_format2_uses_the_base_preset(tmp_path, monkeypatch, caplog, route):
-    root = tmp_path / "Autotrainer"
+    root = tmp_path / "reachAQ"
     folder = root / NAME
     # A real format-2 folder: a format-3 one is read at its live set, never at the base preset.
     # Made before the session: by time, a format-2 calibration made after it would be refused
@@ -351,7 +351,7 @@ def test_a_legacy_live_session_reaching_format2_uses_the_base_preset(tmp_path, m
 
 
 def test_a_preset_the_calibration_lacks_is_refused(tmp_path, monkeypatch):
-    root = tmp_path / "Autotrainer"
+    root = tmp_path / "reachAQ"
     index = _write_format3_with_live_set(root / NAME)
     project = _project(tmp_path)
     _write_metadata(project, _metadata(IN_SECOND_WINDOW, id=index.id, preset="300x300_bin3"))
@@ -398,7 +398,7 @@ def test_a_session_older_than_every_kept_calibration_is_refused(tmp_path, monkey
 
 
 def test_an_aware_calibration_date_is_compared_in_local_time(tmp_path, caplog):
-    root = tmp_path / "Autotrainer"
+    root = tmp_path / "reachAQ"
     folder = root / NAME
     index = _write_format3_with_live_set(folder)
     # An index whose created carries a UTC offset, as a hand-edited or future one might.
@@ -440,7 +440,7 @@ def test_the_cli_resolves_unless_given_a_calib_dir(monkeypatch, tmp_path):
     finally:
         logging.root.setLevel(root_level)
     assert [(c["calib_dir"], c["calib_root"]) for c in calls] == [
-        (None, Path.home() / "Autotrainer"),
+        (None, Path.home() / "reachAQ"),
         (tmp_path / "chosen", tmp_path / "root"),
     ]
 
@@ -467,7 +467,7 @@ def _preset_pixels(X: np.ndarray, g: PresetGeometry) -> dict:
 
 @pytest.mark.parametrize("g", [BASE, PRESETS[1]], ids=lambda g: g.name)
 def test_format2_offline_3d_is_the_motor_frame(tmp_path, monkeypatch, g):
-    folder = tmp_path / "Autotrainer" / NAME
+    folder = tmp_path / "reachAQ" / NAME
     _write_format3_with_live_set(folder)
     preset = store.load_preset(folder, g)
     # Each part held still at its own motor point for twelve frames, seen with p = 1.

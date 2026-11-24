@@ -697,7 +697,7 @@ def main(argv=None) -> int:
                                        stream.sample_rate_hz)
 
     prefs = root / "prefs.ini"
-    settings = root / "Autotrainer"
+    settings = root / "reachAQ"
     prefs.write_text(f"[system]\nconfiguration_location={settings}\n"
                      f"animal_location={settings / 'animals'}\n\n"
                      f"[softmouse]\nmanifest_path={root / 'no_softmouse_manifest.csv'}\n"

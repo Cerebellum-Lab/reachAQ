@@ -612,10 +612,10 @@ def _default_preferences_path() -> Optional[Path]:
     """Where QSettings keeps the app's preferences, without starting Qt."""
     if sys.platform.startswith("win"):
         base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
-        path = base / "Colorado" / "Auto Trainer.ini"
+        path = base / "reachAQ" / "reachAQ.ini"
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-        path = base / "Colorado" / "Auto Trainer.conf"
+        path = base / "reachAQ" / "reachAQ.conf"
     return path if path.is_file() else None
 
 

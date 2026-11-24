@@ -60,13 +60,13 @@ class UserPreferences(ObservableObject):
 
         if sys.platform.startswith("win"):
             if settings_file_path is None:
-                settings = self._settings = QSettings(QSettings.Format.IniFormat, QSettings.Scope.UserScope, "Colorado", "Auto Trainer")
+                settings = self._settings = QSettings(QSettings.Format.IniFormat, QSettings.Scope.UserScope, "reachAQ", "reachAQ")
             else:
                 settings = self._settings = QSettings(*settings_args)
         else:
-            QCoreApplication.setOrganizationName("Colorado")
+            QCoreApplication.setOrganizationName("reachAQ")
             QCoreApplication.setOrganizationDomain("colorado.edu")
-            QCoreApplication.setApplicationName("Auto Trainer")
+            QCoreApplication.setApplicationName("reachAQ")
             # IniFormat is required for the settings_file_path to be effective,
             # otherwise it's prepended with XDG_CONFIG_DIR :
             settings = self._settings = QSettings(*settings_args)

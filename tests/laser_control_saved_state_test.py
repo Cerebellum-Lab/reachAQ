@@ -7,7 +7,7 @@ splitter's position, and read back when the panel is made.
 
 Every test here saves to the settings file the app_model fixture gives its
 preferences, settings_ini_path under tmp_path; none reaches the user's own
-~/.config/Colorado/Auto Trainer.conf.
+~/.config/reachAQ/reachAQ.conf.
 """
 
 import os

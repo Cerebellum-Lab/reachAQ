@@ -572,7 +572,7 @@ def _recorded_session(tmp_path: Path, entry: Path, serials: Dict[str, str], X: n
 
 
 def test_session_offline_3d_uses_every_calibrated_camera_but_the_swapped_one(tmp_path):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     entry = _entry(config)
     before = _tree_hashes(entry)
     X = _motor_points(60)
@@ -594,7 +594,7 @@ def test_session_offline_3d_uses_every_calibrated_camera_but_the_swapped_one(tmp
 
 
 def test_session_offline_3d_with_fewer_than_two_cameras_is_2d_only(tmp_path):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     entry = _entry(config)
     project, session, metadata = _recorded_session(tmp_path, entry, {"left": "21000001", "right": "21000099"},
                                                    _motor_points(10))
@@ -606,7 +606,7 @@ def test_session_offline_3d_with_fewer_than_two_cameras_is_2d_only(tmp_path):
 
 
 def test_session_offline_3d_runs_the_check_when_enabled(tmp_path):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     entry = _entry(config)
     library.update_settings(entry.parent, checks={"pose_consistency": {
         "enabled": True, "min_frames": 10, "min_observations": 10}})
@@ -625,7 +625,7 @@ THREE = {"left": "21000001", "right": "21000002", "camera4": "21000004"}
 def test_a_per_camera_override_is_given_by_the_configured_name(tmp_path):
     # As the reference-image check takes it: the camera's name in the app, which the session
     # maps to the calibration's name by serial (here camera4 has been renamed stimCam).
-    entry = _entry(tmp_path / "Autotrainer")
+    entry = _entry(tmp_path / "reachAQ")
     library.update_settings(entry.parent, checks={"pose_consistency": {
         "enabled": True, "min_frames": 10, "min_observations": 10,
         "per_camera": {"stimCam": {"median_px": 9.0}, "camera4": {"median_px": 1.0}}}})
@@ -646,7 +646,7 @@ def test_a_per_camera_override_is_given_by_the_configured_name(tmp_path):
 
 
 def test_a_calibrated_camera_without_a_readable_pose_file_is_named(tmp_path):
-    entry = _entry(tmp_path / "Autotrainer")
+    entry = _entry(tmp_path / "reachAQ")
     project, session, metadata = _recorded_session(tmp_path, entry, THREE, _motor_points(20))
     _pose_path(project, "camera4").unlink()
     result = session_offline_3d(project, entry, metadata, library_dir=entry.parent)
@@ -662,7 +662,7 @@ def test_a_calibrated_camera_without_a_readable_pose_file_is_named(tmp_path):
 
 
 def test_a_camera_named_left_does_not_take_far_left_s_pose_file(tmp_path):
-    entry = _entry(tmp_path / "Autotrainer")
+    entry = _entry(tmp_path / "reachAQ")
     project, session, metadata = _recorded_session(tmp_path, entry, THREE, _motor_points(20))
     _pose_path(project, "left").rename(_pose_path(project, "far_left"))
     result = session_offline_3d(project, entry, metadata, library_dir=entry.parent)
@@ -672,7 +672,7 @@ def test_a_camera_named_left_does_not_take_far_left_s_pose_file(tmp_path):
 
 
 def test_a_camera_recorded_at_another_frame_rate_is_not_paired(tmp_path):
-    entry = _entry(tmp_path / "Autotrainer")
+    entry = _entry(tmp_path / "reachAQ")
     project, session, metadata = _recorded_session(tmp_path, entry, THREE, _motor_points(20),
                                                    fps={"left": 150, "right": 150.0, "camera4": 900})
     result = session_offline_3d(project, entry, metadata, library_dir=entry.parent)
@@ -692,7 +692,7 @@ def _tree_hashes(folder: Path) -> dict:
 # --- intersession processing --------------------------------------------------------------
 
 def test_intersession_live_3d_switched_off_is_not_refused(tmp_path, monkeypatch):
-    root = tmp_path / "Autotrainer"
+    root = tmp_path / "reachAQ"
     folder = root / NAME
     index = _write_format3_with_live_set(folder)
     project = _project(tmp_path)
@@ -706,7 +706,7 @@ def test_intersession_live_3d_switched_off_is_not_refused(tmp_path, monkeypatch)
 
 
 def test_intersession_live_3d_off_without_a_preset_reads_the_recorded_geometry(tmp_path, monkeypatch):
-    root = tmp_path / "Autotrainer"
+    root = tmp_path / "reachAQ"
     folder = root / NAME
     index = _write_format3_with_live_set(folder)
     project = _project(tmp_path)
@@ -720,7 +720,7 @@ def test_intersession_live_3d_off_without_a_preset_reads_the_recorded_geometry(t
 
 
 def test_intersession_live_3d_off_with_a_swapped_left_is_refused(tmp_path, monkeypatch):
-    root = tmp_path / "Autotrainer"
+    root = tmp_path / "reachAQ"
     index = _write_format3_with_live_set(root / NAME)
     project = _project(tmp_path)
     data = _metadata(IN_SECOND_WINDOW, id=index.id, preset=None, live3dDisabledReason=LIVE_3D_OFF)
@@ -737,7 +737,7 @@ def test_intersession_live_3d_off_with_a_swapped_left_is_refused(tmp_path, monke
 
 
 def test_intersession_live_3d_off_with_unreadable_recorded_params_is_refused(tmp_path, monkeypatch):
-    root = tmp_path / "Autotrainer"
+    root = tmp_path / "reachAQ"
     index = _write_format3_with_live_set(root / NAME)
     project = _project(tmp_path)
     data = _metadata(IN_SECOND_WINDOW, id=index.id, preset=None, live3dDisabledReason=LIVE_3D_OFF)
@@ -752,7 +752,7 @@ def test_intersession_live_3d_off_with_unreadable_recorded_params_is_refused(tmp
 
 
 def test_offline_3d_runs_for_a_session_without_a_left_right_pair(tmp_path, caplog):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     rig = _rig_abc()
     entry = _entry(config, rig=rig, capture=CAPTURE_ABC, live=LIVE_ABC)
     X = _motor_points(30, rig)
@@ -770,11 +770,11 @@ def test_offline_3d_runs_for_a_session_without_a_left_right_pair(tmp_path, caplo
 
 
 def test_offline_3d_of_a_calibration_outside_the_library_derives_into_the_session(tmp_path, monkeypatch):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     entry = _entry(config)
     outside = tmp_path / "elsewhere" / entry.name
     shutil.copytree(entry, outside)
-    home = tmp_path / "home" / "Autotrainer"
+    home = tmp_path / "home" / "reachAQ"
     monkeypatch.setattr(intersession_module, "DEFAULT_CONFIG_DIR", home)
     # camera4 at a window no stored preset set has, so its TOML is derived.
     project, session, metadata = _recorded_session(tmp_path, entry, THREE, _motor_points(20),
@@ -796,7 +796,7 @@ def test_offline_3d_of_a_calibration_outside_the_library_derives_into_the_sessio
 
 
 def test_intersession_runs_offline_3d_after_2d_processing(tmp_path, monkeypatch):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     entry = _entry(config)
     library.set_active(entry.parent, entry.name, by="test")
     project, session, metadata = _recorded_session(
@@ -825,7 +825,7 @@ def test_intersession_runs_offline_3d_after_2d_processing(tmp_path, monkeypatch)
 
 def _recorded_order(tmp_path, monkeypatch):
     """A session whose 2D step, segmentation, response and offline 3D are stubs that record their order."""
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     entry = _entry(config)
     project = _project(tmp_path)
     _write_metadata(project, _metadata(IN_SECOND_WINDOW, id=entry.name, preset=BASE.name))
@@ -861,7 +861,7 @@ def test_intersession_can_leave_offline_3d_to_its_caller(tmp_path, monkeypatch):
 
 
 def test_intersession_offline_3d_failure_does_not_stop_the_session(tmp_path, monkeypatch, caplog):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     entry = _entry(config)
     project = _project(tmp_path)
     _write_metadata(project, _metadata(IN_SECOND_WINDOW, id=entry.name, preset=BASE.name))
@@ -884,7 +884,7 @@ def test_intersession_offline_3d_failure_does_not_stop_the_session(tmp_path, mon
 # --- camera offsets of a library entry ----------------------------------------------------
 
 def test_intersession_offsets_of_a_library_entry_come_from_the_offsets_store(tmp_path):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     entry = _entry(config)
     store_dir = entry.parent / ".offsets" / entry.name
     # None yet: generated for this run, never saved, and nothing is written in the entry.
@@ -902,7 +902,7 @@ def test_intersession_offsets_of_a_library_entry_come_from_the_offsets_store(tmp
 
 
 def test_intersession_offsets_fall_back_to_a_legacy_entry_s_own_file(tmp_path):
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     legacy = config / NAME
     (legacy / "camera_matrix").mkdir(parents=True)
     (legacy / "camera_matrix" / "stereo_params.pickle").write_bytes(b"not read")

@@ -57,7 +57,7 @@ the script is not on `PATH`.
 
 The setup is per user: settings and the column mapping are saved as the
 `animal_metadata/source` entry of that user's preferences
-(`~/.config/Colorado/Auto Trainer.conf`). Another user on the same computer
+(`~/.config/reachAQ/reachAQ.conf`). Another user on the same computer
 sets up their own.
 
 ### Kind settings
@@ -173,7 +173,7 @@ FAKE-001 and FAKE-002 with test-range ISO RFIDs (`999000000000001`,
 `999000000000002`), FAKE-003 and FAKE-004 with barcode IDs (`BC-0003-A`,
 `bc-0004-b`), FAKE-005 with none, and FAKE-006 and FAKE-007 sharing
 `DUP-0006`, which neither gets. Use it only with scratch preferences and a
-scratch settings directory, so the real source, cache and `~/Autotrainer`
+scratch settings directory, so the real source, cache and `~/reachAQ`
 are untouched:
 
 ```bash

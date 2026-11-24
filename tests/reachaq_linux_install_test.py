@@ -213,7 +213,7 @@ def test_portable_installer_covers_softmouse_rfid_requirements():
 def test_desktop_launcher_installer_creates_terminal_entry(tmp_path):
     home = tmp_path / "home"
     desktop = home / "Desktop"
-    config_dir = home / "Autotrainer"
+    config_dir = home / "reachAQ"
     fake_conda = tmp_path / "conda"
     home.mkdir()
     desktop.mkdir()

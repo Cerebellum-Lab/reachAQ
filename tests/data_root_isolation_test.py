@@ -1,11 +1,11 @@
-"""No test writes into the operator's data folder, or into ~/.config/Colorado.
+"""No test writes into the operator's data folder, or into ~/.config/reachAQ.
 
 The full runs on christielab10 on 2026-10-01 left 1,533 logs, two hourly event
 files and two empty session folders in ~/Documents/rawdatalocal/20261001/
 christielab10, the folder its real sessions are recorded into. AppModel opened
 them under its default data folder while it was constructed, before any
 configuration's outputLocation was loaded. The same runs created and deleted
-the operator's ~/.config/Colorado/autotrainer_running_status.env.
+the operator's ~/.config/reachAQ/running_status.env.
 
 These tests move HOME under tmp_path to stand in for the operator's, and the
 guard's tests give it a folder there to protect, so even against code that
@@ -144,33 +144,33 @@ def test_the_guard_protects_the_production_default_data_folder():
 
 def test_the_guard_protects_and_watches_the_operators_preferences_folder():
     production = top_fixtures.PRODUCTION_STATUS_FILE_PATH
-    assert production == Path("~/.config/Colorado/autotrainer_running_status.env")
+    assert production == Path("~/.config/reachAQ/running_status.env")
     folder = production.parent.expanduser()
     # The folder, so the preferences file in it too; and that file, which Qt
     # writes from C++, is watched.
     assert folder in top_fixtures.data_root_guard.roots
-    assert top_fixtures.data_root_guard.watched == (folder / "Auto Trainer.conf",)
+    assert top_fixtures.data_root_guard.watched == (folder / "reachAQ.conf",)
 
 
 @pytest.fixture
 def preferences_folder(tmp_path, monkeypatch) -> Path:
-    """A stand-in for ~/.config/Colorado, protected and watched beside the real one."""
-    folder = tmp_path.joinpath("operator-home", ".config", "Colorado")
+    """A stand-in for ~/.config/reachAQ, protected and watched beside the real one."""
+    folder = tmp_path.joinpath("operator-home", ".config", "reachAQ")
     folder.mkdir(parents=True)
-    folder.joinpath("Auto Trainer.conf").write_text("[system]\nserial_number=christielab10\n")
+    folder.joinpath("reachAQ.conf").write_text("[system]\nserial_number=christielab10\n")
     guard = top_fixtures.data_root_guard
     monkeypatch.setattr(guard, "roots", (*guard.roots, folder))
-    monkeypatch.setattr(guard, "watched", (*guard.watched, folder / "Auto Trainer.conf"))
+    monkeypatch.setattr(guard, "watched", (*guard.watched, folder / "reachAQ.conf"))
     return folder
 
 
 def test_the_guard_refuses_the_status_file_there(preferences_folder):
-    status = preferences_folder.joinpath("autotrainer_running_status.env")
+    status = preferences_folder.joinpath("running_status.env")
     with pytest.raises(top_fixtures.DataRootWriteRefused):
         status.write_text("status='running'\n")
     with pytest.raises(top_fixtures.DataRootWriteRefused):
-        preferences_folder.joinpath("Auto Trainer.conf").unlink()
-    assert sorted(path.name for path in preferences_folder.iterdir()) == ["Auto Trainer.conf"]
+        preferences_folder.joinpath("reachAQ.conf").unlink()
+    assert sorted(path.name for path in preferences_folder.iterdir()) == ["reachAQ.conf"]
     assert len(top_fixtures.data_root_guard.take_refused()) == 2
 
 
@@ -179,7 +179,7 @@ def test_the_guard_sees_a_preferences_write_the_hook_cannot(preferences_folder):
     before = guard.snapshot()
     assert guard.changes_since(before) == []
     # QSettings writes from C++, out of the audit hook's sight.
-    conf = preferences_folder.joinpath("Auto Trainer.conf")
+    conf = preferences_folder.joinpath("reachAQ.conf")
     settings = QSettings(conf.as_posix(), QSettings.Format.IniFormat)
     settings.setValue("system/serial_number", "pytest")
     settings.sync()
@@ -188,7 +188,7 @@ def test_the_guard_sees_a_preferences_write_the_hook_cannot(preferences_folder):
     assert guard.changes_since(before) == [f"{conf} changed"]
     with pytest.raises(pytest.fail.Exception,
                        match=r"(?s)changed during this test \(by this test, or by another"
-                             r" process such as a running reachAQ\):.*Auto Trainer\.conf changed"):
+                             r" process such as a running reachAQ\):.*reachAQ\.conf changed"):
         guard.fail_on_refusals(before)
 
 
@@ -206,7 +206,7 @@ def test_the_guard_ignores_the_operators_app_writing_its_status_file(preferences
     guard = top_fixtures.data_root_guard
     before = guard.snapshot()
     time.sleep(0.05)  # past the kernel's clock tick, so the folder's mtime moves
-    status = preferences_folder.joinpath("autotrainer_running_status.env")
+    status = preferences_folder.joinpath("running_status.env")
     _write_from_another_process(status, b"status='running'\n")
     assert QFile.remove(status.as_posix())
     _write_from_another_process(status, b"status='calibration_3d'\n")
@@ -217,7 +217,7 @@ def test_the_guard_ignores_the_operators_app_writing_its_status_file(preferences
 def test_the_guard_sees_a_lock_left_beside_the_preferences(preferences_folder):
     guard = top_fixtures.data_root_guard
     before = guard.snapshot()
-    lock = preferences_folder.joinpath("Auto Trainer.conf.lock")
+    lock = preferences_folder.joinpath("reachAQ.conf.lock")
     _write_from_another_process(lock, b"12345\n")
     assert guard.changes_since(before) == [f"{lock} created"]
 

@@ -865,7 +865,7 @@ class WatchdogItems(str, enum.Enum):
 
 
 class AppModel(ObservableObject):
-    status_file_path: ClassVar[Path] = Path("~/.config/Colorado/autotrainer_running_status.env")
+    status_file_path: ClassVar[Path] = Path("~/.config/reachAQ/running_status.env")
 
     configuration_loaded_event: AppModelEvents.configuration_loaded_event
     on_error: AppModelEvents.on_error
@@ -10766,7 +10766,7 @@ class AppModel(ObservableObject):
         # where the application looks when no file is named; saving there meant
         # a run started with -c on a copy overwrote the real configuration on
         # exit, which on the reference rig wrote a test run's settings into
-        # ~/Autotrainer on 2026-09-16.
+        # ~/reachAQ on 2026-09-16.
         loc = self._loaded_configuration_path
         logger.info("Saving configuration to %s", loc)
         # A training phase's device settings are not the operator's configuration.

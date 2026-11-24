@@ -15,7 +15,7 @@ rewrite if that deployment is needed later.
 ```bash
 export REACHAQ_REPO="$HOME/Documents/reachAQ"
 export REACHAQ_ENV="reachaq"
-export REACHAQ_CONFIG="$HOME/Autotrainer/system_configuration.yaml"
+export REACHAQ_CONFIG="$HOME/reachAQ/system_configuration.yaml"
 export REACHAQ_DATA="$HOME/Documents/rawdatalocal"
 mkdir -p "$(dirname "$REACHAQ_CONFIG")" "$REACHAQ_DATA"
 ```
@@ -169,7 +169,7 @@ freshness, while SET reports the saved send position in the same coordinates.
 
 ## Motor travel limits
 
-`pellet.x`, `pellet.y` and `pellet.z` in `~/Autotrainer/motor_config.yaml` can
+`pellet.x`, `pellet.y` and `pellet.z` in `~/reachAQ/motor_config.yaml` can
 each set `min_pos` and `max_pos`, the stage's travel in board millimetres.
 christielab10 uses `min_pos: 0` and `max_pos: 35` on all three axes. Either key
 can be left out: that side is then not limited. A value that is not a finite
@@ -385,7 +385,7 @@ bump past 58 is acceptable.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `REACHAQ_CONFIG_DIR` | `~/Autotrainer` | The per-computer settings directory: `system_configuration.yaml`, the motor and move files, `animals/`, the 3D calibration and the hardware tools' records. Every default that names one of those files is built from it (`reachaq.core.config_directory`). Read at start-up. The installer uses it when `REACHAQ_INSTALL_CONFIG_DIR` is unset. Put it in `runtime.env` so the launcher exports it. |
+| `REACHAQ_CONFIG_DIR` | `~/reachAQ` | The per-computer settings directory: `system_configuration.yaml`, the motor and move files, `animals/`, the 3D calibration and the hardware tools' records. Every default that names one of those files is built from it (`reachaq.core.config_directory`). Read at start-up. The installer uses it when `REACHAQ_INSTALL_CONFIG_DIR` is unset. Put it in `runtime.env` so the launcher exports it. |
 | `REACHAQ_STIM_RT_PRIORITY` | `80` | SCHED_FIFO priority for the stim capture loop. `0`, `off` or `false` disables it. See the [latency tuning guide](latency-tuning.md). |
 | `REACHAQ_POSE_BACKEND` | `tensorflow` where installed, else `torch` | Selects the engine a DeepLabCut model runs on: `tensorflow` or `torch`. It applies to DeepLabCut models only, which need the optional DeepLabCut plugin (`tensorflow` also needs the plugin's TensorFlow engine, which its installer adds). A keypoint or YOLO model ignores it and always runs on `torch`. For a model no installed plugin can run, or no model, it still selects the GPU runtime the live-inference preflight probes, so the two cannot disagree. |
 | `REACHAQ_POSE_CONFIDENCE_THRESHOLD` | per engine | Confidence a keypoint needs to count as present and to enter 3D triangulation. The default comes from the pose backend that runs the model, because every engine reports on its own scale: 0.1 for keypoint and YOLO models, and for DeepLabCut 0.9 on `tensorflow` (which saturates its likelihood at 1.0) and 0.6 on `torch`, with measured per-backbone refinements. The DeepLabCut PyTorch default is provisional and should be re-derived on held-out frames. |

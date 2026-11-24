@@ -784,7 +784,7 @@ def test_every_laser_claims_its_names_while_the_backend_is_enabled(name):
 
 #: christielab10's own nidaqPorts and nidaqStream blocks, deviceIdentities
 #: and timing included, copied read-only from the rig's
-#: ~/Autotrainer/system_configuration.yaml on 2026-09-25.
+#: ~/reachAQ/system_configuration.yaml on 2026-09-25.
 _CHRISTIELAB10_BLOCKS = Path(__file__).with_name("christielab10_nidaq_blocks.yaml")
 
 

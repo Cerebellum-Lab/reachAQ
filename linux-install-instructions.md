@@ -183,7 +183,7 @@ configuration, without live inference:
 ```bash
 conda run --no-capture-output -n reachaq python -m reachaq.app \
   --no-live-inference \
-  -c "$HOME/Autotrainer/system_configuration.yaml"
+  -c "$HOME/reachAQ/system_configuration.yaml"
 ```
 
 `--no-capture-output` makes application logs stream to the launching terminal.

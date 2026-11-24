@@ -52,9 +52,9 @@ SIMULATION_ENVIRONMENT: Tuple[str, ...] = (
 
 PREFERENCES_NAME = "preferences.ini"
 LOCK_NAME = "app.lock"
-#: Beside the operator's preferences on a rig (~/.config/Colorado).
-RUNNING_STATUS_NAME = "autotrainer_running_status.env"
-#: The motor and move files a rig keeps in ~/Autotrainer, seeded from the
+#: Beside the operator's preferences on a rig (~/.config/reachAQ).
+RUNNING_STATUS_NAME = "running_status.env"
+#: The motor and move files a rig keeps in ~/reachAQ, seeded from the
 #: repository's copies so the emulated board gets the same motor setup.
 _MOTOR_FILES = ("motor_config.yaml", "move_config.yaml")
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -75,7 +75,7 @@ class SimulationRun:
     preferences_path: Path
     bus_path: Path
     lock_path: Path
-    #: The 3D calibration AppModel loads, in place of ~/Autotrainer's.
+    #: The 3D calibration AppModel loads, in place of ~/reachAQ's.
     calib_dir: Path
     #: The held instance lock; keep it for the process's life. None where
     #: flock does not exist.

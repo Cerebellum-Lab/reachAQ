@@ -743,7 +743,7 @@ both the session and the acquisition metadata:
 
 Offline 3D (`python -m reachaq.inference.analysis`, and the app's own
 intersession analysis) uses `--calib-dir` as given. Without it, it resolves the
-session's calibration under `--calib-root` (default the settings directory, `~/Autotrainer` unless
+session's calibration under `--calib-root` (default the settings directory, `~/reachAQ` unless
 `REACHAQ_CONFIG_DIR` moves it; the app's
 configuration location in the app): by `calibration3d.id` when the session has
 one, otherwise as the calibration active at the session's start. The start is
@@ -1260,7 +1260,7 @@ latency record pairs by host arrival, `mixed`). See `alignment.json` above.
    deviation of D over the rest, with the number of sessions, are the
    calibration (at least two sessions); the gate scales the spread by Student's
    t for that number.
-4. Add `--write` to put it into `~/Autotrainer/system_configuration.yaml`. The file
+4. Add `--write` to put it into `~/reachAQ/system_configuration.yaml`. The file
    is copied to `system_configuration_before_delivery_calibration_<time>.yaml`
    first and only changed after every session has finished; without `--write`
    nothing outside `--out` is changed. Then remove the cable.

@@ -140,17 +140,17 @@ starts. A failure leaves the GUI idle.
 ```bash
 # Honor the saved inference setting
 conda run --no-capture-output -n reachaq python -m reachaq.app \
-  -c "$HOME/Autotrainer/system_configuration.yaml"
+  -c "$HOME/reachAQ/system_configuration.yaml"
 
 # Disable inference for one run
 conda run --no-capture-output -n reachaq python -m reachaq.app \
   --no-live-inference \
-  -c "$HOME/Autotrainer/system_configuration.yaml"
+  -c "$HOME/reachAQ/system_configuration.yaml"
 
 # Require inference for one run
 conda run --no-capture-output -n reachaq python -m reachaq.app \
   --live-inference \
-  -c "$HOME/Autotrainer/system_configuration.yaml"
+  -c "$HOME/reachAQ/system_configuration.yaml"
 ```
 
 The command-line overrides are not persisted. Use the **Live inference** switch

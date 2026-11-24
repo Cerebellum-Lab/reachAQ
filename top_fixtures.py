@@ -69,8 +69,8 @@ def _own_monkeypatch():
     # Not the test's monkeypatch, which a test can undo(): the undo() that
     # test_saving_resumes_once_a_load_completes used to call lifted the
     # isolation below with its own patches, and its app's teardown then tried
-    # to unlink the operator's real ~/.config/Colorado/
-    # autotrainer_running_status.env (refused by the guard on christielab10 on
+    # to unlink the operator's real ~/.config/reachAQ/
+    # running_status.env (refused by the guard on christielab10 on
     # 2026-10-01).
     return pytest.MonkeyPatch.context()
 
@@ -96,7 +96,7 @@ def isolated_default_data_root(tmp_path_factory) -> Generator[Path, None, None]:
         yield root
 
 
-# ~/.config/Colorado/autotrainer_running_status.env, beside the operator's
+# ~/.config/reachAQ/running_status.env, beside the operator's
 # preferences file. Read at import, before any fixture replaces it.
 PRODUCTION_STATUS_FILE_PATH = AppModel.status_file_path
 
@@ -124,12 +124,12 @@ def app_launch_env(tmp_path) -> dict:
 
     The child resolves its default data folder from its own HOME, out of the
     fixture above's reach, so it gets a HOME under tmp_path. What else the
-    child finds under HOME (~/Autotrainer, ~/.config) moves with it, so its
-    ~/Autotrainer is given the motor and move files the motor_config fixture
+    child finds under HOME (~/reachAQ, ~/.config) moves with it, so its
+    ~/reachAQ is given the motor and move files the motor_config fixture
     gives in-process tests.
     """
     home = tmp_path.joinpath("home")
-    autotrainer = home.joinpath("Autotrainer")
+    autotrainer = home.joinpath("reachAQ")
     autotrainer.mkdir(parents=True)
     for default in (MotorConfigurationFile.DEFAULT_LOCATION, CompoundMovements.DEFAULT_LOCATION):
         shutil.copy(repo_root_tests_subdir.joinpath(default.name), autotrainer)
@@ -149,7 +149,7 @@ class DataRootWriteRefused(RuntimeError):
 class DataRootGuard:
     """Refuse, and record, every write a test makes under the operator's folders.
 
-    They are the data folder and ~/.config/Colorado, which holds the
+    They are the data folder and ~/.config/reachAQ, which holds the
     preferences file and the running-status file.
 
     It is an audit hook (PEP 578), so it sees each file and folder this process
@@ -203,9 +203,9 @@ class DataRootGuard:
         "reachaq.app",
     )
     _APP_SCRIPTS = ("reachaq", "reachaq-headless")
-    # QSettings' file for organisation "Colorado", application "Auto Trainer"
+    # QSettings' file for organisation "reachAQ", application "reachAQ"
     # (user_preferences.py).
-    PREFERENCES_FILE_NAME = "Auto Trainer.conf"
+    PREFERENCES_FILE_NAME = "reachAQ.conf"
 
     def __init__(self, default_output_path: Path, preferences_folder: Path):
         # The default is under HOME, which each process resolves for itself.
@@ -534,7 +534,7 @@ def diamond_triangle_config(diamond_config_path) -> DiamondTriangleOffsetConfig:
 
 @pytest.fixture
 def trainer_config_dir(tmp_path):
-    cfg_dir = tmp_path.joinpath("Autotrainer")
+    cfg_dir = tmp_path.joinpath("reachAQ")
     cfg_dir.mkdir()
     return cfg_dir
 

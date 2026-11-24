@@ -121,7 +121,7 @@ their return to low, confirms the board refuses pulses on tone lines, counts
 50 short pulses at both ends under normal CAN traffic, checks that no event
 claims board time without the capability for it, and reconnects and reboots
 the board. It writes a JSON record under
-`~/Autotrainer/pellet_firmware_qualification/` and exits non-zero if any check
+`~/reachAQ/pellet_firmware_qualification/` and exits non-zero if any check
 fails. It drives STIM0-STIM3 and plays tones, but moves no motor and opens no
 shutter.
 

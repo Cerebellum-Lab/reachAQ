@@ -211,7 +211,7 @@ def _tree_hashes(folder: Path) -> dict:
 def test_a_legacy_library_entry_is_never_written_to(project_info, tmp_path):
     """The legacy path saves offsets it generates into a legacy folder; never into a library
     entry, which is immutable once in place."""
-    config = tmp_path / "Autotrainer"
+    config = tmp_path / "reachAQ"
     legacy = config / DEFAULT_3D_CALIB_DIR_NAME
     shutil.copytree(calib_dir, legacy)
     # No offsets anywhere, so the legacy path generates them.

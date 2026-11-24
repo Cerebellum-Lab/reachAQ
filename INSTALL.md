@@ -94,7 +94,7 @@ A software-only smoke test, with random cameras and no live inference:
 ```bash
 conda run --no-capture-output -n reachaq python -m reachaq.app \
   --random-cameras --no-live-inference \
-  -c "$HOME/Autotrainer/system_configuration.yaml"
+  -c "$HOME/reachAQ/system_configuration.yaml"
 ```
 
 Headless mode starts acquisition immediately, because it has no control that
@@ -103,7 +103,7 @@ could start an idle process later:
 ```bash
 conda run --no-capture-output -n reachaq reachaq-headless \
   --no-live-inference \
-  -c "$HOME/Autotrainer/system_configuration.yaml"
+  -c "$HOME/reachAQ/system_configuration.yaml"
 ```
 
 Omit `--no-live-inference` to honour the saved configuration, or use

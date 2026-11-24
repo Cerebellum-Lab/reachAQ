@@ -123,7 +123,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         self._pose_algorithm = pose_algorithm
         self._pose_parts: List[str] = []
         # Offline analysis uses calib_dir as given. Without one it finds each session's own
-        # calibration under calib_root (~/Autotrainer when None), the one its live 3D used.
+        # calibration under calib_root (~/reachAQ when None), the one its live 3D used.
         self._calib_dir = calib_dir
         self._calib_root = calib_root
 

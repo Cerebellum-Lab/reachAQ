@@ -17,12 +17,12 @@ the values that used to be built in.
 ## Settings directory
 
 There is nothing to do. `REACHAQ_CONFIG_DIR` is unset on the rig, so it keeps
-`~/Autotrainer`.
+`~/reachAQ`.
 
 ## SoftMouse publication
 
 The publication on the lab's Isilon share used to be built in. It is now the
-`[softmouse]` preferences, in `~/.config/Colorado/Auto Trainer.conf`:
+`[softmouse]` preferences, in `~/.config/reachAQ/reachAQ.conf`:
 
 ```ini
 [softmouse]

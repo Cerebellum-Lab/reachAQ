@@ -161,7 +161,7 @@ MOTOR_LOWER_LIMIT = 0.0
 #     settle = max(SETTLE_FLOOR_S, distance / v_max + v_max / a_max + SETTLE_MARGIN_S)
 #
 # with v_max (mm/s) and a_max (mm/s^2) the moving axis's, from the motor configurations
-# HardwareModel wrote at connect (~/Autotrainer/motor_config.yaml), and SETTLE_FALLBACK_S when
+# HardwareModel wrote at connect (~/reachAQ/motor_config.yaml), and SETTLE_FALLBACK_S when
 # the axis has none. The 2026-10-26 motor check on christielab10 showed last_position is the
 # firmware echoing the target about 0.1 s after the command, so the arrival check cannot see
 # the stage still moving; the ack came 0.20-0.30 s after the command for 2.7-5 mm moves, which

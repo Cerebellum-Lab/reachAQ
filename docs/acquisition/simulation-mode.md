@@ -26,7 +26,7 @@ them, run `git lfs checkout` first; the simulation refuses to start from pointer
 | `--sim-reset` | Regenerate the home's configuration, preferences, motor files and calibration. Without it they are generated on first run only, so edits made in the app persist. |
 
 `-c` and `--preferences-file` still work; given, they replace the home's files.
-A simulation never reads or writes `~/Autotrainer`, the operator's preferences
+A simulation never reads or writes `~/reachAQ`, the operator's preferences
 or the rig's instance lock. It takes its own lock, `<home>/app.lock`, so it can
 run beside the rig's instance, and a second simulation on the same home exits
 with status 3.

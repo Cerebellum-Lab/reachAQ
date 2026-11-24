@@ -32,7 +32,7 @@ from reachaq.core.multiproc import get_mp_ctx
 
 logger = get_verbose_logger(__name__)
 
-POSE_TRAINING_ROOT = os.path.join(os.path.expanduser("~"), "Autotrainer", "pose_training")
+POSE_TRAINING_ROOT = os.path.join(os.path.expanduser("~"), "reachAQ", "pose_training")
 DATASETS_ROOT = os.path.join(POSE_TRAINING_ROOT, "datasets")
 MODELS_ROOT = os.path.join(POSE_TRAINING_ROOT, "models")
 DEPLOY_HISTORY = "deploy_history.yaml"

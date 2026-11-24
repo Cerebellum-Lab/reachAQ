@@ -53,7 +53,7 @@ used, see
    The settle after each move is `distance / v_max + v_max / a_max + 0.25 s`, at
    least 0.25 s, with `v_max` and `a_max` the moving axis's maximum velocity and
    acceleration as the app wrote them to the motors at connect (from
-   `~/Autotrainer/motor_config.yaml`). An axis without a usable configuration
+   `~/reachAQ/motor_config.yaml`). An axis without a usable configuration
    settles 1.0 s, and so does waypoint 0 when the motor has reported no position
    before it. On christielab10 (120 mm/s and 600 mm/s² on every axis) the settles
    run from 0.45 s to 0.59 s, the longest for the 17 mm x move. Each settle is
@@ -196,7 +196,7 @@ only re-aiming the camera helps.
 
 1. **Grid.** 4 x 4 x 3 = 48 points evenly spaced inside the stage's configured
    travel: `min_pos` and `max_pos` under `pellet.x`, `pellet.y` and `pellet.z`
-   in `~/Autotrainer/motor_config.yaml` (0-35 mm on every axis on
+   in `~/reachAQ/motor_config.yaml` (0-35 mm on every axis on
    christielab10; see [Motor travel limits](../linux-install/runtime-configuration.md#motor-travel-limits)).
    The scout reads that file itself, so it has the travel before any connect.
    On an axis with no travel configured, the box is the one the hand-written
@@ -529,7 +529,7 @@ The capture creates a session folder in the normal data location. In it:
   install as the session's record, and when a fail is kept out.
 
 An install adds `.new` to the **calibration library** (next section) as a new
-entry, `<configuration location>/calibrations/<id>/` (default `~/Autotrainer`),
+entry, `<configuration location>/calibrations/<id>/` (default `~/reachAQ`),
 and makes it the active entry; the app loads it from there. If the active
 pointer cannot be written, the entry is removed again and the previous
 calibration stays active, so the install can be retried. A `.new` folder holding
@@ -544,7 +544,7 @@ library took over.
 ## Calibration library
 
 Every calibration is kept as an immutable entry under
-`<configuration location>/calibrations/` (`~/Autotrainer/calibrations/`):
+`<configuration location>/calibrations/` (`~/reachAQ/calibrations/`):
 
 ```
 calibrations/
@@ -778,7 +778,7 @@ preset is never substituted, because its pixels are not the frames' pixels.
 **Offline analysis** resolves the calibration a session used from its metadata,
 `hardware.configured.calibration3d`:
 
-- `id` finds the calibration under `--calib-root` (default `~/Autotrainer`),
+- `id` finds the calibration under `--calib-root` (default `~/reachAQ`),
   whether it is the active folder or a dated backup. With no id, the session's
   start time picks the calibration that was active then.
 - `preset` names the preset to read. With a format-3 calibration, a session
@@ -984,7 +984,7 @@ always to the legacy reader.
 
 **Before deploying.**
 
-1. Back up `~/Autotrainer/diamond_triangle_offset.yaml` (the default
+1. Back up `~/reachAQ/diamond_triangle_offset.yaml` (the default
    configuration folder; use your own if the configuration location was
    changed). A rollback may need it.
 2. Note the version now installed, so you know what to roll back to.
@@ -993,7 +993,7 @@ always to the legacy reader.
 
 1. Stop the app.
 2. Install v3.1.0.
-3. If `~/Autotrainer/diamond_triangle_offset.yaml` contains a `calibration_id:`
+3. If `~/reachAQ/diamond_triangle_offset.yaml` contains a `calibration_id:`
    line, put back the backup from before the deploy, or remove the file.
    Otherwise v3.1.0 fails to load its configuration.
 4. Start the app.
