@@ -276,3 +276,19 @@ def test_a_board_test_on_a_laser_without_a_board_line_is_refused(bench):
         model.run_stim_bench_test(make_profile(), 1, "hardware_stim3")
 
     assert hardware.pulses == []
+
+
+def test_a_waveform_that_never_ends_is_cancelled_before_the_result(bench, monkeypatch):
+    # Board acknowledged, but the STIM edge never reached the trigger
+    # terminal: the output stayed armed on it, and a later edge would fire it.
+    from tools.acquisition.model import app_model as app_model_module
+
+    model, laser, hardware, operation = bench
+    hardware.pulse_stim = lambda duration_us, stim_line=3: "token"
+    monkeypatch.setattr(app_model_module, "bench_wait_seconds", lambda *_args: 0.05)
+
+    result = model.run_stim_bench_test(model._laser_profiles["stim-a"], 1, "hardware_stim3")
+
+    assert result.arm_to_terminal_ms is None
+    assert operation.cancelled
+    assert laser.released == [operation]

@@ -7136,6 +7136,10 @@ class AppModel(ObservableObject):
                 self._hardware.wait_pending_command_acked(token, timeout=timeout)
             completed = finished.wait(bench_wait_seconds(profile, firing))
             elapsed_ms = (time.perf_counter() - started) * 1000.0
+            if not completed:
+                # Not ended: on the board route the output is still armed on
+                # its trigger terminal, and a later edge there would fire it.
+                self._cancel_protocol_laser(prepared)
         except Exception:
             # Never leave an armed analog output behind on a failed test.
             cancel = getattr(prepared, "cancel", None)
