@@ -1,7 +1,8 @@
 """The scout pass: choose a move list that every ticked camera sees well.
 
-Before a capture the stage visits a coarse grid inside the box the hand-written move list
-already travels (bounds_from_plan), and each ticked camera looks for the board at every
+Before a capture the stage visits a coarse grid inside the stage's configured travel, or on
+an axis without one the box the hand-written move list already travels (bounds_from_plan),
+and each ticked camera looks for the board at every
 grid point (scout_view). From what each camera saw, select_waypoints picks up to 36 points
 that join the cameras through shared views and give each one 12 or more views, spread over
 its image and over depth; order_path turns them into a path of one-axis moves. A camera
@@ -146,22 +147,36 @@ class ScoutResult:
     views: Dict[int, Dict[str, ScoutView]] = field(default_factory=dict)
 
 
-def bounds_from_plan(plan_targets: Sequence[Sequence[float]], configured: Optional[Bounds]) -> Bounds:
-    """The box the plan's commanded targets span, intersected with `configured` when given.
+#: Per axis x, y, z, the stage's configured travel (min_pos, max_pos) in mm; None on a side
+#: that is not configured (motor_config.yaml, HardwareModel refuses moves outside it).
+Travel = Sequence[Tuple[Optional[float], Optional[float]]]
 
-    Never wider than either. Raises ValueError when there are no targets or the two boxes
-    do not overlap on some axis.
+
+def bounds_from_plan(
+    plan_targets: Sequence[Sequence[float]], configured: Optional[Bounds], travel: Optional[Travel] = None
+) -> Bounds:
+    """The scout box: per axis the configured `travel`, a side without one the box the plan's
+    commanded targets span; then intersected with `configured` (scoutBounds) when given.
+
+    Never wider than the travel or `configured`. Without travel it is the plan's box, never
+    wider. Raises ValueError when there are no targets or the boxes do not overlap on some axis.
     """
     targets = np.asarray(plan_targets, float).reshape(-1, 3)
     if len(targets) == 0:
         raise ValueError("the scout bounds need the hand-written plan's targets; there are none")
     lo, hi = targets.min(axis=0), targets.max(axis=0)
+    for k, (minimum, maximum) in enumerate(travel or ()):
+        if minimum is not None:
+            lo[k] = minimum
+        if maximum is not None:
+            hi[k] = maximum
+    box = (tuple(float(v) for v in lo), tuple(float(v) for v in hi))
     if configured is not None:
         lo = np.maximum(lo, np.asarray(configured.lo, float))
         hi = np.minimum(hi, np.asarray(configured.hi, float))
     if np.any(lo > hi):
-        raise ValueError(f"the configured scout bounds {configured} have no overlap with the hand-written"
-                         f" list's box {tuple(targets.min(axis=0))} - {tuple(targets.max(axis=0))}")
+        raise ValueError(f"the configured scout bounds {configured} have no overlap with the box"
+                         f" {box[0]} - {box[1]} (the configured travel, else the hand-written list's)")
     return Bounds(tuple(float(v) for v in lo), tuple(float(v) for v in hi))
 
 

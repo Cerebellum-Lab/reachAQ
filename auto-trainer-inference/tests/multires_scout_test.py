@@ -110,6 +110,30 @@ def test_bounds_never_exceed_the_plan_box():
         bounds_from_plan([], None)
 
 
+def test_the_configured_travel_replaces_the_plan_box():
+    targets = [(0.0, 0.1, 19.8), (17.7, 25.1, 32.8), (5.0, 12.0, 25.0)]
+    travel = ((0.0, 35.0), (0.0, 35.0), (0.0, 35.0))
+    box = bounds_from_plan(targets, None, travel)
+    assert box == Bounds((0.0, 0.0, 0.0), (35.0, 35.0, 35.0))
+    # Every point of the grid lies inside the travel.
+    for point in scout_grid(box):
+        assert all(0.0 <= v <= 35.0 for v in point)
+
+    # scoutBounds still narrows it, and the travel caps a wider scoutBounds.
+    narrowed = bounds_from_plan(targets, Bounds((2.0, -5.0, 21.0), (40.0, 20.0, 50.0)), travel)
+    assert narrowed == Bounds((2.0, 0.0, 21.0), (35.0, 20.0, 35.0))
+    for point in scout_grid(narrowed):
+        assert all(0.0 <= v <= 35.0 for v in point)
+
+    # An axis without travel keeps the plan's side; a one-sided travel replaces only its side.
+    partial = bounds_from_plan(targets, None, ((None, None), (3.0, None), (None, 30.0)))
+    assert partial == Bounds((0.0, 3.0, 19.8), (17.7, 25.1, 30.0))
+    assert bounds_from_plan(targets, None, None) == bounds_from_plan(targets, None)
+
+    with pytest.raises(ValueError, match="no overlap"):
+        bounds_from_plan(targets, Bounds((40.0, 0.0, 0.0), (50.0, 30.0, 30.0)), travel)
+
+
 def test_grid_moves_one_axis_at_a_time():
     grid = scout_grid(BOX)
     assert len(grid) == 4 * 4 * 3 == len(set(grid))

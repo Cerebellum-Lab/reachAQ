@@ -17,6 +17,7 @@ from autotrainer.video import VideoRecordMode
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from autotrainer.device import MotorConfigurationFile
 from autotrainer.inference.multires_calibration.fit import BoardSpec, CaptureCamera
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
 from autotrainer.inference.multires_calibration.library import add_entry, entry_path, read_settings
@@ -41,6 +42,7 @@ from autotrainer.inference.multires_calibration.scout import (
     Bounds,
     ScoutAborted,
     ScoutResult,
+    Travel,
     bounds_from_plan,
     choose_move_list,
     configured_bounds,
@@ -147,9 +149,10 @@ default_params = dict(
 AXES = "xyz"
 
 # The stage's lower travel limit on every axis, in motor units (mm). HardwareModel._set_axis
-# clamps SET targets below it (hardware_model.py, "limited move to 0"); _move_axis sends MOVE
-# targets as they are, but the firmware stops there: in the 2026-10-26 motor check on
-# christielab10 a MOVE to x -1.722 left the stage at 0.000.
+# clamps SET targets below it (hardware_model.py, "limited move to 0"). Without a configured
+# travel, _move_axis sends MOVE targets as they are, and the firmware stops there: in the
+# 2026-10-26 motor check on christielab10 a MOVE to x -1.722 left the stage at 0.000. With
+# one (min_pos / max_pos in motor_config.yaml), a MOVE outside it is refused.
 MOTOR_LOWER_LIMIT = 0.0
 
 # The settle after each move's ack, before the arrival check and the dwell (ruling R52):
@@ -281,6 +284,22 @@ def wait_until_arrived(
         if now() - t_start >= timeout:
             return False, reported
         sleep(poll)
+
+
+def motor_travel() -> Travel:
+    """Per axis x, y, z, the stage's (min_pos, max_pos) travel in mm from the motor config
+    file HardwareModel loads at connect (MotorConfigurationFile.DEFAULT_LOCATION, parsed as
+    load_default_motor_config parses it), None on a side it does not set and on every side
+    without a file. Read from the file, so a scout before any connect has it too. A travel
+    the file gets wrong raises ValueError naming the axis, as the connect would."""
+    location = MotorConfigurationFile.DEFAULT_LOCATION.expanduser()
+    if not location.exists():
+        return ((None, None),) * 3
+    configurations = MotorConfigurationFile.from_file(location)
+    return tuple(
+        (config.minimum_position, config.maximum_position)
+        for _, config in (configurations.x_config, configurations.y_config, configurations.z_config)
+    )
 
 
 def axis_limits(motor_configurations) -> Dict[str, Optional[Tuple[float, float]]]:
@@ -732,12 +751,15 @@ def run_scout(
     counts: Sequence[int] = DEFAULT_COUNTS,
     board: BoardSpec = BoardSpec(),
     max_path: int = MAX_PATH,
+    travel: Optional[Travel] = None,
     **timing,
 ) -> ScoutResult:
     """A short capture over a coarse grid, then the move list every camera sees.
 
-    The grid is scout_grid inside bounds_from_plan(plan_targets, configured): the box the
-    hand-written plan's targets span, never wider. It is recorded as the capture is
+    The grid is scout_grid inside bounds_from_plan(plan_targets, configured, travel): per
+    axis the stage's configured travel (`travel`, motor_travel() when not given), else the
+    box the hand-written plan's targets span; never wider than scoutBounds (`configured`)
+    either, nor ever outside the travel. It is recorded as the capture is
     (_record_plan, TRIGGER), each point one axis from the one before and paused
     SCOUT_DWELL_S, with run_waypoints strict: a motor fault, a failed command or a point
     the motor does not confirm raises ScoutAborted at once, sending nothing more. The
@@ -750,7 +772,7 @@ def run_scout(
     if cam_params is None:
         cam_params = default_params
     dcs = app_model.behavior.algorithm.loaded_diamond_triangle_config
-    bounds = bounds_from_plan(plan_targets, configured)
+    bounds = bounds_from_plan(plan_targets, configured, motor_travel() if travel is None else travel)
     grid = scout_grid(bounds, counts)
     plan = scout_plan(grid, dcs)
     names = [camera.name for camera in cameras]
@@ -776,7 +798,8 @@ def run_scout(
 def saved_scout_list(root: Optional[Path], identities: Sequence[str], bounds: Bounds):
     """The scout list saved in the library `root` for these cameras, or None when there is
     none, it has fewer than MIN_SCOUT_POINTS points, a point lies outside `bounds` (today's
-    hand-written box: the DCS may have moved it) or two in a row differ in other than one axis."""
+    scout box: the configured travel, or the hand-written box the DCS may have moved) or two
+    in a row differ in other than one axis."""
     if root is None:
         return None
     points = load_move_list(Path(root, SCOUT_MOVE_LIST_FILE), identities)
@@ -787,7 +810,7 @@ def saved_scout_list(root: Optional[Path], identities: Sequence[str], bounds: Bo
                        len(points), MIN_SCOUT_POINTS)
         return None
     if not all(lo <= v <= hi for p in points for v, lo, hi in zip(p, bounds.lo, bounds.hi)):
-        logger.warning("the saved scout move list leaves the hand-written list's box %s - %s; scouting again",
+        logger.warning("the saved scout move list leaves today's scout box %s - %s; scouting again",
                        bounds.lo, bounds.hi)
         return None
     if not all(sum(a != b for a, b in zip(p, q)) == 1 for p, q in zip(points, points[1:])):
@@ -1058,7 +1081,8 @@ def make_3d_calib(
         identities = [camera.serial or camera.name for camera in capture_list]
         configured = None if root is None else configured_bounds(read_settings(root))
         targets = [motor for *_, motor in plan]
-        saved = None if rescout else saved_scout_list(root, identities, bounds_from_plan(targets, configured))
+        travel = motor_travel()
+        saved = None if rescout else saved_scout_list(root, identities, bounds_from_plan(targets, configured, travel))
         if rescout:
             logger.notice("Scouting again, as asked: any saved scout move list is not used this time")
         if saved is not None:
@@ -1067,7 +1091,7 @@ def make_3d_calib(
         else:
             scout = run_scout(app_model, cameras, targets, project=project, session_dir=Path(sess_path.location),
                               cams_before_cfg=cams_before_cfg, capture_list=capture_list, cam_params=cam_params,
-                              record_mode=record_mode, configured=configured)
+                              record_mode=record_mode, configured=configured, travel=travel)
             plan, used = choose_plan(SCOUT, diamond_triangle_cfg, scout)
             # The rule is checked on the list that will be used, too: the 60-waypoint cap can
             # leave a camera short, and shared views can join the cameras in separate groups.
