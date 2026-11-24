@@ -405,6 +405,15 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         logger.error(refusal)
         return True
 
+    def _axis_has_travel(self, coord_idx: int) -> bool:
+        """True when the loaded motor configurations limit axis `coord_idx` on either side."""
+        configurations = self._motor_configurations
+        if configurations is None:
+            return False
+        _, config = getattr(configurations, f"{'xyz'[coord_idx]}_config")
+        return (getattr(config, "minimum_position", None) is not None
+                or getattr(config, "maximum_position", None) is not None)
+
     def _set_axis(self, value: float, *, absolute: bool = True,
                   system_set_cmd: SystemCommandKind, coord_idx: int, sender: str="NA") -> Optional[UUID]:
         coord = "xyz"[coord_idx]
@@ -427,8 +436,14 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                          coord.upper(), value, absolute)
         if self._refuse_outside_travel(coord_idx, new_value):
             return None
-        res = self._send_with_token(self._device_conn, system_set_cmd,
-                                    SystemDataArgsKwargs(value, relative=not absolute))
+        if self._axis_has_travel(coord_idx):
+            # The board adds a relative SET to its own reported send position, which can
+            # differ from the requested one checked here (a SET it refused, a save_as_fixed
+            # step): send the checked absolute target, so it cannot add a different base.
+            data = SystemDataArgsKwargs(new_value, relative=False)
+        else:
+            data = SystemDataArgsKwargs(value, relative=not absolute)
+        res = self._send_with_token(self._device_conn, system_set_cmd, data)
         if res is not None:
             self._last_requested_set_coordinates = self._last_requested_set_coordinates.replace(**{coord: new_value})
             self._on_property_changed(f"set_{coord}", new_value, prev_value)
@@ -493,20 +508,40 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         sequence is then refused before its first step. Targets are taken from the last
         reported stepper position and the requested send position (the reported one before
         any SET); a step relative to a position the host does not know is not checked,
-        CanDevice and CanInterface send nothing for it."""
+        CanDevice and CanInterface send nothing for it.
+
+        The send-position steps are checked from the board's reported send position too, the
+        base CanDevice adds send_*_rel to and the one predefined send goes to, when it differs
+        from the requested one (a SET the board refused, a save_as_fixed step). A predefined
+        send is refused while the send position of an axis with travel is not known at all."""
         if self._motor_configurations is None:
             return False
+        reported_send = self._last_motor_send_coordinates
         send_position = Offset3DTuple(*(
             requested if math.isfinite(requested) else reported
-            for requested, reported in zip(self._last_requested_set_coordinates,
-                                           self._last_motor_send_coordinates)
+            for requested, reported in zip(self._last_requested_set_coordinates, reported_send)
         ))
+        steps = self._pellet_sequences[name].steps
         refused = False
-        for axis, target in sequence_stepper_targets(
-            self._pellet_sequences[name].steps, self._last_motor_coordinates, send_position
+        # Both walks yield the same steps in the same order; only the send-based values differ.
+        for (axis, target), (_, device_target) in zip(
+            sequence_stepper_targets(steps, self._last_motor_coordinates, send_position),
+            sequence_stepper_targets(steps, self._last_motor_coordinates, reported_send),
         ):
-            if math.isfinite(target) and self._refuse_outside_travel("xyz".index(axis), target):
+            coord_idx = "xyz".index(axis)
+            if math.isfinite(target) and self._refuse_outside_travel(coord_idx, target):
                 refused = True
+            if (math.isfinite(device_target) and device_target != target
+                    and self._refuse_outside_travel(coord_idx, device_target)):
+                refused = True
+        unknown = [
+            "XYZ"[idx] for idx, value in enumerate(send_position)
+            if not math.isfinite(value) and self._axis_has_travel(idx)
+        ]
+        if unknown and any(step.get("predefined") == "send" for step in steps):
+            logger.error("Pellet sequence %s refused: the send position of %s is not known",
+                         name, ", ".join(unknown))
+            return True
         if refused:
             logger.error("Pellet sequence %s refused: a step lies outside the configured travel", name)
         return refused
@@ -1617,6 +1652,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             commands_in_prog = list(self._pending_tokens.values())
         if popped is not None:
             self._refresh_cmd_in_progress(commands_in_prog)
+            self._forget_refused_set(popped[0])
         # Below ERROR: the device has logged it at ERROR already, and every
         # ERROR record lands in the footer, where AppModel shows the notice.
         logger.warning("Pellet board refused command %s (token=%s): %s",
@@ -1650,6 +1686,19 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             category="board_refusal",
             error_code=int(refusal.error),
         ))
+
+    def _forget_refused_set(self, command) -> None:
+        """A refused SET_X/Y/Z left the board's send position where it was: put the requested
+        one back to the reported one (nan when that is not known), so the travel checks of the
+        next relative SET and sequence use the base the board really has."""
+        coord_idx = {SystemCommandKind.SET_X: 0, SystemCommandKind.SET_Y: 1, SystemCommandKind.SET_Z: 2}.get(command)
+        if coord_idx is None:
+            return
+        coord = "xyz"[coord_idx]
+        prev = self._last_requested_set_coordinates[coord_idx]
+        reported = self._last_motor_send_coordinates[coord_idx]
+        self._last_requested_set_coordinates = self._last_requested_set_coordinates.replace(**{coord: reported})
+        self._on_property_changed(f"set_{coord}", reported, prev)
 
     def _set_axes_needing_home(self, axes: Tuple[str, ...]) -> None:
         prev, self._axes_needing_home = self._axes_needing_home, tuple(axes)

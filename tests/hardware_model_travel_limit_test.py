@@ -61,10 +61,62 @@ def test_a_set_below_zero_still_clamps_to_zero():
     hardware._send_with_token.assert_called_once_with(
         mock.sentinel.device, SystemCommandKind.SET_X, SystemDataArgsKwargs(0, relative=False))
     hardware._send_with_token.reset_mock()
-    # x is now 0; a relative SET below 0 clamps too
+    # x is now 0; a relative SET below 0 clamps too, and is sent as the absolute 0 it checked
     assert hardware.set_x(-9, absolute=False) is mock.sentinel.token
     hardware._send_with_token.assert_called_once_with(
-        mock.sentinel.device, SystemCommandKind.SET_X, SystemDataArgsKwargs(0, relative=True))
+        mock.sentinel.device, SystemCommandKind.SET_X, SystemDataArgsKwargs(0, relative=False))
+
+
+def test_with_travel_a_relative_set_is_sent_as_the_absolute_target_it_checked():
+    # The board adds a relative SET to its own reported send position (y 34 here), not to the
+    # requested one the host checked (y 20, a SET the board refused): 34 + 5 would leave the
+    # 35 mm travel. So the checked absolute target, 25, is sent.
+    hardware = _hardware(TRAVEL, set_at=(10.0, 20.0, 10.0))
+    hardware._last_motor_send_coordinates = Offset3DTuple(10.0, 34.0, 10.0)
+    assert hardware.set_y(5, absolute=False) is mock.sentinel.token
+    hardware._send_with_token.assert_called_once_with(
+        mock.sentinel.device, SystemCommandKind.SET_Y, SystemDataArgsKwargs(25.0, relative=False))
+    assert hardware._last_requested_set_coordinates.y == 25.0
+
+
+def test_an_axis_without_travel_still_sends_a_relative_set_relative():
+    hardware = _hardware({"x": {"min_pos": 0, "max_pos": 35}}, set_at=(10.0, 20.0, 10.0))
+    assert hardware.set_y(5, absolute=False) is mock.sentinel.token
+    hardware._send_with_token.assert_called_once_with(
+        mock.sentinel.device, SystemCommandKind.SET_Y, SystemDataArgsKwargs(5, relative=True))
+
+
+def test_a_send_relative_step_is_checked_from_the_reported_send_position_too(caplog):
+    # CanDevice adds send_*_rel to the board's reported send position, which can differ from
+    # the requested one: both bases are checked.
+    hardware = _with_sequence(_hardware(TRAVEL, set_at=(10.0, 20.0, 10.0)), "move_retract", [{"send_y_rel": 2}])
+    hardware._last_motor_send_coordinates = Offset3DTuple(10.0, 34.0, 10.0)
+    with caplog.at_level(logging.ERROR):
+        assert hardware.send_retract() is None
+    hardware._send_with_token.assert_not_called()
+    assert "Axis-Y: move to 36.000 refused" in caplog.text
+    assert "Axis-Y: move to 22.000" not in caplog.text
+
+
+def test_predefined_send_reaching_out_of_range_on_the_reported_send_position_is_refused(caplog):
+    hardware = _with_sequence(_hardware(TRAVEL, set_at=(10.0, 20.0, 10.0)), "send_pellet", [{"predefined": "send"}])
+    hardware._last_motor_send_coordinates = Offset3DTuple(10.0, 35.5, 10.0)
+    with caplog.at_level(logging.ERROR):
+        assert hardware.send_pellet() is None
+    assert "Axis-Y: move to 35.500 refused" in caplog.text
+
+
+def test_predefined_send_to_an_unknown_send_position_is_refused_with_travel(caplog):
+    # Nothing SET since the connect and no send position reported: the board would go to a
+    # saved position nobody has checked.
+    hardware = _with_sequence(_hardware(TRAVEL, set_at=(math.nan,) * 3), "send_pellet", [{"predefined": "send"}])
+    with caplog.at_level(logging.ERROR):
+        assert hardware.send_pellet() is None
+    hardware._send_with_token.assert_not_called()
+    assert "Pellet sequence send_pellet refused: the send position of X, Y, Z is not known" in caplog.text
+    # Without travel it is sent as before.
+    hardware = _with_sequence(_hardware(None, set_at=(math.nan,) * 3), "send_pellet", [{"predefined": "send"}])
+    assert hardware.send_pellet() is mock.sentinel.token
 
 
 def test_a_clamped_set_still_below_a_positive_min_is_refused(caplog):

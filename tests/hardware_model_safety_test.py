@@ -418,6 +418,27 @@ def test_a_refusal_of_a_token_this_model_did_not_send_still_marks_needs_home(har
     assert reported[0].command is SystemCommandKind.SEND_HOME
 
 
+def test_a_refused_set_rolls_the_requested_axis_back_to_the_reported_send_position(hardware_model):
+    """The board kept its own send position: the travel checks must use it, not the refused SET."""
+    from autotrainer.core import Offset3DTuple
+
+    hardware_model._last_requested_set_coordinates = Offset3DTuple(10.0, 20.0, 12.0)
+    hardware_model._last_motor_send_coordinates = Offset3DTuple(10.0, 34.0, 12.0)
+    token = _pending(hardware_model, SystemCommandKind.SET_Y)
+
+    hardware_model._command_refused(token, refusal=_refusal(
+        token, -16, command=SystemCommandKind.SET_Y,
+        command_class=RefusedCommandClass.STEPPER_MOVE, motors=(Motor.PELLET_Y_MOTOR,),
+    ))
+
+    assert tuple(hardware_model._last_requested_set_coordinates) == (10.0, 34.0, 12.0)
+    # Any other refused command leaves the requested position alone.
+    other = _pending(hardware_model, SystemCommandKind.SEND_PELLET)
+    hardware_model._last_motor_send_coordinates = Offset3DTuple(1.0, 2.0, 3.0)
+    hardware_model._command_refused(other, refusal=_refusal(other))
+    assert tuple(hardware_model._last_requested_set_coordinates) == (10.0, 34.0, 12.0)
+
+
 class _ConnectionWhoseHomeIsRefused:
     """Stands in for DeviceConnection: version and configuration succeed, the home is refused.
 
