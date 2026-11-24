@@ -129,6 +129,15 @@ def main():
 
     args = parser.parse_args()
 
+    # Before the lock and logging, which would make a fresh ~/reachAQ beside the
+    # operator's unmigrated ~/Autotrainer. A simulation keeps its own home.
+    if not args.simulate:
+        from reachaq.core.settings_migration import UNMIGRATED_SETTINGS_EXIT, unmigrated_settings_message
+        refusal = unmigrated_settings_message()
+        if refusal:
+            print(refusal, file=sys.stderr)
+            return UNMIGRATED_SETTINGS_EXIT
+
     # After argument parsing, so -h still answers while an instance runs, and
     # before logging, so a refused start leaves no log behind.
     from reachaq.app.instance_lock import (

@@ -91,7 +91,7 @@ def _clean_env(**extra):
     return env
 
 
-def test_the_settings_directory_is_still_autotrainer_by_default():
+def test_the_settings_directory_is_reachaq_by_default():
     paths = _default_paths(_clean_env())
 
     assert paths == {
