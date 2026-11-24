@@ -97,6 +97,7 @@ class EmulationInterface(DeviceInterface):
         }
 
         self._messages = _SharedList(lock=self._thread_lock)
+        self.estop_frames = []
     def _set_pellet_address(self, addr):
         pass
 
@@ -329,6 +330,12 @@ class EmulationInterface(DeviceInterface):
                 add(self._configs[Motor.PELLET_Z_MOTOR])
 
             self._messages.append(Acknowledge(uuid=EmulationInterface.next_uuid()))
+        return self._is_open
+
+    def estop(self, asserted: bool = True) -> bool:
+        # Unacknowledged, as on the board. Recorded so tests can see the order of frames.
+        self.estop_frames.append(bool(asserted))
+        logger.info("ESTOP %s", "asserted" if asserted else "released")
         return self._is_open
 
     def send_heartbeat(self) -> bool:

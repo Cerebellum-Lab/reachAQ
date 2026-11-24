@@ -266,16 +266,17 @@ def test_a_refusal_clears_the_ack_timeout_engaged_flag_like_an_ack(board):
 
 
 def test_a_timeout_still_resends_and_a_refusal_never_does(board):
+    # A SET: a stepper frame whose ack is lost is stopped instead (can_device_estop_test).
     board.device.default_command_ack_timeout_duration = 0.2
     refused_calls = board.answer("move_motor_x", -5)
-    lost_calls = board.answer("move_motor_y", _LOST)
+    lost_calls = board.answer("set_motor_y", _LOST)
 
     refused = board.send(SystemCommandKind.MOVE_X, 1.0, token="refused")
     board.refusal_of(refused)
     time.sleep(0.5)  # past the 0.2 s timeout: a refusal is never re-sent
     assert len(refused_calls) == 1
 
-    lost = board.send(SystemCommandKind.MOVE_Y, 1.0, token="lost")
+    lost = board.send(SystemCommandKind.SET_Y, 1.0, token="lost")
     assert board.wait_for(SystemStatusMessageKind.ACKNOWLEDGE, lost) is not None
     assert len(lost_calls) == 2, "a lost ack is still re-sent once it times out"
 
@@ -294,13 +295,13 @@ def test_ebusy_on_a_first_send_stepper_command_marks_the_axis_needs_home(board):
 def test_ebusy_on_a_resent_stepper_command_is_not_reported_as_needs_home(board):
     """The resend of a move still running is refused at once with -EBUSY.
 
-    That is "still moving or unknown", not "needs homing": the axis is
-    finishing a normal move.
+    That is "still moving or unknown", not "needs homing". A MOVE is no longer
+    re-sent (its lost ack stops the stage), so a SET, which still is, stands in.
     """
     board.device.default_command_ack_timeout_duration = 0.3
-    board.answer("move_motor_x", _LOST, -16)
+    board.answer("set_motor_x", _LOST, -16)
 
-    refusal = board.refusal_of(board.send(SystemCommandKind.MOVE_X, 1.0))
+    refusal = board.refusal_of(board.send(SystemCommandKind.SET_X, 1.0))
 
     assert refusal.resent is True
     assert refusal.needs_home == ()

@@ -102,6 +102,14 @@ class CommandRefusal:
     #: The refused frame was a resend after an ACK timeout.
     resent: bool = False
     perf_c: float = math.nan
+    #: Set when the host ended the command with an ESTOP, not the board with
+    #: an error: why the stage was stopped. The error is then -EPERM, the
+    #: code the latched board answers every move with until it is released.
+    estop_reason: str = ""
+
+    @property
+    def stopped_by_estop(self) -> bool:
+        return bool(self.estop_reason)
 
     @property
     def error_name(self) -> str:
@@ -121,6 +129,17 @@ class CommandRefusal:
             and self.error == EBUSY
             and self.command_class in _STEPPER_CLASSES
         )
+
+    @property
+    def motion_may_continue(self) -> bool:
+        """-EBUSY on a stepper command: an axis may still be moving.
+
+        The board answers -EBUSY while an axis is in motion, and an axis whose
+        step timer free-runs stays in motion for ever (pellet firmware 2.3.1,
+        limitation 4). The host cannot tell that from "needs homing", which
+        is answered with the same code, so it stops the stage either way.
+        """
+        return self.error == EBUSY and self.command_class in _STEPPER_CLASSES
 
     @property
     def needs_home(self) -> Tuple[Motor, ...]:
@@ -145,6 +164,8 @@ class CommandRefusal:
     @property
     def message(self) -> str:
         """What the operator is told: what happened, and what to do."""
+        if self.stopped_by_estop:
+            return f"Pellet stage stopped: {self.estop_reason}. Home before continuing. ({self._what()})"
         return f"{self._advice()} ({self._what()}: {self.error_name} {int(self.error)})"
 
     def _what(self) -> str:
