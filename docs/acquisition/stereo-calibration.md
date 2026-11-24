@@ -206,7 +206,12 @@ only re-aiming the camera helps.
    from the list. An optional `scoutBounds` entry in the library's
    `settings.yaml`, `{lo: [x, y, z], hi: [x, y, z]}` in motor mm, can narrow the
    box; any other form is ignored with a warning. The grid never leaves the
-   travel. A saved scout list with a point outside today's box is scouted again.
+   travel. A low edge below 1 mm is then raised to 1 mm (`SCOUT_HOME_MARGIN_MM`):
+   on 2026-11-23 christielab10 was commanded y 0.133 mm from home, stayed at
+   0.000, and the scout stopped at its first point. A move onto the home stop
+   itself is made, so an axis whose whole box is below 1 mm is scouted at 0. The
+   upper edges keep no margin. A saved scout list with a point outside today's
+   box is scouted again.
    A hand-written waypoint outside the travel is refused like any other move:
    the capture stops with "the move of x to ... was not queued" and the
    `Axis-X: move to ... refused` line in the log.

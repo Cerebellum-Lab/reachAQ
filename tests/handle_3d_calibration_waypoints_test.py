@@ -1217,15 +1217,17 @@ def test_run_scout_searches_the_configured_travel_without_a_connect(tmp_path, mo
     targets = [(10.0, 20.0, 30.0), (14.0, 26.0, 34.0)]
     h3d.run_scout(app_model, cameras, targets, **_scout_kwargs(app_model, tmp_path, clock, cameras))
 
-    assert seen["targets"] == scout_grid(Bounds((0.0, 0.0, 0.0), (35.0, 35.0, 35.0)), counts=(2, 2, 2))
+    # The low edges keep SCOUT_HOME_MARGIN_MM (1 mm) clear of the home stop.
+    assert seen["targets"] == scout_grid(Bounds((1.0, 1.0, 1.0), (35.0, 35.0, 35.0)), counts=(2, 2, 2))
     commanded = app_model.hardware.commands
     assert commanded, "the scout moved the stage"
     for axis, value in commanded:
         assert 0.0 <= value <= 35.0, (axis, value)
-    # It reaches both ends of the travel on every axis.
+        assert not 0.0 < value < 1.0, (axis, value)
+    # It reaches the margin and the top of the travel on every axis.
     for axis in "xyz":
         values = {value for a, value in commanded if a == axis}
-        assert min(values) == 0.0 and max(values) == 35.0
+        assert min(values) == 1.0 and max(values) == 35.0
 
     # scoutBounds still narrows the travel.
     seen.clear()
@@ -1234,7 +1236,7 @@ def test_run_scout_searches_the_configured_travel_without_a_connect(tmp_path, mo
         (tmp_path / "session" / f"{name}_recording_timestamps.txt").write_text("1000.0,0\n")
     h3d.run_scout(app_model, cameras, targets, configured=Bounds((5.0, 0.0, 31.0), (99, 20.0, 99)),
                   **_scout_kwargs(app_model, tmp_path, clock, cameras))
-    assert seen["targets"] == scout_grid(Bounds((5.0, 0.0, 31.0), (35.0, 20.0, 35.0)), counts=(2, 2, 2))
+    assert seen["targets"] == scout_grid(Bounds((5.0, 1.0, 31.0), (35.0, 20.0, 35.0)), counts=(2, 2, 2))
 
 
 def test_an_aborted_scout_stops_the_cameras_and_moves_no_video(tmp_path, monkeypatch):
