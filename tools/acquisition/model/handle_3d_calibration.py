@@ -6,6 +6,7 @@ import dataclasses
 from datetime import datetime
 from typing import Callable, Dict, Any, Optional, List, Mapping, Sequence, Tuple
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import yaml
@@ -17,7 +18,7 @@ from autotrainer.video import VideoRecordMode
 from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
-from autotrainer.device import MotorConfigurationFile
+from autotrainer.device import MotorConfigurationFile, stepper_travel_refusal
 from autotrainer.inference.multires_calibration.fit import BoardSpec, CaptureCamera
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
 from autotrainer.inference.multires_calibration.library import add_entry, entry_path, read_settings
@@ -300,6 +301,27 @@ def motor_travel() -> Travel:
         (config.minimum_position, config.maximum_position)
         for _, config in (configurations.x_config, configurations.y_config, configurations.z_config)
     )
+
+
+def check_plan_in_travel(
+    plan: Sequence[Tuple[str, float, Tuple[float, float, float]]], travel: Travel, which: str
+) -> None:
+    """Raise RuntimeError when a motor position of `plan` lies outside `travel` (motor_travel),
+    checked as HardwareModel checks a move. Called before anything is homed or recorded, so a
+    list the stage cannot follow is refused up front, not at its first bad waypoint mid-capture."""
+    outside = []
+    for k, (_, _, motor) in enumerate(plan):
+        for axis, value, (minimum, maximum) in zip(AXES, motor, travel):
+            limits = SimpleNamespace(minimum_position=minimum, maximum_position=maximum)
+            if stepper_travel_refusal(axis, value, limits) is not None:
+                low = -math.inf if minimum is None else minimum
+                high = math.inf if maximum is None else maximum
+                outside.append(f"waypoint {k} {axis} {value:.3f} mm (travel {low:g}-{high:g} mm)")
+    if outside:
+        more = f" and {len(outside) - 3} more" if len(outside) > 3 else ""
+        name = "hand-written" if which == HANDWRITTEN else which
+        raise RuntimeError(f"the {name} move list leaves the configured travel: "
+                           f"{'; '.join(outside[:3])}{more}. Nothing was moved")
 
 
 def axis_limits(motor_configurations) -> Dict[str, Optional[Tuple[float, float]]]:
@@ -1054,6 +1076,10 @@ def make_3d_calib(
     if len(set(names)) != len(names):
         raise ValueError(f"a camera is given twice: {', '.join(names)}")
     plan = plan_waypoints(start, moves, diamond_triangle_cfg)
+    # The stage travel (motor_config.yaml): a list that leaves it is refused before anything moves.
+    travel = motor_travel()
+    if move_list != SCOUT:
+        check_plan_in_travel(plan, travel, HANDWRITTEN)
     # put primary first:
     cameras = [camera for camera in given if camera.is_primary] + [camera for camera in given if not camera.is_primary]
     # Read before prepare() replaces the camera configurations with the capture's own.
@@ -1081,18 +1107,19 @@ def make_3d_calib(
         identities = [camera.serial or camera.name for camera in capture_list]
         configured = None if root is None else configured_bounds(read_settings(root))
         targets = [motor for *_, motor in plan]
-        travel = motor_travel()
         saved = None if rescout else saved_scout_list(root, identities, bounds_from_plan(targets, configured, travel))
         if rescout:
             logger.notice("Scouting again, as asked: any saved scout move list is not used this time")
         if saved is not None:
             logger.notice("Using the scout move list saved for these cameras: %d waypoints", len(saved))
             plan = scout_plan(saved, diamond_triangle_cfg)
+            check_plan_in_travel(plan, travel, SCOUT)
         else:
             scout = run_scout(app_model, cameras, targets, project=project, session_dir=Path(sess_path.location),
                               cams_before_cfg=cams_before_cfg, capture_list=capture_list, cam_params=cam_params,
                               record_mode=record_mode, configured=configured, travel=travel)
             plan, used = choose_plan(SCOUT, diamond_triangle_cfg, scout)
+            check_plan_in_travel(plan, travel, used)  # a hand-written fallback is first checked here
             # The rule is checked on the list that will be used, too: the 60-waypoint cap can
             # leave a camera short, and shared views can join the cameras in separate groups.
             shortfalls = {} if used != SCOUT else selection_shortfalls(

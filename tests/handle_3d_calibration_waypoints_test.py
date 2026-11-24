@@ -1253,9 +1253,9 @@ def test_an_aborted_scout_stops_the_cameras_and_moves_no_video(tmp_path, monkeyp
     assert not (tmp_path / "session" / "scout").exists()
 
 
-def _scout_result(n_selected, diagnosis=None, *, per_camera=None, groups=None):
+def _scout_result(n_selected, diagnosis=None, *, per_camera=None, groups=None, z=60.0):
     # inside the hand-written list's box on _dcs(): motor x 0.6-20, y 5-30, z 52-65
-    points = [(1.0 + i, 20.0, 60.0) for i in range(n_selected)]
+    points = [(1.0 + i, 20.0, z) for i in range(n_selected)]
     per_camera = {"left": n_selected, "right": n_selected} if per_camera is None else per_camera
     selection = Selection(points=points, per_camera=per_camera, connected=groups is None or len(groups) == 1,
                           groups=groups)
@@ -1388,7 +1388,8 @@ def test_the_saved_list_is_checked_against_the_configured_travel(tmp_path, monke
     # The saved list lies outside the hand-written box (motor z 52-65 on _dcs()) but inside
     # the configured travel: it is used, and the scout is passed the travel.
     _no_motor_config_file.write_text(yaml.safe_dump({"pellet": {"z": {"min_pos": 0, "max_pos": 35}}}))
-    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(14)])
+    # The scout searches the travel, so the list it chooses lies inside it (z 30).
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(14, z=30.0)])
     points = [(1.0 + i, 20.0, 30.0) for i in range(14)]
     save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
                    datetime(2026, 11, 20))
@@ -1506,3 +1507,29 @@ def test_a_saved_list_with_fewer_than_12_points_is_not_used(tmp_path, monkeypatc
                    [(1.0 + i, 20.0, 60.0) for i in range(11)], ["left", "right"], datetime(2026, 11, 20))
     run()
     assert seen["scouts"] == 1
+
+
+def test_a_hand_written_list_outside_the_travel_is_refused_before_anything_moves(tmp_path, _no_motor_config_file):
+    # _dcs() puts the hand-written list's motor z at 52-65 mm, past a 0-35 mm z travel.
+    _no_motor_config_file.write_text(yaml.safe_dump({"pellet": {"z": {"min_pos": 0, "max_pos": 35}}}))
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    with pytest.raises(RuntimeError, match=r"hand-written move list leaves the configured travel: .*z"):
+        make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert calls == []  # no camera prepared, no home, no move
+
+
+def test_a_scout_falling_back_to_a_hand_written_list_outside_the_travel_is_refused(
+        tmp_path, monkeypatch, _no_motor_config_file):
+    _no_motor_config_file.write_text(yaml.safe_dump({"pellet": {"z": {"min_pos": 0, "max_pos": 35}}}))
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(11)])
+    with pytest.raises(RuntimeError, match="hand-written move list leaves the configured travel"):
+        run()
+    assert seen["scouts"] == 1 and seen["plans"] == []
+
+
+def test_a_hand_written_list_inside_the_travel_is_captured(tmp_path, monkeypatch, _no_motor_config_file):
+    _no_motor_config_file.write_text(yaml.safe_dump({"pellet": {"z": {"min_pos": 0, "max_pos": 70}}}))
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(11)])
+    run()
+    assert seen["plans"] == [plan_waypoints(start, moves, _dcs())]
