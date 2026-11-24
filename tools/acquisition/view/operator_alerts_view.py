@@ -10,6 +10,11 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as _dt
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import threading
 from pathlib import Path
 from typing import Optional
@@ -18,6 +23,7 @@ from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -39,7 +45,6 @@ from PySide6.QtWidgets import (
 from autotrainer.core.logging import get_verbose_logger
 from tools.acquisition.model.diagnostic_bundle import (
     BundleSources,
-    build_diagnostic_bundle,
     default_bundle_name,
     default_credential_files,
 )
@@ -51,6 +56,8 @@ from tools.acquisition.model.operator_alerts import (
 )
 
 logger = get_verbose_logger(__name__)
+
+EXPORT_TIMEOUT_S = 600
 
 #: background, border/stripe, text
 SEVERITY_COLORS = {
@@ -82,6 +89,8 @@ class _Relay(QObject):
     changed = Signal()
     dialog_requested = Signal(object)
     export_finished = Signal(object, str)
+    #: A function to run on the GUI thread.
+    run = Signal(object)
 
 
 class _ElidedLabel(QLabel):
@@ -162,7 +171,7 @@ class OperatorAlertBanner(QFrame):
         )
         repeat = f" (×{alert.count})" if alert.count > 1 else ""
         self.title_label.setText(f"{SEVERITY_LABELS[alert.severity]}: {alert.title}{repeat}")
-        message = " ".join(alert.message.split())
+        message = " ".join(f"{alert.message} {alert.note}".split())
         self.message_label.set_full_text(message)
         self.remedy_label.set_full_text(f"What to do: {alert.remedy}" if alert.remedy else "")
         self.remedy_label.setVisible(bool(alert.remedy))
@@ -224,7 +233,7 @@ class OperatorAlertLogDialog(QDialog):
                 _time_text(alert.raised_wall_time),
                 SEVERITY_LABELS[alert.severity],
                 alert.title,
-                alert.message,
+                f"{alert.message}\n{alert.note}" if alert.note else alert.message,
                 alert.remedy,
                 state,
             )
@@ -242,8 +251,9 @@ class OperatorAlertsUi:
         self._app_model = app_model
         self._preferences = preferences
         self.center = OperatorAlertCenter()
-        self.bridge = OperatorAlertBridge(app_model, self.center)
         self._relay = _Relay()
+        self._relay.run.connect(lambda function: function(), Qt.ConnectionType.QueuedConnection)
+        self.bridge = OperatorAlertBridge(app_model, self.center, dispatch=self._relay.run.emit)
         self._relay.changed.connect(self._refresh, Qt.ConnectionType.QueuedConnection)
         self._relay.dialog_requested.connect(self._show_dialog, Qt.ConnectionType.QueuedConnection)
         self._relay.export_finished.connect(self._on_export_finished, Qt.ConnectionType.QueuedConnection)
@@ -275,6 +285,9 @@ class OperatorAlertsUi:
 
         self.bridge.connect()
         self._refresh()
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.close)
 
     # -- banner and log --------------------------------------------------
 
@@ -300,6 +313,9 @@ class OperatorAlertsUi:
         box = self._alert_box = QMessageBox(self.window)
         box.setIcon(QMessageBox.Icon.Critical)
         box.setWindowTitle(alert.title)
+        # Plain text: a message can hold a traceback line such as
+        # "<class '...'>", which rich text would swallow.
+        box.setTextFormat(Qt.TextFormat.PlainText)
         box.setText(alert.title)
         informative = alert.message
         if alert.remedy:
@@ -357,6 +373,37 @@ class OperatorAlertsUi:
             credential_files=default_credential_files(),
         )
 
+    def _recording_active(self) -> bool:
+        status = getattr(self._app_model, "session_recording_status", None)
+        return str(getattr(status, "value", status)) in ("arming", "recording", "stopping")
+
+    def export_command(self, path: Path, sources: BundleSources, work_dir: Path):
+        """The command that builds the bundle in its own process: redacting tens of
+        megabytes of logs here would hold this interpreter, and with it the
+        GUI, NI, CAN and watchdog threads, for seconds."""
+        snapshot = work_dir / "app_snapshot.json"
+        snapshot.write_text(json.dumps({
+            "subsystem_statuses": sources.subsystem_snapshot,
+            "alerts": sources.alerts,
+            "app_state": sources.app_state,
+        }, default=str), encoding="utf-8")
+        result_file = work_dir / "result.json"
+        command = [sys.executable, "-m", "tools.acquisition.model.diagnostic_bundle",
+                   "-o", str(path), "--app-snapshot", str(snapshot), "--result-file", str(result_file)]
+        if sources.configuration_path is not None:
+            command += ["-c", str(sources.configuration_path)]
+        if sources.preferences_path is not None:
+            command += ["--preferences-file", str(sources.preferences_path)]
+        for root in sources.output_roots:
+            command += ["--data-dir", str(root)]
+        for root in sources.log_dirs:
+            command += ["--log-dir", str(root)]
+        if self._recording_active():
+            command.append("--no-gpu-query")
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = os.pathsep.join(entry for entry in sys.path if entry)
+        return command, environment, result_file
+
     def export_bundle(self) -> None:
         if self._export_thread is not None and self._export_thread.is_alive():
             self.window.statusBar().showMessage("A diagnostic bundle is already being written", 5000)
@@ -374,13 +421,24 @@ class OperatorAlertsUi:
 
         def run(path=Path(path), sources=sources):
             try:
-                result = build_diagnostic_bundle(path, sources)
+                with tempfile.TemporaryDirectory(prefix="reachaq-bundle-") as work_dir:
+                    command, environment, result_file = self.export_command(
+                        path, sources, Path(work_dir))
+                    completed = subprocess.run(
+                        command, env=environment, capture_output=True, text=True,
+                        timeout=EXPORT_TIMEOUT_S, check=False)
+                    result = (json.loads(result_file.read_text(encoding="utf-8"))
+                              if result_file.is_file() else {})
+                if completed.returncode != 0 or "error" in result or not result:
+                    error = result.get("error") or completed.stderr.strip()[-400:] or (
+                        f"exit {completed.returncode}")
+                    raise RuntimeError(error)
             except Exception as error:
-                logger.warning("Diagnostic bundle failed: %s", error, exc_info=True)
+                logger.warning("Diagnostic bundle failed: %s", error)
                 self._relay.export_finished.emit(None, str(error) or type(error).__name__)
             else:
                 logger.info("Diagnostic bundle written to %s (%s bytes, %s redactions)",
-                            result.path, result.size_bytes, result.redactions)
+                            result["path"], result["size_bytes"], result["redactions"])
                 self._relay.export_finished.emit(result, "")
 
         self._export_thread = threading.Thread(target=run, name="diagnostic-bundle", daemon=True)
@@ -392,17 +450,21 @@ class OperatorAlertsUi:
         if result is None:
             QMessageBox.warning(self.window, "Diagnostic bundle not written", error)
             return
-        skipped = f"\n\n{len(result.skipped)} item(s) were skipped; see manifest.json." if result.skipped else ""
+        skipped = (f"\n\n{result['skipped']} item(s) were skipped; see manifest.json."
+                   if result.get("skipped") else "")
         QMessageBox.information(
             self.window,
             "Diagnostic bundle written",
-            f"{result.path}\n\n{result.size_bytes / 1e6:.1f} MB, {len(result.members)} files, "
-            f"{result.redactions} value(s) redacted.{skipped}\n\n"
+            f"{result['path']}\n\n{result['size_bytes'] / 1e6:.1f} MB, {result['members']} files, "
+            f"{result['redactions']} value(s) redacted.{skipped}\n\n"
             "Passwords, tokens and keyring entries are not included.",
         )
 
     def close(self) -> None:
-        self.bridge.disconnect()
+        try:
+            self.bridge.disconnect()
+        except Exception:
+            logger.exception("Operator alerts: disconnect failed")
 
 
 def install_operator_alerts(window: QMainWindow, app_model, preferences) -> OperatorAlertsUi:

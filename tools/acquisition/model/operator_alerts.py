@@ -24,6 +24,8 @@ import enum
 import itertools
 import threading
 import time
+
+from autotrainer.core.logging import get_verbose_logger
 from typing import Callable, Deque, Dict, List, Mapping, Optional, Tuple
 
 from tools.acquisition.model.subsystem_status import (
@@ -31,6 +33,23 @@ from tools.acquisition.model.subsystem_status import (
     SubsystemState,
     SubsystemStatus,
 )
+
+
+logger = get_verbose_logger(__name__)
+
+
+def _guarded(handler):
+    """Model events do not catch handler exceptions, so one raised here would
+    land in the thread that reported the failure and skip later handlers."""
+
+    def run(self, *args):
+        try:
+            handler(self, *args)
+        except Exception:
+            logger.exception("Operator alert handler %s failed", handler.__name__)
+
+    run.__name__ = handler.__name__
+    return run
 
 
 class AlertSeverity(enum.IntEnum):
@@ -46,6 +65,9 @@ class OperatorAlert:
     title: str
     message: str
     remedy: str = ""
+    #: Context that changes without the condition changing (whether a
+    #: recording is running); shown, but not news on its own.
+    note: str = ""
     #: Data were lost or a recording ended early: the operator gets a dialog.
     needs_dialog: bool = False
     #: A condition clears itself; an event waits for Dismiss.
@@ -124,7 +146,10 @@ _DATA_AT_RISK = (
 #: line only: most are refusals of something the operator just tried.
 ERROR_RULES: Mapping[str, _ErrorRule] = {
     # The recording ended, or data were not written.
-    "Recording failed": _ErrorRule(AlertSeverity.CRITICAL, _DATA_AT_RISK, True),
+    # A start that failed: nothing was recorded, and the operator is at the rig.
+    "Recording failed": _ErrorRule(
+        AlertSeverity.ERROR,
+        f"No data were recorded. Check the primary camera, then {REFRESH} and record again."),
     "Camera writer close timeout": _ErrorRule(AlertSeverity.CRITICAL, _DATA_AT_RISK, True),
     "Pose writer close timeout": _ErrorRule(AlertSeverity.CRITICAL, _DATA_AT_RISK, True),
     "Camera recording incomplete": _ErrorRule(AlertSeverity.CRITICAL, _DATA_AT_RISK, True),
@@ -133,8 +158,8 @@ ERROR_RULES: Mapping[str, _ErrorRule] = {
     "Session stream save failed": _ErrorRule(AlertSeverity.CRITICAL, _DATA_AT_RISK, True),
     "Abort cleanup failed": _ErrorRule(AlertSeverity.CRITICAL, _DATA_AT_RISK, True),
     "Automatic recording stop timeout": _ErrorRule(AlertSeverity.CRITICAL, _DATA_AT_RISK, True),
-    "Storage critical — recording will stop": _ErrorRule(
-        AlertSeverity.CRITICAL, STORAGE_REMEDY, True),
+    # The "Recording stopped early" alert that follows carries the dialog.
+    "Storage critical — recording will stop": _ErrorRule(AlertSeverity.CRITICAL, STORAGE_REMEDY),
     # Data are still being written, but something needs attention.
     "Abort cleanup waiting for writer": _ErrorRule(
         AlertSeverity.ERROR, "Wait for the writer to finish before closing the app."),
@@ -226,15 +251,19 @@ def alert_for_subsystem(
         )
     if status.state is not SubsystemState.FAILED:
         return None
-    message = str(detail)
-    if recording:
-        message += " The recording continues without it; review this session before analysis."
+    if subsystem_id == SubsystemId.RUNTIME_DIAGNOSTICS.value:
+        # The "Internal software error" event alert reports it already.
+        return None
     return OperatorAlert(
         key=f"subsystem:{subsystem_id}",
         severity=AlertSeverity.ERROR,
         title=f"{name} failed",
-        message=message,
+        message=str(detail),
         remedy=subsystem_remedy(subsystem_id),
+        note=(
+            "The recording continues without it; review this session before analysis."
+            if recording else ""
+        ),
         is_condition=True,
     )
 
@@ -346,21 +375,27 @@ class OperatorAlertCenter:
                 and alert.is_condition
                 and (previous.title, previous.message) == (alert.title, alert.message)
             ):
-                return previous  # the same condition published again
-            count = 1 if previous is None else previous.count + 1
-            stored = dataclasses.replace(
-                alert,
-                raised_wall_time=now,
-                count=count,
-                active=True,
-                # A changed condition is news; a repeated event stays dismissed
-                # only if the operator already dismissed it.
-                dismissed=bool(previous and previous.dismissed and not alert.is_condition),
-                sequence=next(self._sequence),
-            )
-            self._active[alert.key] = stored
-            self._history.append(stored)
-            if stored.needs_dialog:
+                if previous.note == alert.note:
+                    return previous  # the same condition published again
+                # Only its context changed: no news, so it stays dismissed if
+                # it was, and its count does not grow.
+                stored = self._active[alert.key] = dataclasses.replace(previous, note=alert.note)
+                news = False
+            else:
+                news = True
+                stored = dataclasses.replace(
+                    alert,
+                    raised_wall_time=now,
+                    count=1 if previous is None else previous.count + 1,
+                    active=True,
+                    # A changed condition is news; a repeated event stays
+                    # dismissed only if the operator already dismissed it.
+                    dismissed=bool(previous and previous.dismissed and not alert.is_condition),
+                    sequence=next(self._sequence),
+                )
+                self._active[alert.key] = stored
+                self._history.append(stored)
+            if news and stored.needs_dialog:
                 last = self._last_dialog.get(alert.key)
                 if last is None or now - last >= self.DIALOG_REPEAT_SECONDS:
                     self._last_dialog[alert.key] = now
@@ -419,15 +454,23 @@ class OperatorAlertBridge:
     ``session_recording_status`` and ``hardware``.
     """
 
-    def __init__(self, app_model, center: OperatorAlertCenter):
+    def __init__(self, app_model, center: OperatorAlertCenter, *, dispatch=None):
         self._app_model = app_model
         self.center = center
+        #: Runs a reconcile. The window passes one that queues it on the GUI
+        #: thread: one thread then applies them in order and each reads the
+        #: latest statuses, with no lock held while it reads the model's.
+        self._dispatch = dispatch or (lambda function: function())
         self._lock = threading.RLock()
         self._recording = False
         self._sessions = 0
-        #: Set when a session leaves ARMING/RECORDING and cleared once its
-        #: ending reason is read. The reason is recorded a step after the
-        #: status turns STOPPING, so it is read on every later transition too.
+        #: The current session reached RECORDING. A session that fails while
+        #: ARMING never recorded, and the ending reason still holds the last
+        #: session's until the next one starts recording.
+        self._reached_recording = False
+        #: Set when a recorded session stops and cleared once its ending
+        #: reason is read. The reason is recorded a step after the status
+        #: turns STOPPING, so it is read on every later transition too.
         self._stop_check_pending = False
         self._connected = False
 
@@ -457,18 +500,23 @@ class OperatorAlertBridge:
 
     # -- event handlers --------------------------------------------------
 
+    @_guarded
     def _on_error(self, title, message) -> None:
         alert = alert_for_error(str(title), str(message or ""))
         if alert is not None:
             self.center.raise_alert(alert)
 
+    @_guarded
     def _on_app_property_changed(self, name, value, _previous) -> None:
         props = self._app_model.Props
         if name == props.SUBSYSTEM_STATUSES:
-            self._reconcile_subsystems(value)
+            # Not from ``value``: snapshots are published after the model's
+            # lock is released, so two threads can deliver them out of order.
+            self._dispatch(self._reconcile_subsystems)
         elif name == props.SESSION_RECORDING_STATUS:
             self._on_recording_status(value)
 
+    @_guarded
     def _on_hardware_property_changed(self, name, value, _previous) -> None:
         hardware = self._app_model.hardware
         kinds = {
@@ -497,8 +545,11 @@ class OperatorAlertBridge:
             self._recording = value in _RECORDING_STATES
             if value == "arming":
                 self._sessions += 1
+                self._reached_recording = False
                 self._stop_check_pending = False
-            if was_recording and not self._recording:
+            elif value == "recording":
+                self._reached_recording = True
+            if was_recording and not self._recording and self._reached_recording:
                 self._stop_check_pending = True
             check_stop = self._stop_check_pending and not self._recording
             session_number = self._sessions
@@ -512,15 +563,16 @@ class OperatorAlertBridge:
             if alert is not None:
                 self.center.raise_alert(alert)
         if was_recording != self._recording:
-            self._reconcile_subsystems()
+            self._dispatch(self._reconcile_subsystems)
 
-    def _reconcile_subsystems(self, statuses: Optional[Mapping[str, SubsystemStatus]] = None) -> None:
-        if statuses is None:
-            try:
-                statuses = self._app_model.subsystem_statuses
-            except Exception:
-                return
-        recording = self._recording
+    def _reconcile_subsystems(self) -> None:
+        try:
+            statuses = self._app_model.subsystem_statuses
+        except Exception:
+            logger.exception("Operator alerts: subsystem statuses unavailable")
+            return
+        with self._lock:
+            recording = self._recording
         raised = []
         for status in dict(statuses or {}).values():
             alert = alert_for_subsystem(status, recording=recording)

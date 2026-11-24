@@ -84,11 +84,13 @@ def test_help_menu_and_export(qapp, tmp_path, monkeypatch):
     shown = []
     monkeypatch.setattr(operator_alerts_view.QMessageBox, "information",
                         lambda *args: shown.append(args[1]))
-    monkeypatch.setattr(operator_alerts_view, "build_diagnostic_bundle",
-                        _fast_bundle(operator_alerts_view.build_diagnostic_bundle))
+    monkeypatch.setattr(operator_alerts_view.QMessageBox, "warning",
+                        lambda *args: shown.append(args[1:]))
     model.set_status(SubsystemId.LASER, SubsystemState.FAILED, error="fault")
+    qapp.processEvents()
+    # Built in a separate process, the way the app does it.
     ui.export_bundle()
-    ui._export_thread.join(30)
+    ui._export_thread.join(180)
     qapp.processEvents()
     assert shown == ["Diagnostic bundle written"]
     with zipfile.ZipFile(target) as archive:
@@ -98,7 +100,33 @@ def test_help_menu_and_export(qapp, tmp_path, monkeypatch):
     ui.close()
 
 
-def _fast_bundle(build):
-    def run(path, sources):
-        return build(path, sources, versions=lambda: {}, inventory=lambda: {})
-    return run
+def test_export_skips_the_gpu_query_while_recording(qapp, tmp_path):
+    from tools.acquisition.model.app_model_status import SessionRecordingStatus
+
+    window, model, ui = _install(qapp, tmp_path)
+    sources = ui.bundle_sources()
+    command, environment, _ = ui.export_command(tmp_path / "b.zip", sources, tmp_path)
+    assert "--no-gpu-query" not in command
+    model.session_recording_status = SessionRecordingStatus.RECORDING
+    command, environment, _ = ui.export_command(tmp_path / "b.zip", sources, tmp_path)
+    assert "--no-gpu-query" in command
+    assert command[1:3] == ["-m", "tools.acquisition.model.diagnostic_bundle"]
+    ui.close()
+
+
+def test_reconcile_runs_on_the_gui_thread(qapp, tmp_path):
+    import threading
+
+    window, model, ui = _install(qapp, tmp_path)
+    threads = []
+    original = ui.bridge._reconcile_subsystems
+    ui.bridge._reconcile_subsystems = lambda: (threads.append(threading.current_thread()), original())
+    worker = threading.Thread(target=lambda: model.set_status(
+        SubsystemId.LASER, SubsystemState.FAILED, error="fault"))
+    worker.start()
+    worker.join()
+    qapp.processEvents()  # the reconcile
+    qapp.processEvents()  # the banner refresh it queues
+    assert threads == [threading.main_thread()]
+    assert ui.banner.title_label.text() == "Error: Laser failed"
+    ui.close()

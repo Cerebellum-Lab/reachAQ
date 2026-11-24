@@ -58,6 +58,40 @@ def test_set_data_folder_changes_only_that_line_and_keeps_a_backup(tmp_path):
     assert SystemConfiguration.load_yaml_file(config).persistence.output_location == new.as_posix()
 
 
+def test_set_data_folder_writes_nothing_when_unchanged_and_never_overwrites_a_backup(tmp_path):
+    config = first_run.create_configuration(tmp_path / "system_configuration.yaml", tmp_path / "a")
+    assert first_run.set_data_folder(config, tmp_path / "a") is None
+    assert not list(tmp_path.glob("*.before-first-run*"))
+    first = first_run.set_data_folder(config, tmp_path / "b")
+    second = first_run.set_data_folder(config, tmp_path / "c")
+    assert first != second and first.is_file() and second.is_file()
+    assert "/a" in first.read_text() and "/b" in second.read_text()
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("persistence:\n  outputLocation: /data/rig # moved 2026\n", "/data/rig"),
+    ("  outputLocation: 'it''s here'\n", "it's here"),
+    ('  outputLocation: "/q d"\n', "/q d"),
+    ("  outputLocation:\nnext: 1\n", None),
+])
+def test_output_location_from_text(text, expected):
+    assert first_run.output_location_from_text(text) == expected
+
+
+def test_an_unmounted_configured_folder_is_never_created(qapp, tmp_path):
+    missing = tmp_path / "mnt" / "data"
+    config = first_run.create_configuration(tmp_path / "system_configuration.yaml", missing)
+    dialog = FirstRunDialog(first_run.assess(config), hardware_checks=(_no_hardware,))
+    assert not dialog.accept_button.isEnabled()
+    assert "mounted" in dialog.data_status.text()
+    dialog.accept_button.click()  # disabled: does nothing
+    assert not missing.exists() and dialog.result() != dialog.DialogCode.Accepted
+    dialog.start_unchanged_button.click()
+    assert dialog.result() == dialog.DialogCode.Accepted
+    assert not missing.exists()
+    assert first_run.output_location_from_text(config.read_text()) == missing.as_posix()
+
+
 def test_an_unreadable_folder_is_reported(tmp_path):
     a_file = tmp_path / "file"
     a_file.write_text("x")
@@ -83,6 +117,7 @@ def test_dialog_creates_the_configuration(qapp, tmp_path):
     config = tmp_path / "Autotrainer" / "system_configuration.yaml"
     dialog = FirstRunDialog(first_run.assess(config), hardware_checks=(_no_hardware,))
     dialog.data_edit.setText(str(tmp_path / "new data"))
+    dialog._check_data_folder()
     assert dialog.data_status.text() == "The folder will be created."
     dialog._accept()
     assert dialog.result() == dialog.DialogCode.Accepted

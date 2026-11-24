@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -73,8 +73,10 @@ class FirstRunDialog(QDialog):
             "No configuration was found on this computer. Choose where recordings are saved; "
             "the rest of the configuration can be changed later in the app."
             if new_install else
-            "The data folder in this computer's configuration cannot be used. "
-            "Choose a folder that can be written before starting."
+            "The data folder in this computer's configuration cannot be used. If it is on a "
+            "drive that is not mounted, mount it and choose Check again. Otherwise choose "
+            "another folder, or start without changing it: recording stays unavailable "
+            "until the folder can be written."
         )
         intro.setWordWrap(True)
 
@@ -96,7 +98,13 @@ class FirstRunDialog(QDialog):
         form.addRow("", self.data_status)
         log_label = QLabel(log_location or "In the data folder, one log per day")
         form.addRow("Logs:", log_label)
-        self.data_edit.textChanged.connect(self._check_data_folder)
+        # Checked a moment after typing stops: each check writes a probe file,
+        # and a network path can take a while to answer.
+        self._data_timer = QTimer(self)
+        self._data_timer.setSingleShot(True)
+        self._data_timer.setInterval(400)
+        self._data_timer.timeout.connect(self._check_data_folder)
+        self.data_edit.textChanged.connect(lambda _text: self._data_timer.start())
 
         hardware = QGroupBox("Hardware found")
         hardware_layout = QVBoxLayout(hardware)
@@ -111,6 +119,7 @@ class FirstRunDialog(QDialog):
         hardware_layout.addWidget(self.hardware_note)
         self.recheck_button = QPushButton("Check again")
         self.recheck_button.clicked.connect(self.start_hardware_check)
+        self.recheck_button.clicked.connect(self._check_data_folder)
         recheck_row = QHBoxLayout()
         recheck_row.addStretch(1)
         recheck_row.addWidget(self.recheck_button)
@@ -120,6 +129,11 @@ class FirstRunDialog(QDialog):
         self.accept_button = self.buttons.addButton(
             "Create configuration and start" if new_install else "Use this folder and start",
             QDialogButtonBox.ButtonRole.AcceptRole)
+        self.start_unchanged_button = None
+        if not new_install:
+            self.start_unchanged_button = self.buttons.addButton(
+                "Start without changing", QDialogButtonBox.ButtonRole.ActionRole)
+            self.start_unchanged_button.clicked.connect(self._start_unchanged)
         self.buttons.addButton("Quit", QDialogButtonBox.ButtonRole.RejectRole)
         self.buttons.accepted.connect(self._accept)
         self.buttons.rejected.connect(self.reject)
@@ -146,7 +160,12 @@ class FirstRunDialog(QDialog):
         if chosen:
             self.data_edit.setText(chosen)
 
+    def _is_configured_folder(self, path: Path) -> bool:
+        return (self.assessment.configuration_exists
+                and path.as_posix() == Path(self.assessment.data_folder).expanduser().as_posix())
+
     def _check_data_folder(self) -> first_run.FolderCheck:
+        self._data_timer.stop()
         text = self.data_edit.text().strip()
         if not text:
             self.data_status.setText("Choose a folder.")
@@ -158,13 +177,18 @@ class FirstRunDialog(QDialog):
             self.data_status.setText(check.summary)
             self.data_status.setStyleSheet(
                 MISSING_STYLE if (check.free_bytes or 0) < first_run.LOW_SPACE_BYTES else OK_STYLE)
-        elif not check.path.exists():
-            # Created on accept, if its parent can be written.
+        elif not check.path.exists() and not self._is_configured_folder(check.path):
+            # A new folder is created on accept, if its parent can be written.
             self.data_status.setText("The folder will be created.")
             self.data_status.setStyleSheet(MISSING_STYLE)
         else:
+            # The configured folder is never created here: when its drive is
+            # not mounted, a new folder at the mount point would take the
+            # recordings onto the system disk and hide them once it mounts.
             self.data_status.setText(check.summary)
             self.data_status.setStyleSheet(PROBLEM_STYLE)
+            self.accept_button.setEnabled(False)
+            return check
         self.accept_button.setEnabled(True)
         return check
 
@@ -207,8 +231,14 @@ class FirstRunDialog(QDialog):
 
     # -- accept ----------------------------------------------------------
 
+    def _start_unchanged(self) -> None:
+        logger.warning("First run: started with the data folder unusable: %s (%s)",
+                       self.assessment.data_folder, self.assessment.data_check.problem)
+        self.accept()
+
     def _accept(self) -> None:
-        check = first_run.check_folder(self.data_folder(), create=True)
+        folder = self.data_folder()
+        check = first_run.check_folder(folder, create=not self._is_configured_folder(folder))
         if not check.ok:
             self._check_data_folder()
             QMessageBox.warning(self, "Data folder", f"{check.path}\n\n{check.problem}")
@@ -216,8 +246,9 @@ class FirstRunDialog(QDialog):
         try:
             if self.assessment.configuration_exists:
                 backup = first_run.set_data_folder(self.assessment.configuration_path, check.path)
-                logger.notice("First run: data folder set to %s; previous configuration kept at %s",
-                              check.path, backup)
+                if backup is not None:
+                    logger.notice("First run: data folder set to %s; previous configuration kept at %s",
+                                  check.path, backup)
                 self.written_path = self.assessment.configuration_path
             else:
                 self.written_path = first_run.create_configuration(

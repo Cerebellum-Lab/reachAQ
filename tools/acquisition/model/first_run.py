@@ -26,8 +26,36 @@ from autotrainer.core.configuration.system_configuration import SystemConfigurat
 #: Below this the data folder is reported as low on space (about 1 h of 3-camera video).
 LOW_SPACE_BYTES = 50 * 1024 ** 3
 
+# One line only: "[ \t]" so an empty value never reaches into the next line.
 _OUTPUT_LOCATION_RE = re.compile(
-    r"^(?P<lead>\s*(?:outputLocation|output_location):\s*)(?P<value>.*?)\s*$", re.MULTILINE)
+    r"^(?P<lead>[ \t]*(?:outputLocation|output_location):[ \t]*)(?P<value>[^\r\n]*?)[ \t]*$",
+    re.MULTILINE)
+
+
+def _yaml_scalar(raw: str) -> str:
+    """A plain or quoted YAML scalar on one line, without a trailing comment."""
+    raw = raw.strip()
+    if raw.startswith("'"):
+        end = 1
+        while True:
+            end = raw.find("'", end)
+            if end < 0 or raw[end + 1:end + 2] != "'":
+                break
+            end += 2
+        return raw[1:end if end > 0 else None].replace("''", "'")
+    if raw.startswith('"'):
+        end = raw.find('"', 1)
+        return raw[1:end if end > 0 else None].replace('\\"', '"')
+    comment = re.search(r"[ \t]#", raw)
+    return (raw[:comment.start()] if comment else raw).strip()
+
+
+def output_location_from_text(text: str) -> Optional[str]:
+    """The ``outputLocation`` value of a configuration's text, or None."""
+    match = _OUTPUT_LOCATION_RE.search(text)
+    if match is None:
+        return None
+    return _yaml_scalar(match.group("value")) or None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -102,10 +130,9 @@ def configured_data_folder(configuration_path: Path) -> Tuple[Optional[Path], st
         text = Path(configuration_path).read_text(encoding="utf-8")
     except OSError as error:
         return None, f"Cannot read the configuration: {error}"
-    match = _OUTPUT_LOCATION_RE.search(text)
-    if match is None:
+    value = output_location_from_text(text)
+    if value is None:
         return PersistenceConfiguration.get_default_output_path(), ""
-    value = match.group("value").strip().strip("'\"")
     return Path(value).expanduser(), ""
 
 
@@ -133,9 +160,11 @@ def create_configuration(configuration_path: Path, data_folder: Path) -> Path:
     return configuration_path.with_suffix(".yaml")
 
 
-def set_data_folder(configuration_path: Path, data_folder: Path) -> Path:
+def set_data_folder(configuration_path: Path, data_folder: Path) -> Optional[Path]:
     """Point an existing configuration at ``data_folder``, changing only that
-    line. The previous file is kept beside it as ``*.before-first-run``."""
+    line. The previous file is kept beside it as ``*.before-first-run`` (an
+    earlier backup is never overwritten). Returns the backup, or None when the
+    folder was already the configured one and nothing was written."""
     configuration_path = Path(configuration_path).expanduser()
     text = configuration_path.read_text(encoding="utf-8")
     value = Path(data_folder).expanduser().as_posix()
@@ -143,8 +172,15 @@ def set_data_folder(configuration_path: Path, data_folder: Path) -> Path:
     if match is None:
         raise ValueError(
             f"{configuration_path} has no outputLocation line; set Preferences ▸ Data location")
+    current = _yaml_scalar(match.group("value"))
+    if current and Path(current).expanduser().as_posix() == value:
+        return None
     new_text = text[:match.start("value")] + _yaml_string(value) + text[match.end("value"):]
     backup = configuration_path.with_name(configuration_path.name + ".before-first-run")
+    index = 1
+    while backup.exists():
+        index += 1
+        backup = configuration_path.with_name(f"{configuration_path.name}.before-first-run.{index}")
     shutil.copy2(configuration_path, backup)
     partial = configuration_path.with_name(configuration_path.name + ".partial")
     partial.write_text(new_text, encoding="utf-8")

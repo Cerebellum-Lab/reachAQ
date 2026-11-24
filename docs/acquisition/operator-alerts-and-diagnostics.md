@@ -10,8 +10,9 @@ as before.
 
 | Severity | Shown as | Examples |
 |---|---|---|
-| Critical | Banner, plus a dialog | The recording stopped early (primary camera failed, the data drive filled, writing did not finish); recording failed to start; a camera or pose writer did not close; video, timestamps or session data incomplete; the configuration could not be loaded |
-| Error | Banner | A subsystem failed: a camera, reach camera synchronization, live pose, the pellet board (CAN), the NI-DAQ input stream, the laser, the RFID reader; a refused NI-DAQ plan; a pellet motor driver fault; an internal software error |
+| Critical | Banner, plus a dialog | The recording stopped early (primary camera failed, the data drive filled, writing did not finish); a camera or pose writer did not close; video, timestamps or session data incomplete; the configuration could not be loaded |
+| Critical | Banner | Data drive below 1 minute (the "Recording stopped early" dialog follows) |
+| Error | Banner | A subsystem failed: a camera, reach camera synchronization, live pose, the pellet board (CAN), the NI-DAQ input stream, the laser, the RFID reader; a refused NI-DAQ plan; a pellet motor driver fault; recording failed to start (nothing was recorded); an internal software error |
 | Warning | Banner | Data drive below 30 or 10 minutes; projected capacity below the session length; pellet axes need homing; camera synchronization incomplete |
 
 A failure that happens while recording says so: the NI-DAQ stream, the laser,
@@ -20,7 +21,8 @@ carries on, and the alert asks for the session to be reviewed before analysis.
 
 Alerts for a subsystem clear themselves when the subsystem recovers, for
 example after **Refresh Hardware**. A dismissed subsystem alert stays hidden
-until its detail changes. Other alerts stay until dismissed. A dialog opens at
+until its detail changes; a recording starting or stopping does not bring it
+back. Other alerts stay until dismissed. A dialog opens at
 most once a minute for the same alert, and only one dialog is open at a time.
 
 **Help ▸ Alerts…** lists every alert since the app started, including the
@@ -40,8 +42,12 @@ any device: FLIR cameras, the NI chassis, the CAN adapter and the GPU. Missing
 hardware does not stop setup. **Create configuration and start** writes a
 default configuration that records into the chosen folder. For an existing
 configuration, **Use this folder and start** changes only its `outputLocation`
-line and keeps the previous file beside it as `*.before-first-run`. **Quit**
-writes nothing.
+line and keeps the previous file beside it as `*.before-first-run` (numbered,
+never overwritten). The configured folder itself is never created here: if its
+drive is not mounted, a folder made at the mount point would put recordings on
+the system disk. Mount the drive and choose **Check again**, choose another
+folder, or **Start without changing** (recording stays unavailable until the
+folder can be written). **Quit** writes nothing.
 
 The step is skipped with `--simulate`, on an offscreen display, and when
 `REACHAQ_SKIP_FIRST_RUN` is set.
@@ -73,6 +79,10 @@ reachaq-diagnostics -o ~/reachaq-diagnostics.zip
 `-c` names the configuration, `--preferences-file` the preferences, and
 `--data-dir` (repeatable) the folders to search for logs and sessions.
 
+From the app, the bundle is built by this same command in a separate process,
+so redacting the logs does not slow the running app. While a recording runs it
+skips `nvidia-smi`, which briefly stalls live pose inference.
+
 ### Secrets
 
 - The OS keyring is never read.
@@ -81,5 +91,8 @@ reachaq-diagnostics -o ~/reachaq-diagnostics.zip
 - In every file, values of fields named like password, token, secret, API key,
   credential, authorization or cookie are replaced with `<redacted>`, as are
   credentials in URLs and bearer tokens.
-- Values stored in the local credential file are searched for in the finished
-  bundle. If one is found, the export fails and no file is written.
+- Values stored in the local credential file are removed wherever they appear,
+  and the finished bundle is searched for them again. If one is found, the
+  export fails and no file is written.
+- A secret held only in the OS keyring is protected by the field redaction
+  alone, since its value is never read. The manifest says so.

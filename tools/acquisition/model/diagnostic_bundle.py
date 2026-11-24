@@ -42,12 +42,16 @@ SECRET_FIELD_PATTERN = (
     r"passw(?:or)?d|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key"
     r"|credential|authorization|auth[_-]?key|cookie"
 )
+# A field name starts the text or follows a separator: space, punctuation, a
+# query string's ? or &, a cookie's ;, or the backslash of escaped JSON.
 _FIELD_RE = re.compile(
-    r"(?P<lead>(?:^|[\s,{(\"'])(?:[\w.\-/]*?)(?:" + SECRET_FIELD_PATTERN + r")[\w.\-]*[\"']?)"
+    r"(?P<lead>(?:^|[\s,{(\"'?&;\\])(?:[\w.\-/]*?)(?:" + SECRET_FIELD_PATTERN + r")[\w.\-]*(?:\\?[\"'])?)"
     r"(?P<sep>\s*[:=]\s*)"
-    r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;}\])]+)",
+    r"(?P<value>\\\"[^\"\\]*\\\"|\"[^\"]*\"|'[^']*'|[^\s,;&}\])\\]+)",
     re.IGNORECASE,
 )
+# Every cookie on a Cookie or Set-Cookie line, whatever its name.
+_COOKIE_LINE_RE = re.compile(r"(?P<lead>\b(?:set-)?cookie\s*:\s*)[^\r\n]+", re.IGNORECASE)
 _URL_CREDENTIALS_RE = re.compile(r"(?P<scheme>\b[a-z][a-z0-9+.\-]*://)[^/\s:@]+:[^/\s@]+@", re.IGNORECASE)
 _BEARER_RE = re.compile(r"(?P<lead>\b(?:bearer|basic)\s+)[A-Za-z0-9._~+/=\-]{8,}", re.IGNORECASE)
 
@@ -81,10 +85,13 @@ def redact_text(text: str) -> Tuple[str, int]:
     def field(match: re.Match) -> str:
         nonlocal count
         value = match.group("value")
-        if value.strip("\"'") in ("", REDACTED):
+        if value.strip("\\\"'") in ("", REDACTED):
             return match.group(0)
         count += 1
-        quote = value[0] if value[:1] in ("'", '"') else ""
+        if value.startswith('\\"'):
+            quote = '\\"'
+        else:
+            quote = value[0] if value[:1] in ("'", '"') else ""
         return f"{match.group('lead')}{match.group('sep')}{quote}{REDACTED}{quote}"
 
     def url(match: re.Match) -> str:
@@ -97,8 +104,14 @@ def redact_text(text: str) -> Tuple[str, int]:
         count += 1
         return f"{match.group('lead')}{REDACTED}"
 
+    def cookie_line(match: re.Match) -> str:
+        nonlocal count
+        count += 1
+        return f"{match.group('lead')}{REDACTED}"
+
     # Bearer first: "Authorization: Bearer x" would otherwise lose only "Bearer".
     text = _BEARER_RE.sub(bearer, text)
+    text = _COOKIE_LINE_RE.sub(cookie_line, text)
     text = _FIELD_RE.sub(field, text)
     text = _URL_CREDENTIALS_RE.sub(url, text)
     return text, count
@@ -279,13 +292,20 @@ def collect_versions() -> Dict[str, object]:
     return versions
 
 
-def collect_hardware_inventory() -> Dict[str, object]:
+def collect_hardware_inventory(*, query_gpu: bool = True) -> Dict[str, object]:
     """Read-only probes that open no device: nothing here touches the CAN bus,
-    an NI task or a camera stream."""
+    an NI task or a camera stream. ``query_gpu=False`` skips nvidia-smi, whose
+    every call stalls live pose inference by 16-19 ms; it is off while a
+    recording runs."""
     inventory: Dict[str, object] = {}
     try:
         from tools.acquisition.model.hardware_scan import scan_can_adapters, scan_gpus
-        for name, scan in (("can_adapters", scan_can_adapters), ("gpus", scan_gpus)):
+        scans = [("can_adapters", scan_can_adapters)]
+        if query_gpu:
+            scans.append(("gpus", scan_gpus))
+        else:
+            inventory["gpus"] = "not queried: a recording was running"
+        for name, scan in scans:
             try:
                 entry = scan()
                 inventory[name] = {"state": entry.state, "info": entry.info}
@@ -294,7 +314,8 @@ def collect_hardware_inventory() -> Dict[str, object]:
     except Exception as error:
         inventory["scan_error"] = str(error)
     if sys.platform.startswith("linux"):
-        inventory["nvidia_smi"] = _run(("nvidia-smi",))
+        if query_gpu:
+            inventory["nvidia_smi"] = _run(("nvidia-smi",))
         # 1093 is National Instruments; 1e10 is Teledyne FLIR.
         inventory["ni_pci_devices"] = _run(("lspci", "-nn", "-d", "1093:"))
         inventory["flir_usb_devices"] = _run(("lsusb", "-d", "1e10:"))
@@ -384,6 +405,23 @@ def build_diagnostic_bundle(
         except OSError:
             pass
     partial = destination.with_name(destination.name + ".partial")
+    try:
+        writer = _write_bundle(partial, sources, secrets, credential_paths, now, versions, inventory)
+        _verify_no_secrets(partial, secrets)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    os.replace(partial, destination)
+    return BundleResult(
+        path=destination,
+        members=tuple(writer.members),
+        skipped=tuple(writer.skipped),
+        redactions=writer.redactions,
+        size_bytes=destination.stat().st_size,
+    )
+
+
+def _write_bundle(partial, sources, secrets, credential_paths, now, versions, inventory) -> "_Writer":
     with zipfile.ZipFile(partial, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         writer = _Writer(archive, secrets)
 
@@ -443,21 +481,15 @@ def build_diagnostic_bundle(
             "redactions": writer.redactions,
             "secret_handling": (
                 "The OS keyring was not read. Credential files were not added. Values of "
-                "password, token, secret and key fields, URL credentials and bearer tokens "
-                "were replaced with " + REDACTED + "."
+                "password, token, secret and key fields, cookies, URL credentials and bearer "
+                "tokens were replaced with " + REDACTED + ". Values in the local credential "
+                "file were also searched for and removed. A secret held only in the OS "
+                "keyring is protected by the field redaction alone, since its value is "
+                "never read."
             ),
         }
         writer.text("manifest.json", json.dumps(manifest, indent=2), redact=False)
-
-    _verify_no_secrets(partial, secrets)
-    os.replace(partial, destination)
-    return BundleResult(
-        path=destination,
-        members=tuple(writer.members),
-        skipped=tuple(writer.skipped),
-        redactions=writer.redactions,
-        size_bytes=destination.stat().st_size,
-    )
+    return writer
 
 
 def _verify_no_secrets(path: Path, secrets: Sequence[str]) -> None:
@@ -468,8 +500,6 @@ def _verify_no_secrets(path: Path, secrets: Sequence[str]) -> None:
         for name in archive.namelist():
             data = archive.read(name)
             if any(secret in data for secret in encoded):
-                archive.close()
-                path.unlink(missing_ok=True)
                 raise SecretLeakError(f"a stored credential appeared in {name}; no bundle was written")
 
 
@@ -507,8 +537,10 @@ def _configured_output_roots(configuration_path: Path) -> List[Path]:
         text = Path(configuration_path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
-    match = re.search(r"^\s*(?:outputLocation|output_location):\s*['\"]?([^'\"\n]+)", text, re.MULTILINE)
-    return [Path(match.group(1).strip()).expanduser()] if match else []
+    from tools.acquisition.model.first_run import output_location_from_text
+
+    value = output_location_from_text(text)
+    return [Path(value).expanduser()] if value else []
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -521,6 +553,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--preferences-file", type=Path, help="preferences ini file")
     parser.add_argument("--data-dir", type=Path, action="append", default=[],
                         help="data folder to search for logs and sessions (repeatable)")
+    parser.add_argument("--log-dir", type=Path, action="append", default=[],
+                        help="extra folder to search for logs (repeatable)")
+    # Used by the running app, which builds the bundle in this separate
+    # process so its work never holds the app's interpreter: the app's
+    # statuses and alerts in, a result file out.
+    parser.add_argument("--app-snapshot", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--result-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--no-gpu-query", action="store_true",
+                        help="skip nvidia-smi (it briefly stalls live pose inference)")
     args = parser.parse_args(argv)
 
     from autotrainer.core.configuration.system_configuration import SystemConfiguration
@@ -533,12 +574,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         configuration, args.preferences_file or _default_preferences_path())
     if args.data_dir:
         sources.output_roots = tuple(args.data_dir)
+    if args.log_dir:
+        sources.log_dirs = tuple(args.log_dir)
+    if args.app_snapshot is not None:
+        snapshot = json.loads(args.app_snapshot.read_text(encoding="utf-8"))
+        sources.subsystem_snapshot = snapshot.get("subsystem_statuses")
+        sources.alerts = snapshot.get("alerts")
+        sources.app_state = snapshot.get("app_state")
     output = args.output or (Path.home() / default_bundle_name())
     try:
-        result = build_diagnostic_bundle(output, sources)
-    except SecretLeakError as error:
-        print(f"Diagnostic bundle refused: {error}", file=sys.stderr)
-        return 2
+        result = build_diagnostic_bundle(
+            output, sources,
+            inventory=lambda: collect_hardware_inventory(query_gpu=not args.no_gpu_query))
+    except Exception as error:
+        refused = isinstance(error, SecretLeakError)
+        label = "Diagnostic bundle refused" if refused else "Diagnostic bundle failed"
+        print(f"{label}: {error}", file=sys.stderr)
+        if args.result_file is not None:
+            args.result_file.write_text(json.dumps({"error": str(error) or type(error).__name__}))
+        return 2 if refused else 1
+    if args.result_file is not None:
+        args.result_file.write_text(json.dumps({
+            "path": str(result.path), "members": len(result.members), "skipped": len(result.skipped),
+            "redactions": result.redactions, "size_bytes": result.size_bytes}))
     print(f"Wrote {result.path} ({result.size_bytes / 1e6:.1f} MB, {len(result.members)} files, "
           f"{result.redactions} values redacted)")
     for line in result.skipped:

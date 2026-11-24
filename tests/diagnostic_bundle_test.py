@@ -156,9 +156,23 @@ def test_a_secret_that_escapes_redaction_fails_the_export(rig, monkeypatch):
     ("tests passed: 12", "tests passed: 12"),
     ("keypoint_count: 12", "keypoint_count: 12"),
     ("connect postgres://user:pw@db/x", f"connect postgres://{REDACTED}@db/x"),
+    ("GET /colony?user=ben&api_key=abc123&page=2", f"GET /colony?user=ben&api_key={REDACTED}&page=2"),
+    ("Cookie: a=1; sessionid=zzz", f"Cookie: {REDACTED}"),
+    ('{\\"password\\": \\"x1\\"}', '{\\"password\\": \\"' + REDACTED + '\\"}'),
+    ("Authorization: Bearer abcdefghijklmnop", f"Authorization: {REDACTED} {REDACTED}"),
 ])
+
 def test_redact_text(line, expected):
     assert redact_text(line)[0] == expected
+
+
+def test_no_partial_file_is_left_when_the_build_fails(rig):
+    def broken():
+        raise OSError("disk full")
+
+    with pytest.raises(OSError):
+        build_diagnostic_bundle(rig["tmp"] / "x.zip", _sources(rig), versions=broken, inventory=dict)
+    assert not list(rig["tmp"].glob("x.zip*"))
 
 
 def test_command_line_bundle(rig, tmp_path, capsys):

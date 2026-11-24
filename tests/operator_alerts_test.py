@@ -124,7 +124,20 @@ def test_a_failure_while_recording_says_the_recording_carries_on(wired):
     model.set_recording(SessionRecordingStatus.RECORDING)
     model.set_status(SubsystemId.LASER, SubsystemState.FAILED, error="controller fault")
     (alert,) = center.active_alerts()
-    assert "recording continues without it" in alert.message
+    assert "recording continues without it" in alert.note
+    assert alert.message == "controller fault"
+
+
+def test_a_dismissed_failure_stays_dismissed_when_recording_starts_and_stops(wired):
+    model, center, _ = wired
+    model.set_status(SubsystemId.RFID_READER, SubsystemState.FAILED, error="no device")
+    center.dismiss("subsystem:rfid_reader")
+    for status in (SessionRecordingStatus.ARMING, SessionRecordingStatus.RECORDING,
+                   SessionRecordingStatus.STOPPING, SessionRecordingStatus.READY):
+        model.set_recording(status)
+    (alert,) = center.active_alerts()
+    assert alert.dismissed and alert.count == 1
+    assert center.visible_alerts() == ()
 
 
 def test_a_dismissed_condition_stays_hidden_until_it_changes(wired):
@@ -167,6 +180,59 @@ def test_an_early_stop_opens_a_dialog_once_the_reason_is_known(wired, reason):
     model.set_recording(SessionRecordingStatus.ANALYZING)
     model.set_recording(SessionRecordingStatus.READY)
     assert [alert.title for alert in dialogs] == ["Recording stopped early"]
+
+
+def test_a_failed_start_after_an_early_stop_reports_nothing_new(wired):
+    """The ending reason keeps the last session's value until the next one starts
+    recording; a start that fails while ARMING must not reuse it."""
+    model, center, dialogs = wired
+    model.set_recording(SessionRecordingStatus.ARMING)
+    model.set_recording(SessionRecordingStatus.RECORDING)
+    model.recording_ending_reason = RecordingEndingReason.STORAGE_LIMIT
+    model.set_recording(SessionRecordingStatus.STOPPING)
+    model.set_recording(SessionRecordingStatus.READY)
+    assert len(dialogs) == 1
+    model.set_recording(SessionRecordingStatus.ARMING)
+    model.set_recording(SessionRecordingStatus.ABORTING)
+    model.set_recording(SessionRecordingStatus.READY)
+    assert len(dialogs) == 1
+
+
+def test_start_failures_and_storage_critical_get_no_dialog_of_their_own(wired):
+    model, center, dialogs = wired
+    model.on_error("Recording failed", "The primary camera did not begin recording within 10 seconds.")
+    model.on_error("Storage critical — recording will stop", "1 min left")
+    assert dialogs == []
+    assert {alert.title for alert in center.active_alerts()} == {
+        "Recording failed", "Storage critical — recording will stop"}
+
+
+def test_an_internal_error_alerts_once(wired):
+    model, center, _ = wired
+    model.on_error("Internal software error", "ZeroDivisionError")
+    model.set_status(SubsystemId.RUNTIME_DIAGNOSTICS, SubsystemState.FAILED, error="ZeroDivisionError")
+    assert [alert.title for alert in center.active_alerts()] == ["Internal software error"]
+
+
+def test_a_failing_listener_never_reaches_the_reporting_thread(wired):
+    model, center, _ = wired
+
+    def broken():
+        raise RuntimeError("deleted relay")
+
+    center.changed.append(broken)
+    model.on_error("Pellet home failed", "limit switch")  # must not raise
+    model.set_status(SubsystemId.LASER, SubsystemState.FAILED, error="x")
+
+
+def test_reconcile_reads_the_latest_statuses_not_the_published_value(wired):
+    model, center, _ = wired
+    model.set_status(SubsystemId.LASER, SubsystemState.FAILED, error="fault")
+    model.subsystem_statuses = {}
+    # A late, older snapshot: the bridge must use what the model holds now.
+    stale = {"laser": SubsystemStatus("laser", SubsystemState.FAILED, error="fault")}
+    model.property_changed(model.Props.SUBSYSTEM_STATUSES, stale, None)
+    assert center.active_alerts() == ()
 
 
 def test_an_operator_stop_opens_no_dialog(wired):
