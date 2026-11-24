@@ -187,7 +187,8 @@ def _spawning_inference(monkeypatch):
     model._msg_thread = object()  # already running; start() must not add one
     model._data_monitor_proc = SimpleNamespace(
         stop_recorded=threading.Event(), is_alive=lambda: True,
-        join=lambda timeout=None: None, exitcode=0, pid=0)
+        join=lambda timeout=None: None, exitcode=0, pid=0,
+        camera_names=("left", "right"))
     model._pose_process = None
     model._pose_process_error = None
     model._pose_process_watchdog_perf_c = SimpleNamespace(value=math.nan)
@@ -216,7 +217,7 @@ _LIVE_QUEUE = _LiveQueue()
 def test_inference_is_loading_from_the_moment_its_process_is_spawned(monkeypatch):
     model = _spawning_inference(monkeypatch)
 
-    assert model.start(_LIVE_QUEUE)
+    assert model.start(_LIVE_QUEUE, camera_names=("left", "right"))
 
     assert model._pose_process.started
     assert model.status == InferenceStatus.loading
@@ -224,7 +225,7 @@ def test_inference_is_loading_from_the_moment_its_process_is_spawned(monkeypatch
 
 def test_a_stop_before_the_model_reports_loading_still_stops_the_process(monkeypatch):
     model = _spawning_inference(monkeypatch)
-    model.start(_LIVE_QUEUE)
+    model.start(_LIVE_QUEUE, camera_names=("left", "right"))
     process = model._pose_process
     model._cmd_queue.process = process
 
@@ -263,7 +264,7 @@ def test_a_process_being_stopped_cannot_make_inference_active_again(status, mess
 
 def test_a_process_that_dies_before_the_model_reports_loading_is_caught(monkeypatch):
     model = _spawning_inference(monkeypatch)
-    model.start(_LIVE_QUEUE)
+    model.start(_LIVE_QUEUE, camera_names=("left", "right"))
     process = model._pose_process
     process.exitcode = 1  # an import failed in the child, say
 
@@ -285,7 +286,7 @@ def test_a_process_that_dies_before_the_model_reports_loading_is_caught(monkeypa
 def test_stopping_inference_tells_the_live_queue_nothing_reads_it(monkeypatch):
     model = _spawning_inference(monkeypatch)
     live_queue = _LiveQueue()
-    model.start(live_queue)
+    model.start(live_queue, camera_names=("left", "right"))
     model._cmd_queue.process = model._pose_process
 
     model.stop()
@@ -296,7 +297,7 @@ def test_stopping_inference_tells_the_live_queue_nothing_reads_it(monkeypatch):
 def test_a_pose_process_that_dies_leaves_the_live_queue_closed(monkeypatch):
     model = _spawning_inference(monkeypatch)
     live_queue = _LiveQueue()
-    model.start(live_queue)
+    model.start(live_queue, camera_names=("left", "right"))
     model._pose_process.exitcode = 0  # raised in predict, and returned
 
     model._check_pose_process_exited()
@@ -308,9 +309,69 @@ def test_a_live_queue_is_not_closed_while_its_reader_runs(monkeypatch):
     model = _spawning_inference(monkeypatch)
     live_queue = _LiveQueue()
 
-    model.start(live_queue)
+    model.start(live_queue, camera_names=("left", "right"))
 
     assert not live_queue.consumer_closed
+
+
+# -- a reused data monitor ---------------------------------------------------
+#
+# The data monitor splits every batch by the queue cameras it was built with. A
+# start() that reuses a monitor still alive from a capture with other cameras
+# would attribute this queue's poses by the previous order.
+
+class _FakeDataMonitor:
+    built = []
+
+    def __init__(self, **kwargs):
+        self.camera_names = tuple(kwargs["camera_names"])
+        self.stop_recorded = threading.Event()
+        self.started = False
+        _FakeDataMonitor.built.append(self)
+
+    def start(self):
+        self.started = True
+
+    def is_alive(self):
+        return self.started
+
+
+def _reusing_inference(monkeypatch):
+    model = _spawning_inference(monkeypatch)
+    _FakeDataMonitor.built = []
+    monkeypatch.setattr(inference_model_module, "InferenceMonitorDataProc", _FakeDataMonitor)
+    model._data_monitor_watchdog_perf_c = SimpleNamespace(value=math.nan)
+    model._data_monitor_cmd_ack_event = threading.Event()
+    model._project = None
+    model._pair_offsets_2_handler = {}
+    return model
+
+
+def test_a_data_monitor_built_for_other_cameras_is_rebuilt_for_the_new_queue(monkeypatch, caplog):
+    model = _reusing_inference(monkeypatch)
+    old = model._data_monitor_proc
+    model._data_monitor_cmd_queue.put(("stale", (), None))
+
+    with caplog.at_level("INFO", logger=inference_model_module.logger.name):
+        model.start(_LIVE_QUEUE, camera_names=("right", "left"))
+
+    assert [monitor.camera_names for monitor in _FakeDataMonitor.built] == [("right", "left")]
+    assert model._data_monitor_proc is _FakeDataMonitor.built[0]
+    assert model._data_monitor_proc is not old
+    assert model._data_monitor_cmd_queue.empty(), "the old monitor's sentinel reaches the new one"
+    rebuilt = [record for record in caplog.records if "rebuilding the pose data monitor" in record.getMessage()]
+    assert len(rebuilt) == 1
+    assert rebuilt[0].levelname == "INFO"
+
+
+def test_a_data_monitor_built_for_the_same_cameras_is_reused(monkeypatch):
+    model = _reusing_inference(monkeypatch)
+    old = model._data_monitor_proc
+
+    model.start(_LIVE_QUEUE, camera_names=("left", "right"))
+
+    assert _FakeDataMonitor.built == []
+    assert model._data_monitor_proc is old
 
 
 # -- closing the message loop ---------------------------------------------

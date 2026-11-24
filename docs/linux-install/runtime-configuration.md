@@ -167,6 +167,114 @@ electrical homing direction, not this coordinate convention. Existing
 25 still commands X to 25 mm. The LIVE line reports current feedback and its
 freshness, while SET reports the saved send position in the same coordinates.
 
+## Motor travel limits
+
+`pellet.x`, `pellet.y` and `pellet.z` in `~/Autotrainer/motor_config.yaml` can
+each set `min_pos` and `max_pos`, the stage's travel in board millimetres.
+christielab10 uses `min_pos: 0` and `max_pos: 35` on all three axes. Either key
+can be left out: that side is then not limited. A value that is not a finite
+number, or `min_pos` above `max_pos`, stops the connect with an error naming
+the axis (`pellet-x`, `pellet-y` or `pellet-z`). The keys stay on the host;
+nothing new is written to the board.
+
+ReachAQ checks each stage target against the travel before it sends anything:
+
+- **SET and MOVE** of x, y or z, absolute, relative or given in DCS
+  coordinates. That covers the animal's base position, protocol presentations,
+  the Hardware Control buttons, the intersession shift and every calibration
+  and scout waypoint. SET keeps its clamp of a target below 0 to 0, and the
+  check runs after it. On an axis with travel, a relative SET is sent to the
+  board as the absolute target that was checked, so the board cannot add it
+  to a different base. A target within 1e-6 mm of a limit counts as inside.
+- **The animal's base position and a protocol presentation** are checked on
+  all three axes before any is SET. One axis out of range sends none of them,
+  so the stage never mixes the new position with the previous one. The base
+  position logs `Not sending <animal>'s pellet position ...: it lies outside
+  the configured travel` and shows a "Pellet position refused" error. The
+  previous animal's position is still SET on the board, so **no pellet is
+  presented** (`Pellet presentation refused: ...` in the log) until the board
+  has accepted a SET of each of X, Y and Z: an animal whose position is inside
+  the travel is selected, or the operator sets all three in Hardware Control.
+  A SET the board refuses, or never acknowledges, leaves its axis blocked. A
+  protocol target or the intersession shift does not lift the block. A
+  protocol presentation stops with an error. While the animal has a protocol,
+  X, Y and Z set in Hardware Control apply to this session only and are not
+  saved to the animal; the dialog says so. To keep a new position, select
+  **Manual pellet control** in Protocol, set X, Y and Z, then select the
+  protocol again.
+- **The intersession shift** is checked on every axis it shifts before any is
+  SET. One shifted axis out of range shifts none of them and logs `Not
+  applying the pellet send_position shift ...`. A refused shift is not
+  recorded as applied: the last processed shift (the `applied_shift` of later
+  pellet-cycle records) keeps its previous value, the `intertrialPelletShift`
+  event carries `applied: false` and the `refusal` reason, and a tongue-eaten
+  shift's y-limit is not saved to the animal. A shift whose SETs fail with an
+  error (for example a relative SET before any SET since the connect) is
+  posted the same way, with the error as the reason. `applied` is true only
+  when every shifted axis was sent to the board. A shift that is disabled (in
+  Preferences or by a training-plan phase), that has no pellet device, or
+  whose SET was not queued is posted with `applied: false` and that reason,
+  and is not recorded as the last processed shift.
+- **Changed with this:** a tongue-eaten y-limit is saved to the animal only
+  when its shift was applied. While the intersession shift is disabled, a
+  tongue-eaten result no longer sets the animal's y-limit.
+- **The `move_config.yaml` sequences** (`load_pellet`, `send_pellet`,
+  `cover_pellet`, `release_pellet`, `move_retract`, or their built-in
+  defaults). Every stepper step is checked before the sequence starts, as
+  the steps before it leave the stage. One step out of range refuses the
+  whole sequence. As the board command does, a step's target is first held
+  to 0 and 15 motor turns (36.5 mm), so a retract that runs into 0 still
+  passes. Steps relative to the send position, and `predefined: send`, are
+  checked from both the requested send position and the one the board
+  reports, when they differ. A sequence with `predefined: send` is refused
+  while the send position of an axis with travel is not known at all (no SET
+  since the connect and none reported).
+- **A motor drift correction** that would put the saved send position outside
+  the travel.
+
+A target outside the travel is **refused, not clamped**: nothing is sent, the
+command is not queued, and the log has an error such as
+
+```
+Axis-X: move to 36.000 refused: outside the configured travel 0-35 mm
+```
+
+An unset side prints as `-inf` or `inf`. A refused sequence also logs
+`Pellet sequence load_pellet refused: a step lies outside the configured
+travel`. Without `min_pos` and `max_pos`, behaviour is as before.
+
+When the board refuses a SET on an axis with travel, the host puts that axis's
+requested send position back to the one the board reports, so later checks use
+the base the board really has. It does so silently (the animal's saved position
+is not changed), and not when a newer SET of that axis was queued since or the
+refusal's outcome is unknown (`-EBUSY` on a resend). Without travel, a refused
+SET leaves the requested position as before.
+
+Right after an in-range SET, a `send_pellet` can be refused once if the
+send position the board still reports is outside the travel (left there by a
+maintenance tool, for example). It clears with the board's next status.
+
+Not checked:
+
+- **Homing** (`send_home`, `send_to_limits` and home steps in a sequence). The
+  firmware stops at the switch.
+- **A target the host does not know**: a relative sequence step from a
+  position the board has not reported. The host sends nothing for it. In the
+  moment after a connect, before the first status reaches the host, a
+  `send_*_rel` step is not checked either, while the board side may already
+  hold a send position. Neither built-in sequence uses `send_*_rel`.
+- **Turning drift correction off**. That sends a SET of 0 relative to the
+  send position the board last reported, not the last requested SET. Right
+  after a new SET it can therefore bring back the previous send position. It
+  never saves a position the board has not held already.
+- **The maintenance tools that bypass the acquisition app**: the pellet
+  delivery tool (`tools/pellet_delivery`), `scripts/can_console.py` and
+  `tools/hardware/validate_can_hardware.py`. They command the board directly
+  and do not read the travel.
+
+The 3D calibration scout searches the configured travel (see
+[Automatic move list](../acquisition/stereo-calibration.md#automatic-move-list)).
+
 For the current JerryCAN board, expect `can0`, `mtu 72`, CAN FD,
 1 Mbit/s arbitration, and 5 Mbit/s data. See the
 [PEAK/SocketCAN guide](peak-socketcan.md) for installation, termination,

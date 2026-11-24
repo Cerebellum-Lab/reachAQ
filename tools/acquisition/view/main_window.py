@@ -1,18 +1,18 @@
 import os
 import logging
-import pickle
 import random
-import shutil
 import textwrap
 import threading
 import time
 import math
 import traceback
+import dataclasses
+import getpass
 from datetime import datetime
 from functools import partial
 from itertools import chain
 from pathlib import Path
-from typing import List, Optional, Dict, Tuple, Callable, Union, Literal
+from typing import List, Optional, Dict, Tuple, Callable, Union, Literal, Mapping, Sequence
 
 from PySide6.QtCore import Qt, QCoreApplication, QRect, QTimer, Signal, QSize, QKeyCombination
 from PySide6.QtGui import QAction, QIcon
@@ -24,17 +24,19 @@ import qtawesome as qta
 from autotrainer.core import EventManager, Offset3DTuple, AnimalSubject, SystemConfiguration, CameraConfiguration, \
     calculate_std_dev_manual, ProjectInfo, get_perf_now
 from autotrainer.core.capture import CaptureProcessStatus
-from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.logging import get_console_handler, get_verbose_logger
 from autotrainer.core.multiproc import make_daemon_timer, no_op_timer
 from autotrainer.core.pose_elements import SceneElement
 from autotrainer.core.event.api_event_kind import ApiEventKind
-from autotrainer.core.project.project_info import DATE_TIME_FORMAT
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 
 from autotrainer.inference import InferenceStatus, PoseResponse
 from autotrainer.inference.analysis import IntersessionResponse
-from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME, make_cam_offsets_dict
+from autotrainer.inference.analysis.prepare_jetson_data import make_cam_offsets_dict
+from autotrainer.inference.multires_calibration import library
+from autotrainer.inference.multires_calibration.report import QualityReport
+from autotrainer.inference.multires_calibration.store import (CalibrationIndex, CalibrationResolutionError,
+                                                             calibration_created, load_index)
 
 from autotrainer.behavior import SystemState
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus, BehaviorAlgoProps
@@ -49,12 +51,21 @@ from autotrainer.pyside.xyz_label import XYZQLabel
 from tools.autotrainer_version import __version__ as app_version
 from tools.acquisition.model.app_model import AppModel
 from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
-from tools.acquisition.model.handle_3d_calibration import make_3d_calib
+from tools.acquisition.model.calibration_install import decide_install, install_calibration, override_record
+from tools.acquisition.model.calibration_reminder import (
+    MAKE_CALIBRATION_MENU_PATH, calibration_due, due_label_text, reminder_text)
+from tools.acquisition.model.dcs_state import DcsState
+from tools.acquisition.model.calibration_geometry import camera_serial, match_cameras
+from tools.acquisition.model.handle_3d_calibration import capture_reference_entry, make_3d_calib
 from tools.acquisition.model.nidaq_discovery import discover_nidaq_devices
 from tools.acquisition.model.rfid_resolution import RfidResolutionKind
 from tools.acquisition.model.subsystem_status import SubsystemState
+from tools.acquisition.view.operator_alerts_view import install_operator_alerts
 from tools.acquisition.model.training_plan import get_plan_id
 from tools.acquisition.model.user_preferences import UserPreferences
+from tools.acquisition.view.calibration_dialog import (CalibrationDialog, CalibrationRequest, camera_unavailable_reason,
+                                                  confirm_reference_capture, confirm_scout_advice, result_page)
+from tools.acquisition.view.calibration_library_view import CalibrationLibraryView
 from tools.acquisition.view.main_content import MainContent
 from tools.acquisition.view.multi_selection_menu import MultiSelectionMenu
 from tools.acquisition.view.ui_availability import calculate_ui_availability
@@ -102,6 +113,48 @@ def _allow_bidirectional_window_resizing(window: QMainWindow) -> None:
     window.setMinimumSize(_MINIMUM_RESIZABLE_WINDOW_SIZE)
     window.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
     window.layout().setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+
+
+def _ask_on_gui_thread(ask, *args) -> bool:
+    """Run `ask(*args)` on the GUI thread and wait for its answer; from the GUI thread it runs at once.
+    An `ask` that raises is logged and answers False (Cancel)."""
+    answer = []
+    done = threading.Event()
+
+    def run():
+        try:
+            answer.append(bool(ask(*args)))
+        except Exception:
+            # A box that fails reads as Cancel, and never escapes the slot.
+            logger.exception("the question %s failed; taken as Cancel", getattr(ask, "__name__", ask))
+        finally:
+            done.set()
+
+    InvokeMethod(run)
+    done.wait()
+    return bool(answer and answer[0])
+
+
+def reference_capture_cameras(configured: Sequence, calibrated: Mapping[str, str]):
+    """The cameras "Capture reference images now" records: (cameras, names of those that only
+    record), or why it cannot run.
+
+    The configured cameras the entry calibrated (`calibrated`: configured name -> its name in
+    the entry) that can record. The configured primary triggers the others, so when the
+    entry did not calibrate it, it records with them and keeps no reference; a primary that
+    cannot record refuses the capture.
+    """
+    cameras = [c for c in configured if c.name in calibrated and camera_unavailable_reason(c) is None]
+    if not cameras:
+        return "None of the configured cameras is one this calibration calibrated."
+    primary = next((c for c in configured if c.is_primary), None)
+    if primary is None or primary in cameras:
+        return cameras, []
+    reason = camera_unavailable_reason(primary)
+    if reason is not None:
+        return (f"The primary camera {primary.name} triggers the others but cannot record ({reason}):"
+                " enable it, or make a new calibration with the cameras that can.")
+    return [primary, *cameras], [primary.name]
 
 
 class MainWindow(QMainWindow):
@@ -156,10 +209,13 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(icon)
 
         self._open_dialogs = []
+        # The open calibration library view, refreshed when a reference capture ends.
+        self._library_view: Optional[CalibrationLibraryView] = None
         self._debug_view: Optional[DebugView] = None
         self._training_plan_index_by_plan_id: Dict[Optional[str], int] = {}
         self._diamond_triangle_calib_run = None
         self._warned_invalid_dcs_config = False
+        self._calibration_reminder_shown = False
 
         self._previous_intersession_analysis_rsp: Optional[Tuple[ProjectInfo, IntersessionResponse]] = None
 
@@ -195,6 +251,8 @@ class MainWindow(QMainWindow):
             raise RuntimeError(f"Error setting up UI: {err}") from err
 
         app_model.on_error += self._show_message
+        # Before the configuration load below, so a load error is an alert too.
+        self.operator_alerts = install_operator_alerts(self, app_model, user_preferences)
         app_model.configuration_loaded_event += self._on_app_model_configuration_loaded
         app_model.training_plan_deserialized += self._on_training_plan_deserialized
 
@@ -270,7 +328,15 @@ class MainWindow(QMainWindow):
 
     @property
     def has_fully_valid_dcs(self) -> bool:
+        """A valid DCS configuration its consumers can use: not while a stale one is held off."""
         cfg = self._app_model.behavior.algorithm.diamond_triangle_config
+        return cfg is not None and cfg.fully_valid
+
+    @property
+    def has_loaded_valid_dcs(self) -> bool:
+        """A valid DCS configuration is loaded, stale or not: what Calibrate Coordinate System
+        needs, so that a stale one can always be redone."""
+        cfg = self._app_model.behavior.algorithm.loaded_diamond_triangle_config
         return cfg is not None and cfg.fully_valid
 
     def _add_box_to_open_dialogs(self, item: Union[QMessageBox, QDialog]):
@@ -332,7 +398,8 @@ class MainWindow(QMainWindow):
             capture_transition=capture_transition,
             hardware_refreshing=self._hardware_refresh_thread is not None,
             nidaq_discovering=self._nidaq_discovery_thread is not None,
-            has_valid_dcs=self.has_fully_valid_dcs,
+            # It gates only Calibrate Coordinate System, which must stay offered while stale.
+            has_valid_dcs=self.has_loaded_valid_dcs,
             laser_calibrating=self._app_model.laser_calibration_active,
         )
         self._app_model_status_combo.setEnabled(state.system_mode)
@@ -341,6 +408,7 @@ class MainWindow(QMainWindow):
         self.edit_camera_settings_action.setEnabled(state.idle_configuration)
         self.edit_daq_ports_action.setEnabled(state.idle_configuration)
         self.make_3d_calib_action.setEnabled(state.idle_configuration)
+        self.calibration_library_action.setEnabled(state.calibration_library)
         # It pauses the NI-DAQ input stream, which in System Mode is the
         # acquisition's; AppModel refuses the pause then as well.
         self.daq_monitor_action.setEnabled(state.idle_configuration)
@@ -348,6 +416,7 @@ class MainWindow(QMainWindow):
         self._set_hardware_menu_actions_enabled(state.idle_configuration)
         self._set_capture_binning_actions_enabled(state.idle_configuration)
         self._animal_dropdown_combo.setEnabled(state.subject)
+        self._rfid_entry.setEnabled(state.subject)
         self.animal_metadata_action.setEnabled(state.subject)
         self._training_plan_combo.setEnabled(state.protocol_selection)
         self._notes.setEnabled(state.notes)
@@ -656,9 +725,17 @@ class MainWindow(QMainWindow):
                 "calibration with a longer, stable capture."
             )
             return
+        app_model = self._app_model
+        # The offsets are kept with the active calibration; without one (it went while DCS
+        # ran) nothing is written: a stand-in folder would be a legacy calibration that is not there.
+        refusal = app_model.dcs_refusal()
+        if refusal is not None:
+            self._post_api_event(ApiEventKind.calibrationDcsFailed, dict(reason="NoActiveCalibration"))
+            logger.error("%s", refusal)
+            QMessageBox.warning(self, "Calibrate Coordinate System", refusal)
+            return
         # success
         self._post_api_event(ApiEventKind.calibrationDcsCompleted)
-        app_model = self._app_model
         algo = app_model.behavior.algorithm
         save_path = algo.diamond_triangle_offset_config_path.expanduser()
         if save_path.exists():
@@ -690,6 +767,12 @@ class MainWindow(QMainWindow):
                                 f"Calibration is being used immediately by now.",
                                 QMessageBox.StandardButton.Ok,
                                 )
+        # The calibration this was measured in, and its folder: the offsets are written
+        # beside it and that folder is reloaded, so the DCS fits it at once. A later 3D
+        # calibration has another id, which makes this DCS stale; a legacy calibration has
+        # no id to record. There is an active folder: dcs_refusal said so above.
+        calibration_index = app_model.active_calibration_index
+        calib_dir = app_model.active_calibration_dir
         new_cfg = DiamondTriangleOffsetConfig(
             used_position=avg_pos,
             measured_offset=avg_offset,
@@ -699,6 +782,7 @@ class MainWindow(QMainWindow):
             # so this allows to not have to calibrate twice.
             raw_diamond_coord=avg_rawdia_loc3,
             version=DiamondTriangleOffsetConfig.current_config_version,
+            calibration_id=None if calibration_index is None else calibration_index.id,
         )
         logger.success("Saving new config %s to %s", new_cfg, save_path.as_posix())
         new_cfg.to_file(save_path)
@@ -710,20 +794,18 @@ class MainWindow(QMainWindow):
             y_off=cam_off.y,
             z_off=cam_off.z,
         )
-        calib_dir = Path(self._preferences.configuration_location).joinpath(DEFAULT_3D_CALIB_DIR_NAME)
-        cam_offsets_path = calib_dir.joinpath(DEFAULT_CAM_OFFSET_FILE_NAME)
-        if cam_offsets_path.exists():
-            now = datetime.now()
-            backup_path = cam_offsets_path.parent.joinpath(f"{cam_offsets_path.name}_{now.strftime(DATE_TIME_FORMAT)}")
-            shutil.copy(cam_offsets_path, backup_path)
-        logger.info("Writing new camera-offsets %s to file %s", cam_offsets, cam_offsets_path)
-        with cam_offsets_path.open("wb") as fh:
-            pickle.dump(cam_offsets, fh)
+        # Beside a library entry, never inside it: an entry is not written to once in place.
+        # Each run is a new file there; the newest is the one live and offline 3D read.
+        cam_offsets_path = app_model.write_camera_offsets(calib_dir, cam_offsets)
+        logger.info("Wrote new camera-offsets %s to file %s", cam_offsets, cam_offsets_path)
         #
         app_model = self._app_model
         app_model.reload_calib(calib_dir)
         algo = app_model.behavior.algorithm
         algo.diamond_triangle_config = new_cfg
+        # Measured against the active calibration, so a stale DCS is valid again and its
+        # consumers get it back, before the animal's position is converted below.
+        app_model.refresh_dcs_state()
         animal = app_model.selected_animal
         # to ensure animal will get its x/y/z in DCS
         app_model.selected_animal = None
@@ -816,9 +898,15 @@ class MainWindow(QMainWindow):
                 if target_status != AppModelStatus.IDLE:
                     self._on_capture_start_stop(True, target_status=target_status)
             else:
-                logger.verbose("AppModelStatus not idle, not starting acquisition", app_status)
+                logger.verbose("AppModelStatus not idle (%s), not starting acquisition", app_status)
 
     def on_calibrate_diamond_triangle(self, is_toggled):
+        refusal = self._app_model.dcs_refusal() if is_toggled and self._diamond_triangle_calib_run is None else None
+        if refusal is not None:
+            logger.error("%s", refusal)
+            self.calib_diamond_triangle_action.setChecked(False)
+            QMessageBox.warning(self, "Calibrate Coordinate System", refusal)
+            return
         if is_toggled and self._diamond_triangle_calib_run is None:
             self._diamond_triangle_calib_run = self._make_diamond_triangle_calib_run()
         calib_run = self._diamond_triangle_calib_run
@@ -839,13 +927,28 @@ class MainWindow(QMainWindow):
         if not is_toggled:
             return
         app_model = self._app_model
+        request = self._ask_calibration_cameras()
+        if request is None:
+            # Cancelled: nothing started, so Run and the action are given back as they were.
+            self.run_action.setEnabled(True)
+            self.make_3d_calib_action.setChecked(False)
+            return
+        # The dialog's choice, in its order: the configured primary first, then camera-list order.
+        by_name = {camera.name: camera for camera in app_model.cameras}
+        cameras = [by_name[name] for name in request.cameras]
         prev_status, app_model.status = app_model.status, AppModelStatus.CALIBRATION_3D
         error = "Processing unfinished"
-        result_dir: Path = None
+        result: Optional[Tuple[Path, Path, CalibrationIndex, QualityReport]] = None
         def handle_3d_calib():
-            nonlocal error, result_dir
+            nonlocal error, result
             try:
-                result_dir = make_3d_calib(self._app_model)
+                result = make_3d_calib(self._app_model, cameras, move_list=request.move_list,
+                                       confirm_scout=lambda advice: _ask_on_gui_thread(
+                                           confirm_scout_advice, self, advice),
+                                       capture_references=request.capture_references,
+                                       confirm_references=lambda: _ask_on_gui_thread(
+                                           confirm_reference_capture, self),
+                                       rescout=request.rescout)
             except Exception as err:
                 logger.exception("3d-calib failed: %s", err)
                 error = err
@@ -854,44 +957,8 @@ class MainWindow(QMainWindow):
 
         @invoke_method
         def show_result():
-            self.run_action.setEnabled(True)
-            self.make_3d_calib_action.setChecked(False)
-            self.make_3d_calib_action.setEnabled(True)
-            app_model.status = prev_status
             logger.verbose("3d-calib thread joined, error=%s", error)
-            if error is not None:
-                self._post_api_event(ApiEventKind.calibration3dFailed, dict(reason=str(error)))
-                return
-            self._post_api_event(ApiEventKind.calibration3dCompleted)
-            backup_path = None
-            target_calib_dir = Path(self._preferences.configuration_location).joinpath(DEFAULT_3D_CALIB_DIR_NAME)
-            if target_calib_dir.exists():
-                rsp = QMessageBox.question(
-                    self,
-                    "3D calibration success",
-                    f"Calibration dir already exists ({target_calib_dir}),\n\n"
-                    f"do you want to replace ?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                if rsp != QMessageBox.StandardButton.Yes:
-                    return
-                now = datetime.now()
-                backup_path = target_calib_dir.parent.joinpath(f"{target_calib_dir.name}_{now.strftime(DATE_TIME_FORMAT)}")
-                target_calib_dir.rename(backup_path)
-                logger.debug("Previous 3d-calib moved to %s", backup_path)
-            shutil.copytree(
-                result_dir, target_calib_dir,
-                dirs_exist_ok=False,  # default already, but to be sure we want be clean
-            )
-            if backup_path is not None:
-                prev_cam_offsets = backup_path.joinpath(DEFAULT_CAM_OFFSET_FILE_NAME)
-                new_cam_offsets = target_calib_dir.joinpath(DEFAULT_CAM_OFFSET_FILE_NAME)
-                if prev_cam_offsets.exists() and not new_cam_offsets.exists():
-                    shutil.copyfile(prev_cam_offsets, target_calib_dir)
-                    logger.verbose("copied previous %s given no new one", DEFAULT_CAM_OFFSET_FILE_NAME)
-            self._app_model.reload_calib(target_calib_dir)
-            QMessageBox.information(
-                self,
-                "3D calibration success", f"Result saved into {target_calib_dir}", QMessageBox.StandardButton.Ok)
+            self._finish_3d_calib(error, result, prev_status)
 
         def wait_3d_calib_done(thread):
             thread.join()
@@ -903,6 +970,291 @@ class MainWindow(QMainWindow):
         waiter_thread = threading.Thread(target=wait_3d_calib_done, name="wait-3d-calibration",
                                          args=(executor_thread,), daemon=True)
         waiter_thread.start()
+
+    def _ask_calibration_cameras(self) -> Optional[CalibrationRequest]:
+        """Which cameras to calibrate, from the calibration dialog; None when cancelled."""
+        dialog = CalibrationDialog(self._app_model.cameras, self)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return None
+            return dialog.request()
+        finally:
+            dialog.deleteLater()
+
+    def _finish_3d_calib(self, error, result, prev_status: AppModelStatus) -> None:
+        """Install the calibration make_3d_calib produced, as its quality report allows, or show why it failed.
+
+        The app is given back (_end_3d_calib) only once the install decision, the install
+        and the reload are done, on every path. Until then it stays in CALIBRATION_3D, so
+        nothing, a remote client included, starts a session under the failed-report dialog
+        or while the new calibration loads.
+
+        One API event per calibration: calibration3dFailed with the reason when the
+        calibration or its install raised, else calibration3dCompleted, also when the
+        operator kept a failed calibration out. Once installed, the calibration has
+        completed: a reload that fails after the install says so and asks for a restart,
+        and a status restore or a dialog that fails is logged without losing the event.
+        """
+        installed_report = None
+        kept_id = None
+        load_error = None
+        try:
+            if error is None:
+                try:
+                    _capture_dir, new_dir, index, report = result
+                    installed = self._install_3d_calib(new_dir, index, report)
+                except Exception as err:
+                    logger.exception("3d-calib could not be completed: %s", err)
+                    error = err
+                else:
+                    if installed is not None and not installed[2]:
+                        kept_id = index.id
+                    elif installed is not None:
+                        installed_dir, installed_report, _activated = installed
+                        try:
+                            self._app_model.reload_calib(installed_dir)
+                        except Exception as err:
+                            # reload_calib has turned live 3D off for this folder (a DCS measured
+                            # against the previous calibration is STALE), and the next
+                            # configuration load or a restart retries it.
+                            logger.exception("3D calibration %s: installed, but could not be loaded", index.id)
+                            load_error = err
+        finally:
+            try:
+                self._end_3d_calib(prev_status)
+            except Exception:
+                logger.exception("could not give the app back after the 3D calibration")
+        if error is not None:
+            reason = str(error)
+            self._post_api_event(ApiEventKind.calibration3dFailed, dict(reason=reason))
+            QMessageBox.critical(self, "3D calibration failed", reason or type(error).__name__)
+            return
+        if installed_report is not None:
+            try:
+                self._show_3d_calib_installed(installed_report, load_error)
+            except Exception:
+                logger.exception("the installed 3D calibration's outcome could not be shown")
+        elif kept_id is not None:
+            try:
+                self._show_msg_box(
+                    "3D calibration kept",
+                    f"3D calibration {kept_id[:8]} is in the calibration library, not active. Set it active"
+                    " from Tools → Calibration library when you want to use it.",
+                    QMessageBox.Icon.Information)
+            except Exception:
+                logger.exception("the kept 3D calibration's outcome could not be shown")
+        self._post_api_event(ApiEventKind.calibration3dCompleted)
+
+    def _show_3d_calib_installed(self, report: QualityReport, load_error: Optional[BaseException]) -> None:
+        """Tell the operator a new calibration is installed: its report, and that it is not
+        loaded yet when its reload failed, or that DCS must be redone when it is stale."""
+        # A new calibration is active, so the monthly reminder's status-bar label is out of date. It
+        # stays when the previous calibration is kept or the install failed: that one is still active.
+        self._set_calibration_due_label(None)
+        if load_error is not None:
+            reason = str(load_error) or type(load_error).__name__
+            self._show_msg_box(
+                "3D calibration not loaded",
+                f"3D calibration installed, but it could not be loaded: {reason}. Restart the app.",
+                QMessageBox.Icon.Warning)
+        self._show_msg_box("3D calibration installed", result_page(report), QMessageBox.Icon.Information)
+        # A DCS measured against the previous calibration is held off and blocks Record until
+        # it is redone. With no DCS at all, the existing missing-DCS warning applies instead.
+        if self._app_model.dcs_state is DcsState.STALE:
+            self._show_msg_box(
+                "Coordinate system out of date",
+                "Redo Tools → Calibrate Coordinate System before running sessions.",
+                QMessageBox.Icon.Warning)
+
+    def _end_3d_calib(self, prev_status: AppModelStatus) -> None:
+        """Give Run, the 3D calibration action and the app status back to the operator."""
+        self.run_action.setEnabled(True)
+        self.make_3d_calib_action.setChecked(False)
+        self.make_3d_calib_action.setEnabled(True)
+        self._app_model.status = prev_status
+
+    def _install_3d_calib(self, new_dir: Path, index: CalibrationIndex,
+                          report: QualityReport) -> Optional[Tuple[Path, QualityReport, bool]]:
+        """Install the calibration in `new_dir` on a pass or warn report, or on a fail the operator overrides.
+
+        A pass or warn asks Set as active or Keep, don't activate (_ask_activate_3d_calib);
+        kept, the calibration is added to the library and the previous one stays active.
+        Returns (the library entry's folder, the report as installed, with any override,
+        whether it was made active), or None when a failed calibration is kept out. Loading it
+        is left to the caller.
+        """
+        install, override, activate = decide_install(
+            report.verdict, lambda: self._ask_install_failed_3d_calib(report),
+            lambda: self._ask_activate_3d_calib(report))
+        if not install:
+            logger.notice("kept the previous 3D calibration: %s (%s) failed its quality checks", new_dir, index.id)
+            return None
+        if override:
+            record = override_record(getpass.getuser(), datetime.now())
+            # The library keeps it as a decision about the calibration; the calibration is not edited.
+            report = dataclasses.replace(report, override=record)
+            logger.warning("3D calibration %s: override recorded (install pending): %s", index.id, record)
+        try:
+            installed = install_calibration(
+                new_dir, Path(self._preferences.configuration_location), now=datetime.now(),
+                by=getpass.getuser(), override=record if override else None, activate=activate)
+        except Exception:
+            logger.error("3D calibration %s: install failed", index.id)
+            raise
+        if not activate:
+            logger.success("3D calibration %s: kept in the library, not active", index.id)
+            return installed, report, False
+        logger.success("3D calibration %s: installed", index.id)
+        return installed, report, True
+
+    def _ask_activate_3d_calib(self, report: QualityReport) -> bool:
+        """Whether to make a calibration whose report passed or warned the active one.
+
+        The result page, with Set as active (the default, on Enter) and Keep, don't activate.
+        Closing the box (Escape) keeps the calibration without activating it.
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle("3D calibration done")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(result_page(report))
+        activate = box.addButton("Set as active", QMessageBox.ButtonRole.AcceptRole)
+        keep = box.addButton("Keep, don't activate", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(activate)
+        box.setEscapeButton(keep)
+        box.exec()
+        return box.clickedButton() != keep
+
+    def _ask_install_failed_3d_calib(self, report: QualityReport) -> bool:
+        """Whether to install a calibration whose quality report failed.
+
+        Keep previous is the default; Install anyway… asks a second time.
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle("3D calibration failed its quality checks")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(result_page(report))
+        keep = box.addButton("Keep previous", QMessageBox.ButtonRole.RejectRole)
+        install = box.addButton("Install anyway…", QMessageBox.ButtonRole.AcceptRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec()
+        if box.clickedButton() != install:
+            return False
+        rsp = QMessageBox.question(
+            self,
+            "3D calibration override",
+            "Install a calibration that failed its quality checks?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return rsp == QMessageBox.StandardButton.Yes
+
+    def _on_calibration_library(self) -> None:
+        view = self._library_view = CalibrationLibraryView(
+            self._app_model.calibration_library_root, set_active=self._set_active_calibration,
+            capture_references=self._capture_reference_images, parent=self)
+        try:
+            view.exec()
+        finally:
+            self._library_view = None
+            view.deleteLater()
+
+    def _capture_reference_images(self, calibration_id: str) -> Optional[str]:
+        """Start capturing reference images for library entry `calibration_id`, into a new entry.
+
+        The configured cameras that entry calibrated (by serial, by name without one) record
+        a short still clip (capture_reference_entry) on a worker thread, with the app held in
+        CALIBRATION_3D as for a calibration. Returns None when it started or the operator
+        cancelled, or why it cannot run. Once done, the operator is offered to set the new
+        entry active.
+        """
+        app_model = self._app_model
+        if (app_model.status == AppModelStatus.CALIBRATION_3D or not self.make_3d_calib_action.isEnabled()
+                or app_model.session_recording_status != SessionRecordingStatus.READY):
+            return ("Reference images are captured as a calibration is: stop the acquisition, the recording or"
+                    " the calibration first.")
+        root = app_model.calibration_library_root
+        try:
+            index = load_index(library.entry_path(root, calibration_id))
+        except (ValueError, CalibrationResolutionError) as err:
+            return f"This calibration cannot take reference images: {err}. Make a new calibration instead."
+        match = match_cameras(index.cameras, {c.name: camera_serial(c.active_config) for c in app_model.cameras})
+        chosen = reference_capture_cameras(app_model.cameras, match.calibrated)
+        if isinstance(chosen, str):
+            return chosen
+        cameras, record_only = chosen
+        if not confirm_reference_capture(self, skip_label="Cancel"):
+            return None
+        names = {camera.name: match.calibrated[camera.name] for camera in cameras if camera.name in match.calibrated}
+        prev_status, app_model.status = app_model.status, AppModelStatus.CALIBRATION_3D
+        self.run_action.setEnabled(False)
+        self.make_3d_calib_action.setEnabled(False)
+        outcome = {}
+
+        @invoke_method
+        def finish():
+            try:
+                self._end_3d_calib(prev_status)
+            finally:
+                self._finish_reference_capture(calibration_id, outcome)
+
+        def run():
+            try:
+                outcome["id"] = capture_reference_entry(app_model, root, calibration_id, cameras, names=names,
+                                                        record_only=record_only)
+            except Exception as err:
+                logger.exception("reference images for %s not captured: %s", calibration_id, err)
+                outcome["error"] = err
+            finally:
+                finish()
+
+        threading.Thread(target=run, name="reference-images", daemon=True).start()
+        return None
+
+    def _finish_reference_capture(self, source_id: str, outcome: dict) -> None:
+        """Say how the reference capture ended and offer to set the new entry active."""
+        if self._library_view is not None:
+            self._library_view.refresh()
+        error = outcome.get("error")
+        if error is not None or "id" not in outcome:
+            QMessageBox.critical(self, "Reference images not captured", str(error or "the capture did not finish"))
+            return
+        new_id = outcome["id"]
+        rsp = QMessageBox.question(
+            self,
+            "Reference images captured",
+            f"The reference images are in a new calibration, {new_id[:8]}, with the fit of {source_id[:8]}. "
+            "Set it active now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if rsp == QMessageBox.StandardButton.Yes:
+            refusal = self._set_active_calibration(new_id)
+            if refusal:
+                QMessageBox.warning(self, "Calibration not set active", refusal)
+        if self._library_view is not None:
+            self._library_view.refresh()
+
+    def _set_active_calibration(self, calibration_id: str) -> Optional[str]:
+        """Make library entry `calibration_id` the active calibration and load it
+        (AppModel.set_active_calibration, under the session lock).
+
+        Returns None, or why it was not set or not loaded. When it was set active, the
+        monthly reminder's label is reset, as after an install, even if it then could not be
+        loaded; a refused call leaves the label as it was.
+        """
+        app_model = self._app_model
+        before = library.pointer_id(app_model.calibration_library_root)
+        refusal = app_model.set_active_calibration(calibration_id)
+        moved = before != calibration_id and library.pointer_id(app_model.calibration_library_root) == calibration_id
+        if refusal is None or moved:
+            self._set_calibration_due_label(None)
+        if refusal is not None:
+            return refusal
+        if app_model.dcs_state is DcsState.STALE:
+            self._show_msg_box(
+                "Coordinate system out of date",
+                "Redo Tools → Calibrate Coordinate System before running sessions.",
+                QMessageBox.Icon.Warning)
+        return None
 
     @invoke_method
     def _show_msg_box(self, title, text, icon):
@@ -940,15 +1292,92 @@ class MainWindow(QMainWindow):
         self._open_dialogs = []
         for dialog in dialogs:
             dialog.close()
+        self._close_finishing = True
         super().close()
+
+    def _confirm_close_with_session(self) -> bool:
+        """Ask before closing over a session; True to go on closing.
+
+        Closing stops acquisition, which once aborted a recording and deleted
+        the session with no prompt. It now stops and saves; deleting is the
+        operator's explicit choice here, as with Abort.
+        """
+        app_model = self._app_model
+        status = app_model.session_recording_status
+        if status is SessionRecordingStatus.READY:
+            return True
+        project = app_model.project
+        session = "The session" if project is None else project.short_id
+        box = QMessageBox(self)
+        box.setWindowTitle("Session in progress")
+        box.setIcon(QMessageBox.Icon.Warning)
+        abort = None
+        if status in {SessionRecordingStatus.ARMING, SessionRecordingStatus.RECORDING}:
+            box.setText(
+                f"{session} is recording. Closing stops the recording and "
+                "saves it first."
+            )
+            proceed = box.addButton("Stop, save and close", QMessageBox.ButtonRole.AcceptRole)
+            abort = box.addButton(
+                "Abort (delete session) and close", QMessageBox.ButtonRole.DestructiveRole)
+        elif status is SessionRecordingStatus.ABORTING:
+            box.setText(
+                f"{session} is being aborted. Close when that finishes?"
+            )
+            proceed = box.addButton("Close when done", QMessageBox.ButtonRole.AcceptRole)
+        else:
+            box.setText(
+                f"{session} is still being saved. Close when saving finishes?"
+            )
+            proceed = box.addButton("Close when saved", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if abort is not None and clicked == abort:
+            if not app_model.abort_recording():
+                self._show_msg_box(
+                    "Abort refused",
+                    f"{session} could not be aborted; it was not closed.",
+                    QMessageBox.Icon.Warning,
+                )
+                return False
+            return True
+        return clicked == proceed
 
     def close(self):
         logger.debug("received close")
         with self._app_model.app_lock:
+            closing = self._closing
+        if not closing:
+            # The prompt runs a nested event loop, in which a second close
+            # (another window close, Ctrl-C) can arrive: it waits for this one.
+            event = self._close_event
+            self._close_event = None
+            if getattr(self, "_confirming_close", False):
+                if event is not None:
+                    event.ignore()
+                return
+            self._confirming_close = True
+            try:
+                confirmed = self._confirm_close_with_session()
+            finally:
+                self._confirming_close = False
+            if not confirmed:
+                if event is not None:
+                    event.ignore()
+                return
+            self._close_event = event
+        with self._app_model.app_lock:
             event = self._close_event
             if self._closing:
                 if event is not None:
-                    event.accept()
+                    # Only the close _finish_close makes is accepted: one
+                    # made while the close thread still saves a session would
+                    # take the window, and its error dialogs, away early.
+                    if getattr(self, "_close_finishing", False):
+                        event.accept()
+                    else:
+                        event.ignore()
                     self._close_event = None
                 else:
                     logger.warning("already closing")
@@ -1240,6 +1669,10 @@ class MainWindow(QMainWindow):
         action.setCheckable(True)
         action.triggered.connect(self.on_3d_calibrate)
 
+        action = self.calibration_library_action = QAction("Calibration library…", self)
+        action.setToolTip("Every 3D calibration, which one is active, and which cameras each left 2D only")
+        action.triggered.connect(self._on_calibration_library)
+
         action = self.daq_monitor_action = QAction(
             _toolbar_icon("fa5s.wave-square"), "DAQ Monitor", self)
         action.setToolTip(
@@ -1319,6 +1752,7 @@ class MainWindow(QMainWindow):
         tools_menu.addSeparator()
         tools_menu.addAction(self.calib_diamond_triangle_action)
         tools_menu.addAction(self.make_3d_calib_action)
+        tools_menu.addAction(self.calibration_library_action)
         tools_menu.addSeparator()
         resolution_menu = tools_menu.addMenu("Camera resolution")
         for action in self.capture_binning_actions.values():
@@ -1531,6 +1965,17 @@ class MainWindow(QMainWindow):
         self._rfid_status_label = QLabel("RFID: —")
         self._rfid_status_label.setContentsMargins(8, 0, 8, 0)
         toolbar.addWidget(self._rfid_status_label)
+        # A USB barcode scanner types its code and Enter here, like a keyboard.
+        entry = self._rfid_entry = QLineEdit()
+        entry.setPlaceholderText("Scan or type RFID, Enter")
+        entry.setToolTip(
+            "An RFID, barcode or other unique animal ID. Enter selects the "
+            "animal as an RFID reader scan does."
+        )
+        entry.setClearButtonEnabled(True)
+        entry.setMinimumWidth(150)
+        entry.returnPressed.connect(self._rfid_entered)
+        toolbar.addWidget(entry)
         toolbar.addAction(self.animal_metadata_action)
 
         toolbar.addSeparator()
@@ -1655,6 +2100,13 @@ class MainWindow(QMainWindow):
         hbox.addWidget(_make_separator())
         lbl = self._status_label_send_pos = XYZQLabel(prefix="Send: ", sep=", ", tail=" mm")
         hbox.addWidget(lbl)
+        # Shown by the monthly reminder (_remind_if_calibration_due) once the app finds the calibration
+        # due, and hidden again when a new one is installed. Left of the position widget, which stays rightmost.
+        lbl = self._calibration_due_label = QLabel("")
+        lbl.setStyleSheet("font-weight: 600; color: #b45309;")
+        lbl.setToolTip(f"Choose {MAKE_CALIBRATION_MENU_PATH} when the rig is ready.")
+        lbl.setVisible(False)
+        bar.addPermanentWidget(self._calibration_due_label)
         bar.addPermanentWidget(widget)
         self.setStatusBar(bar)
         status_log_handler = self._status_log_handler = StatusLogHandler(self._show_logged_error)
@@ -1740,6 +2192,11 @@ class MainWindow(QMainWindow):
         time.sleep(1.5)
         return fake_result
 
+    @staticmethod
+    def _simulate_intersession_offline_3d(*args, **kwargs):
+        # A simulated session has no pose files to triangulate.
+        logger.verbose("Simulate intersession offline 3D: skipped")
+
     def _prepare_simulated_analysis_result(self):
         app_model = self._app_model
         if self.analysis_results_action.isChecked():
@@ -1756,6 +2213,7 @@ class MainWindow(QMainWindow):
                 rh_max_vp_list=[Offset3DTuple(x, y, z)]
             )
             inference._intersession_process_execute = partial(self._simulate_intersession_process, fake_result=res)
+            inference._intersession_offline_3d_execute = self._simulate_intersession_offline_3d
 
     def _internal_set_pellet_seen(self):
         self._app_model.behavior.algorithm.update_pellet_seen(True)
@@ -1779,10 +2237,12 @@ class MainWindow(QMainWindow):
         if is_checked:
             self._orig_inference_analysis_feed = inference._feed_intersession_analysis_execute
             self._orig_inference_analysis_process = inference._intersession_process_execute
+            self._orig_inference_offline_3d = inference._intersession_offline_3d_execute
         else:
             logger.verbose("Restoring intersession segmentation and detection to real procedures")
             inference._feed_intersession_analysis_execute = self._orig_inference_analysis_feed
             inference._intersession_process_execute = self._orig_inference_analysis_process
+            inference._intersession_offline_3d_execute = self._orig_inference_offline_3d
 
     def _simulate_sessions(
         self,
@@ -1886,6 +2346,19 @@ class MainWindow(QMainWindow):
     def _add_animal(self):
         self._app_model.add_animal(self._animal_dropdown_combo.currentText(), select=True)
 
+    def _rfid_entered(self) -> None:
+        text = self._rfid_entry.text()
+        self._rfid_entry.clear()
+        if not text.strip():
+            return
+        try:
+            self._app_model.resolve_entered_rfid(text)
+        except ValueError as exc:
+            self.statusBar().showMessage(f"RFID not accepted: {exc}", 8000)
+        except Exception:
+            logger.exception("Typed animal identifier resolution failed")
+            self.statusBar().showMessage("RFID lookup failed; see the log", 8000)
+
     def _animal_changed(self, _):
         if self._animal_dropdown_combo.currentIndex() in (0, -1):
             self._app_model.selected_animal = None
@@ -1925,7 +2398,8 @@ class MainWindow(QMainWindow):
         elif name == props.STATUS:
             logger.debug("got new app model status: %s", value)
 
-            valid_dcs = self.has_fully_valid_dcs
+            # For Calibrate Coordinate System only, which redoes a stale DCS.
+            valid_dcs = self.has_loaded_valid_dcs
 
             self.blockSignals(True)
 
@@ -2288,6 +2762,49 @@ class MainWindow(QMainWindow):
             and self._nidaq_discovery_thread is None
         )
         self._refresh_ui_availability()
+        self._remind_if_calibration_due()
+
+    def _remind_if_calibration_due(self) -> None:
+        """Suggest a new 3D calibration, once per run, when the active one is old or there is none.
+
+        Checked at the run's first configuration load, due or not: by then the app has loaded its
+        calibration, and a month-old threshold crossed later in a run is not worth a second look.
+        It only shows the message, non-modal, and a status-bar label that stays until a new
+        calibration is installed (_finish_3d_calib); the operator starts a calibration from the
+        menu they name. An unreadable calibration counts as due, and nothing here may fail a
+        configuration load.
+        """
+        if self._calibration_reminder_shown:
+            return
+        self._calibration_reminder_shown = True
+        created = None
+        unreadable = False
+        calib_dir = self._app_model.active_calibration_dir
+        if calib_dir is not None:
+            try:
+                created = calibration_created(calib_dir)
+            except Exception as err:
+                unreadable = True
+                # An unreadable or corrupt calibration is expected; anything else is a bug worth its traceback.
+                logger.warning("3D calibration reminder: the date of %s is unreadable, taken as due: %s: %s",
+                               calib_dir, type(err).__name__, err,
+                               exc_info=not isinstance(err, (OSError, ValueError)))
+        # A format-2 index may carry a UTC offset; comparing with a naive now would raise.
+        now = datetime.now(None if created is None else created.tzinfo)
+        if calibration_due(created, now, self._preferences.calibration_reminder_days):
+            self._set_calibration_due_label(due_label_text(created, unreadable=unreadable))
+            self._show_msg_box(
+                "Calibration due", reminder_text(created, unreadable=unreadable), QMessageBox.Icon.Information)
+
+    @invoke_method
+    def _set_calibration_due_label(self, text: Optional[str]) -> None:
+        """Show `text` in the status bar's calibration-due label, or hide the label for None."""
+        label = self._calibration_due_label
+        if text is None:
+            label.setVisible(False)
+            return
+        label.setText(text)
+        label.setVisible(True)
 
     @invoke_method
     def _on_inference_analysis_result_ready(self, prj: ProjectInfo, rsp: IntersessionResponse):

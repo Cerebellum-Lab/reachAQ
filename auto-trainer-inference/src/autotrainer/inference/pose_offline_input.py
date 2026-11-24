@@ -7,7 +7,7 @@ from itertools import chain
 from multiprocessing import synchronize
 from multiprocessing.synchronize import Semaphore as SemaphoreType
 from pathlib import Path
-from typing import Tuple, Optional, Dict, List
+from typing import Tuple, Optional, Dict, List, Sequence
 
 import cv2
 import numpy
@@ -102,7 +102,7 @@ class OfflineInputProcess:
         stop_recorded: synchronize.Event,
         frame_shape: Tuple[int, ...],
         frames_per_cam: int,
-        nr_cams: int,
+        camera_names: Sequence[str],
         msg_queue: multiprocessing.Queue,
         event_cb_ack: multiprocessing.synchronize.Event,
         record_stop_sema: Optional[SemaphoreType] = None,
@@ -111,7 +111,10 @@ class OfflineInputProcess:
         self._live_requested = False
         self._interrupted = False
         self._frame_shape = frame_shape
-        self._nr_cams = nr_cams
+        # The live queue's cameras, in queue order: replayed frames go to the same
+        # slots as live ones, so the data monitor reads both with one ordering.
+        self._camera_names = tuple(camera_names)
+        nr_cams = self._nr_cams = len(self._camera_names)
         self._frames_per_cam = frames_per_cam
         self._frames_per_batch = frames_per_cam * nr_cams
         self._msg_queue = msg_queue
@@ -339,8 +342,17 @@ class OfflineInputProcess:
 
     def _feed_intersession_analysis_execute(self, project, wait_stop_recorded):
         captures_d: Dict[int, cv2.VideoCapture] = {}
-        cams = _get_project_camera_names(project)
+        # Replay the queued cameras that record, each into its own queue slot. A
+        # queued camera that does not record has no video: its slots are padding,
+        # as a missing live frame is, so it never produces poses. A recording camera
+        # outside the queue (the stimulation-mode stimCam) is never posed.
+        recording_cams = _get_project_camera_names(project)
+        slots = [slot for slot, cam in enumerate(self._camera_names) if cam in recording_cams]
+        padded_slots = [slot for slot in range(self._nr_cams) if slot not in slots]
+        cams = tuple(self._camera_names[slot] for slot in slots)
         n_cams = len(cams)
+        if n_cams == 0:
+            raise RuntimeError(f"no queued camera {self._camera_names} records {recording_cams}")
         cams_paths = [
             tuple(map(Path, project.get_video_path(name=cam, allow_overwrite=True)))
             for cam in cams
@@ -383,7 +395,8 @@ class OfflineInputProcess:
                 t_end = t_before + 10  # sometimes record thread might be ~long to flush/close,
                 # especially at high FPS.
                 logger.debug("waiting record_stop_sema %s ; t_end=%.1f", record_stop_sema, t_end)
-                while count_acquired < n_cams:
+                # Every recording camera releases it, posed or not.
+                while count_acquired < len(recording_cams):
                     while True:
                         try:
                             if record_stop_sema.acquire(timeout=0.1):
@@ -524,17 +537,19 @@ class OfflineInputProcess:
                     tot_skipped_frames += skipped
 
                 if all_read[cdx]:
-                    self._put_block(self._empty_frame, cdx, FrameIndexCategory.PADDING)
+                    self._put_block(self._empty_frame, slots[cdx], FrameIndexCategory.PADDING)
                 else:
-                    if not self._put_intersession_frame(cam_capture, cdx, cams_frame_idx[cdx]):
+                    if not self._put_intersession_frame(cam_capture, slots[cdx], cams_frame_idx[cdx]):
                         all_read[cdx] = True
-                        self._put_block(self._empty_frame, cdx, FrameIndexCategory.PADDING)
+                        self._put_block(self._empty_frame, slots[cdx], FrameIndexCategory.PADDING)
                         # if we prematurely reach the end of the video stream then give a padding instead
                     else:
                         frames_idx_sent[cdx].append(cams_frame_idx[cdx])
                         cams_frame_idx[cdx] += 1
                 cams_sent_frame_count[cdx] += 1
             # end for cdx ...
+            for slot in padded_slots:
+                self._put_block(self._empty_frame, slot, FrameIndexCategory.PADDING)
             if all(all_read):
                 logger.info("reached end of all video cams: %s ; frame_idx=%s", all_read, frame_idx)
                 break

@@ -94,6 +94,7 @@ def _send_data_queued_by_the_app(app_model, recipe):
     sent = []
     hardware = object.__new__(HardwareModel)
     hardware._device_conn = mock.sentinel.device_conn
+    hardware._motor_configurations = None  # no travel configured: send_pellet is not checked
     hardware._send_with_token = (
         lambda device, kind, data=None: sent.append((kind, data)) or "token"
     )

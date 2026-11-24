@@ -641,7 +641,9 @@ def _disable_timers():
 
 @pytest.fixture
 def pellet_device() -> PelletDeviceProtocol:
-    return mock.create_autospec(PelletDeviceProtocol)
+    device = mock.create_autospec(PelletDeviceProtocol)
+    device.refuse_shift_outside_travel.return_value = False  # no travel configured
+    return device
 
 
 @pytest.fixture
@@ -654,6 +656,10 @@ class VoidInference(InferenceProtocol):
     def __init__(self):
         super().__init__()
         self._stop_recorded_event = threading.Event()  # noqa
+        # AppModel.reload_calib reads these off the inference model, as InferenceModel
+        # has them, and every configuration load reloads the 3D calibration.
+        self.model_location = None
+        self.pose_parts = []
 
     @property
     def stop_recorded_event(self) -> synchronize.Event:

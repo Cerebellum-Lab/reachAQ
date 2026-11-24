@@ -4,6 +4,7 @@ from autotrainer.core.animal.external_metadata import (
     ExternalAnimalRecord,
     ExternalIdentity,
     NormalizedAnimalBatch,
+    is_iso11784_rfid,
     normalize_rfid,
     reader_payload_to_rfid,
     split_genotype,
@@ -14,10 +15,14 @@ TAG_A = "933000321342797"
 READER_PAYLOAD_A = "D4D47231005A30010000000000"
 
 
-def test_rfid_normalization_uses_iso_11784_decimal_plate_id():
+def test_rfid_normalization_keeps_iso_11784_and_other_codes():
     assert normalize_rfid(TAG_A) == TAG_A
+    assert is_iso11784_rfid(TAG_A)
+    # Any other non-empty code is an identifier too, just not an ISO RFID.
+    assert normalize_rfid(" BC-0003-A ") == "BC-0003-A"
+    assert not is_iso11784_rfid("D4D47231005A30010000000000")
     with pytest.raises(ValueError):
-        normalize_rfid("D4D47231005A30010000000000")
+        normalize_rfid("  ")
 
 
 def test_reader_payload_converts_to_iso_11784_decimal_plate_id():

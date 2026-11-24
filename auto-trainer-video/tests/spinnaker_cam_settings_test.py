@@ -193,3 +193,20 @@ def test_the_startup_buffer_self_check_runs_only_up_to_256_square(size, checked)
         assert (len(spin._start_frames) > 0) is checked
     finally:
         spin._camera = None
+
+
+class _RefusingNode(_Node):
+    def SetValue(self, value):
+        raise RuntimeError("node is locked while streaming")
+
+
+def test_a_refused_bool_set_logs_the_node_and_the_error(caplog):
+    node = _RefusingNode("Gamma Enable", True)
+
+    SpinCam._set_bounded_bool_property_node(node, False)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "Gamma Enable" in message and "node is locked while streaming" in message
+        for message in messages
+    ), messages

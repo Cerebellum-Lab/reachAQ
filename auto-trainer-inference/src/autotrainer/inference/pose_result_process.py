@@ -12,7 +12,7 @@ from itertools import chain
 from multiprocessing import synchronize
 from multiprocessing.sharedctypes import Synchronized
 from pathlib import Path
-from typing import Optional, List, TextIO, Tuple, Callable, Dict
+from typing import Optional, List, TextIO, Tuple, Callable, Dict, Sequence
 
 import h5py
 import numpy
@@ -175,6 +175,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
         self,
         *,
         project: ProjectInfo,
+        camera_names: Sequence[str],
         pose_data_queue: multiprocessing.Queue,
         cmd_queue: multiprocessing.Queue,
         cmd_ack_event: synchronize.Event,
@@ -198,12 +199,16 @@ class InferenceMonitorDataProc(multiprocessing.Process):
             # which refuse to work with daemon=True. This should be ok though.
         )
         self._project = project
+        # The live queue's cameras, in queue order: slot i of every batch, live or
+        # replayed, is camera_names[i]. project.camera_names are the recording
+        # cameras, in configuration order, and only decide which slots get files.
+        self._camera_names = tuple(camera_names)
         self._data_queue = pose_data_queue
         self._cmd_queue = cmd_queue
         self._cmd_ack_event = cmd_ack_event
         self._msg_queue = msg_queue
         self._frames_per_camera = frames_per_cam
-        self._camera_count = len(_get_project_camera_names(project))
+        self._camera_count = len(self._camera_names)
         self._recording_live_batch = int(os.getenv("INFERENCE_LIVE_BATCH", 150 * 5))  # 5s at 150 FPS
         self._monitored_parts_offsets = monitored_parts_offsets
         self._parts_offsets = 0
@@ -219,6 +224,11 @@ class InferenceMonitorDataProc(multiprocessing.Process):
         self._live_pose_workers: List[LivePoseResultProcessWorker] = []
         self._live_old_workers: List[LivePoseResultProcessWorker] = []
         self._live_generation_renew_age = LIVE_WORKERS_RENEW_TIMER_DELAY
+
+    @property
+    def camera_names(self) -> Tuple[str, ...]:
+        """The queue cameras this monitor splits batches by, fixed at construction."""
+        return self._camera_names
 
     @property
     def stop_recorded(self) -> synchronize.Event:
@@ -259,7 +269,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
             monitored_parts_offsets=self._monitored_parts_offsets,
             output_q=self._msg_queue,
             input_q=self._live_input_q,
-            camera_count=self._camera_count,
+            camera_names=self._camera_names,
             generation=generation,
             log_config=self._log_dict_config,
         )
@@ -295,7 +305,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
         project_info: ProjectInfo,
         perf_c_start_offline: float,
         pose_algo: PoseAlgorithm,
-        range_cams, ib_pose_data_list, ib_pose_data_dict, cams_read_h5_idx,
+        posed_slots, ib_pose_data_list, ib_pose_data_dict, cams_read_h5_idx,
         cams_read_h5_dss, cams_read_h5_fhs,
     ):
         feed_prj = self._feed_intersession_project
@@ -309,7 +319,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                 "Processing intersession offline post-process on %s", project_info
             )
             shape = self._intersession_offline_process2(
-                project_info, perf_c_start_offline, pose_algo, range_cams,
+                project_info, perf_c_start_offline, pose_algo, posed_slots,
                 ib_pose_data_list, ib_pose_data_dict, cams_read_h5_idx, cams_read_h5_dss
             )
         except Exception as err:
@@ -327,15 +337,18 @@ class InferenceMonitorDataProc(multiprocessing.Process):
         project_info: ProjectInfo,
         perf_c_start_offline: float,
         pose_algo: PoseAlgorithm,
-        range_cams,
+        posed_slots: List[int],
         ib_pose_data_list: List[List],
         ib_pose_data_dict,
         cams_read_h5_idx,
         cams_read_h5_dss,
     ):
-        for cdx, pdl, cur_h5_idx, cur_h5_dss in zip(
-            range_cams, ib_pose_data_list, cams_read_h5_idx, cams_read_h5_dss
-        ):
+        # Only the queue slots whose camera records: the others have no live file
+        # and were padding in the replay.
+        for cdx in posed_slots:
+            pdl = ib_pose_data_list[cdx]
+            cur_h5_idx = cams_read_h5_idx[cdx]
+            cur_h5_dss = cams_read_h5_dss[cdx]
             skipped = 0
             while cur_h5_idx < len(cur_h5_dss):
                 ds_row = cur_h5_dss[cur_h5_idx]
@@ -361,15 +374,17 @@ class InferenceMonitorDataProc(multiprocessing.Process):
         #             fh.write("\n".join(chain(map(str, sorted(ib_pose_data_dict[cdx])), [''])))
 
         # we must ensure same number of data for each sub-list:
-        min_nbr_pd = min(map(len, ib_pose_data_list))
-        for idx, lst in enumerate(ib_pose_data_list):
+        posed_lists = [ib_pose_data_list[cdx] for cdx in posed_slots]
+        min_nbr_pd = min(map(len, posed_lists))
+        for idx, lst in zip(posed_slots, posed_lists):
             cut = len(lst) - min_nbr_pd
             if cut > 0:
                 logger.verbose("cut ib_pose_data_list[%s] to %s", idx, cut)
                 del lst[-cut:]
 
+        # Interleaved over the posed cameras, in queue order.
         final_pose_data = numpy.stack(
-            (ib_pose_data_list[0], ib_pose_data_list[1]),
+            posed_lists,
             axis=1,
         ).reshape(-1, pose_algo.part_count * 3)
 
@@ -396,10 +411,11 @@ class InferenceMonitorDataProc(multiprocessing.Process):
         logger.info("assembled %s pose responses, speed=%.3f/s (vstack=%s)"
                   " now calling intersession_inference() ; shape=%s",
                   min_nbr_pd,
-                   2 * min_nbr_pd / (time.perf_counter() - perf_c_start_offline),
+                   len(posed_lists) * min_nbr_pd / (time.perf_counter() - perf_c_start_offline),
                    final_pose_data.shape[0], final_pose_data.shape)
 
-        intersession_inference(final_pose_data, pose_algo.part_names, project_info)
+        intersession_inference(final_pose_data, pose_algo.part_names, project_info,
+                               [self._camera_names[cdx] for cdx in posed_slots])
         logger.success("fully processed session-%s inference with %s total pose responses",
                        project_info.session, final_pose_data.shape[0])
         return final_pose_data.shape
@@ -436,7 +452,10 @@ class InferenceMonitorDataProc(multiprocessing.Process):
         frames_indices: Optional[numpy.ndarray]
 
         frames_per_batch = self._frames_per_camera
-        cams = list(_get_project_camera_names(project))
+        # Queue order. A slot whose camera does not record gets no files (pose_paths
+        # and cams_frame_idx_fhs hold None there) and is skipped; a recording camera
+        # outside the queue (the stimulation-mode stimCam) is never posed.
+        cams = list(self._camera_names)
         n_cams = len(cams)
         range_cams: List[int] = list(range(n_cams))
         cams_frame_idx_fhs = None
@@ -467,6 +486,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
         tot_skipped = 0
         perf_c_start_offline = 0
         skip_next_pose_data = 0
+        split_error_logged = False
 
         perf_c_log_counters = time.perf_counter()
         t_perf_live_check_data_queue_size = time.perf_counter() + 5
@@ -500,7 +520,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
             cams_frame_idx_fhs = None
             close_pose_latency_in_background()
             for cam_pose_path, cam_indices, cam_h5_live in zip(pose_paths, cur_cams_indices, cur_h5_live_batch):
-                if len(cam_h5_live) == 0:
+                if cam_pose_path is None or len(cam_h5_live) == 0:
                     continue
                 write_duration = write_h5_batch(cam_pose_path, cam_h5_live, cam_indices,
                                                 columns=columns)
@@ -619,6 +639,20 @@ class InferenceMonitorDataProc(multiprocessing.Process):
             except queue.Empty:
                 continue
             monitor_recv_perf = time.perf_counter()
+
+            if pose_data is not None and (
+                len(pose_data) % n_cams != 0
+                or (frames_indices is not None and len(frames_indices) != n_cams)
+            ):
+                # Read with the wrong stride, every frame would go to another camera.
+                if not split_error_logged:
+                    split_error_logged = True
+                    logger.error(
+                        "skipping pose batches that do not split into the %s queue cameras %s:"
+                        " %s frames, %s frame-index rows (logged once)",
+                        n_cams, cams, len(pose_data),
+                        None if frames_indices is None else len(frames_indices))
+                continue
 
             tot_count_data_received += 1
             perf_now = get_perf_now()
@@ -767,7 +801,12 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                 ib_pose_data_dict = []
                 if __debug__:
                     ib_pose_data_dict = [{} for _ in range_cams]
+                recording_cams = set(_get_project_camera_names(cur_local_prj))
                 for cam in cams:
+                    if cam not in recording_cams:
+                        cams_frame_idx_fhs.append(None)
+                        pose_paths.append(None)
+                        continue
                     _, _, p_indices = cur_local_prj.get_video_path(cam, allow_overwrite=True)
                     cams_frame_idx_fhs.append(Path(p_indices).open("w"))
                     pose_path = Path(
@@ -818,6 +857,8 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                         for cdx, cam_fr_indices, cam_pose_path, cam_h5_live, cam_indices in zip(
                             range_cams, frames_indices, pose_paths, cur_h5_live_batch, cur_cams_indices
                         ):
+                            if cam_pose_path is None:
+                                continue  # posed, not recorded
                             # reminder: pose_data has 1 frame cam1, 1 frame cam2, 1 frame cam1, etc..
                             cur = pose_data[cdx::n_cams]
                             cur = {
@@ -884,13 +925,20 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                                       prev_mode, frames_indices.tolist())
                         cur_local_prj = self._project.to_local_value()
                         # re-obtain the paths, project info might be from a batch session
+                        recording_cams = set(_get_project_camera_names(cur_local_prj))
                         pose_paths = [
                             Path(cur_local_prj.get_intersession_pose_path(cam, suffix="_live"))
+                            if cam in recording_cams else None
                             for cam in cams
                         ]
                         cams_read_h5_dss = []
                         cams_read_h5_fhs = []
                         for cam_pose_path in pose_paths:
+                            if cam_pose_path is None:
+                                # posed, not recorded: no live file, padding in the replay
+                                cams_read_h5_fhs.append(None)
+                                cams_read_h5_dss.append(())
+                                continue
                             f5fh, f5dss = open_h5_file(cam_pose_path)
                             cams_read_h5_fhs.append(f5fh)
                             cams_read_h5_dss.append(f5dss)
@@ -927,7 +975,7 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                                 cur_local_prj,
                                 perf_c_start_offline,
                                 pose_algo,
-                                range_cams,
+                                [cdx for cdx in range_cams if pose_paths[cdx] is not None],
                                 ib_pose_data_list,
                                 ib_pose_data_dict,
                                 cams_read_h5_idx,
@@ -952,8 +1000,10 @@ class InferenceMonitorDataProc(multiprocessing.Process):
                         for cdx, pdl, cur_h5_dss, cam_fr_indices in zip(
                             range_cams, ib_pose_data_list, cams_read_h5_dss, frames_indices
                         ):
+                            if pose_paths[cdx] is None:
+                                continue  # posed, not recorded
                             cur_h5_ix = cams_read_h5_idx[cdx]
-                            for fx, frame in enumerate(pose_data[cdx::len(cams)]):
+                            for fx, frame in enumerate(pose_data[cdx::n_cams]):
                                 frame_idx = cam_fr_indices[fx]
                                 if frame_idx < 0:  # == FrameIndexCategory.PADDING:
                                     __debug__ and \

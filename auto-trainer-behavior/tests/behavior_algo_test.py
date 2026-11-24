@@ -6,7 +6,7 @@ import pytest
 from autotrainer.behavior import BehaviorAlgorithm
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
-from autotrainer.core.interfaces import CoverServoStatus
+from autotrainer.core.interfaces import CoverServoStatus, RecordingEndingReason
 from autotrainer.behavior.pellet import PelletState
 from autotrainer.core import BehaviorConfiguration, Offset3DTuple, ProjectInfo
 from autotrainer.core.capture import CaptureProcessStatus
@@ -183,6 +183,21 @@ def test_start_twice_session_fails(algo):
 def test_end_session_if_not_running_fails(algo):
     assert algo.is_in_session is False
     assert algo.end_capture_session() is False
+    assert algo.is_in_session is False
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [reason for reason in RecordingEndingReason if reason is not RecordingEndingReason.NA],
+)
+def test_every_app_stop_reason_ends_a_young_session_at_once(algo, reason):
+    # The app model reverts its STOPPING status when this returns False, and a
+    # deferred end later bypasses that status, so the session is never
+    # finalized: a storage-critical stop in the first 1.5 s left the app stuck
+    # in RECORDING.
+    assert algo.start_session(reason="test") is True
+
+    assert algo.end_capture_session(reason=reason) is True
     assert algo.is_in_session is False
 
 

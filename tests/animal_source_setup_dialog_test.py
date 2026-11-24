@@ -94,8 +94,10 @@ def test_spreadsheet_setup_maps_the_files_columns(qapp, tmp_path):
     dialog.read_columns()
     assert "1 rows" in dialog.status.text()
     assert dialog._mapping_combos["external_identity_column"].currentText() == "Mouse ID"
-    # Only the tag and RFID columns are chosen; the rest are filled in by name.
-    assert set(dialog._mapping_combos) == {"external_identity_column", "rfid_column"}
+    # Only the tag, name and RFID columns are chosen; the rest are filled in by name.
+    assert set(dialog._mapping_combos) == {
+        "external_identity_column", "new_animal_name_column", "rfid_column"
+    }
     assert "State = Status" in dialog.other_columns.text()
     dialog.save()
 
@@ -105,6 +107,26 @@ def test_spreadsheet_setup_maps_the_files_columns(qapp, tmp_path):
     assert configuration.mapping.rfid_column == "RFID"
     assert configuration.mapping.state_column == "Status"
     assert not configuration.mapping.require_rfid
+
+
+def test_setup_saves_a_name_column_apart_from_the_physical_tag(qapp, tmp_path):
+    sheet = tmp_path / "animals.csv"
+    sheet.write_text(f"Physical Tag,Name,RFID\nM-1,Mouse One,{TAG}\n", encoding="utf-8")
+    preferences = Preferences()
+    dialog = AnimalSourceSetupDialog(
+        preferences,
+        credentials=CredentialStore(keyring_backend=False, fallback_path=tmp_path / "s.json"),
+    )
+    choose_kind(dialog, "spreadsheet")
+    dialog._field_widgets["path"].setText(str(sheet))
+
+    dialog.read_columns()
+    assert dialog._mapping_combos["new_animal_name_column"].currentText() == "Name"
+    dialog.save()
+
+    mapping = load_source_configuration(preferences).mapping
+    assert mapping.external_identity_column == "Physical Tag"
+    assert mapping.new_animal_name_column == "Name"
 
 
 def test_errors_stay_in_the_dialog_and_nothing_is_saved(qapp, tmp_path):

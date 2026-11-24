@@ -99,12 +99,14 @@ class DeviceConnectionProtocol(Protocol):
         )
         return False
 
-    def load_default_move_config(self):
+    def load_default_move_config(self) -> Optional[CompoundMovements]:
+        """Apply ~/Autotrainer/move_config.yaml; return what was applied, or None without a file."""
         default_move_cfg_file = CompoundMovements.DEFAULT_LOCATION.expanduser()
         if default_move_cfg_file.exists():
             logger.notice("Reading and applying default move config: %s", default_move_cfg_file)
             move_cfg = CompoundMovements.from_file(default_move_cfg_file)
             self.use_compound_movements(move_cfg)
+            return move_cfg
         else:
             logger.warning(
                 "Default move config file %s not present, no move config auto-applied, this might be critical",

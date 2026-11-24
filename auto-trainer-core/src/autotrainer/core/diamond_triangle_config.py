@@ -35,6 +35,10 @@ class DiamondTriangleOffsetConfig:
     version: Optional[int] = None
     current_config_version: ClassVar[int] = 2  # NB: bump me when need to
 
+    # The id of the format-2 3D calibration this was measured against; None for a legacy
+    # calibration, which has none. A different active calibration makes this stale.
+    calibration_id: Optional[str] = None
+
     DEFAULT_CONFIG_PATH: ClassVar = DEFAULT_DIAMOND_TRIANGLE_CONFIG_PATH
 
     # 3 coordinate systems,
@@ -56,6 +60,7 @@ class DiamondTriangleOffsetConfig:
         diamond_coord: Offset3DTuple = _offset_nans,
         raw_diamond_coord: Offset3DTuple = _offset_nans,
         version: Optional[int] = None,
+        calibration_id: Optional[str] = None,
     ):
         super().__init__()
         self.used_position = used_position
@@ -63,6 +68,7 @@ class DiamondTriangleOffsetConfig:
         self.diamond_coord = diamond_coord
         self.raw_diamond_coord = raw_diamond_coord
         self.version = version
+        self.calibration_id = calibration_id
 
     @property
     def fully_valid(self):
@@ -97,12 +103,23 @@ class DiamondTriangleOffsetConfig:
         if dct is None:
             # in case of empty file
             return cls(used_position=_offset_nans, measured_offset=_offset_nans, version=cls.current_config_version)
-        return cls(**dict((k, v if k == "version" else Offset3DTuple(v)) for k, v in dct.items()))
+        values = {}
+        for k, v in dct.items():
+            if k == "version":
+                values[k] = v
+            elif k == "calibration_id":
+                values[k] = None if v is None else str(v)
+            else:
+                values[k] = Offset3DTuple(v)
+        return cls(**values)
 
     def to_file(self, path: Path):
         d = dataclasses.asdict(self)
+        if d["calibration_id"] is None:
+            # A legacy calibration's DCS is saved exactly as before the id existed.
+            del d["calibration_id"]
         for k, v in d.items():
-            if k != "version":
+            if k not in ("version", "calibration_id"):
                 d[k] = list(v)  # getting yaml type error with Offset3D not natively supported by yaml
         with path.expanduser().open("w") as fh:
             yaml.safe_dump(d, fh)

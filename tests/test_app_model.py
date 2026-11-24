@@ -546,6 +546,97 @@ def test_configuration_mutators_reject_active_session(app_model):
         app_model._set_session_recording_status(SessionRecordingStatus.READY)
 
 
+def _lock_held_elsewhere(lock) -> bool:
+    """Whether another thread holds `lock`: this one cannot take it without waiting."""
+    taken = []
+
+    def try_it():
+        taken.append(lock.acquire(blocking=False))
+        if taken[0]:
+            lock.release()
+
+    thread = threading.Thread(target=try_it)
+    thread.start()
+    thread.join()
+    return not taken[0]
+
+
+def _record_set_active(app_model, monkeypatch):
+    import importlib
+
+    module = importlib.import_module("tools.acquisition.model.app_model")
+    calls = []
+
+    def set_active(root, calibration_id, *, by):
+        calls.append(("set_active", calibration_id, by,
+                      _lock_held_elsewhere(app_model._session_lifecycle_command_lock)))
+
+    def reload_calib(calib_dir):
+        calls.append(("reload", calib_dir, _lock_held_elsewhere(app_model._session_lifecycle_command_lock)))
+
+    monkeypatch.setattr(module, "set_active", set_active)
+    monkeypatch.setattr(app_model, "reload_calib", reload_calib)
+    return calls
+
+
+def test_set_active_refused_while_recording(app_model, monkeypatch):
+    calls = _record_set_active(app_model, monkeypatch)
+    for status in (SessionRecordingStatus.RECORDING,):
+        app_model._set_session_recording_status(status)
+        try:
+            assert app_model.set_active_calibration("a" * 32) == f"set active is not possible while {status.value}"
+        finally:
+            app_model._set_session_recording_status(SessionRecordingStatus.READY)
+    assert calls == []
+
+
+def test_set_active_refused_during_dcs(app_model, monkeypatch):
+    calls = _record_set_active(app_model, monkeypatch)
+    previous = app_model._status
+    try:
+        app_model._status = AppModelStatus.CALIBRATION_DCS
+        assert (app_model.set_active_calibration("a" * 32)
+                == "set active is not possible while the coordinate system is calibrated")
+        app_model._status = AppModelStatus.CALIBRATION_3D
+        assert app_model.set_active_calibration("a" * 32) == "set active is not possible while a 3D calibration runs"
+    finally:
+        app_model._status = previous
+    assert calls == []
+
+
+def test_set_active_reloads_under_the_lock(app_model, monkeypatch):
+    calls = _record_set_active(app_model, monkeypatch)
+
+    assert app_model.set_active_calibration("a" * 32, by="ben") is None
+
+    # Written, then reloaded, both while the session lock is held: no Record can start between.
+    assert calls == [("set_active", "a" * 32, "ben", True), ("reload", None, True)]
+    assert not _lock_held_elsewhere(app_model._session_lifecycle_command_lock)
+
+
+def test_set_active_errors_are_refusals(app_model, monkeypatch):
+    import importlib
+
+    from autotrainer.inference.multires_calibration.store import CalibrationResolutionError
+
+    module = importlib.import_module("tools.acquisition.model.app_model")
+
+    def missing(root, calibration_id, *, by):
+        raise CalibrationResolutionError(f"the calibration library {root} has no calibration {calibration_id}")
+
+    monkeypatch.setattr(module, "set_active", missing)
+    refusal = app_model.set_active_calibration("a" * 32)
+    assert refusal.startswith("aaaaaaaa was not set active: the calibration library ")
+
+    def unloadable(calib_dir):
+        raise ValueError("bad preset")
+
+    monkeypatch.setattr(module, "set_active", lambda root, calibration_id, *, by: None)
+    monkeypatch.setattr(app_model, "reload_calib", unloadable)
+    assert app_model.set_active_calibration("a" * 32) == (
+        "Set active, but it could not be loaded: bad preset. Restart the app.")
+
+
 def test_disabling_analysis_changes_scored_counting_to_completed(app_model):
     control = app_model.behavior.algorithm.active_config.session_control
     control.intertrial_analysis_enabled = True
@@ -1548,7 +1639,7 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
 
     serialized_json = output.with_suffix(".json").read_text()
     saved = json.loads(serialized_json)
-    assert saved["metadataSchemaVersion"] == 2
+    assert saved["metadataSchemaVersion"] == 3
     assert saved["scope"] == "session"
     assert saved["recording"]["firstPelletDeliveryOffsetSeconds"] is None
     assert saved["recording"]["firstPelletPresentationOffsetSeconds"] is None
@@ -1580,9 +1671,13 @@ def test_final_metadata_uses_canonical_boundary_not_stale_project_timestamp(
         "watchdog",
     }
     # Keep the authoritative document bounded while retaining the complete
-    # versioned tone, laser, and automatic-shift policy snapshot, and the
-    # capture and inference shape recorded for every camera.
-    assert len(serialized_json) < 21_000
+    # versioned tone, laser, and automatic-shift policy snapshot, the capture
+    # and inference shape recorded for every camera, and schema 3's camera
+    # identity and calibration fields: hardware.configured.calibration3d and each
+    # camera's serial, cameraId, inCalibration and uncalibratedReason. Measured
+    # 20_992 bytes on a clean tree (2026-11-20); a dirty tree's version suffix
+    # (.dYYYYMMDD) adds 10.
+    assert len(serialized_json) < 23_000
     assert saved["artifacts"]["alignment"]["$ref"] == "streams/alignment.json"
     assert saved["artifacts"]["trialSummary"]["$ref"] == "streams/trial_summary.json"
     # The live counters the operator watched are kept with the session, so the
@@ -2277,6 +2372,41 @@ def test_notes_save_without_a_running_validation_writes_at_once(app_model):
     save.assert_called_once_with(app_model._editable_notes_project, caller="session_notes_updated")
 
 
+def test_a_notes_save_changes_only_the_notes_of_the_finished_session(app_model):
+    # A notes save rebuilt the whole session document from live state: one
+    # made after the operator set up the next session wrote that session's
+    # settings into this one. Here the live stop reason stands in for them.
+    project = app_model.project.to_local_value()
+    _, token = app_model._recording_session.begin_record(project.short_id, {})
+    app_model._recording_session.set_boundary(SessionBoundary(
+        session_id=project.short_id,
+        primary_camera="left",
+        primary_frame_id=42,
+        start_perf_time=10.0,
+        start_wall_time=100.0,
+        camera_when=1_000_000.0,
+    ), token)
+    streams = Path(project.get_session_path().location) / "streams"
+    streams.mkdir(parents=True, exist_ok=True)
+    (streams / "alignment.json").write_text(json.dumps({
+        "canonicalBoundary": {"startPerfTime": 10.0, "startWallTime": 100.0},
+    }))
+    app_model._recording_ending_reason = RecordingEndingReason.MANUAL_STOP
+    app_model._notes = "typed during the session"
+    app_model._save_project_metadata(project, caller="intertrial_analysis_finished")
+    metadata = Path(project.get_metadata_file(project.session, project.when) + ".json")
+    finalized = json.loads(metadata.read_text())
+
+    app_model._recording_ending_reason = RecordingEndingReason.STORAGE_LIMIT
+    app_model._notes = "typed after the session"
+    app_model._save_project_metadata(project, caller="session_notes_updated")
+
+    saved = json.loads(metadata.read_text())
+    assert saved["notes"] == "typed after the session"
+    assert saved["recording"]["stopReason"] == "ManualStop"
+    assert {**saved, "notes": None} == {**finalized, "notes": None}
+
+
 def test_notes_wait_for_a_running_validation_and_are_saved_when_it_ends(app_model):
     app_model._editable_notes_project = app_model.project.to_local_value()
     states = [SessionValidationState(status="running", profile="quick")]
@@ -2392,3 +2522,45 @@ def test_only_a_successful_session_metadata_save_marks_the_live_notes_saved(app_
     with mock.patch.object(app_model, "_save_metadata"):
         app_model._save_project_metadata(project, caller="NA")
     assert app_model._notes_saved_revision == app_model._notes_revision
+
+
+def test_live_inference_is_started_with_the_live_queue_cameras_in_queue_order(app_model, system_config):
+    """Live pose names its cameras by the queue: primary first, no stimulation-mode stimCam.
+
+    Configured left, right, stimCam with right primary and all three recording, so
+    project.camera_names (configuration order, recording cameras) is left, right, stimCam
+    and differs from the queue's right, left.
+    """
+    assert app_model.load_configuration() is True
+    cameras = {camera.name: camera for camera in app_model.reach_cameras}
+    left, right, stim = cameras["left"], cameras["right"], cameras["stimCam"]
+    for camera in (left, right, stim):
+        camera.is_enabled = True
+        camera.is_recording_enabled = True
+    left._configured_is_primary = False
+    right._configured_is_primary = True
+    app_model._ensure_reach_primary_camera()
+    app_model.project = app_model.make_project_info()
+    assert app_model.project.camera_names == ("left", "right", "stimCam")
+
+    started = []
+
+    def start(live_queue, *, camera_names):
+        started.append(tuple(camera_names))
+        return True
+
+    previous_inference = app_model._inference
+    try:
+        with mock.patch.object(
+            type(app_model), "_is_independent_stim_camera", side_effect=lambda camera: camera is stim,
+        ):
+            app_model._inference_cameras = app_model._select_inference_cameras()
+        app_model._inference_queue = object()
+        app_model._inference = SimpleNamespace(is_enabled=True, start=start, stop=lambda: None)
+
+        assert app_model._start_inference_domain(
+            reach_synchronization_ready=True, preflight_error=None)
+    finally:
+        app_model._inference = previous_inference
+
+    assert started == [("right", "left")]

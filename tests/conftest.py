@@ -1,6 +1,16 @@
+import sys
 from pathlib import Path
 
 import pytest
+
+# Tests here (calibration_install_test.py) import the synthetic rig, multires_synthetic, from
+# auto-trainer-inference/tests. That folder is on sys.path only once pytest has collected a test
+# from it, so such a test passed in the full-suite order and failed when run alone or per
+# directory. Appended, not inserted: a module of the same name here still wins. Not the pytest
+# `pythonpath` ini option, which pytest.ini does not use and which would apply to every directory.
+_INFERENCE_TESTS = str(Path(__file__).resolve().parents[1] / "auto-trainer-inference" / "tests")
+if _INFERENCE_TESTS not in sys.path:
+    sys.path.append(_INFERENCE_TESTS)
 
 from autotrainer.behavior import BehaviorAlgorithm
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME

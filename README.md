@@ -77,6 +77,7 @@ from the core logic of the applications for two reasons:
     * [Local API: events and commands over TCP](docs/acquisition/local-api.md)
     * [Session validation command and rule coverage](docs/acquisition/session-validation.md)
     * [Pellet firmware compatibility and rollout](docs/acquisition/pellet-firmware-compatibility.md)
+    * [Operator alerts, first-run setup and the diagnostic bundle](docs/acquisition/operator-alerts-and-diagnostics.md)
     * Use `--random-cameras` to start with software-generated frames when no physical cameras are configured.
     * Use `--simulate` to run with no hardware at all: [simulation mode](docs/acquisition/simulation-mode.md) and its [backend interfaces](docs/acquisition/backend-interfaces.md).
   * Headless implementation for command line only

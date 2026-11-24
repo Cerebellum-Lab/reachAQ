@@ -1,3 +1,4 @@
+import time
 from typing import Dict, Optional
 
 from numpy import ndarray
@@ -20,6 +21,10 @@ from tools.acquisition.view.capture_telemetry_panel import CaptureTelemetryPanel
 
 logger = get_verbose_logger(__name__)
 
+#: A displayed frame older than this (seconds) is no current view of the camera: the
+#: reference-image check then can't tell, rather than judge a frozen picture.
+DISPLAYED_FRAME_MAX_AGE = 1.0
+
 
 class CameraContent(ContentWidget):
     def __init__(self, app_model: AppModel, capture_model: VideoCaptureModel):
@@ -30,6 +35,10 @@ class CameraContent(ContentWidget):
 
         self._text_overlay: Optional[str] = None
         self._text_overlay_color = Qt.GlobalColor.yellow
+        # The newest frame shown (refresh_image), which Record's reference-image check registers,
+        # and when it was shown (time.monotonic()).
+        self._displayed_frame: Optional[ndarray] = None
+        self._displayed_at: Optional[float] = None
 
         layout = QGridLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -71,6 +80,8 @@ class CameraContent(ContentWidget):
         NotificationCenter.default_center().add_observer(TriggerNotification.CAPTURE_ID, self._trigger_received)
 
         capture_model.property_changed += self._on_model_property_changed
+        app_model.property_changed += self._on_app_model_property_changed
+        self._refresh_calibration_tag()
 
         # Swap because model shape is row x col == height x width
         capture_view.setShape(capture_model.shape[1], capture_model.shape[0])
@@ -85,6 +96,7 @@ class CameraContent(ContentWidget):
     def close(self):
         NotificationCenter.default_center().remove_observer(TriggerNotification.CAPTURE_ID, self._trigger_received)
         self._model.property_changed -= self._on_model_property_changed
+        self._app_model.property_changed -= self._on_app_model_property_changed
         # The panel holds a running timer and an observer on the telemetry
         # model, which outlives this view; leaving either attached keeps the
         # widget alive and ticking after it is gone.
@@ -93,9 +105,19 @@ class CameraContent(ContentWidget):
 
     @Slot(ndarray, float)
     def refresh_image(self, data: ndarray, fps: float, frame_id: int = -1):
+        self._displayed_frame, self._displayed_at = data, time.monotonic()
         row, col = data.shape
         self._capture_view.refresh_image(
             ImageData(data, col, row, frame_id), fps)
+
+    def displayed_frame(self) -> Optional[ndarray]:
+        """The newest frame this view was given, at the camera's capture geometry; None before
+        the first, after capture stopped, and when it is older than DISPLAYED_FRAME_MAX_AGE
+        (the camera stalled), so the reference-image check can't tell instead of judging an
+        old picture. The queue hands each frame over as its own copy, so it is not overwritten."""
+        if self._displayed_at is None or time.monotonic() - self._displayed_at > DISPLAYED_FRAME_MAX_AGE:
+            return None
+        return self._displayed_frame
 
     @invoke_method
     def set_is_editable(self, is_editable: bool):
@@ -103,6 +125,9 @@ class CameraContent(ContentWidget):
 
     @invoke_method
     def set_is_capture_active(self, is_active: bool):
+        if not is_active:
+            # A stopped camera has no current view; its last frame is not one.
+            self._displayed_frame = self._displayed_at = None
         self._capture_view.set_is_capture_active(is_active)
 
     @invoke_method
@@ -141,6 +166,17 @@ class CameraContent(ContentWidget):
             self._capture_view.recording_indicator_changed.emit(notification.context)
 
     @invoke_method
+    def _on_app_model_property_changed(self, name, value, _):
+        if name == AppModel.Props.CAMERA_CALIBRATION:
+            self._refresh_calibration_tag()
+
+    def _refresh_calibration_tag(self) -> None:
+        """"2D only" beside the camera's name while the active calibration does not calibrate
+        it, with the reason as the tooltip."""
+        reason = self._app_model.uncalibrated_reasons.get(self._model.name)
+        self._capture_view.setTag("" if reason is None else "2D only", reason or "")
+
+    @invoke_method
     def _on_model_property_changed(self, name, value, _):
         if name == VideoCaptureModel.CAMERA_PROP:
             self._capture_view.setCamera(value)
@@ -160,6 +196,7 @@ class CameraContent(ContentWidget):
                 self._capture_view.setShape(value[1], value[0])
         elif name == VideoCaptureModel.CAMERA_LIST_PROP:
             self._capture_view.setCameras(self._model.camera_list)
+            self._capture_view.setCamera(self._model.camera_source)
         elif name == VideoCaptureModel.TEXT_OVERLAY_PROP:
             self._text_overlay = value
             self._capture_view.set_text_overlay(

@@ -49,6 +49,14 @@ class StepperConfigMessage(Protocol):
         1 - Invert motor direction
         """
 
+    @property
+    def minimum_position(self) -> Optional[float]:
+        """Lowest allowed target (mm); None when that side is not limited"""
+
+    @property
+    def maximum_position(self) -> Optional[float]:
+        """Highest allowed target (mm); None when that side is not limited"""
+
     uuid_ack_timeout: Optional[float]
     """Optional custom uuid ack timeout for the motor"""
 

@@ -418,6 +418,191 @@ def test_a_refusal_of_a_token_this_model_did_not_send_still_marks_needs_home(har
     assert reported[0].command is SystemCommandKind.SEND_HOME
 
 
+_TRAVEL = {"pellet": {a: {"min_pos": 0, "max_pos": 35} for a in "xyz"}}
+
+
+def _set_y_refused_setup(hardware_model, *, travel=True):
+    """Requested (10, 20, 12), the board reporting y 34; SETs are queued as tokens."""
+    from autotrainer.core import Offset3DTuple
+    from autotrainer.device import MotorConfigurationFile
+
+    hardware_model._motor_configurations = (
+        MotorConfigurationFile.from_yaml_dict(_TRAVEL, source=None) if travel else None)
+    hardware_model._last_requested_set_coordinates = Offset3DTuple(10.0, 20.0, 12.0)
+    hardware_model._last_motor_send_coordinates = Offset3DTuple(10.0, 34.0, 12.0)
+
+    def send_with_token(_device, command, _data=None):
+        token = _pending(hardware_model, command)
+        return token
+
+    hardware_model._send_with_token = send_with_token
+    return hardware_model
+
+
+def _refuse_set(hardware_model, token, **kwargs):
+    hardware_model._command_refused(token, refusal=_refusal(
+        token, kwargs.pop("error", -16), command=SystemCommandKind.SET_Y,
+        command_class=RefusedCommandClass.STEPPER_MOVE, motors=(Motor.PELLET_Y_MOTOR,), **kwargs,
+    ))
+
+
+def test_a_refused_set_rolls_the_requested_axis_back_to_the_reported_send_position(hardware_model):
+    """With travel, the board kept its own send position: the travel checks must use it."""
+    _set_y_refused_setup(hardware_model)
+    token = hardware_model.set_y(25.0)
+
+    _refuse_set(hardware_model, token)
+
+    assert tuple(hardware_model._last_requested_set_coordinates) == (10.0, 34.0, 12.0)
+    # Any other refused command leaves the requested position alone.
+    other = _pending(hardware_model, SystemCommandKind.SEND_PELLET)
+    hardware_model._command_refused(other, refusal=_refusal(other))
+    assert tuple(hardware_model._last_requested_set_coordinates) == (10.0, 34.0, 12.0)
+
+
+def test_the_roll_back_is_silent_so_the_selected_animal_keeps_its_position(hardware_model):
+    """AppModel takes a set_<axis> change for an operator edit and saves it into the animal;
+    a board refusal is not one."""
+    from tools.acquisition.model.app_model import AppModel
+
+    _set_y_refused_setup(hardware_model)
+    animal = SimpleNamespace(name="m1", pellet_x=10.0, pellet_y=20.0, pellet_z=12.0, is_pellet_dcs=False)
+    app = SimpleNamespace(
+        _selected_animal=animal, _hardware=hardware_model, _attached_plan=None,
+        _protocol_positioning_active=False, _dcs_held_off=False,
+        _behavior=SimpleNamespace(algorithm=SimpleNamespace(diamond_triangle_config=None)),
+        _save_animal_metadata=mock.Mock(),
+        property_changed=mock.Mock(), recording_blockers=(), Props=AppModel.Props,
+    )
+    hardware_model.property_changed += (
+        lambda name, value, old: AppModel._on_hardware_property_changed(app, name, value, old))
+    token = hardware_model.set_y(25.0)  # an accepted operator SET is saved, as before
+    assert animal.pellet_y == 25.0
+    app._save_animal_metadata.reset_mock()
+
+    _refuse_set(hardware_model, token)
+
+    assert (animal.pellet_x, animal.pellet_y, animal.pellet_z) == (10.0, 25.0, 12.0)
+    app._save_animal_metadata.assert_not_called()
+
+
+def test_a_refused_set_is_not_rolled_back_over_a_newer_set_on_the_axis(hardware_model):
+    _set_y_refused_setup(hardware_model)
+    first = hardware_model.set_y(25.0)
+    hardware_model.set_y(27.0)
+
+    _refuse_set(hardware_model, first)
+
+    assert hardware_model._last_requested_set_coordinates.y == 27.0
+
+
+def test_a_refusal_with_an_unknown_outcome_is_not_rolled_back(hardware_model):
+    _set_y_refused_setup(hardware_model)
+    token = hardware_model.set_y(25.0)
+
+    _refuse_set(hardware_model, token, resent=True)  # -EBUSY on a resend: maybe still moving
+
+    assert hardware_model._last_requested_set_coordinates.y == 25.0
+
+
+def test_without_travel_a_refused_set_is_not_rolled_back(hardware_model):
+    """No min_pos / max_pos: the requested position is left as before this branch."""
+    _set_y_refused_setup(hardware_model, travel=False)
+    token = hardware_model.set_y(25.0)
+
+    _refuse_set(hardware_model, token)
+
+    assert hardware_model._last_requested_set_coordinates.y == 25.0
+
+
+def test_a_board_refusal_of_a_block_lifting_set_keeps_the_presentation_blocked(hardware_model):
+    """N-8: a refused base position blocks presentation; the operator sets X, Y and Z, and the
+    board refuses the Y SET. Only the SETs it accepts lift the block, so Y keeps it."""
+    _set_y_refused_setup(hardware_model)
+    hardware_model.block_presentation("m1's pellet position lies outside the configured travel")
+    x = hardware_model.set_x(10.0, sender="UI-Set-Button")
+    y = hardware_model.set_y(25.0, sender="UI-Set-Button")
+    z = hardware_model.set_z(12.0, sender="UI-Set-Button")
+    assert hardware_model.presentation_blocked, "queued is not accepted"
+
+    hardware_model._ack_received(x)
+    _refuse_set(hardware_model, y)
+    hardware_model._ack_received(z)
+
+    assert hardware_model.presentation_blocked
+    assert hardware_model._presentation_blocked_axes == frozenset({1})
+    hardware_model._ack_received(hardware_model.set_y(26.0, sender="UI-Set-Button"))
+    assert not hardware_model.presentation_blocked
+
+
+def test_an_ack_that_lands_before_the_lift_token_is_recorded_still_lifts(hardware_model):
+    """N-11: the board's ack can be handled while _send_with_token's listeners still run,
+    before _set_axis records the token; the outcome table then already says acknowledged."""
+    _set_y_refused_setup(hardware_model)
+    hardware_model.block_presentation("m1's pellet position lies outside the configured travel")
+
+    def send_and_ack_at_once(_device, command, _data=None):
+        token = _pending(hardware_model, command)
+        hardware_model._ack_received(token)
+        return token
+
+    hardware_model._send_with_token = send_and_ack_at_once
+    for axis in "xyz":
+        getattr(hardware_model, f"set_{axis}")(12.0, sender="UI-Set-Button")
+
+    assert not hardware_model.presentation_blocked
+    assert hardware_model._block_lifting_sets == {}
+
+
+def test_the_ack_time_lift_waits_for_the_model_lock(hardware_model):
+    """N-12: the lift reads and rewrites the block under _lock, so block_presentation (also
+    under _lock) cannot run between its read and its write."""
+    _set_y_refused_setup(hardware_model)
+    hardware_model.block_presentation("first block")
+    token = hardware_model.set_y(25.0, sender="UI-Set-Button")
+    lifted = threading.Event()
+
+    def ack():
+        hardware_model._lift_presentation_block(token)
+        lifted.set()
+
+    with hardware_model._lock:
+        worker = threading.Thread(target=ack, daemon=True)
+        worker.start()
+        assert not lifted.wait(0.2), "the lift ran without the lock"
+        hardware_model.block_presentation("second block")  # re-entrant: same thread
+    worker.join(2.0)
+    assert lifted.is_set()
+    # The token belonged to the first block: the second one keeps every axis.
+    assert hardware_model._presentation_blocked_axes == frozenset({0, 1, 2})
+
+
+@pytest.mark.parametrize("ack", ["early", "late"])
+def test_a_set_sent_under_one_block_cannot_lift_a_block_raised_during_its_send(hardware_model, ack):
+    """N-15: Set Y is pressed under block 1; while it is being sent, another out-of-travel
+    animal raises block 2. Whether the board's ack is handled during the send or after,
+    that SET belongs to block 1 and must leave block 2's Y blocked."""
+    _set_y_refused_setup(hardware_model)
+    hardware_model.block_presentation("block 1")
+    sent = []
+
+    def send_while_a_new_block_is_raised(_device, command, _data=None):
+        token = _pending(hardware_model, command)
+        hardware_model.block_presentation("block 2")
+        if ack == "early":
+            hardware_model._ack_received(token)
+        sent.append(token)
+        return token
+
+    hardware_model._send_with_token = send_while_a_new_block_is_raised
+    hardware_model.set_y(25.0, sender="UI-Set-Button")
+    if ack == "late":
+        hardware_model._ack_received(sent[0])
+
+    assert 1 in hardware_model._presentation_blocked_axes
+    assert hardware_model._block_lifting_sets == {}
+
+
 class _ConnectionWhoseHomeIsRefused:
     """Stands in for DeviceConnection: version and configuration succeed, the home is refused.
 

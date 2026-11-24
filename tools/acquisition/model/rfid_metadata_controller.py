@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 from autotrainer.core.logging import (
     ALWAYS_CONSOLE_LOG_ATTRIBUTE,
@@ -13,6 +13,35 @@ from .animal_registry import AnimalRegistry
 
 
 logger = get_verbose_logger(__name__)
+
+#: How old the last import may be before a lookup is reported as stale.
+CACHE_STALE_AFTER_SECONDS = 48 * 60 * 60
+
+
+def lookup_rfid(
+    registry: AnimalRegistry,
+    rfid: str,
+    stale_after_seconds: float = CACHE_STALE_AFTER_SECONDS,
+) -> Tuple[object, object, bool]:
+    """Resolve an identifier: ``(record or None, last import row, cache_stale)``.
+
+    Shared by the RFID reader and typed or barcode-scanned entry, so both
+    resolve an animal the same way.
+    """
+    record = registry.resolve_rfid(rfid)
+    ledger = registry.last_complete_import()
+    cache_stale = True
+    if ledger is not None:
+        try:
+            imported = datetime.fromisoformat(
+                ledger["imported_utc"].replace("Z", "+00:00")
+            )
+            cache_stale = (
+                datetime.now(timezone.utc) - imported
+            ).total_seconds() > stale_after_seconds
+        except (TypeError, ValueError):
+            cache_stale = True
+    return record, ledger, cache_stale
 
 
 def _qt_dispatcher():
@@ -46,7 +75,7 @@ class RfidMetadataController:
         registry: AnimalRegistry,
         dispatch: Optional[Callable[[Callable[[], None]], None]] = None,
         reader_factory=RfidReaderService,
-        cache_stale_after_seconds: float = 48 * 60 * 60,
+        cache_stale_after_seconds: float = CACHE_STALE_AFTER_SECONDS,
         **reader_options,
     ):
         self.app_model = app_model
@@ -94,22 +123,12 @@ class RfidMetadataController:
             extra={ALWAYS_CONSOLE_LOG_ATTRIBUTE: True},
         )
         try:
-            record = self.registry.resolve_rfid(event.rfid)
-            ledger = self.registry.last_complete_import()
+            record, ledger, cache_stale = lookup_rfid(
+                self.registry, event.rfid, self.cache_stale_after_seconds
+            )
         except Exception:
             logger.exception("RFID registry lookup failed: rfid=%s", event.rfid)
             raise
-        cache_stale = True
-        if ledger is not None:
-            try:
-                imported = datetime.fromisoformat(
-                    ledger["imported_utc"].replace("Z", "+00:00")
-                )
-                cache_stale = (
-                    datetime.now(timezone.utc) - imported
-                ).total_seconds() > self.cache_stale_after_seconds
-            except (TypeError, ValueError):
-                cache_stale = True
 
         logger.info(
             "RFID registry lookup: rfid=%s matched=%s subject_id=%s "
