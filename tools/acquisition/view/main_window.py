@@ -895,7 +895,7 @@ class MainWindow(QMainWindow):
                 if target_status != AppModelStatus.IDLE:
                     self._on_capture_start_stop(True, target_status=target_status)
             else:
-                logger.verbose("AppModelStatus not idle, not starting acquisition", app_status)
+                logger.verbose("AppModelStatus not idle (%s), not starting acquisition", app_status)
 
     def on_calibrate_diamond_triangle(self, is_toggled):
         refusal = self._app_model.dcs_refusal() if is_toggled and self._diamond_triangle_calib_run is None else None
