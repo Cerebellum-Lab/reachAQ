@@ -35,7 +35,7 @@ from reachaq.inference.multires_calibration.pipeline import (
     load_frame_times,
     write_waypoint_log,
 )
-from reachaq.inference.multires_calibration.report import QualityReport
+from reachaq.inference.multires_calibration.report import QualityReport, configured_lenses
 from reachaq.inference.multires_calibration.scout import (
     DEFAULT_COUNTS,
     MAX_PATH,
@@ -569,6 +569,7 @@ def calibrate_waypoint_capture(
     board: Optional[BoardSpec] = None,
     fit_mode: Optional[str] = None,
     fix_principal_point: bool = False,
+    lenses=None,
 ) -> Tuple[Path, CalibrationIndex, QualityReport]:
     """Write `log` as the capture's waypoints.yaml beside its source_videos, then calibrate
     every preset into <session_dir>/<DEFAULT_3D_CALIB_DIR_NAME>.new. With `live_geometries`
@@ -589,6 +590,8 @@ def calibrate_waypoint_capture(
         extra["fit_mode"] = fit_mode
     if fix_principal_point:
         extra["fix_principal_point"] = True
+    if lenses is not None and lenses.lens_mm:
+        extra["lenses"] = lenses
     index, report = calibrate_capture(
         Path(capture_dir),
         output_dir=output_dir,
@@ -1124,6 +1127,7 @@ def make_3d_calib(
     board = configured_board(library_settings)
     fit_mode = configured_fit(library_settings, board)
     fix_principal_point = configured_principal_point(library_settings)
+    lenses = configured_lenses(library_settings)
     if board.kind == BoardSpec().kind:
         logger.notice("Calibration board: checkerboard, %d x %d inner corners, %g mm squares",
                       board.rows, board.cols, board.square_mm)
@@ -1188,6 +1192,7 @@ def make_3d_calib(
         board=board,
         fit_mode=fit_mode,
         fix_principal_point=fix_principal_point,
+        lenses=lenses,
     )
 
     logger.success("Successfully calibrated the capture: %s, verdict %s", index.id, report.verdict)

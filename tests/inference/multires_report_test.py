@@ -145,7 +145,8 @@ def test_clean_synthetic_fit_passes(rig, fitted):
     assert report.thresholds == DEFAULT_THRESHOLDS
     # Every metric that applies without a previous calibration is graded, per camera where it
     # is per camera; the leave-one-camera-out check needs a third camera.
-    assert {m.name for m in report.metrics} == set(DEFAULT_THRESHOLDS) - CHANGE_METRICS - {"loo_triangulation_px"}
+    assert {m.name for m in report.metrics} == (
+        set(DEFAULT_THRESHOLDS) - CHANGE_METRICS - {"loo_triangulation_px", "focal_vs_nominal_rel"})
     for name in ("views_kept", "covisible_views", "reprojection_rms_px", "coverage_roi_fraction", "fx_fy_ratio_dev",
                  "focal_rel_std", "principal_point_offset_frac", "max_distortion_shift_px"):
         for cam in CAMERAS:

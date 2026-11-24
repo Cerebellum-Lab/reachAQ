@@ -391,6 +391,31 @@ example `waypoint 13: board 3.3 mm short of commanded z`), each waypoint's board
 tilt and its axis in the motor frame, and every waypoint's residual. They are
 warnings about the stage, not the calibration; `motor_scale_dev` stays a warning.
 
+`fit_principal_point: centre` holds every camera's principal point at the image
+centre in the per-view fit (default `free`). The board only translates, so its
+views barely separate the principal point from the camera's position: on
+christielab10's session002 (2026-11-24) the free principal points landed 0.9-1.4
+ROI half-sides off centre.
+
+**Nominal lenses.** The report compares each camera's fitted focal length with
+its lens when `calibrations/settings.yaml` gives one:
+
+```yaml
+lenses:
+  "24152533": {lens_mm: 8.5}    # by camera serial; a camera without one by its name
+  "24152513": {lens_mm: 12}
+  "26040425": {lens_mm: 8.5}
+pixel_um: 3.45                  # the sensor's pixel pitch (BFS-U3-16S2M)
+```
+
+Each camera gets a line such as `right: fitted 12.5 mm, HFOV 22.5° (nominal 12 mm)`
+(the fitted fx × `pixel_um`, at the capture's binning 1), and a warning,
+`focal_vs_nominal_rel`, when the fitted focal length is more than 15 % from the
+nominal one. `focal_pair_rel` then compares two cameras' fitted focal ratio with
+their lenses' ratio; for a pair without both lenses it is reported ungraded.
+`lens_mm` and `pixel_um` must be positive numbers, `lenses` needs `pixel_um`, and
+an unknown key in a lens entry is refused.
+
 ### The calibration library
 
 **Tools → Calibration library…** lists every calibration in the library, newest
