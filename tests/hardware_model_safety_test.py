@@ -515,6 +515,26 @@ def test_without_travel_a_refused_set_is_not_rolled_back(hardware_model):
     assert hardware_model._last_requested_set_coordinates.y == 25.0
 
 
+def test_a_board_refusal_of_a_block_lifting_set_keeps_the_presentation_blocked(hardware_model):
+    """N-8: a refused base position blocks presentation; the operator sets X, Y and Z, and the
+    board refuses the Y SET. Only the SETs it accepts lift the block, so Y keeps it."""
+    _set_y_refused_setup(hardware_model)
+    hardware_model.block_presentation("m1's pellet position lies outside the configured travel")
+    x = hardware_model.set_x(10.0, sender="UI-Set-Button")
+    y = hardware_model.set_y(25.0, sender="UI-Set-Button")
+    z = hardware_model.set_z(12.0, sender="UI-Set-Button")
+    assert hardware_model.presentation_blocked, "queued is not accepted"
+
+    hardware_model._ack_received(x)
+    _refuse_set(hardware_model, y)
+    hardware_model._ack_received(z)
+
+    assert hardware_model.presentation_blocked
+    assert hardware_model._presentation_blocked_axes == frozenset({1})
+    hardware_model._ack_received(hardware_model.set_y(26.0, sender="UI-Set-Button"))
+    assert not hardware_model.presentation_blocked
+
+
 class _ConnectionWhoseHomeIsRefused:
     """Stands in for DeviceConnection: version and configuration succeed, the home is refused.
 

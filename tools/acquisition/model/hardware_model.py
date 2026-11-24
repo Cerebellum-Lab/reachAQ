@@ -82,6 +82,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     # send_pellet is refused until none is left.
     _presentation_blocked_axes: frozenset = frozenset()
     _presentation_block_reason: str = ""
+    # token -> axis of each queued SET that lifts the block once the board acknowledges it.
+    _block_lifting_sets: Dict[UUID, int] = {}  # replaced, never mutated in place
     # SETs that only move the stage for a while, or shift it from where it is: they do not
     # stand in for the refused base position.
     _SENDERS_NOT_CLEARING_THE_BLOCK = frozenset({"ordered_protocol", "processed_shift_xyz"})
@@ -452,11 +454,25 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         return refused
 
     def block_presentation(self, reason: str) -> None:
-        """Refuse send_pellet, logging `reason`, until each of x, y and z has been SET again,
-        by anything but a protocol target or the intersession shift. Called after the
-        animal's base position was refused, so the previous animal's position is not used."""
+        """Refuse send_pellet, logging `reason`, until the board has accepted a SET of each of
+        x, y and z, from anything but a protocol target or the intersession shift. Called
+        after the animal's base position was refused, so the previous animal's position is
+        not used. A SET the board refuses, or never acknowledges, leaves its axis blocked."""
         self._presentation_blocked_axes = frozenset(range(3))
         self._presentation_block_reason = str(reason)
+        self._block_lifting_sets = {}
+
+    def _lift_presentation_block(self, token) -> None:
+        """The board acknowledged `token`: when it is a SET that lifts the block, its axis is
+        no longer blocked."""
+        coord_idx = self._block_lifting_sets.get(token)
+        if coord_idx is None:
+            return
+        self._block_lifting_sets = {t: i for t, i in self._block_lifting_sets.items() if t != token}
+        if coord_idx in self._presentation_blocked_axes:
+            self._presentation_blocked_axes = self._presentation_blocked_axes - {coord_idx}
+            if not self._presentation_blocked_axes:
+                logger.notice("Pellet presentation allowed again: the board accepted x, y and z")
 
     @property
     def presentation_blocked(self) -> bool:
@@ -497,9 +513,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             tokens[coord_idx] = res
             self._latest_set_tokens = tuple(tokens)
             if sender not in self._SENDERS_NOT_CLEARING_THE_BLOCK and coord_idx in self._presentation_blocked_axes:
-                self._presentation_blocked_axes = self._presentation_blocked_axes - {coord_idx}
-                if not self._presentation_blocked_axes:
-                    logger.notice("Pellet presentation allowed again: x, y and z have been SET")
+                # Lifted on the board's ack (_lift_presentation_block), not here.
+                self._block_lifting_sets = {**self._block_lifting_sets, res: coord_idx}
             self._last_requested_set_coordinates = self._last_requested_set_coordinates.replace(**{coord: new_value})
             self._on_property_changed(f"set_{coord}", new_value, prev_value)
         return res
@@ -1697,6 +1712,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 "Received unexpected ack token: %s", token)
         else:
             self._refresh_cmd_in_progress(commands_in_prog)
+            self._lift_presentation_block(token)
             if popped[0] in {SystemCommandKind.SEND_HOME, SystemCommandKind.SEND_TO_LIMITS}:
                 # Both home all three axes, and only the whole sequence is acknowledged.
                 self._set_axes_needing_home(())

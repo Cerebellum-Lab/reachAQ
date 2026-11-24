@@ -5,6 +5,7 @@ import logging
 import math
 from types import SimpleNamespace
 from unittest import mock
+from uuid import uuid4
 
 import pytest
 
@@ -25,7 +26,13 @@ def _hardware():
     hardware._pellet_sequences = _pellet_sequences()
     hardware._device_conn = SimpleNamespace(device=SimpleNamespace(connected=True))
     hardware._on_property_changed = mock.Mock()
-    hardware._send_with_token = mock.Mock(return_value=mock.sentinel.token)
+    hardware.sent_tokens = []
+
+    def send_with_token(*_args):
+        hardware.sent_tokens.append(uuid4())
+        return hardware.sent_tokens[-1]
+
+    hardware._send_with_token = mock.Mock(side_effect=send_with_token)
     hardware.wait_pending_command_acked = mock.Mock()
     return hardware
 
@@ -40,8 +47,15 @@ def _app_model(hardware):
     )
 
 
-def _animal(x, y, z):
-    return SimpleNamespace(name="m1", pellet_x=x, pellet_y=y, pellet_z=z, is_pellet_dcs=False)
+def _animal(x, y, z, protocol=None):
+    return SimpleNamespace(name="m1", pellet_x=x, pellet_y=y, pellet_z=z, is_pellet_dcs=False,
+                           training=SimpleNamespace(current_protocol=protocol))
+
+
+def _board_accepts_everything_sent(hardware):
+    """The board acknowledges every SET queued so far, as HardwareModel._ack_received hears it."""
+    for token in hardware.sent_tokens:
+        hardware._lift_presentation_block(token)
 
 
 def test_an_animal_base_position_outside_the_travel_sets_no_axis(caplog):
@@ -98,8 +112,9 @@ def test_an_accepted_base_position_clears_the_block():
     app_model = _app_model(hardware)
     AppModel._set_animal_base_positions(app_model, _animal(5.0, 36.2, 7.0))
     AppModel._set_animal_base_positions(app_model, _animal(5.0, 30.0, 7.0))
-    hardware._send_with_token.reset_mock()
-    assert hardware.send_pellet() is mock.sentinel.token
+    assert hardware.send_pellet() is None  # queued, not yet accepted by the board
+    _board_accepts_everything_sent(hardware)
+    assert hardware.send_pellet() is not None
 
 
 def test_the_operator_setting_every_axis_clears_the_block_and_a_protocol_target_does_not():
@@ -107,13 +122,15 @@ def test_the_operator_setting_every_axis_clears_the_block_and_a_protocol_target_
     app_model = _app_model(hardware)
     AppModel._set_animal_base_positions(app_model, _animal(5.0, 36.2, 7.0))
     AppModel._move_protocol_motor_target(app_model, Offset3DTuple(5.0, 30.0, 7.0))
+    _board_accepts_everything_sent(hardware)
     assert hardware.send_pellet() is None
     hardware.set_x(5.0, sender="UI-Set-Button")
     hardware.set_y(30.0, sender="UI-Set-Button")
+    _board_accepts_everything_sent(hardware)
     assert hardware.send_pellet() is None  # z not set yet
     hardware.set_z(7.0, sender="UI-Set-Button")
-    hardware._send_with_token.reset_mock()
-    assert hardware.send_pellet() is mock.sentinel.token
+    _board_accepts_everything_sent(hardware)
+    assert hardware.send_pellet() is not None
 
 
 def test_the_shift_is_refused_whole_when_one_shifted_axis_leaves_the_travel(caplog):
