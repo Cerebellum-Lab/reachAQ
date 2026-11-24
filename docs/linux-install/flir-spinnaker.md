@@ -1,106 +1,77 @@
 # FLIR Spinnaker camera setup
 
-Use this guide only on a reachAQ host with Teledyne FLIR/Point Grey cameras.
-The portable installer does not install the vendor SDK, because the SDK,
-architecture, and camera firmware must be compatible and the SDK needs root.
-Install the SDK (steps 1-2), then rerun the portable installer: it installs
-the matching bundled Python wheel (step 3) and lists the cameras it can see.
+reachAQ does not ship FLIR software. On a host with Teledyne FLIR/Point Grey
+cameras, the customer downloads the Spinnaker SDK for Linux from Teledyne
+FLIR, and `tools/install/reachaq-linux-install.sh` installs the SDK packages
+and the Spinnaker Python binding (PySpin) from that download, configures
+camera access and verifies the cameras. Supported releases are listed in
+[supported platforms](supported-platforms.md): Spinnaker 3.2, whose binding
+matches the reachAQ environment's Python 3.10.
 
-## Inputs
+On a host without FLIR cameras, run the installer with
+`REACHAQ_INSTALL_SPINNAKER=0`; the Spinnaker steps are then reported as SKIP.
 
-Set the checkout and environment names used below:
+## 1. Download
+
+1. Sign in (or create a free account) at
+   <https://www.teledynevisionsolutions.com/products/spinnaker-sdk/>.
+2. Under *Spinnaker SDK All Versions for Download*, take the Linux Ubuntu
+   release of Spinnaker 3.2 (the reference rig runs 3.2.0.57). It is one zip,
+   `Spinnaker-3.2.<build>-Linux.zip`, holding the SDK for each Ubuntu version
+   and the Python bindings.
+3. Save it in `~/Downloads`, or anywhere and set
+   `REACHAQ_SPINNAKER_DOWNLOADS=<that folder>` for the installer.
+
+The installer accepts the zip, the folder it unpacks to, or just the two files
+it needs from it:
+
+| File | Used for |
+|---|---|
+| `spinnaker-<version>-amd64-pkg-22.04.tar.gz` | the SDK `.deb` packages for Ubuntu 22.04 |
+| `spinnaker_python-<version>-cp310-cp310-linux_x86_64.tar.gz` (or the `.whl` inside it) | PySpin for Python 3.10 |
+
+Other files in the zip (other Ubuntu versions, ARM builds, Python 3.8) are
+ignored.
+
+## 2. Run the installer
 
 ```bash
-export REACHAQ_REPO="$HOME/Documents/reachAQ"
-export REACHAQ_ENV="reachaq"
+./tools/install/reachaq-linux-install.sh
 ```
 
-reachAQ includes Spinnaker Python 3.2.0.62 wheels for CPython 3.8 and 3.10.
-Pick the one matching the interpreter of the target environment: the wheels
-are ABI-locked, so a cp38 wheel will not import on 3.10 and renaming it does
-not help. `vendor/spinnaker/manifest.json` lists what is bundled.
+Its Spinnaker steps:
 
-The reachAQ environment is Python 3.10, so it uses the cp310 wheel; the cp38
-wheels remain for archived Python 3.8 environments. The
-bundled 3.2.0.62 wheel runs against the 3.2.0.57 system runtime on
-christielab10 and lists both of its cameras.
+| Step | What it does |
+|---|---|
+| Install Spinnaker SDK | Unless a supported SDK is already installed, unpacks the SDK packages from the download and installs them with `apt-get`. The FLIR packages show the **FLIR Spinnaker SDK licence agreement** in the terminal; reading and accepting it is the operator's decision, and declining stops the install. The `libspinnaker` package also reports the install to FLIR (Google Analytics); that is FLIR's packaging, not reachAQ's. |
+| Configure FLIR camera access | Adds the operator to `flirimaging` and `plugdev`, writes `/etc/udev/rules.d/40-flir-spinnaker.rules` and reloads udev, and enables `reachaq-usbfs-memory.service`, which sets the USB-FS buffer to 1000 MB at boot (the kernel's 16 MB starves USB3 cameras). This is what FLIR's interactive `install_spinnaker.sh` offers, without its prompts; its GenTL and example `PATH` settings are not needed and are left out. |
+| Install Spinnaker Python binding | Installs PySpin from the download into the `reachaq` environment, preferring the build of the installed SDK, else the newest of the same major.minor. A binding of the SDK's major.minor that is already installed is kept, so reruns need no download. |
+| Verify Spinnaker cameras | Imports PySpin, prints the SDK version it loaded and the serials of the attached cameras. |
 
-```bash
-find "$REACHAQ_REPO/vendor/spinnaker/linux" -name 'spinnaker_python-*.whl'
-```
+If it stops at one of these steps, the output above the report says what is
+missing. The usual causes:
 
-## 1. Install the matching system SDK
+- no download where it looked: it names the folder searched and what to
+  download;
+- an installed SDK that is not on the supported list: remove it with the
+  `remove_spinnaker.sh` from that release's own download, then rerun;
+- the licence was declined, or the installer was not run in a terminal, so the
+  licence could not be shown: rerun it from a terminal;
+- `REACHAQ_INSTALL_SYSTEM=0` with no SDK installed: installing it needs root.
 
-Download the Linux SDK from Teledyne FLIR. Match its release to the Python
-wheel whenever possible; do not mix an arbitrary wheel and system runtime.
-Follow the SDK bundle's README/install script. A typical downloaded Debian
-package bundle uses:
+After the operator is added to `flirimaging`, log out and back in (or reboot)
+before using the cameras, then rerun the installer so the camera check runs in
+the new session.
 
-```bash
-cd "$HOME/Downloads/Spinnaker-<VERSION>-Linux"
-sudo apt install ./*.deb
-sudo ldconfig
-sudo reboot
-```
-
-The package names vary by SDK version, so this vendor step is intentionally not
-part of the portable installer.
-
-## 2. Configure operator permissions
-
-After the SDK creates its camera-access group, add the operator and then log out
-and back in (or reboot):
+## 3. Verify the complete camera path by hand
 
 ```bash
-getent group flirimaging
-sudo usermod -a -G flirimaging,plugdev "$USER"
-groups
-```
-
-If `flirimaging` does not exist, consult the installed SDK's udev instructions
-instead of creating an unrelated group manually.
-
-## 3. Install the matching Python wheel
-
-The portable installer does this step whenever the SDK is present, under
-`Spinnaker camera binding` in its report. By hand, let the interpreter choose
-its own wheel, so a 3.8 and a 3.10 environment can be provisioned with the same
-command:
-
-```bash
-conda run -n "$REACHAQ_ENV" python - <<'PY'
-import json, pathlib, platform, subprocess, sys
-root = pathlib.Path("$REACHAQ_REPO/vendor/spinnaker")
-tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
-manifest = json.loads((root / "manifest.json").read_text())
-match = [a for a in manifest["artifacts"]
-         if a["system"] == "linux"
-         and a["machine"] == platform.machine()
-         and a["python"] == tag]
-if not match:
-    raise SystemExit(f"no bundled Spinnaker wheel for {tag} on {platform.machine()}")
-subprocess.check_call([sys.executable, "-m", "pip", "install",
-                       str(root / match[0]["path"])])
-PY
-```
-
-Or name the wheel directly. x86_64 Ubuntu, CPython 3.10:
-
-```bash
-conda run -n "$REACHAQ_ENV" python -m pip install \
-  "$REACHAQ_REPO/vendor/spinnaker/linux/x86_64/spinnaker_python-3.2.0.62-cp310-cp310-linux_x86_64.whl"
-```
-
-There is no cp310 wheel for Windows here: the 3.2.0.62 Windows bundle is a
-separate download from the Linux one, and only its cp38 wheel was vendored.
-
-## 4. Verify the complete camera path
-
-```bash
-ldconfig -p | grep -i spinnaker
-ls /etc/udev/rules.d/*spinnaker* 2>/dev/null
-conda run -n "$REACHAQ_ENV" python -c "import PySpin; print('PySpin import ok')"
-conda run -n "$REACHAQ_ENV" python "$REACHAQ_REPO/scripts/list_cameras.py"
+dpkg-query -W libspinnaker
+cat /etc/udev/rules.d/40-flir-spinnaker.rules
+cat /sys/module/usbcore/parameters/usbfs_memory_mb
+id -nG | tr ' ' '\n' | grep -x flirimaging
+conda run -n reachaq python -c "import PySpin; print('PySpin import ok')"
+conda run -n reachaq python "$HOME/Documents/reachAQ/scripts/list_cameras.py"
 ```
 
 Expected result: each connected FLIR camera appears with a
@@ -116,7 +87,7 @@ Expected result: each connected FLIR camera appears with a
 | Camera opens with unexpected behavior | Camera firmware and SDK compatibility; configured serial and URL properties |
 | One synchronized camera never produces a frame | Primary/secondary roles and the physical GPIO trigger path |
 
-Upstream SDK: <https://prep.flir.com/products/spinnaker-sdk/>
+Upstream SDK: <https://www.teledynevisionsolutions.com/products/spinnaker-sdk/>
 
 ## Work in progress: right-camera preview timeout
 

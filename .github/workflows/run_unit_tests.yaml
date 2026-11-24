@@ -48,10 +48,9 @@ jobs:
       - name: Pull the LFS test data
         shell: bash  # -eo pipefail: a failing ls-files must fail the step, not feed jq nothing
         run: |
-          git lfs pull --include="tests/inference/**,src/reachaq/app/view/*.png" --exclude="vendor/**"
+          git lfs pull --include="tests/inference/**,src/reachaq/app/view/*.png"
           du -sh .git/lfs
           find .git/lfs/objects -type f | wc -l
-          git lfs ls-files --json --include="vendor/**" | jq -e '(.files | length) > 0 and all(.files[]; .downloaded == false)'
           git lfs ls-files --json --include="tests/inference/**,src/reachaq/app/view/*.png" | jq -e '(.files | length) > 0 and all(.files[]; .checkout == true and .downloaded == true)'
       - name: Save Git LFS objects
         if: steps.lfs-cache.outputs.cache-hit != 'true'
@@ -86,7 +85,6 @@ jobs:
           cat /home/runner/.config/pip/pip.conf
           pip install "torch>=2.7,<2.8" "torchvision>=0.22,<0.23" --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[test]"
-          git lfs ls-files --json --include="vendor/**" | jq -e '(.files | length) > 0 and all(.files[]; .downloaded == false)'
       - name: Check torch is the CPU build
         run: python -c "import torch,sys; print(torch.__version__); sys.exit(not torch.__version__.endswith('+cpu'))"
       - name: Licence check

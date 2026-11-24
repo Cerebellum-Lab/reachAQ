@@ -3,12 +3,11 @@
 Complete the portable install and each applicable hardware guide before using a
 physical subsystem.
 
-Bundled Spinnaker Python artifacts are organized under `vendor/spinnaker` by
-operating system and architecture. `reachaq.platform_support` resolves Linux
-x86-64 and the retained Windows x86-64 artifact from the shared
-manifest. Windows hardware operation is not qualified by this repository; the
-artifact and platform-neutral interfaces are retained to avoid an architectural
-rewrite if that deployment is needed later.
+reachAQ ships no Spinnaker software: the SDK and its Python binding are
+installed from the customer's own download (see the
+[FLIR Spinnaker guide](flir-spinnaker.md)). Windows hardware operation is not
+qualified by this repository; the platform-neutral interfaces are kept to
+avoid an architectural rewrite if that deployment is needed later.
 
 ## Runtime paths
 
@@ -481,8 +480,10 @@ on the workstation on that date; the hardware entries are from 2026-09-09.
   environment, archived by the installer, kept as a fallback. Its TensorFlow
   has no GPU (its cuDNN 8 was overwritten), so DeepLabCut TensorFlow models run
   on the CPU there; YOLO models still use the GPU.
-- Spinnaker system runtime 3.2.0.57 (verified); bundled Python wheel 3.2.0.62,
-  which lists both cameras against it (verified).
+- Spinnaker system runtime 3.2.0.57 (verified); Python wheel 3.2.0.62, which
+  lists both cameras against it (verified). reachAQ bundled that wheel until
+  2026-11; the installer now keeps an installed 3.2 binding and otherwise takes
+  one from the FLIR download.
 - NI-DAQmx 26.3.1 (verified) and PXI Platform Services 26.3; configured
   PXI-6713 output alias `PXI1Slot4` and PXI-6221 sampled-input alias
   `PXI1Slot5`. Kernel modules `nitiork`, `niwfrk` and `nixsrk` are built

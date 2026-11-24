@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "notes": [
+    "Read by tools/install/platform_check.py and tools/install/spinnaker_download.py before the installer changes anything.",
+    "Each entry is something reachAQ has been installed and run on. Add a platform here only after the installer has run on it end to end.",
+    "docs/linux-install/supported-platforms.md explains each value."
+  ],
+  "operating_systems": [
+    {"id": "ubuntu", "version_id": "22.04", "name": "Ubuntu 22.04 LTS"}
+  ],
+  "architectures": ["x86_64"],
+  "nvidia": {
+    "min_driver": "570.26",
+    "min_compute_capability": "7.5",
+    "max_compute_capability": "12.0",
+    "why": "torch 2.7 on CUDA 12.8 (the torch extra of reachaq): CUDA 12.8 needs driver 570.26 or newer, and the build carries kernels for compute capability 7.5 to 12.0."
+  },
+  "spinnaker": {
+    "versions": ["3.2"],
+    "why": "Spinnaker 3.2 is the SDK the reference rig runs (3.2.0.57) and the 3.2 Python binding imports against it. Major.minor must match between the SDK and the binding; the binding is the build for the environment's Python (3.10, cp310)."
+  }
+}

@@ -1,0 +1,19 @@
+[Unit]
+Description=Give USB3 cameras 1000 MB of USB-FS buffer memory for reachAQ
+Documentation=https://www.kernel.org/doc/html/latest/driver-api/usb/usb.html
+ConditionPathExists=/sys/module/usbcore/parameters/usbfs_memory_mb
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The kernel's default is 16 MB for all USB devices together, which FLIR's SDK
+# documents as too little for high-resolution or multiple USB3 cameras; 1000 MB
+# is FLIR's recommendation. FLIR's own script puts this in /etc/rc.local; a
+# unit is used instead, like reachaq-cpu-governor.service. ExecStop restores
+# the kernel default.
+ExecStart=/bin/sh -c 'echo 1000 > /sys/module/usbcore/parameters/usbfs_memory_mb'
+ExecStop=/bin/sh -c 'echo 16 > /sys/module/usbcore/parameters/usbfs_memory_mb'
+
+[Install]
+WantedBy=multi-user.target
