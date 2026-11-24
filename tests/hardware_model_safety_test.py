@@ -8,9 +8,9 @@ from uuid import uuid4
 
 import pytest
 
-from autotrainer.core import Motor, SystemCommandKind
-from autotrainer.core.message import SystemStatusMessageKind
-from autotrainer.device import (
+from reachaq.core import Motor, SystemCommandKind
+from reachaq.core.message import SystemStatusMessageKind
+from reachaq.device import (
     CanFailure,
     CanFailureKind,
     CanTransportConfiguration,
@@ -20,7 +20,7 @@ from autotrainer.device import (
     DeviceConnection,
     RefusedCommandClass,
 )
-from tools.acquisition.model.hardware_model import HardwareModel
+from reachaq.app.model.hardware_model import HardwareModel
 
 
 def test_test_harness_forces_can_emulation():
@@ -66,7 +66,7 @@ def test_confirmed_can_safety_shutdown_resets_configured_transport_without_activ
     hardware._disconnect_transport = mock.Mock()
     hardware._reset_socketcan = mock.Mock()
     monkeypatch.setattr(
-        "tools.acquisition.model.hardware_model.CanTransportConfiguration.from_environment",
+        "reachaq.app.model.hardware_model.CanTransportConfiguration.from_environment",
         lambda: mock.sentinel.transport,
     )
 
@@ -185,7 +185,7 @@ def test_ack_failure_captures_interface_counters_before_recovery(
     hardware_model._run_can_recovery = mock.Mock()
     captured = {"channel": "can7", "interface_state": "ERROR-ACTIVE"}
     monkeypatch.setattr(
-        "tools.acquisition.model.hardware_model.capture_can_diagnostics",
+        "reachaq.app.model.hardware_model.capture_can_diagnostics",
         lambda channel: captured,
     )
     reported = []
@@ -423,8 +423,8 @@ _TRAVEL = {"pellet": {a: {"min_pos": 0, "max_pos": 35} for a in "xyz"}}
 
 def _set_y_refused_setup(hardware_model, *, travel=True):
     """Requested (10, 20, 12), the board reporting y 34; SETs are queued as tokens."""
-    from autotrainer.core import Offset3DTuple
-    from autotrainer.device import MotorConfigurationFile
+    from reachaq.core import Offset3DTuple
+    from reachaq.device import MotorConfigurationFile
 
     hardware_model._motor_configurations = (
         MotorConfigurationFile.from_yaml_dict(_TRAVEL, source=None) if travel else None)
@@ -463,7 +463,7 @@ def test_a_refused_set_rolls_the_requested_axis_back_to_the_reported_send_positi
 def test_the_roll_back_is_silent_so_the_selected_animal_keeps_its_position(hardware_model):
     """AppModel takes a set_<axis> change for an operator edit and saves it into the animal;
     a board refusal is not one."""
-    from tools.acquisition.model.app_model import AppModel
+    from reachaq.app.model.app_model import AppModel
 
     _set_y_refused_setup(hardware_model)
     animal = SimpleNamespace(name="m1", pellet_x=10.0, pellet_y=20.0, pellet_z=12.0, is_pellet_dcs=False)
@@ -654,8 +654,8 @@ class _ConnectionWhoseHomeIsRefused:
 def test_connect_fails_with_the_reason_when_the_connect_time_home_is_refused(
     hardware_model, monkeypatch,
 ):
-    import tools.acquisition.model.hardware_model as hardware_model_module
-    from autotrainer.core import MessageHandler
+    import reachaq.app.model.hardware_model as hardware_model_module
+    from reachaq.core import MessageHandler
 
     connection = _ConnectionWhoseHomeIsRefused
     monkeypatch.setattr(connection, "refusal", _refusal(
@@ -711,7 +711,7 @@ def test_a_refusal_is_logged_below_error_so_the_footer_keeps_the_operator_notice
     import logging
 
     token = _pending(hardware_model)
-    with caplog.at_level(logging.DEBUG, logger="tools.acquisition.model.hardware_model"):
+    with caplog.at_level(logging.DEBUG, logger="reachaq.app.model.hardware_model"):
         hardware_model._command_refused(token, refusal=_refusal(token))
 
     refused = [r for r in caplog.records if "refused" in r.getMessage()]

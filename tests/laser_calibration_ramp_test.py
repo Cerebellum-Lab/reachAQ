@@ -22,18 +22,18 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from autotrainer.core import (  # noqa: E402
+from reachaq.core import (  # noqa: E402
     LaserChannelConfiguration,
     LaserChannelId,
     LaserSystemConfiguration,
 )
-from autotrainer.device import LaserCalibrationRamp, NullLaserController  # noqa: E402
-from tools.acquisition.model import laser_model as laser_model_module  # noqa: E402
-from tools.acquisition.model.app_model import AppModel  # noqa: E402
-from tools.acquisition.model.app_model_status import SessionRecordingStatus  # noqa: E402
-from tools.acquisition.model.laser_model import LaserModel  # noqa: E402
-from tools.acquisition.model.nidaq_monitor_session import NidaqMonitorSession  # noqa: E402
-from tools.acquisition.view.laser_control_content import LaserControlContent  # noqa: E402
+from reachaq.device import LaserCalibrationRamp, NullLaserController  # noqa: E402
+from reachaq.app.model import laser_model as laser_model_module  # noqa: E402
+from reachaq.app.model.app_model import AppModel  # noqa: E402
+from reachaq.app.model.app_model_status import SessionRecordingStatus  # noqa: E402
+from reachaq.app.model.laser_model import LaserModel  # noqa: E402
+from reachaq.app.model.nidaq_monitor_session import NidaqMonitorSession  # noqa: E402
+from reachaq.app.view.laser_control_content import LaserControlContent  # noqa: E402
 
 from nidaq_stream_lifecycle_test import (  # noqa: E402,F401
     _settle,
@@ -322,7 +322,7 @@ def test_run_pulse_is_refused_while_a_hung_laser_close_is_in_the_driver(
 ):
     # The laser model still holds the controller whose close hung in the
     # driver; Run Pulse would call into it.
-    from tools.acquisition.model import app_model as app_model_module
+    from reachaq.app.model import app_model as app_model_module
 
     app_model, content, _tab = idle_panel
     app_model.laser.configure_null(_null_lasers())
@@ -842,7 +842,7 @@ def test_a_ramp_whose_controller_close_hangs_is_let_go_within_the_bound(
     # The ramp closed its own controller in its finally with no bound: a
     # driver hung in that close kept the calibration active, the panel
     # stuck, and nothing was said until reachAQ closed.
-    from tools.acquisition.model import app_model as app_model_module
+    from reachaq.app.model import app_model as app_model_module
 
     monkeypatch.setattr(app_model_module, "_LASER_CONTROLLER_CLOSE_S", 0.3)
     app, spy = ramp_app
@@ -931,14 +931,14 @@ def _hang_the_ramps_close(spy, release):
 
 
 def _laser_status(app):
-    from tools.acquisition.model.subsystem_status import SubsystemId
+    from reachaq.app.model.subsystem_status import SubsystemId
 
     return app.subsystem_statuses.get(SubsystemId.LASER.value)
 
 
 def _ramp_whose_close_hangs(app, spy, monkeypatch, ramp=RAMP):
     """Run `ramp`, its close hung; the release that lets that close end."""
-    from tools.acquisition.model import app_model as app_model_module
+    from reachaq.app.model import app_model as app_model_module
 
     monkeypatch.setattr(app_model_module, "_LASER_CONTROLLER_CLOSE_S", 0.3)
     release = threading.Event()
@@ -986,7 +986,7 @@ def test_a_ramps_hung_close_keeps_the_stream_stopped_until_it_ends(ramp_app, mon
 def test_a_ramps_hung_close_fails_the_laser_until_it_ends(ramp_app, monkeypatch):
     # LASER said nothing of it, unlike a failed open's close still in the
     # driver: the refusal showed only once laser work was tried.
-    from tools.acquisition.model.subsystem_status import SubsystemState
+    from reachaq.app.model.subsystem_status import SubsystemState
 
     app, spy = ramp_app
     release = _ramp_whose_close_hangs(app, spy, monkeypatch)
@@ -1009,7 +1009,7 @@ def test_a_hung_close_says_nothing_of_holding_back_a_disabled_stream(
 ):
     # With the stream disabled there is nothing to hold back. It said "held
     # back" all the same, and still said it once the close had ended.
-    from autotrainer.core import NidaqPortConfiguration
+    from reachaq.core import NidaqPortConfiguration
 
     system_config.nidaq_ports = NidaqPortConfiguration()
     system_config.save_default(trainer_config_dir)

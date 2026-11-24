@@ -15,9 +15,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication
 
-from autotrainer.pyside.capture.QtCaptureView import QCaptureView
-from autotrainer.video import CaptureCameraAttrs
-from tools.acquisition.model.video_capture_model import VideoCaptureModel
+from reachaq.pyside.capture.QtCaptureView import QCaptureView
+from reachaq.video import CaptureCameraAttrs
+from reachaq.app.model.video_capture_model import VideoCaptureModel
 
 
 @pytest.fixture(scope="module")

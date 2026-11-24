@@ -1,6 +1,6 @@
 import pytest
 
-from tools.acquisition.model.pellet_load_offsets import (
+from reachaq.app.model.pellet_load_offsets import (
     MAX_ABS_OFFSET_MM,
     PelletLoadOffset,
     PelletLoadOffsets,

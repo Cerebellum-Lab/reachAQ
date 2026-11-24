@@ -16,16 +16,16 @@ from pathlib import Path
 
 import numpy as np
 
-from autotrainer.core import ProjectInfo
-from autotrainer.device import (
+from reachaq.core import ProjectInfo
+from reachaq.device import (
     LaserChannelConfiguration,
     LaserChannelId,
     LaserPulseTrain,
     LaserSystemConfiguration,
 )
-from tools.acquisition.model.laser_model import LaserModel
-from tools.acquisition.model.session_data_recorder import SessionDataRecorder
-from tools.session_validation import ValidationProfile, validate_session
+from reachaq.app.model.laser_model import LaserModel
+from reachaq.app.model.session_data_recorder import SessionDataRecorder
+from reachaq.session_validation import ValidationProfile, validate_session
 
 
 MANUAL = {"profile_id": "burst", "profile_revision": 2, "trigger_mode": "internal"}

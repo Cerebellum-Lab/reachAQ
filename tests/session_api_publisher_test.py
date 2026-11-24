@@ -1,10 +1,10 @@
 from unittest import mock
 
-from autotrainer.core.api import ApiEventKind
-from autotrainer.behavior import PelletTrialLedger, TrialOutcome
-from autotrainer.core.event.event_manager import EventQueueFullError
+from reachaq.core.api import ApiEventKind
+from reachaq.behavior import PelletTrialLedger, TrialOutcome
+from reachaq.core.event.event_manager import EventQueueFullError
 
-from tools.acquisition.model.session_api_publisher import SessionApiPublisher
+from reachaq.app.model.session_api_publisher import SessionApiPublisher
 
 
 def test_session_and_pellet_attempt_lifecycle_is_balanced_exactly_once():

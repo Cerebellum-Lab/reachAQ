@@ -14,9 +14,9 @@ import yaml
 
 torch = pytest.importorskip("torch")
 
-from autotrainer.inference import pose_plugins  # noqa: E402
-from autotrainer.inference.keypoint import KeypointPoseModel  # noqa: E402
-from autotrainer.inference.keypoint.train import (  # noqa: E402
+from reachaq.inference import pose_plugins  # noqa: E402
+from reachaq.inference.keypoint import KeypointPoseModel  # noqa: E402
+from reachaq.inference.keypoint.train import (  # noqa: E402
     CHECKPOINT,
     SIDECAR,
     WEIGHTS,

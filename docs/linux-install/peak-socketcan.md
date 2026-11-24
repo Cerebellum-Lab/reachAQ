@@ -141,22 +141,22 @@ automatically during every boot, before reachAQ is launched:
 ```bash
 cd "$HOME/Documents/reachAQ"
 sudo install -m 0755 \
-  tools/hardware/reachaq-bring-up-can.sh \
+  src/reachaq/hardware/reachaq-bring-up-can.sh \
   /usr/local/sbin/reachaq-bring-up-can
 sudo install -m 0755 \
-  tools/hardware/reachaq-bring-down-can.sh \
+  src/reachaq/hardware/reachaq-bring-down-can.sh \
   /usr/local/sbin/reachaq-bring-down-can
 sudo install -m 0755 \
-  tools/hardware/reachaq-reset-can.sh \
+  src/reachaq/hardware/reachaq-reset-can.sh \
   /usr/local/sbin/reachaq-reset-can
 sudo install -m 0644 \
-  tools/hardware/reachaq-can.default \
+  src/reachaq/hardware/reachaq-can.default \
   /etc/default/reachaq-can
 sudo install -m 0644 \
-  tools/hardware/reachaq-can.service \
+  src/reachaq/hardware/reachaq-can.service \
   /etc/systemd/system/reachaq-can.service
 sudo install -m 0644 \
-  tools/hardware/reachaq-can.tmpfiles \
+  src/reachaq/hardware/reachaq-can.tmpfiles \
   /etc/tmpfiles.d/reachaq-can.conf
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/reachaq-can.conf
 sudo systemctl daemon-reload
@@ -178,7 +178,7 @@ through a dedicated operator group:
 sudo groupadd -f reachaq
 sudo usermod -aG reachaq "$USER"
 sudo install -m 0440 \
-  tools/hardware/reachaq-can-reset.sudoers \
+  src/reachaq/hardware/reachaq-can-reset.sudoers \
   /etc/sudoers.d/reachaq-can-reset
 sudo visudo -cf /etc/sudoers.d/reachaq-can-reset
 ```
@@ -301,17 +301,17 @@ update with the Git checkout:
 
 ```bash
 cd "$HOME/Documents/reachAQ"
-sudo install -m 0755 tools/hardware/reachaq-bring-up-can.sh \
+sudo install -m 0755 src/reachaq/hardware/reachaq-bring-up-can.sh \
   /usr/local/sbin/reachaq-bring-up-can
-sudo install -m 0755 tools/hardware/reachaq-bring-down-can.sh \
+sudo install -m 0755 src/reachaq/hardware/reachaq-bring-down-can.sh \
   /usr/local/sbin/reachaq-bring-down-can
-sudo install -m 0755 tools/hardware/reachaq-reset-can.sh \
+sudo install -m 0755 src/reachaq/hardware/reachaq-reset-can.sh \
   /usr/local/sbin/reachaq-reset-can
-sudo install -m 0644 tools/hardware/reachaq-can.service \
+sudo install -m 0644 src/reachaq/hardware/reachaq-can.service \
   /etc/systemd/system/reachaq-can.service
-sudo install -m 0644 tools/hardware/reachaq-can.tmpfiles \
+sudo install -m 0644 src/reachaq/hardware/reachaq-can.tmpfiles \
   /etc/tmpfiles.d/reachaq-can.conf
-sudo install -m 0440 tools/hardware/reachaq-can-reset.sudoers \
+sudo install -m 0440 src/reachaq/hardware/reachaq-can-reset.sudoers \
   /etc/sudoers.d/reachaq-can-reset
 sudo visudo -cf /etc/sudoers.d/reachaq-can-reset
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/reachaq-can.conf
@@ -324,7 +324,7 @@ template before replacing it:
 
 ```bash
 diff -u /etc/default/reachaq-can \
-  tools/hardware/reachaq-can.default || true
+  src/reachaq/hardware/reachaq-can.default || true
 ```
 
 ## 5. Configure the reachAQ application
@@ -334,7 +334,7 @@ Load the tracked environment defaults before launching:
 ```bash
 cd "$HOME/Documents/reachAQ"
 set -a
-source tools/hardware/reachaq_hardware.env.example
+source src/reachaq/hardware/reachaq_hardware.env.example
 set +a
 ```
 
@@ -363,7 +363,7 @@ Monitor and validate without commanding motion:
 
 ```bash
 timeout 5 candump -L can0
-conda run -n reachaq python tools/hardware/validate_can_hardware.py \
+conda run -n reachaq python src/reachaq/hardware/validate_can_hardware.py \
   --transport socketcan \
   --channel can0 \
   --action discover
@@ -437,7 +437,7 @@ out-of-tree PCAN driver and `/dev/pcan*` exists.
 | Application and service use different channels | Match `AUTOTRAINER_CAN_CHANNEL` to `REACHAQ_CAN_INTERFACE` |
 | `REQUEST_VERSION` times out while RX traffic continues | Host startup/ACK handling issue, not proof of a dead board; retain the complete application log |
 | Validator opens bus but misses board | Correct interface, board power, bitrate, and target firmware |
-| Another backend is selected | Source `tools/hardware/reachaq_hardware.env.example` |
+| Another backend is selected | Source `src/reachaq/hardware/reachaq_hardware.env.example` |
 
 References:
 

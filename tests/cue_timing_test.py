@@ -1,6 +1,6 @@
 import pytest
 
-from tools.acquisition.model.cue_timing import (
+from reachaq.app.model.cue_timing import (
     MAX_POST_CLEAR_DELAY_MS,
     CueCancelReason,
     CueDecision,
@@ -211,7 +211,7 @@ def test_non_finite_times_are_rejected():
 
 
 def test_lock_timing_is_protocol_persisted_and_defaults_on():
-    from tools.acquisition.model.trial_protocol_schedule import TrialProtocolRow
+    from reachaq.app.model.trial_protocol_schedule import TrialProtocolRow
 
     row = TrialProtocolRow(trial_id=1)
     assert row.cue_lock_timing is True
@@ -219,7 +219,7 @@ def test_lock_timing_is_protocol_persisted_and_defaults_on():
 
 
 def test_row_rejects_a_post_clear_delay_while_locked():
-    from tools.acquisition.model.trial_protocol_schedule import TrialProtocolRow
+    from reachaq.app.model.trial_protocol_schedule import TrialProtocolRow
 
     with pytest.raises(ValueError, match="only when lock timing is off"):
         TrialProtocolRow(trial_id=1).with_updates({
@@ -232,7 +232,7 @@ def test_row_rejects_a_post_clear_delay_while_locked():
 
 
 def test_row_accepts_a_post_clear_delay_when_unlocked():
-    from tools.acquisition.model.trial_protocol_schedule import TrialProtocolRow
+    from reachaq.app.model.trial_protocol_schedule import TrialProtocolRow
 
     row = TrialProtocolRow(trial_id=1).with_updates({
         "tone_profile_id": "tone-1",
@@ -246,7 +246,7 @@ def test_row_accepts_a_post_clear_delay_when_unlocked():
 
 
 def test_row_rejects_a_post_clear_delay_without_a_cue_tone():
-    from tools.acquisition.model.trial_protocol_schedule import TrialProtocolRow
+    from reachaq.app.model.trial_protocol_schedule import TrialProtocolRow
 
     with pytest.raises(ValueError, match="requires a cue tone profile"):
         TrialProtocolRow(trial_id=1).with_updates({
@@ -256,7 +256,7 @@ def test_row_rejects_a_post_clear_delay_without_a_cue_tone():
 
 
 def test_row_post_clear_delay_bounds_are_enforced():
-    from tools.acquisition.model.trial_protocol_schedule import TrialProtocolRow
+    from reachaq.app.model.trial_protocol_schedule import TrialProtocolRow
 
     with pytest.raises(ValueError, match="cue_post_clear_delay_ms must be"):
         TrialProtocolRow(trial_id=1).with_updates({

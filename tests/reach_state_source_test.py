@@ -10,7 +10,7 @@ throughout.
 
 import pytest
 
-from tools.acquisition.model.reach_state_source import (
+from reachaq.app.model.reach_state_source import (
     DEFAULT_MAX_AGE_MS,
     MAX_MAX_AGE_MS,
     MIN_MAX_AGE_MS,

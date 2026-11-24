@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.platform_support import SpinnakerArtifactError, select_spinnaker_wheel
+from reachaq.platform_support import SpinnakerArtifactError, select_spinnaker_wheel
 
 
 @pytest.mark.parametrize(

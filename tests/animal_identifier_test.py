@@ -9,25 +9,25 @@ from pathlib import Path
 
 import pytest
 
-from autotrainer.core.animal.external_metadata import (
+from reachaq.core.animal.external_metadata import (
     ExternalAnimalRecord,
     ExternalIdentity,
     is_iso11784_rfid,
     normalize_rfid,
 )
-from tools.acquisition.model.animal_registry import AnimalRegistry
-from tools.acquisition.model.animal_sources.mapping import (
+from reachaq.app.model.animal_registry import AnimalRegistry
+from reachaq.app.model.animal_sources.mapping import (
     AnimalTableMapper,
     ColumnMapping,
     SourceTable,
 )
-from tools.acquisition.model.animal_sources.source_setup import (
+from reachaq.app.model.animal_sources.source_setup import (
     OPERATOR_COLUMNS,
     build_mapping,
     suggest_mapping,
 )
-from tools.acquisition.model.animal_sources.spreadsheet import SpreadsheetSource
-from tools.acquisition.model.rfid_resolution import RfidResolutionKind
+from reachaq.app.model.animal_sources.spreadsheet import SpreadsheetSource
+from reachaq.app.model.rfid_resolution import RfidResolutionKind
 
 
 RFID = "999000000000001"
@@ -284,7 +284,7 @@ def test_the_toolbar_field_sends_its_text_and_clears(qapp):
 
     from PySide6.QtWidgets import QLineEdit
 
-    from tools.acquisition.view.main_window import MainWindow
+    from reachaq.app.view.main_window import MainWindow
 
     entered, messages = [], []
 

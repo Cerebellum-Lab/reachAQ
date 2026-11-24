@@ -5,12 +5,12 @@ from queue import Queue
 
 import cv2
 
-from autotrainer.core.project import ProjectInfo
-from autotrainer.video import VideoManager, VideoRecordProperties, VideoRecordMode
-from autotrainer.video import VideoRecord
+from reachaq.core.project import ProjectInfo
+from reachaq.video import VideoManager, VideoRecordProperties, VideoRecordMode
+from reachaq.video import VideoRecord
 
 logging.basicConfig(level=logging.INFO)
-logging.getLogger('autotrainer').setLevel(logging.DEBUG)
+logging.getLogger('reachaq').setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 

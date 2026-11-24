@@ -17,22 +17,22 @@ from pathlib import Path
 
 import pytest
 
-from autotrainer.core import NidaqTimingRoute, SystemConfiguration
+from reachaq.core import NidaqTimingRoute, SystemConfiguration
 
 from nidaq_timing_test import _pinned_christielab10
-from tools.acquisition.model.nidaq_channel_plan import (
+from reachaq.app.model.nidaq_channel_plan import (
     build_nidaq_acquisition_configuration,
 )
-from tools.acquisition.model.protocol_readiness import (
+from reachaq.app.model.protocol_readiness import (
     STIM_CAMERA_REQUIRED,
     ProtocolRigConfiguration,
     ReadinessLiveState,
     check_protocol_readiness,
     protocol_blocker_lines,
 )
-from tools.acquisition.model.stimulus_profile_repository import StimulusProfileLibrary
-from tools.acquisition.model.trial_action import LaserPulseProfile, StimulusTriggerProfile
-from tools.acquisition.model.trial_protocol_schedule import (
+from reachaq.app.model.stimulus_profile_repository import StimulusProfileLibrary
+from reachaq.app.model.trial_action import LaserPulseProfile, StimulusTriggerProfile
+from reachaq.app.model.trial_protocol_schedule import (
     CoverPolicy,
     LaserTriggerRoute,
     TrialProtocolDocument,

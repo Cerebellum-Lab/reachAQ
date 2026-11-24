@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import numpy
 import pytest
 
-from autotrainer.device.nidaq_signal_stream import NidaqSignalStreamController
+from reachaq.device.nidaq_signal_stream import NidaqSignalStreamController
 
 
 class _PortDigitalReader:

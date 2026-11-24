@@ -4,8 +4,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from autotrainer.device import Motor  # noqa: E402
-from autotrainer.pyside import MotorConfigDialog  # noqa: E402
+from reachaq.device import Motor  # noqa: E402
+from reachaq.pyside import MotorConfigDialog  # noqa: E402
 
 
 def test_motor_configuration_only_exposes_pellet_board_motors():

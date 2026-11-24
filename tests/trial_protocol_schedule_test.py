@@ -1,6 +1,6 @@
 import pytest
 
-from tools.acquisition.model.trial_protocol_schedule import (
+from reachaq.app.model.trial_protocol_schedule import (
     ActionPhase,
     AutomaticWindowMethod,
     LaserTriggerRoute,

@@ -9,7 +9,7 @@ synchronized. The persistenceStatus field itself is unchanged; only the
 sentence says what happened.
 """
 
-from tools.acquisition.model.session_data_recorder import _persistence_reason
+from reachaq.app.model.session_data_recorder import _persistence_reason
 
 
 def test_a_source_that_failed_with_its_data_on_disk_is_called_incomplete():

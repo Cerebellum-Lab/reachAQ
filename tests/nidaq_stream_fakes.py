@@ -7,7 +7,7 @@ reach one function, and a slow import there reads as a worker that never
 became ready.
 """
 
-from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts
+from reachaq.app.model.nidaq_discovery import NidaqDevicePorts
 
 
 def discover_dev1():

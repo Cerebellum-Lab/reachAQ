@@ -1,7 +1,0 @@
-auto-trainer-core
-auto-trainer-device
-auto-trainer-video
-auto-trainer-inference
-auto-trainer-behavior
-auto-trainer-model
-auto-trainer-pyside

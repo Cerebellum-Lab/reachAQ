@@ -5,8 +5,8 @@ import zipfile
 
 import pytest
 
-from tools.acquisition.model import diagnostic_bundle
-from tools.acquisition.model.diagnostic_bundle import (
+from reachaq.app.model import diagnostic_bundle
+from reachaq.app.model.diagnostic_bundle import (
     REDACTED,
     BundleSources,
     SecretLeakError,

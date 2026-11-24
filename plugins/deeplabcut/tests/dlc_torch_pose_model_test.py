@@ -25,7 +25,7 @@ import types
 import numpy
 import pytest
 
-from autotrainer.pose_plugins.deeplabcut import DlcTorchPoseModel
+from reachaq.pose_plugins.deeplabcut import DlcTorchPoseModel
 
 
 PARTS = ["Pellet", "RH_grab", "Triangle"]
@@ -119,7 +119,7 @@ def _loaded_model(tmp_path, monkeypatch, runner=None, **kwargs):
         lambda self, config_path, snapshot_path: runner,
     )
     monkeypatch.setattr(
-        "autotrainer.pose_plugins.deeplabcut.dlc_torch_pose_model.detect_gpu_capability",
+        "reachaq.pose_plugins.deeplabcut.dlc_torch_pose_model.detect_gpu_capability",
         lambda: None,
     )
     model.load()

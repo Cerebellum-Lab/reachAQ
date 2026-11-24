@@ -2,8 +2,8 @@ import json
 
 import yaml
 
-from tools.session_validation import ValidationProfile, validate_session
-from tools.session_validation.engine import _Context, _provenance_rule
+from reachaq.session_validation import ValidationProfile, validate_session
+from reachaq.session_validation.engine import _Context, _provenance_rule
 
 
 def _context(tmp_path, metadata):

@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-HARDWARE_DIR = REPO_ROOT / "tools" / "hardware"
+HARDWARE_DIR = REPO_ROOT / "src" / "reachaq" / "hardware"
 
 
 def test_can_ownership_lock_uses_dedicated_runtime_directory():

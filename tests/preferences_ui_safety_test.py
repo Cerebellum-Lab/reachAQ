@@ -5,9 +5,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
-from tools.acquisition.model.app_model_status import SessionRecordingStatus
-from tools.acquisition.view import preferences_content as preferences_module
-from tools.acquisition.view.preferences_content import PreferencesContent
+from reachaq.app.model.app_model_status import SessionRecordingStatus
+from reachaq.app.view import preferences_content as preferences_module
+from reachaq.app.view.preferences_content import PreferencesContent
 
 
 def _qapp():
@@ -41,7 +41,7 @@ def test_a_closed_preferences_window_does_not_stop_a_session_starting(app_model)
     # ("Internal C++ object (PySide6.QtWidgets.QTabWidget) already deleted"),
     # and the error left start_recording after ARMING.
     import shiboken6
-    from tools.acquisition.view.preferences_dialog import PreferencesDialog
+    from reachaq.app.view.preferences_dialog import PreferencesDialog
 
     app = _qapp()
     previous_inference = app_model._inference

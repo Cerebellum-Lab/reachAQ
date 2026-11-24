@@ -17,7 +17,7 @@ migrated document cannot change how it behaves.
 
 import pytest
 
-from tools.acquisition.model.trial_protocol_schedule import (
+from reachaq.app.model.trial_protocol_schedule import (
     PROTOCOL_SCHEMA_VERSION,
     SUPPORTED_PROTOCOL_SCHEMA_VERSIONS,
     TrialProtocolDocument,

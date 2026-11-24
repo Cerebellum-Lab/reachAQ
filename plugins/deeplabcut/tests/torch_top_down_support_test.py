@@ -22,7 +22,7 @@ own failure modes to a closed loop that already has the animal framed.
 import numpy
 import pytest
 
-from autotrainer.pose_plugins.deeplabcut import DlcTorchPoseModel
+from reachaq.pose_plugins.deeplabcut import DlcTorchPoseModel
 
 
 def _train_folder(tmp_path, names):

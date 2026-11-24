@@ -9,35 +9,35 @@ from unittest import mock
 
 import pytest
 
-from autotrainer.core import (
+from reachaq.core import (
     EventManager,
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
     SystemStatusMessageKind,
     SystemCommandKind,
 )
-from autotrainer.core.interfaces import RecordingEndingReason
-from autotrainer.core.capture import CaptureProcessStatus
-from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
-from autotrainer.behavior.pellet_trial import (
+from reachaq.core.interfaces import RecordingEndingReason
+from reachaq.core.capture import CaptureProcessStatus
+from reachaq.behavior.behavior_algorithm import BehaviorAlgoStatus
+from reachaq.behavior.pellet_trial import (
     HardwareErrorKind,
     PelletTrialLedger,
     TrialOutcome,
 )
-from autotrainer.device import CanFailure, CanFailureKind, Tone, Target
-from autotrainer.inference import InferenceStatus
-from tools.acquisition.model.app_model import (
+from reachaq.device import CanFailure, CanFailureKind, Tone, Target
+from reachaq.inference import InferenceStatus
+from reachaq.app.model.app_model import (
     app_status_to_api_app_mode,
     app_status_to_behavior_algo_status,
     protocol_state_to_api_training_mode,
 )
-from tools.acquisition.model.app_model_status import AppModelStatus, SessionRecordingStatus
-from tools.acquisition.model.session_boundary import SessionBoundary
-from tools.acquisition.model.stimulus_profile_repository import (
+from reachaq.app.model.app_model_status import AppModelStatus, SessionRecordingStatus
+from reachaq.app.model.session_boundary import SessionBoundary
+from reachaq.app.model.stimulus_profile_repository import (
     PROFILE_SCHEMA_VERSION,
 )
-from tools.acquisition.model.inference_model import InferenceModel
-from tools.acquisition.model.intertrial_analysis import (
+from reachaq.app.model.inference_model import InferenceModel
+from reachaq.app.model.intertrial_analysis import (
     IntertrialAnalysisRequest,
     IntertrialAnalysisResult,
     PelletMisplacement,
@@ -45,30 +45,30 @@ from tools.acquisition.model.intertrial_analysis import (
     PelletStateEvidence,
     ReachTrajectory,
 )
-from tools.acquisition.model.live_tracking_buffer import (
+from reachaq.app.model.live_tracking_buffer import (
     LiveTrackingSample,
     TrackingWindow,
 )
-from tools.acquisition.model.session_stop_policy import (
+from reachaq.app.model.session_stop_policy import (
     SessionStopConfiguration,
     SessionStopDecision,
     SessionStopPolicy,
     SessionStopReason,
 )
-from tools.acquisition.model.session_validation_controller import SessionValidationState
-from tools.acquisition.model.subsystem_status import (
+from reachaq.app.model.session_validation_controller import SessionValidationState
+from reachaq.app.model.subsystem_status import (
     SubsystemId,
     SubsystemState,
 )
-from tools.acquisition.model.trial_protocol_repository import (
+from reachaq.app.model.trial_protocol_repository import (
     TrialProtocolRepository,
 )
-from tools.acquisition.model.trial_protocol_schedule import (
+from reachaq.app.model.trial_protocol_schedule import (
     ProtocolPatch,
     TrialProtocolDocument,
 )
 
-from autotrainer.core.api import ApiApplicationMode, ApiTrainingMode
+from reachaq.core.api import ApiApplicationMode, ApiTrainingMode
 
 import top_fixtures
 
@@ -564,7 +564,7 @@ def _lock_held_elsewhere(lock) -> bool:
 def _record_set_active(app_model, monkeypatch):
     import importlib
 
-    module = importlib.import_module("tools.acquisition.model.app_model")
+    module = importlib.import_module("reachaq.app.model.app_model")
     calls = []
 
     def set_active(root, calibration_id, *, by):
@@ -617,9 +617,9 @@ def test_set_active_reloads_under_the_lock(app_model, monkeypatch):
 def test_set_active_errors_are_refusals(app_model, monkeypatch):
     import importlib
 
-    from autotrainer.inference.multires_calibration.store import CalibrationResolutionError
+    from reachaq.inference.multires_calibration.store import CalibrationResolutionError
 
-    module = importlib.import_module("tools.acquisition.model.app_model")
+    module = importlib.import_module("reachaq.app.model.app_model")
 
     def missing(root, calibration_id, *, by):
         raise CalibrationResolutionError(f"the calibration library {root} has no calibration {calibration_id}")
@@ -977,7 +977,7 @@ def test_automatic_stop_finishes_active_trial_normally_before_stopping(
     app_model._set_session_recording_status(SessionRecordingStatus.RECORDING)
     now = iter((10.0, 11.0, 11.0))
     monkeypatch.setattr(
-        "tools.acquisition.model.app_model.get_perf_now",
+        "reachaq.app.model.app_model.get_perf_now",
         lambda: next(now),
     )
 
@@ -1457,7 +1457,7 @@ def test_failed_arming_uses_abort_cleanup_without_reverting_to_arming(
         "end_capture_session",
         return_value=False,
     ), mock.patch(
-        "tools.acquisition.model.app_model.make_daemon_timer",
+        "reachaq.app.model.app_model.make_daemon_timer",
         return_value=timer,
     ):
         assert app_model.abort_recording(token=token)
@@ -1868,7 +1868,7 @@ def test_metadata_pair_is_not_replaced_when_yaml_serialization_fails(
     yaml_path.write_text("previous yaml")
 
     with mock.patch(
-        "tools.acquisition.model.app_model.yaml.dump",
+        "reachaq.app.model.app_model.yaml.dump",
         side_effect=RuntimeError("serialization failed"),
     ):
         with pytest.raises(RuntimeError, match="serialization failed"):

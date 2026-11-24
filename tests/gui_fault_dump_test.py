@@ -10,7 +10,7 @@ import pytest
 def test_sigusr1_prints_every_thread_stack_and_keeps_running():
     script = (
         "import os, signal, threading, time\n"
-        "from tools.acquisition.gui import enable_fault_dumps\n"
+        "from reachaq.app.gui import enable_fault_dumps\n"
         "enable_fault_dumps()\n"
         "threading.Thread(target=time.sleep, args=(5,), name='worker', daemon=True).start()\n"
         "os.kill(os.getpid(), signal.SIGUSR1)\n"

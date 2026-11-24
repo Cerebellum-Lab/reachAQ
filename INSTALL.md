@@ -74,14 +74,14 @@ installer again. Rerunning is always safe:
   gets the DeepLabCut plugin if it has `deeplabcut` installed and the YOLO
   plugin if it has `ultralytics`. To drop a plugin for good, uninstall both its
   distribution and its engine package (for example
-  `pip uninstall auto-trainer-pose-yolo ultralytics`) before rerunning the
+  `pip uninstall reachaq-pose-yolo ultralytics`) before rerunning the
   installer, otherwise it restores the plugin. If the installer cannot tell which plugins
   the environment has, it reports a FAIL for that step rather than restoring none.
 
 To run an archived environment instead:
 
 ```bash
-conda run --no-capture-output -n reachaq-py38-20260924 python -m reachAQ.app
+conda run --no-capture-output -n reachaq-py38-20260924 python -m reachaq.app
 ```
 
 ## Other ways to run it
@@ -92,7 +92,7 @@ Conda buffers the logs until the application exits.
 A software-only smoke test, with random cameras and no live inference:
 
 ```bash
-conda run --no-capture-output -n reachaq python -m reachAQ.app \
+conda run --no-capture-output -n reachaq python -m reachaq.app \
   --random-cameras --no-live-inference \
   -c "$HOME/Autotrainer/system_configuration.yaml"
 ```
@@ -101,7 +101,7 @@ Headless mode starts acquisition immediately, because it has no control that
 could start an idle process later:
 
 ```bash
-conda run --no-capture-output -n reachaq auto-trainer-headless \
+conda run --no-capture-output -n reachaq reachaq-headless \
   --no-live-inference \
   -c "$HOME/Autotrainer/system_configuration.yaml"
 ```
@@ -114,7 +114,7 @@ and deliberately does not fall back to the CPU.
 
 - SoftMouse credentials and its optional nightly timer cannot be entered by an
   unattended installer; follow the
-  [SoftMouse/RFID checklist](tools/softmouse_sync/CONFIGURATION_GUIDE.md).
+  [SoftMouse/RFID checklist](src/reachaq/softmouse_sync/CONFIGURATION_GUIDE.md).
 - The latency tuning grants the stim loop real-time priority and sets the
   `performance` CPU governor at boot; both are measured, reversible, and
   described in the [latency tuning guide](docs/linux-install/latency-tuning.md).
@@ -126,5 +126,5 @@ and deliberately does not fall back to the CPU.
 
 Older Autotrainer deployments used environment names such as
 `auto-trainer-1`, Jetson-specific pins, and entry points like
-`python -m tools.acquisition.gui`. They may still help on legacy rigs, but are
+`python -m reachaq.app.gui`. They may still help on legacy rigs, but are
 not the current reachAQ Ubuntu setup.

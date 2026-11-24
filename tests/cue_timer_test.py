@@ -17,7 +17,7 @@ import threading
 
 import pytest
 
-from tools.acquisition.model.cue_timer import (
+from reachaq.app.model.cue_timer import (
     CUE_TIMER_PRIORITY_ENV_VAR,
     DEFAULT_CUE_TIMER_PRIORITY,
     SUGGESTED_CUE_TIMER_PRIORITY,

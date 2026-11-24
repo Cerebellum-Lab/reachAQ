@@ -957,7 +957,7 @@ lists the geometries.
 - **The anipose file is checked in aniposelib 0.8.0 itself, in a separate
   virtualenv.** aniposelib needs opencv-contrib-python, which would replace the
   reachaq environment's cv2, so reachaq never imports it.
-  `auto-trainer-inference/tests/multires_anipose_compat_check.py` writes a
+  `tests/inference/multires_anipose_compat_check.py` writes a
   calibration of the synthetic 3-camera rig in the reachaq environment, then
   loads each of its TOMLs with `CameraGroup.load` in the virtualenv and checks
   the cameras, the metadata keys and `CameraGroup.project` against the fit's
@@ -967,9 +967,9 @@ lists the geometries.
   python3 -m venv ~/anipose-check-venv
   ~/anipose-check-venv/bin/pip install aniposelib==0.8.0 toml
   PYTHONPATH=<the repo's package src dirs> python \
-      auto-trainer-inference/tests/multires_anipose_compat_check.py --write-inputs OUT
+      tests/inference/multires_anipose_compat_check.py --write-inputs OUT
   for t in OUT/*.toml; do ~/anipose-check-venv/bin/python \
-      auto-trainer-inference/tests/multires_anipose_compat_check.py "$t" "${t%.toml}.json"; done
+      tests/inference/multires_anipose_compat_check.py "$t" "${t%.toml}.json"; done
   ```
 
   It is not part of the pytest suite. The DeepLabCut pickle is tested against
@@ -1061,7 +1061,7 @@ a rig, the dialog's default becomes the scout.
 
 ## Where the maths lives
 
-`auto-trainer-inference/src/autotrainer/inference/multires_calibration/`:
+`src/reachaq/inference/multires_calibration/`:
 
 | Module | Holds |
 | --- | --- |
@@ -1074,7 +1074,7 @@ a rig, the dialog's default becomes the scout.
 | `library.py` | the calibration library: entries, the active pointer, decisions, import |
 | `pipeline.py` | `calibrate_capture`, which ties them together |
 
-Capture and install live in `tools/acquisition`: `model/handle_3d_calibration.py`
+Capture and install live in `src/reachaq/app`: `model/handle_3d_calibration.py`
 (waypoints, pauses, `capture_settings`), `model/calibration_install.py`,
 `model/dcs_state.py` (VALID, STALE or MISSING), `model/calibration_reminder.py`,
 `model/calibration_geometry.py` (the live preset from the camera configuration)
@@ -1172,8 +1172,8 @@ itself holds no videos.
 ```python
 from pathlib import Path
 
-from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
-from autotrainer.inference.multires_calibration.pipeline import calibrate_capture
+from reachaq.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
+from reachaq.inference.multires_calibration.pipeline import calibrate_capture
 
 base = PresetGeometry(binning=4, width=256, height=256, offset_x=52, offset_y=6)
 index, report = calibrate_capture(
@@ -1209,4 +1209,4 @@ print(report.to_text())
   `calibration3dFailed` API event; any other outcome posts
   `calibration3dCompleted`.
 - A synthetic rig for capture-free tests, with known K, dist, R and T, is in
-  `auto-trainer-inference/tests/multires_synthetic.py`.
+  `tests/inference/multires_synthetic.py`.

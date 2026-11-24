@@ -1,12 +1,12 @@
 import pytest
 
-from tools.acquisition.model.trial_protocol_schedule import (
+from reachaq.app.model.trial_protocol_schedule import (
     ProtocolPatch,
     ProtocolScope,
     TrialOverride,
     TrialProtocolDocument,
 )
-from tools.acquisition.model.trial_protocol_set import (
+from reachaq.app.model.trial_protocol_set import (
     document_from_set,
     set_from_document,
 )
@@ -87,10 +87,10 @@ def test_a_round_trip_preserves_every_resolved_row():
 
 
 def test_app_model_captures_a_protocol_as_a_set(app_model, tmp_path):
-    from tools.acquisition.model.trial_protocol_repository import (
+    from reachaq.app.model.trial_protocol_repository import (
         TrialProtocolRepository,
     )
-    from tools.acquisition.model.trial_protocol_set_repository import (
+    from reachaq.app.model.trial_protocol_set_repository import (
         TrialProtocolSetRepository,
     )
 
@@ -109,10 +109,10 @@ def test_app_model_captures_a_protocol_as_a_set(app_model, tmp_path):
 
 
 def test_app_model_opens_a_set_as_an_editable_protocol(app_model, tmp_path):
-    from tools.acquisition.model.trial_protocol_repository import (
+    from reachaq.app.model.trial_protocol_repository import (
         TrialProtocolRepository,
     )
-    from tools.acquisition.model.trial_protocol_set_repository import (
+    from reachaq.app.model.trial_protocol_set_repository import (
         TrialProtocolSetRepository,
     )
 
@@ -130,7 +130,7 @@ def test_app_model_opens_a_set_as_an_editable_protocol(app_model, tmp_path):
 
 
 def test_capturing_an_unknown_protocol_is_refused(app_model, tmp_path):
-    from tools.acquisition.model.trial_protocol_repository import (
+    from reachaq.app.model.trial_protocol_repository import (
         TrialProtocolRepository,
     )
 

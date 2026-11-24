@@ -318,8 +318,8 @@ decoded event stream.
 ## Protocol progress
 
 Training plans are reachAQ's own ([training plans](training-plans.md),
-`autotrainer.behavior.training`), run by the trial-boundary adapter in
-`tools/acquisition/model/trial_protocol_runner.py`. A qualifying pellet trial
+`reachaq.behavior.training`), run by the trial-boundary adapter in
+`src/reachaq/app/model/trial_protocol_runner.py`. A qualifying pellet trial
 is evaluated exactly once at the pellet-trial boundary, so one recording
 session can advance through many trials without stopping camera writers.
 
@@ -445,7 +445,7 @@ ID, and unknown future versions are rejected clearly.
 ## Public API lifecycle
 
 ReachAQ publishes its events on its own [local API](local-api.md)
-(`autotrainer.core.api`) with its own status schema:
+(`reachaq.core.api`) with its own status schema:
 acquisition state, recording-session state, reach synchronization readiness,
 independent subsystem states, animal identity/pellet coordinates, protocol
 state, pellet-device state, and the four session counts. Retired alarm,

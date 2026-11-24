@@ -21,14 +21,14 @@ import pytest
 import yaml
 
 import top_fixtures
-from autotrainer.behavior import BehaviorAlgorithm
-from autotrainer.core import ProjectInfo
-from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
-from autotrainer.core.logging import unregister_fatal_exception_callback
-from autotrainer.inference.analysis.intersession_process import resolve_session_calibration
-from autotrainer.inference.multires_calibration import library, store
-from autotrainer.inference.multires_calibration.fit import BoardSpec
-from autotrainer.inference.multires_calibration.geometry import presets_from_base
+from reachaq.behavior import BehaviorAlgorithm
+from reachaq.core import ProjectInfo
+from reachaq.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
+from reachaq.core.logging import unregister_fatal_exception_callback
+from reachaq.inference.analysis.intersession_process import resolve_session_calibration
+from reachaq.inference.multires_calibration import library, store
+from reachaq.inference.multires_calibration.fit import BoardSpec
+from reachaq.inference.multires_calibration.geometry import presets_from_base
 from multires_calibration_fakes import FIT
 from reload_calib_multires_test import (  # noqa: F401 (start_app is a fixture)
     BASE,
@@ -43,9 +43,9 @@ from reload_calib_multires_test import (  # noqa: F401 (start_app is a fixture)
     _write_multires,
     start_app,
 )
-from tools.acquisition.model import app_model as app_model_module
-from tools.acquisition.model.app_model import AppModel, _camera_configured_metadata
-from tools.acquisition.model.inference_model import InferenceModel
+from reachaq.app.model import app_model as app_model_module
+from reachaq.app.model.app_model import AppModel, _camera_configured_metadata
+from reachaq.app.model.inference_model import InferenceModel
 
 
 # The hardware.configured keys before calibration3d was added beside them.
@@ -275,7 +275,7 @@ def test_offline_3d_after_the_detection_is_abandoned_when_inference_stops(tmp_pa
 
 
 def test_the_pool_worker_yields_to_live_acquisition(monkeypatch):
-    from tools.acquisition.model import inference_model as inference_model_module
+    from reachaq.app.model import inference_model as inference_model_module
 
     niced, initialised = [], []
     for name in inference_model_module._SINGLE_THREAD_ENV:

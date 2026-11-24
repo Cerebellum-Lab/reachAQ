@@ -6,7 +6,7 @@ STIM output also raises a digital readback line since 2.3.0 was qualified
 line failed both outputs and skipped every pulse check after them.
 """
 
-from tools.hardware import qualify_pellet_firmware as qualify
+from reachaq.hardware import qualify_pellet_firmware as qualify
 
 
 def _map(monkeypatch, observed):

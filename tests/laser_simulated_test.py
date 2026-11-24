@@ -3,18 +3,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from autotrainer.core.simulation import ENV_SIM_BUS, ENV_SIMULATION, SimSignalBusReader
-from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
-from autotrainer.device.laser import (
+from reachaq.core.simulation import ENV_SIM_BUS, ENV_SIMULATION, SimSignalBusReader
+from reachaq.device import LaserChannelConfiguration, LaserSystemConfiguration
+from reachaq.device.laser import (
     LaserPulseTrain,
     NullLaserController,
     SimulatedLaserController,
     make_laser_controller,
 )
-from tools.acquisition.model.laser_firing import LaserFiring
-from tools.acquisition.model.laser_model import LaserModel
-from tools.acquisition.model.trial_action import LaserPulseProfile
-from tools.acquisition.model.trial_protocol_schedule import LaserTriggerRoute
+from reachaq.app.model.laser_firing import LaserFiring
+from reachaq.app.model.laser_model import LaserModel
+from reachaq.app.model.trial_action import LaserPulseProfile
+from reachaq.app.model.trial_protocol_schedule import LaserTriggerRoute
 
 SOFTWARE = LaserFiring(1, LaserTriggerRoute.DIRECT_NI_SOFTWARE)
 
@@ -182,7 +182,7 @@ def test_cancelled_train_clears_its_unfired_windows(simulation):
 
 def _record_publish_times(monkeypatch):
     """Wrap the laser's publish_signal so each event's publish time is kept."""
-    from autotrainer.device import laser
+    from reachaq.device import laser
 
     published = []
     original = laser.publish_signal
@@ -214,7 +214,7 @@ def test_windows_start_after_they_are_published(simulation, monkeypatch):
 
 
 def test_blocking_train_survives_a_bus_write_error(simulation, monkeypatch, caplog):
-    from autotrainer.device import laser
+    from reachaq.device import laser
 
     def broken(*_args, **_kwargs):
         raise OSError("disk full")
@@ -222,7 +222,7 @@ def test_blocking_train_survives_a_bus_write_error(simulation, monkeypatch, capl
     monkeypatch.setattr(laser, "publish_signal", broken)
     controller = make_laser_controller(_configuration())
     train = LaserPulseTrain(channel_id=1, amplitude_volts=1.5, duration_ms=2)
-    with caplog.at_level("WARNING", logger="autotrainer.device.laser"):
+    with caplog.at_level("WARNING", logger="reachaq.device.laser"):
         controller.run_pulse_train(train)
         controller.run_pulse_train(train)
     assert [r.getMessage() for r in caplog.records].count(
@@ -230,7 +230,7 @@ def test_blocking_train_survives_a_bus_write_error(simulation, monkeypatch, capl
 
 
 def test_async_train_survives_a_bus_write_error(simulation, monkeypatch, caplog):
-    from autotrainer.device import laser
+    from reachaq.device import laser
 
     def broken(*_args, **_kwargs):
         raise OSError("disk full")
@@ -238,7 +238,7 @@ def test_async_train_survives_a_bus_write_error(simulation, monkeypatch, caplog)
     monkeypatch.setattr(laser, "publish_signal", broken)
     controller = make_laser_controller(_configuration())
     model = LaserModel(controller)
-    with caplog.at_level("WARNING", logger="autotrainer.device.laser"):
+    with caplog.at_level("WARNING", logger="reachaq.device.laser"):
         operation = model.prepare_pulse_profile(
             LaserPulseProfile("pulse", 1, 2.5, 5, pulse_count=2, frequency_hz=20),
             SOFTWARE, _recipe())

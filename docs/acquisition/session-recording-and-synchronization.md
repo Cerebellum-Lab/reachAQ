@@ -532,7 +532,7 @@ the primary camera's latency stream:
   of the same kind through the kept brackets can sit from the one used, over
   the latched span.
 - The limits are measured, with one constant: `FALSE_ALARM_PROBABILITY`
-  (1e-6, per check and per session, in `tools/latency/clocks.py`), which gives
+  (1e-6, per check and per session, in `src/reachaq/latency/clocks.py`), which gives
   k = 4.89 standard errors (the two-sided Gaussian quantile; on a robust
   spread, 1.4826 × MAD, an approximation). σ_NI is `niToHost.residual_rms`,
   P is `framePeriodSeconds`, and D̄ and σ_D are the rig's NI delivery
@@ -596,9 +596,9 @@ the primary camera's latency stream:
   `spreadSeconds` (σ_D), and what the calibration covered, for provenance
   (`sessions`, `measured`, `readChunkSamples`, `frameRatesHz`,
   `exposuresSeconds`, `cameraSerials`, `deliveryFloorMinSeconds`,
-  `deliveryFloorMaxSeconds`). `python -m tools.latency.rebuild` judges the
+  `deliveryFloorMaxSeconds`). `python -m reachaq.latency.rebuild` judges the
   latch pairing by this and `exposureSeconds`, as the session did.
-  `tools/hardware/calibrate_ni_delivery.py` measures it with an AO-to-AI
+  `src/reachaq/hardware/calibrate_ni_delivery.py` measures it with an AO-to-AI
   loopback (see "NI delivery calibration" below).
 - `anchorMethod` is the first that yields a transition: `camera_latch` when the
   latch match is `paired`, else `host_arrival` when the arrival match is, else
@@ -741,7 +741,7 @@ both the session and the acquisition metadata:
   "no active 3D calibration: …" when the library has no usable active entry.
   The calibration is still named when it could be read.
 
-Offline 3D (`python -m autotrainer.inference.analysis`, and the app's own
+Offline 3D (`python -m reachaq.inference.analysis`, and the app's own
 intersession analysis) uses `--calib-dir` as given. Without it, it resolves the
 session's calibration under `--calib-root` (default the settings directory, `~/Autotrainer` unless
 `REACHAQ_CONFIG_DIR` moves it; the app's
@@ -1231,7 +1231,7 @@ the calibration covered. Without it the latch match is refused on every session
 and the anchor falls to the arrival match (`ambiguous_hardware_edge`; the
 latency record pairs by host arrival, `mixed`). See `alignment.json` above.
 
-`tools/hardware/calibrate_ni_delivery.py` measures it with a loopback:
+`src/reachaq/hardware/calibrate_ni_delivery.py` measures it with a loopback:
 
 1. With reachAQ and SpinView closed, connect a BNC cable from an unused analog
    output to an unused analog input of the NI stream's board (christielab10:
@@ -1240,7 +1240,7 @@ latency record pairs by host arrival, `mixed`). See `alignment.json` above.
 2. Run, as the operator, from the repository root:
 
    ```bash
-   conda run --no-capture-output -n reachaq python -m tools.hardware.calibrate_ni_delivery \
+   conda run --no-capture-output -n reachaq python -m reachaq.hardware.calibrate_ni_delivery \
        --ao PXI1Slot5/ao0 --ai PXI1Slot5/ai6
    ```
 

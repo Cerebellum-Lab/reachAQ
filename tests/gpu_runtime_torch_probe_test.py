@@ -17,7 +17,7 @@ import subprocess
 import sys
 import types
 
-from autotrainer.inference import gpu_runtime
+from reachaq.inference import gpu_runtime
 
 
 def _install_fake_torch(monkeypatch, *, available=True, devices=("FakeGPU",)):

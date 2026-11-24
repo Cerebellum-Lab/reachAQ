@@ -8,9 +8,9 @@ import pytest
 from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox
 
 from operator_alerts_test import FakeModel  # noqa: E402
-from tools.acquisition.model.subsystem_status import SubsystemId, SubsystemState
-from tools.acquisition.view import operator_alerts_view
-from tools.acquisition.view.operator_alerts_view import install_operator_alerts
+from reachaq.app.model.subsystem_status import SubsystemId, SubsystemState
+from reachaq.app.view import operator_alerts_view
+from reachaq.app.view.operator_alerts_view import install_operator_alerts
 
 
 @pytest.fixture
@@ -101,7 +101,7 @@ def test_help_menu_and_export(qapp, tmp_path, monkeypatch):
 
 
 def test_export_skips_the_gpu_query_while_recording(qapp, tmp_path):
-    from tools.acquisition.model.app_model_status import SessionRecordingStatus
+    from reachaq.app.model.app_model_status import SessionRecordingStatus
 
     window, model, ui = _install(qapp, tmp_path)
     sources = ui.bundle_sources()
@@ -110,7 +110,7 @@ def test_export_skips_the_gpu_query_while_recording(qapp, tmp_path):
     model.session_recording_status = SessionRecordingStatus.RECORDING
     command, environment, _ = ui.export_command(tmp_path / "b.zip", sources, tmp_path)
     assert "--no-gpu-query" in command
-    assert command[1:3] == ["-m", "tools.acquisition.model.diagnostic_bundle"]
+    assert command[1:3] == ["-m", "reachaq.app.model.diagnostic_bundle"]
     ui.close()
 
 

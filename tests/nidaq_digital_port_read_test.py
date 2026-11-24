@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import numpy
 import pytest
 
-from autotrainer.device.nidaq_signal_stream import (
+from reachaq.device.nidaq_signal_stream import (
     NidaqSignalStreamController,
     _line_number,
 )

@@ -7,7 +7,7 @@ import queue
 import time
 from collections import defaultdict
 
-from autotrainer.device import (
+from reachaq.device import (
     CanDevice,
     CanTransportConfiguration,
     DeviceConnection,

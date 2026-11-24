@@ -1,4 +1,4 @@
-"""tools/hardware/validate_laser_hardware.py builds the ramp it is asked for.
+"""src/reachaq/hardware/validate_laser_hardware.py builds the ramp it is asked for.
 
 Nothing here opens a laser: only the command line and the ramp it makes.
 """
@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from autotrainer.device import LaserChannelId
+from reachaq.device import LaserChannelId
 
-_TOOL = Path(__file__).resolve().parents[1] / "tools" / "hardware" / "validate_laser_hardware.py"
+_TOOL = Path(__file__).resolve().parents[1] / "src" / "reachaq" / "hardware" / "validate_laser_hardware.py"
 _spec = importlib.util.spec_from_file_location("validate_laser_hardware", _TOOL)
 cli = importlib.util.module_from_spec(_spec)
 sys.modules.setdefault("validate_laser_hardware", cli)

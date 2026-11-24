@@ -11,9 +11,9 @@ every simulated session says so in its metadata and in validation.
 ## Starting it
 
 ```bash
-python -m reachAQ.app --simulate                          # GUI, starts idle as usual
-python -m reachAQ.app --simulate --start-mode running     # GUI, System Mode running at once
-python -m tools.acquisition.headless --simulate           # headless, starts running
+python -m reachaq.app --simulate                          # GUI, starts idle as usual
+python -m reachaq.app --simulate --start-mode running     # GUI, System Mode running at once
+python -m reachaq.app.headless --simulate           # headless, starts running
 ```
 
 The 3D calibration is copied from files stored in Git LFS. In a checkout without

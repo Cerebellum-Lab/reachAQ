@@ -6,11 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
-from tools.acquisition.model.laser_firing import LaserFiring
-from tools.acquisition.model.laser_model import LaserModel
-from tools.acquisition.model.trial_action import LaserPulseProfile
-from tools.acquisition.model.trial_protocol_schedule import LaserTriggerRoute
+from reachaq.device import LaserChannelConfiguration, LaserSystemConfiguration
+from reachaq.app.model.laser_firing import LaserFiring
+from reachaq.app.model.laser_model import LaserModel
+from reachaq.app.model.trial_action import LaserPulseProfile
+from reachaq.app.model.trial_protocol_schedule import LaserTriggerRoute
 
 
 BOARD = LaserFiring(1, LaserTriggerRoute.HARDWARE_STIM3, "/Dev1/PFI0", 3, 1000)
@@ -209,7 +209,7 @@ def test_a_waited_for_pulse_leaves_the_command_at_its_minimum():
     # The last command stayed at the pulse's amplitude after the pulse had
     # returned to baseline, and a close that hung then named that amplitude
     # as what the output may hold.
-    from autotrainer.device import LaserChannelId, LaserPulseTrain
+    from reachaq.device import LaserChannelId, LaserPulseTrain
 
     model = _null_hardware_timed_model()
 
@@ -222,7 +222,7 @@ def test_a_waited_for_pulse_leaves_the_command_at_its_minimum():
 def test_a_pulse_that_fails_keeps_its_amplitude_as_the_last_command():
     # Its cleanup may not have reset the output, so the amplitude is what
     # the output may hold.
-    from autotrainer.device import LaserChannelId, LaserPulseTrain
+    from reachaq.device import LaserChannelId, LaserPulseTrain
 
     model = _null_hardware_timed_model()
     controller = model._controller
@@ -292,7 +292,7 @@ def test_a_trial_pulse_that_is_cancelled_keeps_its_amplitude():
 def test_a_pulse_that_ends_after_a_newer_command_leaves_that_command():
     # The end of a pulse is its own: once a newer command has been recorded,
     # the pulse's completion does not overwrite it with the minimum.
-    from autotrainer.device import LaserChannelId
+    from reachaq.device import LaserChannelId
 
     model = _null_hardware_timed_model()
     profile = LaserPulseProfile("pulse", 1, 2.5, 1)
@@ -309,7 +309,7 @@ def test_a_pulse_that_ends_after_a_newer_command_leaves_that_command():
 def test_a_command_recorded_as_a_pulse_ends_is_not_overwritten():
     # The completion looked for a newer command, then recorded the minimum,
     # as two steps: a command recorded between them was overwritten.
-    from autotrainer.device import LaserChannelId
+    from reachaq.device import LaserChannelId
 
     model = _null_hardware_timed_model()
     profile = LaserPulseProfile("pulse", 1, 2.5, 1)
@@ -340,7 +340,7 @@ def test_a_command_recorded_as_a_pulse_ends_is_not_overwritten():
 
 def test_test_stims_pulse_says_it_is_test_stim():
     # Its recipe claims no trial, and trial 0 is what its number reads.
-    from tools.acquisition.model.stim_bench_test import BenchRecipe
+    from reachaq.app.model.stim_bench_test import BenchRecipe
 
     model = _null_hardware_timed_model()
     profile = LaserPulseProfile("pulse", 1, 2.5, 1)
@@ -354,7 +354,7 @@ def test_test_stims_pulse_says_it_is_test_stim():
 def test_the_models_nidaq_controllers_take_the_streams_terminal_config(monkeypatch):
     # The laser's own inputs are referenced as the stream references its
     # inputs: the value is passed to each NI-DAQ controller the model opens.
-    from tools.acquisition.model import laser_model as laser_model_module
+    from reachaq.app.model import laser_model as laser_model_module
 
     made = []
 
@@ -390,7 +390,7 @@ def _daqmx_fake():
     from pathlib import Path
 
     path = Path(__file__).resolve().parents[1].joinpath(
-        "auto-trainer-device", "tests", "nidaq_daqmx_fake.py")
+        "tests", "device", "nidaq_daqmx_fake.py")
     spec = importlib.util.spec_from_file_location("nidaq_daqmx_fake", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -401,9 +401,9 @@ def test_a_pulse_the_board_rule_refuses_leaves_the_last_command(monkeypatch):
     # The amplitude was recorded before the controller was asked: a pulse
     # refused, which drove nothing, left it as what the output "may still
     # hold", and a close that failed named it.
-    from autotrainer.device import (
+    from reachaq.device import (
         LaserChannelId, LaserPulseTrain, LaserSynchronizedPulseTrain, NidaqLaserController)
-    from autotrainer.device import nidaq_laser
+    from reachaq.device import nidaq_laser
 
     fake = _daqmx_fake()
     daq = fake.FakeDaqmx()
@@ -433,8 +433,8 @@ def test_a_pulse_the_board_rule_refuses_leaves_the_last_command(monkeypatch):
 
 def _nidaq_model(monkeypatch, configuration=None):
     """A model on a NI-DAQ controller over the device tests' DAQmx fake."""
-    from autotrainer.device import NidaqLaserController
-    from autotrainer.device import nidaq_laser
+    from reachaq.device import NidaqLaserController
+    from reachaq.device import nidaq_laser
 
     fake = _daqmx_fake()
     daq = fake.FakeDaqmx()
@@ -449,8 +449,8 @@ def test_a_pulse_outside_the_lasers_range_leaves_the_last_command(monkeypatch, p
     # Refused in the pulse's own thread, as its operation's ValueError, it
     # left its amplitude as what the output "may still hold", and a close
     # that failed named it. It is refused before anything exists now.
-    from autotrainer.device import LaserChannelId, LaserPulseTrain
-    from autotrainer.device.laser import LaserPulseRefused
+    from reachaq.device import LaserChannelId, LaserPulseTrain
+    from reachaq.device.laser import LaserPulseRefused
 
     model, _daq = _nidaq_model(monkeypatch)
     try:
@@ -471,9 +471,9 @@ def test_an_armed_pulse_records_its_baseline_after_a_refused_pulse_on_its_laser(
     # The refusal takes back its record and its count. Taken back without
     # the count, the armed pulse's completion found a newer command than its
     # own, and left its 2.5 V as what the output may hold.
-    from autotrainer.device import (
+    from reachaq.device import (
         LaserChannelId, LaserOperationState, LaserPulseTrain, LaserSynchronizedPulseTrain)
-    from autotrainer.device.laser import LaserPulseRefused
+    from reachaq.device.laser import LaserPulseRefused
 
     model, _daq = _nidaq_model(monkeypatch)
     armed = model.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
@@ -638,7 +638,7 @@ def test_a_manual_run_pulse_is_told_as_requested_then_completed():
     # Ben, 2026-09-30: Run Pulse stays allowed while a session records, and
     # is kept in it as a marked manual event. It was kept only as its
     # waveform, unmarked, and stamped as that was told: after the train.
-    from autotrainer.device import LaserChannelId, LaserPulseTrain
+    from reachaq.device import LaserChannelId, LaserPulseTrain
 
     model = _null_hardware_timed_model()
     told = _told(model)
@@ -693,7 +693,7 @@ def test_a_manual_run_pulse_is_told_as_requested_then_completed():
 def test_a_manual_pulse_that_fails_is_told_as_failed_with_its_error_class():
     # It may still hold its amplitude: the failed row says what the model
     # keeps as what the output may hold.
-    from autotrainer.device import LaserChannelId, LaserPulseTrain
+    from reachaq.device import LaserChannelId, LaserPulseTrain
 
     model = _null_hardware_timed_model()
     told = _told(model)
@@ -729,9 +729,9 @@ def test_a_refused_manual_pulse_is_told_as_refused_and_leaves_the_baseline_logic
     # A refused pulse drove nothing, and must never read as one that fired.
     # Its refusal still takes back its record and count
     # (_undo_refused_pulse), so the armed pulse's completion finds its mark.
-    from autotrainer.device import (
+    from reachaq.device import (
         LaserChannelId, LaserOperationState, LaserPulseTrain, LaserSynchronizedPulseTrain)
-    from autotrainer.device.laser import LaserPulseRefused
+    from reachaq.device.laser import LaserPulseRefused
 
     model, _daq = _nidaq_model(monkeypatch)
     armed = model.run_synchronized_pulse_train(LaserSynchronizedPulseTrain(
@@ -771,8 +771,8 @@ def test_a_refused_manual_pulse_is_told_as_refused_and_leaves_the_baseline_logic
 def test_every_other_run_pulse_train_caller_is_told_only_the_train():
     # The protocol path, the hardware tool and the tests pass no manual
     # context: one unmarked trace, stamped as it is told, as before.
-    from autotrainer.device import LaserChannelId, LaserPulseTrain
-    from autotrainer.device.laser import LaserPulseRefused
+    from reachaq.device import LaserChannelId, LaserPulseTrain
+    from reachaq.device.laser import LaserPulseRefused
 
     model = _null_hardware_timed_model()
     told = _told(model)
@@ -799,7 +799,7 @@ def test_every_other_run_pulse_train_caller_is_told_only_the_train():
 def test_a_manual_pulse_event_needs_a_train_that_is_waited_for():
     # A train that is not waited for returns before it ends, so "completed"
     # would be a guess. Refused before anything is recorded or driven.
-    from autotrainer.device import LaserChannelId, LaserPulseTrain
+    from reachaq.device import LaserChannelId, LaserPulseTrain
 
     model = _null_hardware_timed_model()
     told = _told(model)
@@ -875,7 +875,7 @@ def test_an_arm_with_no_window_keeps_the_controllers_bound():
 
 
 def test_the_app_arms_protocol_lasers_for_the_whole_trial(app_model, monkeypatch):
-    from tools.acquisition.model.laser_model import PROTOCOL_LASER_ARM_WINDOW_S
+    from reachaq.app.model.laser_model import PROTOCOL_LASER_ARM_WINDOW_S
 
     seen = {}
 

@@ -14,12 +14,12 @@ import h5py
 import numpy as np
 import pytest
 
-from autotrainer.core import ProjectInfo
-from autotrainer.core.configuration import NidaqDeliveryCalibration
-from autotrainer.core.latency.schema import CAMERA_FRAME_DTYPE
-from tools.acquisition.model.session_data_recorder import SessionDataRecorder
-from tools.latency import clocks
-from tools.latency.finalize import finalize_session_latency, read_raw_stream
+from reachaq.core import ProjectInfo
+from reachaq.core.configuration import NidaqDeliveryCalibration
+from reachaq.core.latency.schema import CAMERA_FRAME_DTYPE
+from reachaq.app.model.session_data_recorder import SessionDataRecorder
+from reachaq.latency import clocks
+from reachaq.latency.finalize import finalize_session_latency, read_raw_stream
 from frame_alignment_synthetic import (
     ARRIVAL, EXPOSURE, FPS, LATCH_HALF_BRACKET, RATE, SyntheticRig,
 )

@@ -14,9 +14,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from autotrainer.behavior.behavior_algorithm import BehaviorAlgorithm
-from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.trial_action import PreparedState
+from reachaq.behavior.behavior_algorithm import BehaviorAlgorithm
+from reachaq.app.model.app_model import AppModel
+from reachaq.app.model.trial_action import PreparedState
 
 
 @pytest.fixture

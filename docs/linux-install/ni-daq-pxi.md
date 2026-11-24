@@ -305,7 +305,7 @@ holds the input lines this opens tasks on.
 
 ```bash
 cd "$HOME/Documents/reachAQ"
-conda run -n reachaq python tools/hardware/validate_laser_hardware.py \
+conda run -n reachaq python src/reachaq/hardware/validate_laser_hardware.py \
   --config "$HOME/Autotrainer/system_configuration.yaml" \
   --action connect
 ```
@@ -402,13 +402,13 @@ compares the configuration with it. Hardware Status then shows
 warning names each one, for example:
 
 ```text
-NI-DAQ wiring is unverified (did not respond when last checked: laser2_diode; never checked: cam_frames, barcode); run tools/hardware/verify_nidaq_wiring.py
+NI-DAQ wiring is unverified (did not respond when last checked: laser2_diode; never checked: cam_frames, barcode); run src/reachaq/hardware/verify_nidaq_wiring.py
 ```
 
 The same test runs from a terminal, with reachAQ closed:
 
 ```bash
-conda run --no-capture-output -n reachaq python tools/hardware/verify_nidaq_wiring.py
+conda run --no-capture-output -n reachaq python src/reachaq/hardware/verify_nidaq_wiring.py
 ```
 
 | Option | Effect |
@@ -430,7 +430,7 @@ an unused analog input (christielab10: AO 0 to AI 6, AI 6 at SE) and reachAQ
 closed:
 
 ```bash
-conda run --no-capture-output -n reachaq python -m tools.hardware.calibrate_ni_delivery \
+conda run --no-capture-output -n reachaq python -m reachaq.hardware.calibrate_ni_delivery \
     --ao PXI1Slot5/ao0 --ai PXI1Slot5/ai6 --write
 ```
 

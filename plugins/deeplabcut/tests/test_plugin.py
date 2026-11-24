@@ -1,6 +1,6 @@
 """The DeepLabCut plugin as an installed distribution.
 
-These run with auto-trainer-pose-deeplabcut installed: discovery has to find it
+These run with reachaq-pose-deeplabcut installed: discovery has to find it
 through its entry point, not through anything core still ships.
 """
 
@@ -10,10 +10,10 @@ import sys
 
 import pytest
 
-from autotrainer.inference import pose_plugins
-from autotrainer.inference.pose_plugins import discover_plugins
+from reachaq.inference import pose_plugins
+from reachaq.inference.pose_plugins import discover_plugins
 
-PLUGIN_MODULE = "autotrainer.pose_plugins.deeplabcut.plugin"
+PLUGIN_MODULE = "reachaq.pose_plugins.deeplabcut.plugin"
 
 
 def _deeplabcut():
@@ -27,7 +27,7 @@ def test_the_plugin_is_discovered_through_its_entry_point():
     assert "deeplabcut" in [point.name for point in pose_plugins._entry_points()]
     plugin = _deeplabcut()
     assert type(plugin).__module__ == PLUGIN_MODULE
-    assert plugin.distribution == "auto-trainer-pose-deeplabcut"
+    assert plugin.distribution == "reachaq-pose-deeplabcut"
 
 
 def test_the_plugin_claims_a_project_with_config_yaml(tmp_path):
@@ -39,9 +39,9 @@ def test_the_plugin_claims_a_project_with_config_yaml(tmp_path):
 
 
 def test_the_model_classes_are_exported_lazily():
-    import autotrainer.pose_plugins.deeplabcut as package
-    from autotrainer.pose_plugins.deeplabcut.dlc_pose_model import DlcPoseModel
-    from autotrainer.pose_plugins.deeplabcut.dlc_torch_pose_model import DlcTorchPoseModel
+    import reachaq.pose_plugins.deeplabcut as package
+    from reachaq.pose_plugins.deeplabcut.dlc_pose_model import DlcPoseModel
+    from reachaq.pose_plugins.deeplabcut.dlc_torch_pose_model import DlcTorchPoseModel
 
     assert package.DlcPoseModel is DlcPoseModel
     assert package.DlcTorchPoseModel is DlcTorchPoseModel
@@ -54,15 +54,15 @@ def test_discovering_the_plugin_loads_no_engine():
 
     Checked in a fresh interpreter, because this one has imported plenty.
     """
-    # .../auto-trainer-inference/src/autotrainer/inference/pose_plugins.py
+    # .../src/reachaq/inference/pose_plugins.py
     inference_src = pathlib.Path(pose_plugins.__file__).resolve().parents[2]
     repo_root = inference_src.parents[1]
-    source_dirs = [str(inference_src), str(repo_root / "auto-trainer-core" / "src")]
+    source_dirs = [str(inference_src), str(repo_root / "reachaq" / "src")]
     script = (
         "import sys\n"
         f"sys.path[:0] = {source_dirs!r}\n"
-        "import autotrainer.inference.pose_plugins as pose_plugins\n"
-        "import autotrainer.pose_plugins.deeplabcut\n"
+        "import reachaq.inference.pose_plugins as pose_plugins\n"
+        "import reachaq.pose_plugins.deeplabcut\n"
         "names = [plugin.name for plugin in pose_plugins.discover_plugins()]\n"
         "assert 'deeplabcut' in names, (names, pose_plugins.broken_plugins())\n"
         "leaked = [name for name in ('deeplabcut', 'tensorflow', 'torch', 'ultralytics')\n"

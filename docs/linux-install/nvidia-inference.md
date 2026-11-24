@@ -72,7 +72,7 @@ recognised. Operators label, train and deploy one inside the app with
 terminal, train one from an exported dataset with:
 
 ```bash
-python -m autotrainer.inference.keypoint.train DATASET OUTPUT --bodyparts NAMES
+python -m reachaq.inference.keypoint.train DATASET OUTPUT --bodyparts NAMES
 ```
 
 `DATASET` holds `images/{train,val}/*.png` and `labels/{train,val}/*.txt` (one
@@ -87,7 +87,7 @@ reachAQ no longer installs `ultralytics`: it is AGPL-3.0. A YOLO model
 directory (`yolo_pose.yaml`) is refused at start-up with a message saying so.
 Retrain it as a keypoint model, or install the optional AGPL plugin
 (`./tools/install/reachaq-plugin-install.sh yolo`, distribution
-`auto-trainer-pose-yolo`) to keep
+`reachaq-pose-yolo`) to keep
 running it.
 
 The PyTorch build covers compute capability 7.5 through 12.0: T1000, RTX A2000
@@ -124,7 +124,7 @@ repeat the reachAQ preflight by hand:
 
 ```bash
 conda run -n reachaq python - <<'PY'
-from autotrainer.inference import detect_gpu_runtime
+from reachaq.inference import detect_gpu_runtime
 
 print(detect_gpu_runtime(required_backend="torch"))
 print(detect_gpu_runtime(required_backend="tensorflow"))
@@ -139,16 +139,16 @@ starts. A failure leaves the GUI idle.
 
 ```bash
 # Honor the saved inference setting
-conda run --no-capture-output -n reachaq python -m reachAQ.app \
+conda run --no-capture-output -n reachaq python -m reachaq.app \
   -c "$HOME/Autotrainer/system_configuration.yaml"
 
 # Disable inference for one run
-conda run --no-capture-output -n reachaq python -m reachAQ.app \
+conda run --no-capture-output -n reachaq python -m reachaq.app \
   --no-live-inference \
   -c "$HOME/Autotrainer/system_configuration.yaml"
 
 # Require inference for one run
-conda run --no-capture-output -n reachaq python -m reachAQ.app \
+conda run --no-capture-output -n reachaq python -m reachaq.app \
   --live-inference \
   -c "$HOME/Autotrainer/system_configuration.yaml"
 ```

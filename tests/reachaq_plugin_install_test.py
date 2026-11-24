@@ -18,7 +18,7 @@ PLUGIN_SCRIPT = INSTALL_DIR / "reachaq-plugin-install.sh"
 PLUGIN_LIB = INSTALL_DIR / "plugin-install-lib.sh"
 MAIN_SCRIPT = INSTALL_DIR / "reachaq-linux-install.sh"
 
-AGPL_NOTICE = "auto-trainer-pose-yolo installs ultralytics, which is AGPL-3.0."
+AGPL_NOTICE = "reachaq-pose-yolo installs ultralytics, which is AGPL-3.0."
 
 FAKE_CONDA = r"""#!/usr/bin/env bash
 # Logs every call. `env list` lists $FAKE_ENVS; `run -n ENV python ...` runs
@@ -85,7 +85,7 @@ def _make_env(envs, name, *, entry_points=(), packages=()):
         (dist / "METADATA").write_text(
             "Metadata-Version: 2.1\nName: fake-plugins\nVersion: 1.0\n")
         (dist / "entry_points.txt").write_text(
-            "[autotrainer.pose_backends]\n"
+            "[reachaq.pose_backends]\n"
             + "".join(f"{name} = fake_module:THING\n" for name in entry_points))
     for package in packages:
         (root / package).mkdir()
@@ -367,7 +367,7 @@ def test_main_installer_verifies_each_restored_plugin():
 
     assert 'conda_run python - "$INSTALL_REPO" "${PLUGINS_TO_RESTORE[@]}"' in verify
     assert "import torch" in verify
-    assert 'f"autotrainer.pose_plugins.{name}.plugin"' in verify
+    assert 'f"reachaq.pose_plugins.{name}.plugin"' in verify
 
 
 def test_installer_scripts_parse():

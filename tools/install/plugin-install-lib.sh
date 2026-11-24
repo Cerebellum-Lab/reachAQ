@@ -8,7 +8,7 @@
 # REPORT_FOOTER, when set, label the final report.
 
 # Pose backend plugins this checkout carries, each a distribution under
-# plugins/<name> that registers <name> in the autotrainer.pose_backends
+# plugins/<name> that registers <name> in the reachaq.pose_backends
 # entry-point group.
 KNOWN_PLUGINS=(deeplabcut yolo)
 
@@ -190,15 +190,15 @@ probe_pose_env() {
     printf '%s\n' "$output" | known_plugins_in
 }
 
-# Plugin names registered in <env>'s autotrainer.pose_backends group. The
+# Plugin names registered in <env>'s reachaq.pose_backends group. The
 # archived environment of an update can be on an older Python, where
 # entry_points() returns a dict, hence both lookups.
 installed_pose_plugins() {
     probe_pose_env "$1" '
 from importlib.metadata import entry_points
 found = entry_points()
-group = (found.select(group="autotrainer.pose_backends") if hasattr(found, "select")
-         else found.get("autotrainer.pose_backends", ()))
+group = (found.select(group="reachaq.pose_backends") if hasattr(found, "select")
+         else found.get("reachaq.pose_backends", ()))
 print("\n".join(sorted({entry.name for entry in group})))
 '
 }
@@ -263,11 +263,11 @@ install_pose_plugin() {
     fi
     if [ "$name" = yolo ]; then
         printf '%s\n' \
-            'auto-trainer-pose-yolo installs ultralytics, which is AGPL-3.0.' \
+            'reachaq-pose-yolo installs ultralytics, which is AGPL-3.0.' \
             'Its terms then cover this environment: distributing it, or letting others use' \
             'a modified copy over a network, requires offering them the source under the' \
             'AGPL. Check that this is acceptable for the site.' \
-            'To remove it: python -m pip uninstall auto-trainer-pose-yolo ultralytics' \
+            'To remove it: python -m pip uninstall reachaq-pose-yolo ultralytics' \
             'Continuing.'
     fi
     if ! conda_run python -m pip install -e "$INSTALL_REPO/plugins/$name"; then
@@ -389,7 +389,7 @@ install_tensorflow_gpu_runtime() {
 verify_tensorflow_gpu_runtime() {
     conda_run python - <<'PY'
 import tensorflow as tf
-from autotrainer.inference import detect_gpu_runtime
+from reachaq.inference import detect_gpu_runtime
 
 status = detect_gpu_runtime(required_backend="tensorflow")
 print(status)

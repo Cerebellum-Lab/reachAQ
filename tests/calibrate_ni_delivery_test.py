@@ -5,13 +5,13 @@ import math
 import numpy as np
 import pytest
 
-from autotrainer.core import CameraConfiguration, CameraId, SystemConfiguration
-from autotrainer.core.configuration import (
+from reachaq.core import CameraConfiguration, CameraId, SystemConfiguration
+from reachaq.core.configuration import (
     NidaqDeliveryCalibration,
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
 )
-from tools.hardware import calibrate_ni_delivery as calibrate
+from reachaq.hardware import calibrate_ni_delivery as calibrate
 
 RATE = 10_000.0
 

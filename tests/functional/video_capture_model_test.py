@@ -4,12 +4,12 @@ import time
 
 import pytest
 
-from autotrainer.core.project import ProjectInfo
-from autotrainer.video import CaptureCameraAttrs
-from tools.acquisition.model.video_capture_model import VideoCaptureModel
+from reachaq.core.project import ProjectInfo
+from reachaq.video import CaptureCameraAttrs
+from reachaq.app.model.video_capture_model import VideoCaptureModel
 
 logging.basicConfig(level=logging.INFO)
-logging.getLogger('autotrainer').setLevel(logging.DEBUG)
+logging.getLogger('reachaq').setLevel(logging.DEBUG)
 logging.getLogger('tools').setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 

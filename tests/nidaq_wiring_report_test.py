@@ -7,11 +7,11 @@ file, and the next question is always which connector that is.
 
 from types import SimpleNamespace
 
-from tools.acquisition.model.nidaq_wiring_report import (
+from reachaq.app.model.nidaq_wiring_report import (
     build_report,
     format_report,
 )
-from tools.acquisition.model.nidaq_wiring_verification import (
+from reachaq.app.model.nidaq_wiring_verification import (
     CONFIRMED,
     OPAQUE,
     SILENT,

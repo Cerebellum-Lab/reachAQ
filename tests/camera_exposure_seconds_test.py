@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools.acquisition.model.app_model import _camera_exposure_seconds
+from reachaq.app.model.app_model import _camera_exposure_seconds
 
 
 class _Camera:

@@ -1,10 +1,10 @@
 import logging
 import sys
 
-from autotrainer.inference import PoseModel, MemoryPoseModel
-from autotrainer.pose_plugins.deeplabcut import DlcPoseModel
+from reachaq.inference import PoseModel, MemoryPoseModel
+from reachaq.pose_plugins.deeplabcut import DlcPoseModel
 
-logging.getLogger("autotrainer").setLevel(logging.DEBUG)
+logging.getLogger("reachaq").setLevel(logging.DEBUG)
 
 
 def show_model(m: PoseModel, name: str):

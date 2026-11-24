@@ -6,17 +6,17 @@ import pytest
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from tools.acquisition.model.trial_protocol_schedule import ProtocolPatch  # noqa: E402
-from tools.acquisition.model.trial_protocol_set import (  # noqa: E402
+from reachaq.app.model.trial_protocol_schedule import ProtocolPatch  # noqa: E402
+from reachaq.app.model.trial_protocol_set import (  # noqa: E402
     ExperimentComposition,
     ExperimentSetEntry,
     TrialProtocolSet,
 )
-from tools.acquisition.model.trial_protocol_set_repository import (  # noqa: E402
+from reachaq.app.model.trial_protocol_set_repository import (  # noqa: E402
     ExperimentCompositionRepository,
     TrialProtocolSetRepository,
 )
-from tools.acquisition.view.protocol_set_sidebar import (  # noqa: E402
+from reachaq.app.view.protocol_set_sidebar import (  # noqa: E402
     ProtocolSetSidebar,
 )
 

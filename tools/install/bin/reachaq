@@ -116,4 +116,4 @@ fi
 
 cd "$repository" || exit 2
 exec "$conda_bin" run --no-capture-output -n "$conda_env" \
-    python -m reachAQ.app -c "$system_config" "$@"
+    python -m reachaq.app -c "$system_config" "$@"

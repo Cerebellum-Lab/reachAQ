@@ -1,6 +1,6 @@
 """The YOLO plugin as an installed distribution.
 
-These run with auto-trainer-pose-yolo installed: discovery has to find it
+These run with reachaq-pose-yolo installed: discovery has to find it
 through its entry point, not through anything core still ships.
 """
 
@@ -10,10 +10,10 @@ import sys
 
 import pytest
 
-from autotrainer.inference import pose_plugins
-from autotrainer.inference.pose_plugins import discover_plugins
+from reachaq.inference import pose_plugins
+from reachaq.inference.pose_plugins import discover_plugins
 
-PLUGIN_MODULE = "autotrainer.pose_plugins.yolo.plugin"
+PLUGIN_MODULE = "reachaq.pose_plugins.yolo.plugin"
 
 
 def _yolo():
@@ -27,7 +27,7 @@ def test_the_plugin_is_discovered_through_its_entry_point():
     assert "yolo" in [point.name for point in pose_plugins._entry_points()]
     plugin = _yolo()
     assert type(plugin).__module__ == PLUGIN_MODULE
-    assert plugin.distribution == "auto-trainer-pose-yolo"
+    assert plugin.distribution == "reachaq-pose-yolo"
     assert plugin.requires == ("ultralytics", "torch")
 
 
@@ -42,8 +42,8 @@ def test_the_plugin_claims_a_project_with_yolo_pose_yaml(tmp_path):
 
 
 def test_the_model_class_is_exported_lazily():
-    import autotrainer.pose_plugins.yolo as package
-    from autotrainer.pose_plugins.yolo.yolo_pose_model import YoloPoseModel
+    import reachaq.pose_plugins.yolo as package
+    from reachaq.pose_plugins.yolo.yolo_pose_model import YoloPoseModel
 
     assert package.YoloPoseModel is YoloPoseModel
     with pytest.raises(AttributeError):
@@ -55,15 +55,15 @@ def test_discovering_the_plugin_loads_no_engine():
 
     Checked in a fresh interpreter, because this one has imported plenty.
     """
-    # .../auto-trainer-inference/src/autotrainer/inference/pose_plugins.py
+    # .../src/reachaq/inference/pose_plugins.py
     inference_src = pathlib.Path(pose_plugins.__file__).resolve().parents[2]
     repo_root = inference_src.parents[1]
-    source_dirs = [str(inference_src), str(repo_root / "auto-trainer-core" / "src")]
+    source_dirs = [str(inference_src), str(repo_root / "reachaq" / "src")]
     script = (
         "import sys\n"
         f"sys.path[:0] = {source_dirs!r}\n"
-        "import autotrainer.inference.pose_plugins as pose_plugins\n"
-        "import autotrainer.pose_plugins.yolo\n"
+        "import reachaq.inference.pose_plugins as pose_plugins\n"
+        "import reachaq.pose_plugins.yolo\n"
         "names = [plugin.name for plugin in pose_plugins.discover_plugins()]\n"
         "assert 'yolo' in names, (names, pose_plugins.broken_plugins())\n"
         "leaked = [name for name in ('deeplabcut', 'tensorflow', 'torch', 'ultralytics')\n"

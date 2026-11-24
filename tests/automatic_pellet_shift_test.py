@@ -1,4 +1,4 @@
-from tools.acquisition.model.automatic_pellet_shift import (
+from reachaq.app.model.automatic_pellet_shift import (
     AutomaticPelletShiftController,
     AutomaticShiftPolicy,
     ReachPositionObservation,

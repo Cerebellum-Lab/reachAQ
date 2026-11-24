@@ -5,11 +5,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication
 
-from autotrainer.core.configuration.system_configuration import SystemConfiguration
-from tools.acquisition.model import first_run
-from tools.acquisition.model.first_run import HardwareCheck
-from tools.acquisition.view import first_run_dialog
-from tools.acquisition.view.first_run_dialog import FirstRunDialog
+from reachaq.core.configuration.system_configuration import SystemConfiguration
+from reachaq.app.model import first_run
+from reachaq.app.model.first_run import HardwareCheck
+from reachaq.app.view import first_run_dialog
+from reachaq.app.view.first_run_dialog import FirstRunDialog
 
 
 @pytest.fixture

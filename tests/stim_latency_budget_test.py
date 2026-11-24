@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from tools.acquisition.model.stim_latency_budget import (
+from reachaq.app.model.stim_latency_budget import (
     STIM_LATENCY_STAGES,
     StimLatencyBudget,
     percentile,

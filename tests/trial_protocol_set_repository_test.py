@@ -1,12 +1,12 @@
 import json
 
-from tools.acquisition.model.trial_protocol_schedule import ProtocolPatch
-from tools.acquisition.model.trial_protocol_set import (
+from reachaq.app.model.trial_protocol_schedule import ProtocolPatch
+from reachaq.app.model.trial_protocol_set import (
     ExperimentComposition,
     ExperimentSetEntry,
     TrialProtocolSet,
 )
-from tools.acquisition.model.trial_protocol_set_repository import (
+from reachaq.app.model.trial_protocol_set_repository import (
     ExperimentCompositionRepository,
     TrialProtocolSetRepository,
 )

@@ -10,14 +10,14 @@ Three failures matter more than the arithmetic:
 
 import pytest
 
-from tools.acquisition.model.intertrial_send_gate import BLOCK_NAME, InterTrialSendGate
-from tools.acquisition.model.intertrial_timing import (
+from reachaq.app.model.intertrial_send_gate import BLOCK_NAME, InterTrialSendGate
+from reachaq.app.model.intertrial_timing import (
     InterTrialDecision,
     InterTrialReason,
     InterTrialTimingConfiguration,
     InterTrialTimingPolicy,
 )
-from tools.acquisition.model.send_block_reasons import SendBlockReasons
+from reachaq.app.model.send_block_reasons import SendBlockReasons
 
 
 class _ManualTimer:

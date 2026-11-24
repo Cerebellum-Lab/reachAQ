@@ -5,7 +5,7 @@ import math
 
 import numpy as np
 
-from tools.latency import clocks
+from reachaq.latency import clocks
 
 RATE = 10_000.0
 #: Host perf seconds of NI second 0: the rigs below put the host clock at NI seconds plus this.

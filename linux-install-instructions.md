@@ -19,7 +19,7 @@ Complete only the hardware categories present on the target rig.
 | 3b | NI DAQ/PXI | [NI-DAQmx and PXI/MXI guide](docs/linux-install/ni-daq-pxi.md), including the `intel_iommu=off` boot parameter Intel hosts need for NI DMA |
 | 3c | Pellet CAN | [PEAK SocketCAN guide](docs/linux-install/peak-socketcan.md) |
 | 3d | Live inference | [NVIDIA guide](docs/linux-install/nvidia-inference.md) |
-| 3e | SoftMouse/RFID | [SoftMouse/RFID guide](tools/softmouse_sync/CONFIGURATION_GUIDE.md) |
+| 3e | SoftMouse/RFID | [SoftMouse/RFID guide](src/reachaq/softmouse_sync/CONFIGURATION_GUIDE.md) |
 | 3f | Closed-loop stim timing | [Latency tuning guide](docs/linux-install/latency-tuning.md) |
 | 4 | Rig configuration and launch | [Runtime guide](docs/linux-install/runtime-configuration.md) |
 
@@ -87,13 +87,13 @@ the kernel driver or install a system-wide CUDA toolkit.
 - An environment on another Python version cannot be upgraded in place, so it
   is kept, renamed `reachaq-py<version>-<date>`, and a fresh one is built. Run
   the archive with
-  `conda run --no-capture-output -n <archive> python -m reachAQ.app`.
+  `conda run --no-capture-output -n <archive> python -m reachaq.app`.
 - The pose plugins the environment had are reinstalled from the checkout, into
   a rebuilt environment too. An environment from before the plugins existed
   gets the DeepLabCut plugin if it has `deeplabcut` installed and the YOLO
   plugin if it has `ultralytics`. To drop a plugin for good, uninstall both its
   distribution and its engine package (for example
-  `pip uninstall auto-trainer-pose-yolo ultralytics`) before rerunning the
+  `pip uninstall reachaq-pose-yolo ultralytics`) before rerunning the
   installer, otherwise it restores the plugin.
 - `REACHAQ_INSTALL_SYSTEM=0` skips the steps that need root (apt packages,
   groups, limits, systemd) and reports them as `SKIP`. Use it to rerun on a rig
@@ -181,7 +181,7 @@ Start it with `reachaq`, or the desktop icon. A safe first launch after
 configuration, without live inference:
 
 ```bash
-conda run --no-capture-output -n reachaq python -m reachAQ.app \
+conda run --no-capture-output -n reachaq python -m reachaq.app \
   --no-live-inference \
   -c "$HOME/Autotrainer/system_configuration.yaml"
 ```

@@ -25,9 +25,9 @@ import numpy
 
 import source_contract
 
-from autotrainer.core.fixed_array_multiqueue import BufferResult
-from autotrainer.core.fixed_array_multiqueue import FixedArrayMultiQueue
-from autotrainer.core.frame_index import FrameIndexCategory
+from reachaq.core.fixed_array_multiqueue import BufferResult
+from reachaq.core.fixed_array_multiqueue import FixedArrayMultiQueue
+from reachaq.core.frame_index import FrameIndexCategory
 
 SHAPE = (4, 4)
 CAMERAS = 2
@@ -160,7 +160,7 @@ def test_the_capture_loop_names_each_frame_it_offers():
     live_queue_freshness_test, because running the loop needs a camera.
     """
     call = source_contract.one_call(
-        "auto-trainer-video/src/autotrainer/video/video_capture.py", "net_q_put")
+        "src/reachaq/video/video_capture.py", "net_q_put")
     frame_id = source_contract.keyword(call, "frame_id")
     assert frame_id is not None, "the capture loop no longer passes frame ids"
     names = {node.id for node in ast.walk(frame_id) if isinstance(node, ast.Name)}

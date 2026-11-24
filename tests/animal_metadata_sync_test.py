@@ -4,11 +4,11 @@ import json
 
 import pytest
 
-from tools.acquisition.model.animal_metadata_sync import AnimalMetadataSyncService
-from tools.acquisition.model.animal_registry import AnimalRegistry
-from tools.acquisition.model.animal_sources.config import SourceConfiguration, build_source
-from tools.acquisition.model.animal_sources.credentials import CredentialStore
-from tools.acquisition.model.animal_sources.mapping import softmouse_mapping
+from reachaq.app.model.animal_metadata_sync import AnimalMetadataSyncService
+from reachaq.app.model.animal_registry import AnimalRegistry
+from reachaq.app.model.animal_sources.config import SourceConfiguration, build_source
+from reachaq.app.model.animal_sources.credentials import CredentialStore
+from reachaq.app.model.animal_sources.mapping import softmouse_mapping
 
 
 TAG = "360002353933099"

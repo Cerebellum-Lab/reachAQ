@@ -2,15 +2,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from autotrainer.behavior import BehaviorAlgorithm
-from autotrainer.core import Offset3DTuple
-from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
-from tools.acquisition.model.app_model_status import (
+from reachaq.behavior import BehaviorAlgorithm
+from reachaq.core import Offset3DTuple
+from reachaq.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from reachaq.app.model.app_model_status import (
     AppModelStatus,
     SessionRecordingStatus,
 )
-from tools.acquisition.view.main_window import MainWindow
-from tools.acquisition.view.ui_availability import calculate_ui_availability
+from reachaq.app.view.main_window import MainWindow
+from reachaq.app.view.ui_availability import calculate_ui_availability
 
 
 def _state(**overrides):

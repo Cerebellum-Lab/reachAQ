@@ -8,7 +8,7 @@ is visible to discovery.
 
 import pytest
 
-from autotrainer.inference.pose_plugins import reset_discovery
+from reachaq.inference.pose_plugins import reset_discovery
 
 
 @pytest.fixture(autouse=True)

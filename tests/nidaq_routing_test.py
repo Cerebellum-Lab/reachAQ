@@ -7,7 +7,7 @@ which names neither which configuration line asked for it nor what to do.
 
 from types import SimpleNamespace
 
-from tools.acquisition.model.nidaq_routing import (
+from reachaq.app.model.nidaq_routing import (
     IMPOSSIBLE,
     PXI_BACKPLANE,
     PXI_BACKPLANE_EXPLICIT,

@@ -43,26 +43,26 @@ def run_simulated_session(home: Path) -> Path:
     from multiprocessing import set_start_method
     set_start_method("spawn")
 
-    from tools.acquisition.args import make_autotrainer_parser
-    from tools.acquisition.model.app_model_status import AppModelStatus
-    from tools.simulation.sim_home import prepare_simulation
+    from reachaq.app.args import make_reachaq_parser
+    from reachaq.app.model.app_model_status import AppModelStatus
+    from reachaq.simulation.sim_home import prepare_simulation
 
-    args = make_autotrainer_parser(default_start_mode=AppModelStatus.RUNNING).parse_args(
+    args = make_reachaq_parser(default_start_mode=AppModelStatus.RUNNING).parse_args(
         ["--simulate", "--sim-home", str(home)])
     simulation = prepare_simulation(args)
 
     import logging
-    from autotrainer.core.logging import setup_logging, stop_multiproc_logging
+    from reachaq.core.logging import setup_logging, stop_multiproc_logging
     setup_logging(logger_level=logging.INFO, time_precision=6, multiprocess_enabled=True)
 
-    from autotrainer.behavior import BehaviorAlgorithm
-    from autotrainer.core import LaserChannelId
-    from autotrainer.core.event.event_manager import EventManager
-    from autotrainer.device import LaserPulseTrain
-    from tools.acquisition.model.app_model import AppModel
-    from tools.acquisition.model.app_model_status import SessionRecordingStatus
-    from tools.acquisition.model.helpers import get_config_location
-    from tools.acquisition.model.user_preferences import UserPreferences
+    from reachaq.behavior import BehaviorAlgorithm
+    from reachaq.core import LaserChannelId
+    from reachaq.core.event.event_manager import EventManager
+    from reachaq.device import LaserPulseTrain
+    from reachaq.app.model.app_model import AppModel
+    from reachaq.app.model.app_model_status import SessionRecordingStatus
+    from reachaq.app.model.helpers import get_config_location
+    from reachaq.app.model.user_preferences import UserPreferences
 
     preferences = UserPreferences(settings_file_path=args.preferences_file)
     app = AppModel(preferences, calib_dir=simulation.calib_dir)
@@ -113,8 +113,8 @@ def run_simulated_session(home: Path) -> Path:
 
 @pytest.mark.functional
 def test_a_simulated_session_validates_with_only_the_provenance_warning(tmp_path):
-    from tools.session_validation.engine import validate_session
-    from tools.session_validation.model import ValidationProfile
+    from reachaq.session_validation.engine import validate_session
+    from reachaq.session_validation.model import ValidationProfile
 
     home = tmp_path / "sim-home"
     log_path, result_path = tmp_path / "session.log", tmp_path / "session.json"

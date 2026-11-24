@@ -2,20 +2,45 @@
 requires = [
     "setuptools >= 61",
     'setuptools-scm >= 9.2.2, < 10',
-    "tomli >= 2, < 3",  # for current setup.py
 ]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "auto-trainer"
-description = "Autotrainer full application and libs"
+name = "reachaq"
+description = "reachAQ acquisition application and libraries"
 license = { text = "MIT" }
 requires-python = ">= 3.10"
-dynamic = ["version", "dependencies"]
-# see setup.py
-#dependencies = [
-# ...
-#]
+dynamic = ["version"]
+dependencies = [
+    "setuptools-scm >= 9.2.2, < 10",
+    "h5py >= 3.8, < 4",
+    "openpyxl >= 3.1, < 4",
+    "requests >= 2.32, < 3",
+    "keyring >= 24, < 25; python_version < \"3.9\"",
+    "keyring >= 25, < 26; python_version >= \"3.9\"",
+    "importlib-resources; python_version < \"3.10\"",
+    "importlib-metadata; python_version < \"3.10\"",
+    "verboselogs >= 1.7, < 2",
+    "coloredlogs >= 15, < 16",
+    "events >= 0.5, < 1",
+    "transitions >= 0.9.2, < 1",
+    "psutil >= 7, < 8",
+    "numpy >= 1.23.5, < 2",
+    "pyhumps >= 3.8, < 4",
+    "pyyaml >= 6.0.2, < 7",
+    "pyserial >= 3.5, < 4",
+    "python-can >= 4.5, < 5 ; platform_system == \"Linux\"",
+    "nidaqmx >= 1.0, < 2 ; platform_system == \"Linux\"",
+    "opencv-python >= 4.10, < 4.12",
+    "pandas >= 2, < 3",
+    "scipy >= 1.10, < 2",
+    "scikit-learn >= 1.3, < 2",
+    "tables >= 3.8, < 4",
+    "tomli >= 2, < 3; python_version < \"3.11\"",
+    "PySide6 >= 6.6.3.1, < 6.7",
+    "pyqtgraph >= 0.13.3, < 1",
+    "QtAwesome >= 1.4.1, < 2",
+]
 
 [project.optional-dependencies]
 test = [
@@ -27,43 +52,40 @@ test = [
     "coverage >= 7, < 8",
     "coverage-enable-subprocess ~= 1.0",
 ]
+# Installed alongside the DeepLabCut plugin's tensorflow extra by
+# tools/install/reachaq-linux-install.sh; the conditions that makes safe are
+# recorded beside that extra in plugins/deeplabcut/pyproject.toml.
+torch = [
+    'torch >= 2.7, < 2.8',
+    # 2.7 on a CUDA 12.8 build covers compute capability 7.5 through 12.0,
+    # which is the whole known fleet: T1000 (7.5), RTX A2000 (8.6),
+    # RTX 5060 Ti (12.0). Do not narrow this to one card. Capped below 2.8
+    # because 2.7.1+cu128 is the build shown to share a process with
+    # TensorFlow; a newer one needs that check repeated before the cap moves.
+    'torchvision >= 0.22, < 0.23',
+]
+# Test-only: tests/inference/multires_anipose_compat_check.py checks the calibration's anipose TOMLs
+# against aniposelib. Install it only in a separate virtualenv, never in the reachaq
+# environment: aniposelib depends on opencv-contrib-python, which replaces opencv-python's cv2.
+anipose-check = ["aniposelib==0.8.0"]
 
 [project.scripts]
-auto-trainer-local = "tools.acquisition.gui:main"
-auto-trainer-headless = "tools.acquisition.headless:main"
-reachaq = "reachAQ.app:main"
-reachaq-validate-session = "tools.session_validation.cli:main"
-reachaq-animal-metadata = "tools.acquisition.model.animal_sources.cli:main"
-reachaq-diagnostics = "tools.acquisition.model.diagnostic_bundle:main"
-# etc... but is same than:
-# python -m tools.acquisition.headless   # for instance.
-#
+reachaq = "reachaq.app.gui:main"
+reachaq-headless = "reachaq.app.headless:main"
+reachaq-validate-session = "reachaq.session_validation.cli:main"
+reachaq-animal-metadata = "reachaq.app.model.animal_sources.cli:main"
+reachaq-diagnostics = "reachaq.app.model.diagnostic_bundle:main"
+reachaq-softmouse-publish = "reachaq.softmouse_sync.cli:main"
 
 [tool.setuptools_scm]
-write_to = "tools/autotrainer_version.txt"
+write_to = "src/reachaq/version.txt"
 git_describe_command = "git describe --tags --dirty --match 'v*' --abbrev=8"
 
-
 [tool.setuptools.packages.find]
-where = [
-    # temporary until split in many repos:
-    "auto-trainer-behavior/src",
-    "auto-trainer-core/src",
-    "auto-trainer-device/src",
-    "auto-trainer-inference/src",
-    "auto-trainer-model/src",
-    "auto-trainer-pyside/src",
-    "auto-trainer-video/src",
-    ".",  # for tools
-]
-include = [
-    "autotrainer.*",
-    "tools",
-    "reachAQ",
-    "reachAQ.*",
-]
+where = ["src"]
+# "reachaq" itself too: reachaq/version.py sits in the namespace root.
+include = ["reachaq", "reachaq.*"]
 namespaces = true
 
 [tool.setuptools.package-data]
-# package = ["file", ...]
-tools = ["autotrainer_version.txt"]
+reachaq = ["version.txt"]

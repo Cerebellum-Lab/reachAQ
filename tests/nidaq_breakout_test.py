@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools.acquisition.model.nidaq_breakout import (
+from reachaq.app.model.nidaq_breakout import (
     ASSIGNED,
     NOT_A_TERMINAL,
     REACHABLE,

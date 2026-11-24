@@ -17,13 +17,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from autotrainer.core import (  # noqa: E402
+from reachaq.core import (  # noqa: E402
     LaserChannelConfiguration,
     LaserChannelId,
     LaserSystemConfiguration,
 )
-from tools.acquisition.model.user_preferences import UserPreferences  # noqa: E402
-from tools.acquisition.view.laser_control_content import (  # noqa: E402
+from reachaq.app.model.user_preferences import UserPreferences  # noqa: E402
+from reachaq.app.view.laser_control_content import (  # noqa: E402
     LaserControlContent,
 )
 
@@ -211,7 +211,7 @@ def test_a_saved_true_or_false_is_read_from_the_file(
 def test_a_damaged_saved_value_falls_back_to_the_default(
     make_panel, app_model, monkeypatch, tmp_path, caplog, damaged,
 ):
-    caplog.set_level("WARNING", logger="tools.acquisition.model.user_preferences")
+    caplog.set_level("WARNING", logger="reachaq.app.model.user_preferences")
     _start_with_file(app_model, monkeypatch, tmp_path / "written.ini", _laser_control_file((
         # One good value, so the panel is shown to read the file at all.
         (r"sections\signals", "true"),

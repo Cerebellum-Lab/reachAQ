@@ -22,9 +22,9 @@ from types import SimpleNamespace
 import pytest
 from PySide6.QtCore import QFile, QIODevice, QSettings
 
-from autotrainer.behavior import BehaviorAlgorithm
-from autotrainer.core import PersistenceConfiguration
-from tools.acquisition.model.app_model import AppModel
+from reachaq.behavior import BehaviorAlgorithm
+from reachaq.core import PersistenceConfiguration
+from reachaq.app.model.app_model import AppModel
 
 import top_fixtures
 
@@ -290,15 +290,15 @@ def test_the_guard_refuses_to_start_reachaq_with_this_home(tmp_path):
     python = tmp_path.joinpath("missing", "python").as_posix()
     no_home = {name: value for name, value in os.environ.items() if name != "HOME"}
     refused = (
-        ([python, "-m", "tools.acquisition.headless"], None),
-        ([python, "/opt/reachAQ/tools/acquisition/gui.py"], None),
-        ([python, "-m", "reachAQ.app"], dict(os.environ)),
+        ([python, "-m", "reachaq.app.headless"], None),
+        ([python, "/opt/reachAQ/src/reachaq/app/gui.py"], None),
+        ([python, "-m", "reachaq.app"], dict(os.environ)),
         ([tmp_path.joinpath("missing", "reachaq").as_posix()], no_home),
     )
     allowed = (
-        ([python, "-m", "tools.acquisition.headless"],
+        ([python, "-m", "reachaq.app.headless"],
          dict(os.environ, HOME=tmp_path.joinpath("home").as_posix())),
-        ([python, "-c", "from tools.acquisition.instance_lock import acquire_instance_lock"],
+        ([python, "-c", "from reachaq.app.instance_lock import acquire_instance_lock"],
          None),
     )
     for command, env in refused:

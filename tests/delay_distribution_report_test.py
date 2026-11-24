@@ -1,11 +1,11 @@
 import pytest
 
-from autotrainer.core.delay_distribution import (
+from reachaq.core.delay_distribution import (
     PUBLISHED_4S_VALUES,
     DelayPreset,
     build_delay_distribution_profile,
 )
-from tools.acquisition.model.delay_distribution_report import (
+from reachaq.app.model.delay_distribution_report import (
     RealizedDelay,
     build_delay_report,
 )

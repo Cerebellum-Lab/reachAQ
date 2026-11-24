@@ -6,15 +6,15 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from autotrainer.core import (  # noqa: E402
+from reachaq.core import (  # noqa: E402
     ObservableObject,
     SystemStatusMessageKind,
 )
-from autotrainer.device import PressureReading, Target  # noqa: E402
-from tools.acquisition.model.nidaq_signal_monitor_model import (  # noqa: E402
+from reachaq.device import PressureReading, Target  # noqa: E402
+from reachaq.app.model.nidaq_signal_monitor_model import (  # noqa: E402
     NidaqSignalMonitorModel,
 )
-from tools.acquisition.view.analysis_content import AnalysisContent  # noqa: E402
+from reachaq.app.view.analysis_content import AnalysisContent  # noqa: E402
 
 # tests/ has no __init__.py, so pytest puts this directory on sys.path
 # rather than the repository root: the sibling is a top-level module here,

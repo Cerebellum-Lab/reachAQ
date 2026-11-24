@@ -12,11 +12,11 @@ from unittest import mock
 
 import pytest
 
-from autotrainer.core import Motor, SystemMessageHandler
-from autotrainer.device import EmulationInterface
-from autotrainer.device.device_interface import Acknowledge
-from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.hardware_model import HardwareModel
+from reachaq.core import Motor, SystemMessageHandler
+from reachaq.device import EmulationInterface
+from reachaq.device.device_interface import Acknowledge
+from reachaq.app.model.app_model import AppModel
+from reachaq.app.model.hardware_model import HardwareModel
 
 _EIO = -5
 _WORKING_HOME = EmulationInterface.stepper_home

@@ -13,8 +13,8 @@ that was 7.4 ms per call instead of 3.6 ms, with nothing in the log to say so.
 
 import source_contract
 
-from autotrainer.inference import pose_process
-from autotrainer.inference.pose_model import PoseModel
+from reachaq.inference import pose_process
+from reachaq.inference.pose_model import PoseModel
 
 
 def test_the_base_hook_does_nothing():

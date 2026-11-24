@@ -1,8 +1,8 @@
 from unittest import mock
 
-from autotrainer.core import SystemCommandKind
-from autotrainer.device import Motor
-from tools.acquisition.model.hardware_model import HardwareModel
+from reachaq.core import SystemCommandKind
+from reachaq.device import Motor
+from reachaq.app.model.hardware_model import HardwareModel
 
 
 def test_pellet_initialization_homes_and_detaches_without_release():

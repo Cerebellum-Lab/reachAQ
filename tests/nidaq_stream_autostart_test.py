@@ -12,12 +12,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from autotrainer.core import (
+from reachaq.core import (
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
 )
-from tools.acquisition.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
-from tools.acquisition.model.nidaq_stream_autostart import NidaqStreamAutoStart
+from reachaq.app.model.nidaq_signal_monitor_model import NidaqSignalMonitorModel
+from reachaq.app.model.nidaq_stream_autostart import NidaqStreamAutoStart
 
 
 class _Monitor:

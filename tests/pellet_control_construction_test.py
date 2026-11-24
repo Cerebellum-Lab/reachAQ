@@ -4,8 +4,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
-from autotrainer.core import ObservableObject, Offset3DTuple
-from tools.pellet_delivery.view.pellet_control import PelletControl
+from reachaq.core import ObservableObject, Offset3DTuple
+from reachaq.pellet_delivery.view.pellet_control import PelletControl
 
 
 class _PelletModelStub(ObservableObject):

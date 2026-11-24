@@ -6,10 +6,10 @@ from types import SimpleNamespace
 import h5py
 import numpy as np
 
-from autotrainer.core import ObservableObject, ProjectInfo
-from autotrainer.core.latency.schema import LIVE_POSE_DTYPE
-from tools.acquisition.model.latency_event_log import LatencyEventLog
-from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+from reachaq.core import ObservableObject, ProjectInfo
+from reachaq.core.latency.schema import LIVE_POSE_DTYPE
+from reachaq.app.model.latency_event_log import LatencyEventLog
+from reachaq.app.model.session_data_recorder import SessionDataRecorder
 
 
 class _EventSource(ObservableObject):

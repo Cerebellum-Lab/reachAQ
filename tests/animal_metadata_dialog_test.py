@@ -5,9 +5,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication, QComboBox, QTabWidget
 
-from autotrainer.core import AnimalSubject
-from tools.acquisition.view.animal_metadata_dialog import AnimalMetadataDialog
-from tools.acquisition.view.main_window import MainWindow
+from reachaq.core import AnimalSubject
+from reachaq.app.view.animal_metadata_dialog import AnimalMetadataDialog
+from reachaq.app.view.main_window import MainWindow
 
 
 @pytest.fixture

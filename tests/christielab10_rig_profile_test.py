@@ -16,18 +16,18 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from tools.acquisition.model.animal_sources import cli as animal_metadata_cli  # noqa: E402
-from tools.acquisition.model.animal_sources.config import (  # noqa: E402
+from reachaq.app.model.animal_sources import cli as animal_metadata_cli  # noqa: E402
+from reachaq.app.model.animal_sources.config import (  # noqa: E402
     SourceConfiguration,
     load_source_configuration,
     save_source_configuration,
 )
-from tools.acquisition.model.animal_sources.mapping import softmouse_mapping  # noqa: E402
-from tools.acquisition.model.animal_sources.publication import (  # noqa: E402
+from reachaq.app.model.animal_sources.mapping import softmouse_mapping  # noqa: E402
+from reachaq.app.model.animal_sources.publication import (  # noqa: E402
     ensure_publication_directory,
 )
-from tools.acquisition.model.user_preferences import UserPreferences  # noqa: E402
-from tools.softmouse_sync import cli  # noqa: E402
+from reachaq.app.model.user_preferences import UserPreferences  # noqa: E402
+from reachaq.softmouse_sync import cli  # noqa: E402
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -63,11 +63,11 @@ def _default_paths(env):
     """The settings paths shared code resolves at import, in a clean interpreter."""
     script = (
         "import json\n"
-        "from autotrainer.core.config_directory import DEFAULT_CONFIG_DIR\n"
-        "from autotrainer.core.configuration import SystemConfiguration\n"
-        "from autotrainer.core.diamond_triangle_config import DEFAULT_DIAMOND_TRIANGLE_CONFIG_PATH\n"
-        "from autotrainer.device import CompoundMovements, MotorConfigurationFile\n"
-        "from tools.acquisition.model.user_preferences import get_default_configuration_location\n"
+        "from reachaq.core.config_directory import DEFAULT_CONFIG_DIR\n"
+        "from reachaq.core.configuration import SystemConfiguration\n"
+        "from reachaq.core.diamond_triangle_config import DEFAULT_DIAMOND_TRIANGLE_CONFIG_PATH\n"
+        "from reachaq.device import CompoundMovements, MotorConfigurationFile\n"
+        "from reachaq.app.model.user_preferences import get_default_configuration_location\n"
         "print(json.dumps({\n"
         "    'dir': str(DEFAULT_CONFIG_DIR),\n"
         "    'system': str(SystemConfiguration.DEFAULT_PATH),\n"
@@ -214,5 +214,5 @@ def test_an_explicit_destination_overrides_setup(monkeypatch, tmp_path, christie
 
 
 def test_shipped_files_name_no_christie_rig_mount():
-    unit = REPO_ROOT / "tools" / "softmouse_sync" / "systemd" / "reachaq-softmouse-publisher.service"
+    unit = REPO_ROOT / "src" / "reachaq" / "softmouse_sync" / "systemd" / "reachaq-softmouse-publisher.service"
     assert "/mnt/isilon" not in unit.read_text()

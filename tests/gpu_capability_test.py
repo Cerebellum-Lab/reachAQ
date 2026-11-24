@@ -19,8 +19,8 @@ MEASURED_FASTER_IN_FP16 is empty until a real measurement fills it.
 
 import pytest
 
-from autotrainer.inference import gpu_capability
-from autotrainer.inference.gpu_capability import (
+from reachaq.inference import gpu_capability
+from reachaq.inference.gpu_capability import (
     PRECISION_ENVIRONMENT_VARIABLE,
     TENSOR_CORE_EXCLUDED_DEVICES,
     GpuCapability,

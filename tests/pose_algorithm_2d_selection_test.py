@@ -11,7 +11,7 @@ import numpy
 import pandas
 import pytest
 
-from autotrainer.inference.pose_algorithm import PoseAlgorithm
+from reachaq.inference.pose_algorithm import PoseAlgorithm
 
 
 THRESHOLD = PoseAlgorithm.MIN_CONFIDENCE_PRESENT_THRESHOLD

@@ -10,8 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from autotrainer.core.multiproc import get_mp_ctx, get_nidaq_mp_ctx
-from autotrainer.device.nidaq_signal_stream import NidaqSignalStreamController
+from reachaq.core.multiproc import get_mp_ctx, get_nidaq_mp_ctx
+from reachaq.device.nidaq_signal_stream import NidaqSignalStreamController
 
 
 # ------------------------------------------------- the worker start method

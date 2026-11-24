@@ -1,6 +1,6 @@
 import pytest
 
-from tools.acquisition.model.session_stop_policy import (
+from reachaq.app.model.session_stop_policy import (
     SessionStopConfiguration,
     SessionStopDecision,
     SessionStopPolicy,

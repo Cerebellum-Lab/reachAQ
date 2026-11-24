@@ -1,6 +1,6 @@
 from unittest import mock
 
-from tools.acquisition import run_acquisition
+from reachaq.app import run_acquisition
 
 
 def test_owned_child_termination_never_signals_a_process_group(monkeypatch):

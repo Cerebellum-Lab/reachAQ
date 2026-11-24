@@ -9,10 +9,11 @@ INSTALL_SCRIPT = REPO_ROOT / "tools" / "install" / "reachaq-linux-install.sh"
 PLUGIN_LIB = REPO_ROOT / "tools" / "install" / "plugin-install-lib.sh"
 DESKTOP_INSTALL_SCRIPT = REPO_ROOT / "tools" / "install" / "install-reachaq-desktop.sh"
 TOOLS_PROJECT = REPO_ROOT / "tools" / "pyproject.toml"
-DEVICE_PROJECT = REPO_ROOT / "auto-trainer-device" / "pyproject.toml"
+DEVICE_PROJECT = REPO_ROOT / "pyproject.toml"
 SOFTMOUSE_SERVICE = (
     REPO_ROOT
-    / "tools"
+    / "src"
+    / "reachaq"
     / "softmouse_sync"
     / "systemd"
     / "reachaq-softmouse-publisher.service"
@@ -109,7 +110,7 @@ def test_every_focused_test_the_installer_runs_exists():
     source = INSTALL_SCRIPT.read_text()
     block = source[source.index("run_focused_tests() {"):]
     block = block[:block.index("\n}\n")]
-    entries = re.findall(r"((?:auto-trainer-[a-z]+/)?tests/[\w/]+\.py(?:::\w+)?)", block)
+    entries = re.findall(r"(tests/[\w/]+\.py(?:::\w+)?)", block)
     assert entries, "no focused tests found"
     missing = []
     for entry in entries:
@@ -151,7 +152,7 @@ def test_latency_setup_script_is_tracked_and_reversible():
     A rig that is already installed should not have to run a full install to
     change a governor, and every action has to have a documented way back.
     """
-    script = REPO_ROOT / "tools" / "hardware" / "reachaq-latency-setup.sh"
+    script = REPO_ROOT / "src" / "reachaq" / "hardware" / "reachaq-latency-setup.sh"
     assert script.is_file()
     text = script.read_text()
 
@@ -165,7 +166,7 @@ def test_latency_setup_script_is_tracked_and_reversible():
 
 
 def test_cpu_governor_unit_is_tracked_and_installable():
-    unit = REPO_ROOT / "tools" / "hardware" / "reachaq-cpu-governor.service"
+    unit = REPO_ROOT / "src" / "reachaq" / "hardware" / "reachaq-cpu-governor.service"
     assert unit.is_file()
     text = unit.read_text()
 
@@ -205,7 +206,7 @@ def test_portable_installer_covers_softmouse_rfid_requirements():
     assert "tests/animal_metadata_cli_test.py" in source
     assert "tests/animal_sources_test.py" in source
     assert "tests/softmouse_https_source_test.py" in source
-    assert "auto-trainer-device/tests/rfid_reader_test.py" in source
+    assert "tests/device/rfid_reader_test.py" in source
     assert "resolves outside the current checkout" in source
 
 
@@ -289,7 +290,7 @@ def test_documented_conda_application_launches_stream_terminal_output():
     for document in REPO_ROOT.rglob("*.md"):
         for line_number, line in enumerate(document.read_text().splitlines(), start=1):
             if "conda run" in line and (
-                "python -m reachAQ.app" in line or "auto-trainer-headless" in line
+                "python -m reachaq.app" in line or "reachaq-headless" in line
             ):
                 launch_lines.append((document, line_number, line))
 

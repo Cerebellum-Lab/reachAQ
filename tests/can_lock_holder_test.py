@@ -11,7 +11,7 @@ import os
 
 import pytest
 
-from autotrainer.device.can_ownership import (
+from reachaq.device.can_ownership import (
     CanChannelInUseError,
     CanChannelOwnership,
     describe_lock_holders,

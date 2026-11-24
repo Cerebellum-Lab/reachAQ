@@ -1,8 +1,8 @@
 import logging
 
-from autotrainer.device.rfid_reader import RfidTagRead
+from reachaq.device.rfid_reader import RfidTagRead
 
-from tools.acquisition.model.rfid_metadata_controller import RfidMetadataController
+from reachaq.app.model.rfid_metadata_controller import RfidMetadataController
 
 
 TAG = "360002353933099"
@@ -43,7 +43,7 @@ class _AppModel:
 def test_reader_scan_and_registry_miss_are_logged(caplog):
     caplog.set_level(
         logging.INFO,
-        logger="tools.acquisition.model.rfid_metadata_controller",
+        logger="reachaq.app.model.rfid_metadata_controller",
     )
     app_model = _AppModel()
     controller = RfidMetadataController(

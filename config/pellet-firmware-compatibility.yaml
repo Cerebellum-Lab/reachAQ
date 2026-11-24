@@ -82,7 +82,7 @@ versions:
         re-save the FIXED_XYZ positions.
       - >-
         Rig evidence, christielab10, 2026-11-10, from
-        tools/hardware/qualify_pellet_firmware.py at reachAQ
+        src/reachaq/hardware/qualify_pellet_firmware.py at reachAQ
         v3.0.0-62-g7bb69c74, as the record names it (that commit is 88256883
         after the 2026-11-11 history rewrite, which changed only commit
         messages): 19 of 19 checks on the rig's pellet v1.2 board,
@@ -142,7 +142,7 @@ versions:
         remains the only thing that answers that.
       - >-
         Rig evidence, christielab10, 2026-09-23, from
-        tools/hardware/qualify_pellet_firmware.py: 19 of 19 checks after a
+        src/reachaq/hardware/qualify_pellet_firmware.py: 19 of 19 checks after a
         rollback to 2.2.0 (also 19 of 19) and back, with both MCUboot slots on
         2.3.0 (pellet-2.3.0-20260924T000947Z.json under
         ~/Autotrainer/pellet_firmware_qualification). Tones map 5 kHz to tone1

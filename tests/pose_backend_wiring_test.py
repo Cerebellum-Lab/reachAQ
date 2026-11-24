@@ -19,16 +19,16 @@ import ast
 
 import source_contract
 
-from autotrainer.inference import pose_process
-from autotrainer.inference.backend_selection import (
+from reachaq.inference import pose_process
+from reachaq.inference.backend_selection import (
     POSE_BACKEND_ENV_VAR,
     TENSORFLOW_BACKEND,
     TORCH_BACKEND,
 )
 
 
-INFERENCE_MODEL = "tools/acquisition/model/inference_model.py"
-APP_MODEL = "tools/acquisition/model/app_model.py"
+INFERENCE_MODEL = "src/reachaq/app/model/inference_model.py"
+APP_MODEL = "src/reachaq/app/model/app_model.py"
 
 
 def test_the_runtime_probe_is_no_longer_pinned_to_tensorflow():

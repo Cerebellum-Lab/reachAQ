@@ -6,8 +6,8 @@ A module of its own so that test files share them without importing each other.
 import cv2
 import numpy as np
 
-from autotrainer.inference.multires_calibration.fit import INTRINSIC_NAMES, CameraModel, MotorFrameFit
-from autotrainer.inference.multires_calibration.geometry import PresetGeometry
+from reachaq.inference.multires_calibration.fit import INTRINSIC_NAMES, CameraModel, MotorFrameFit
+from reachaq.inference.multires_calibration.geometry import PresetGeometry
 
 
 BASE = PresetGeometry(4, 256, 256, 52, 6)

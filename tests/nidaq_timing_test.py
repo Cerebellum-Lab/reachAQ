@@ -4,16 +4,16 @@ import json
 
 import pytest
 
-from autotrainer.core import (
+from reachaq.core import (
     NidaqDeviceIdentity,
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
     NidaqTimingConfiguration,
     NidaqTimingRoute,
 )
-from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts
-from tools.acquisition.model.nidaq_timing import build_nidaq_timing_plan
-from tools.acquisition.model.nidaq_timing import (
+from reachaq.app.model.nidaq_discovery import NidaqDevicePorts
+from reachaq.app.model.nidaq_timing import build_nidaq_timing_plan
+from reachaq.app.model.nidaq_timing import (
     resolve_nidaq_multidevice_probe,
     resolve_nidaq_device_aliases,
     resolve_nidaq_stream_configuration,
@@ -598,7 +598,7 @@ def test_an_auto_multidevice_fallback_leaves_its_slave_task_no_line():
     # auto_multidevice falls back to per-device tasks when its probe fails.
     # The slave's task is then its own, and it has no line: the stream
     # refuses it there, naming the field (nidaq_signal_stream_test).
-    from autotrainer.core.configuration.nidaq_port_configuration import (
+    from reachaq.core.configuration.nidaq_port_configuration import (
         slave_input_timing,
     )
 
@@ -644,10 +644,10 @@ def test_a_slave_line_beside_a_merged_analog_task_takes_the_backplane_clock():
 def _pinned_christielab10():
     """christielab10's own blocks, on its own two boards, as a start builds it."""
     from nidaq_channel_plan_test import _christielab10_from_yaml, _christielab10_lasers
-    from tools.acquisition.model.nidaq_channel_plan import (
+    from reachaq.app.model.nidaq_channel_plan import (
         build_nidaq_acquisition_configuration,
     )
-    from tools.acquisition.model.nidaq_routing import UNIDENTIFIED
+    from reachaq.app.model.nidaq_routing import UNIDENTIFIED
 
     loaded = _christielab10_from_yaml()
     lasers = _christielab10_lasers()
@@ -800,7 +800,7 @@ def test_the_suggested_line_is_not_one_the_laser_takes():
     # One suggester for the plan and the validation (free_backplane_line),
     # and it sees the laser when it is given: here the laser's clock lines
     # are PXI_Trig4 and PXI_Trig5, which a plan blind to them would suggest.
-    from autotrainer.core import LaserSystemConfiguration
+    from reachaq.core import LaserSystemConfiguration
 
     laser = LaserSystemConfiguration(
         backplane_clock_line="PXI_Trig4", pulse_clock_line="PXI_Trig5")

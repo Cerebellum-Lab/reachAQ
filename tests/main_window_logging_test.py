@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from tools.acquisition.model.app_model import AppModelStatus
-from tools.acquisition.view.main_window import MainWindow
+from reachaq.app.model.app_model import AppModelStatus
+from reachaq.app.view.main_window import MainWindow
 
 
 def test_activation_outside_idle_logs_the_status(caplog):

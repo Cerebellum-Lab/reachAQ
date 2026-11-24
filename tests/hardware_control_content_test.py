@@ -9,9 +9,9 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 
-from autotrainer.core import Offset3DTuple  # noqa: E402
-from tools.acquisition.model.hardware_model import HardwareModel  # noqa: E402
-from tools.acquisition.view.hardware_control_content import (  # noqa: E402
+from reachaq.core import Offset3DTuple  # noqa: E402
+from reachaq.app.model.hardware_model import HardwareModel  # noqa: E402
+from reachaq.app.view.hardware_control_content import (  # noqa: E402
     HardwareControlContent,
     _format_motor_feedback,
     _motor_to_ui_position,

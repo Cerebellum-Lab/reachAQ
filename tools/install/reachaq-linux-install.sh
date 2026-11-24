@@ -122,7 +122,7 @@ apt_install_base() {
 check_repo() {
     test -f "$INSTALL_REPO/pyproject.toml" \
         && test -f "$INSTALL_REPO/requirements.txt" \
-        && test -d "$INSTALL_REPO/tools/acquisition"
+        && test -d "$INSTALL_REPO/src/reachaq/app"
 }
 
 make_runtime_directories() {
@@ -165,7 +165,7 @@ install_cpu_governor_unit() {
         return 1
     fi
     run_as_root install -m 0644 \
-        "$INSTALL_REPO/tools/hardware/reachaq-cpu-governor.service" \
+        "$INSTALL_REPO/src/reachaq/hardware/reachaq-cpu-governor.service" \
         /etc/systemd/system/reachaq-cpu-governor.service || return
     run_as_root systemctl daemon-reload || return
     run_as_root systemctl enable --now reachaq-cpu-governor.service || return
@@ -268,7 +268,7 @@ archive_conda_environment() {
             sed -i "1s|^#!$old_prefix/bin/|#!$archive_prefix/bin/|" "$script" || return
         fi
     done
-    printf 'Run the archived environment with: conda run --no-capture-output -n %s python -m reachAQ.app\n' \
+    printf 'Run the archived environment with: conda run --no-capture-output -n %s python -m reachaq.app\n' \
         "$archive_name"
     # The new environment is built from nothing; it gets the plugins the one
     # it replaces had. A failed probe must not stop the new environment being
@@ -311,11 +311,11 @@ install_editable_package() {
 
 # The built-in keypoint backend runs on torch, and the DeepLabCut plugin
 # requires it. Installed first, from the `torch` extra of
-# auto-trainer-inference: left to resolve it alone pip takes the newest build -
+# reachaq: left to resolve it alone pip takes the newest build -
 # CUDA 13, which TensorFlow cannot share a process with - only for this step to
 # replace it, leaving the CUDA 13 libraries behind.
 install_torch_engine() {
-    local pyproject="$INSTALL_REPO/auto-trainer-inference/pyproject.toml"
+    local pyproject="$INSTALL_REPO/pyproject.toml"
     if [ "$(uname -m)" = x86_64 ]; then
         install_extra "$pyproject" torch --index-url https://download.pytorch.org/whl/cu128
     else
@@ -366,7 +366,7 @@ verify_terminal_commands() {
 verify_torch_gpu_runtime() {
     conda_run python - <<'PY'
 import torch
-from autotrainer.inference import detect_gpu_runtime
+from reachaq.inference import detect_gpu_runtime
 
 status = detect_gpu_runtime(required_backend="torch")
 print(status)
@@ -458,17 +458,17 @@ import openpyxl
 import requests
 import serial
 import torch
-import autotrainer.core
-import autotrainer.device
-import autotrainer.video
+import reachaq.core
+import reachaq.device
+import reachaq.video
 import reachAQ
-import tools
+import reachaq.app
 
-plugins = [importlib.import_module(f"autotrainer.pose_plugins.{name}.plugin")
+plugins = [importlib.import_module(f"reachaq.pose_plugins.{name}.plugin")
            for name in sys.argv[2:]]
 
 repository = Path(sys.argv[1]).resolve()
-for module in (autotrainer.core, autotrainer.device, autotrainer.video, reachAQ, tools, *plugins):
+for module in (reachaq.core, reachaq.device, reachaq.video, reachAQ, tools, *plugins):
     module_file = getattr(module, "__file__", None)
     locations = [Path(module_file).resolve()] if module_file else [
         Path(value).resolve() for value in module.__path__ if Path(value).exists()
@@ -495,9 +495,9 @@ import keyring
 import openpyxl
 import requests
 
-from tools.acquisition.model.animal_sources import available_source_kinds
-from tools.acquisition.model.animal_sources.credentials import CredentialStore
-from tools.softmouse_sync.https_source import SoftMouseHttpsSource
+from reachaq.app.model.animal_sources import available_source_kinds
+from reachaq.app.model.animal_sources.credentials import CredentialStore
+from reachaq.softmouse_sync.https_source import SoftMouseHttpsSource
 
 kinds = ", ".join(available_source_kinds())
 store = CredentialStore()
@@ -516,7 +516,7 @@ import os
 from pathlib import Path
 
 import serial
-from autotrainer.device.rfid_reader import RfidReaderService
+from reachaq.device.rfid_reader import RfidReaderService
 
 devices = sorted(Path("/dev/serial/by-id").glob("*"))
 if not devices:
@@ -535,20 +535,20 @@ PY
 
 verify_softmouse_systemd_units() {
     systemd-analyze --user verify \
-        "$INSTALL_REPO/tools/softmouse_sync/systemd/reachaq-softmouse-publisher.service" \
-        "$INSTALL_REPO/tools/softmouse_sync/systemd/reachaq-softmouse-publisher.timer"
+        "$INSTALL_REPO/src/reachaq/softmouse_sync/systemd/reachaq-softmouse-publisher.service" \
+        "$INSTALL_REPO/src/reachaq/softmouse_sync/systemd/reachaq-softmouse-publisher.timer"
 }
 
 run_focused_tests() {
     (
         cd "$INSTALL_REPO" || return
         conda_run python -m pytest \
-            auto-trainer-core/tests/logging_test.py \
-            auto-trainer-core/tests/external_metadata_test.py \
-            auto-trainer-device/tests/can_transport_test.py \
-            auto-trainer-device/tests/laser_test.py \
-            auto-trainer-device/tests/rfid_reader_test.py \
-            auto-trainer-inference/tests/gpu_runtime_test.py \
+            tests/core/logging_test.py \
+            tests/core/external_metadata_test.py \
+            tests/device/can_transport_test.py \
+            tests/device/laser_test.py \
+            tests/device/rfid_reader_test.py \
+            tests/inference/gpu_runtime_test.py \
             tests/acquisition_args_test.py \
             tests/animal_metadata_sync_test.py \
             tests/animal_metadata_cli_test.py \
@@ -556,13 +556,13 @@ run_focused_tests() {
             tests/animal_sources_test.py \
             tests/animal_sources_publication_test.py \
             tests/animal_sources_softmouse_test.py \
-            tests/autotrainer_headless_test.py::test_cli_help \
-            tests/autotrainer_headless_test.py::test_load_config \
-            tests/autotrainer_headless_test.py::test_gpu_preflight_failure_does_not_block_cameras_and_hardware \
-            tests/autotrainer_headless_test.py::test_live_inference_override_is_not_persisted_with_other_configuration_changes \
-            tests/autotrainer_headless_test.py::test_load_config_extra_reach_camera_slot \
-            tests/autotrainer_headless_test.py::test_load_config_random_camera_override \
-            tests/autotrainer_headless_test.py::test_load_config_random_camera_override_adds_default_reach_cameras \
+            tests/reachaq_headless_test.py::test_cli_help \
+            tests/reachaq_headless_test.py::test_load_config \
+            tests/reachaq_headless_test.py::test_gpu_preflight_failure_does_not_block_cameras_and_hardware \
+            tests/reachaq_headless_test.py::test_live_inference_override_is_not_persisted_with_other_configuration_changes \
+            tests/reachaq_headless_test.py::test_load_config_extra_reach_camera_slot \
+            tests/reachaq_headless_test.py::test_load_config_random_camera_override \
+            tests/reachaq_headless_test.py::test_load_config_random_camera_override_adds_default_reach_cameras \
             tests/hardware_status_content_test.py \
             tests/inference_dependencies_test.py \
             tests/instance_lock_test.py \
@@ -701,8 +701,8 @@ else
     run_step "Verify generic imports" verify_imports
     run_step "Verify SoftMouse runtime" verify_softmouse_runtime
     run_step "Verify RFID runtime" verify_rfid_runtime
-    run_step "Verify GUI CLI" conda_run python -m reachAQ.app -h
-    run_step "Verify headless CLI" conda_run auto-trainer-headless -h
+    run_step "Verify GUI CLI" conda_run python -m reachaq.app -h
+    run_step "Verify headless CLI" conda_run reachaq-headless -h
 fi
 run_step "Verify SoftMouse systemd units" verify_softmouse_systemd_units
 

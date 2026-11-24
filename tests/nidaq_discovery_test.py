@@ -1,6 +1,6 @@
 import pytest
 
-from tools.acquisition.model.nidaq_discovery import _optional_device_property
+from reachaq.app.model.nidaq_discovery import _optional_device_property
 
 
 class _DaqError(Exception):

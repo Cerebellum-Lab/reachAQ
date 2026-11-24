@@ -7,11 +7,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["autotrainer.pose_plugins.yolo", "autotrainer.pose_plugins.yolo.*"]
+include = ["reachaq.pose_plugins.yolo", "reachaq.pose_plugins.yolo.*"]
 namespaces = true
 
 [project]
-name = "auto-trainer-pose-yolo"
+name = "reachaq-pose-yolo"
 description = "YOLO-pose (Ultralytics) pose backend plugin for reachAQ"
 # ultralytics is AGPL-3.0, and this distribution links it, so it carries the
 # same licence rather than reachAQ's. Install it only where that is acceptable.
@@ -20,16 +20,16 @@ requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
 
-    # The installed application; auto-trainer-inference is folded into it by
+    # The installed application; reachaq is folded into it by
     # its setup.py and is never installed on its own.
-    "auto-trainer",
+    "reachaq",
 
     'ultralytics >= 8.4, < 9',  # AGPL-3.0; brings torch
 
 ]
 
-[project.entry-points."autotrainer.pose_backends"]
-yolo = "autotrainer.pose_plugins.yolo.plugin:YOLO_PLUGIN"
+[project.entry-points."reachaq.pose_backends"]
+yolo = "reachaq.pose_plugins.yolo.plugin:YOLO_PLUGIN"
 
 [tool.setuptools_scm]
 root = "../.."

@@ -14,7 +14,7 @@ import pytest
 
 cv2 = pytest.importorskip("cv2")
 
-from autotrainer.inference.keypoint.dataset import (  # noqa: E402
+from reachaq.inference.keypoint.dataset import (  # noqa: E402
     FRAME_SIZE,
     PoseDataset,
     import_dlc,
@@ -211,7 +211,7 @@ def test_pick_diverse_is_deterministic_and_skips_excluded_frames(tmp_path):
 
 
 def test_read_frames_seeks_to_the_same_frames_sequential_decoding_gives(tmp_path):
-    from autotrainer.inference.keypoint.dataset import read_frames
+    from reachaq.inference.keypoint.dataset import read_frames
     video = _video(tmp_path)
     sequential = {}
     capture = cv2.VideoCapture(str(video))
@@ -224,7 +224,7 @@ def test_read_frames_seeks_to_the_same_frames_sequential_decoding_gives(tmp_path
 
 
 def test_read_frames_can_shrink_as_it_decodes(tmp_path):
-    from autotrainer.inference.keypoint.dataset import read_frames
+    from reachaq.inference.keypoint.dataset import read_frames
     video = _video(tmp_path)
     found = read_frames(str(video), [0, 5], size=32)
     assert found[5].shape == (32, 32)

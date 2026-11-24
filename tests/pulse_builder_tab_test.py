@@ -5,8 +5,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication, QSizePolicy  # noqa: E402
 
-from tools.acquisition.model.trial_action import LaserPulseProfile  # noqa: E402
-from tools.acquisition.view.pulse_builder_tab import (  # noqa: E402
+from reachaq.app.model.trial_action import LaserPulseProfile  # noqa: E402
+from reachaq.app.view.pulse_builder_tab import (  # noqa: E402
     DRAFT_PROFILE_ID,
     PulseBuilderTab,
     preview_points,

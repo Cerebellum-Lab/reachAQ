@@ -52,7 +52,7 @@ reachaq-animal-metadata status
 reachaq-animal-metadata refresh
 ```
 
-`python -m tools.acquisition.model.animal_sources.cli` is the same command when
+`python -m reachaq.app.model.animal_sources.cli` is the same command when
 the script is not on `PATH`.
 
 The setup is per user: settings and the column mapping are saved as the
@@ -191,7 +191,7 @@ reachaq-animal-metadata --preferences "$SCRATCH/prefs.ini" refresh
 
 The refresh prints `Imported 7 of 7 rows (4 with RFID)` and a warning for
 `DUP-0006`. To try the scan field, start the app with the same preferences
-file (`python -m reachAQ.app --preferences-file "$SCRATCH/prefs.ini"`), type
+file (`python -m reachaq.app --preferences-file "$SCRATCH/prefs.ini"`), type
 `BC-0003-A` in **Scan or type RFID** and press Enter: the first-scan dialog
 opens for FAKE-003. Animal JSONs it creates also go under `$SCRATCH/config`.
 Delete `$SCRATCH` afterwards.
@@ -253,8 +253,8 @@ publishing computer:
 ```bash
 cd ~/Documents/reachAQ
 mkdir -p ~/.config/systemd/user
-cp tools/softmouse_sync/systemd/reachaq-softmouse-publisher.service \
-  tools/softmouse_sync/systemd/reachaq-softmouse-publisher.timer \
+cp src/reachaq/softmouse_sync/systemd/reachaq-softmouse-publisher.service \
+  src/reachaq/softmouse_sync/systemd/reachaq-softmouse-publisher.timer \
   ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now reachaq-softmouse-publisher.timer
@@ -269,15 +269,15 @@ is on a network mount, add `RequiresMountsFor=` in a drop-in
 ## Adding a lab's own source
 
 A source kind is a Python class. Subclass
-`tools.acquisition.model.animal_sources.AnimalMetadataSource`, set `kind`,
+`reachaq.app.model.animal_sources.AnimalMetadataSource`, set `kind`,
 `label` and `provider`, list its settings, and return the table from
 `fetch()`:
 
 ```python
-from tools.acquisition.model.animal_sources import (
+from reachaq.app.model.animal_sources import (
     AnimalMetadataSource, SetupField, SourceTable,
 )
-from tools.acquisition.model.animal_sources.mapping import table_sha256
+from reachaq.app.model.animal_sources.mapping import table_sha256
 
 
 class LabDatabaseSource(AnimalMetadataSource):
@@ -334,8 +334,8 @@ new-animal name choice. Nothing needs changing there.
 
 The computer that ran the nightly SoftMouse publisher does need setup once:
 the colony is no longer built in. Run `reachaq-animal-metadata setup --kind
-softmouse` (or `python -m tools.softmouse_sync.cli --setup`), choose the
+softmouse` (or `python -m reachaq.softmouse_sync.cli --setup`), choose the
 colony, and set **Publish to** the directory that holds the old manifest and
 **Only if mounted** to its mount. The old command,
-`python -m tools.softmouse_sync.cli`, still publishes, so an installed timer
+`python -m reachaq.softmouse_sync.cli`, still publishes, so an installed timer
 from before keeps working once that setup is saved.

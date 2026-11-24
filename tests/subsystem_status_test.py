@@ -1,4 +1,4 @@
-from tools.acquisition.model.subsystem_status import (
+from reachaq.app.model.subsystem_status import (
     SubsystemId,
     SubsystemState,
     SubsystemStatusRegistry,

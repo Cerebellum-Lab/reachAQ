@@ -9,7 +9,7 @@ inference uses.
 import numpy
 import pytest
 
-from autotrainer.inference.keypoint.evaluate import (  # noqa: E402
+from reachaq.inference.keypoint.evaluate import (  # noqa: E402
     INDICATIVE_BELOW,
     match_parts,
     score,

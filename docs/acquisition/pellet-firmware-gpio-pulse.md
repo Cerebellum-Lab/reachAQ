@@ -214,7 +214,7 @@ The host gates on a capability bitmask it never receives, because
   would let the host learn what a board can do. Worth doing, but it is a
   separate piece of work from the pulse.
 - The relevant bit is `1 << 2`, named `finite_stim3_pulse` in
-  `tools/acquisition/model/firmware_compatibility.py`. The name is legacy: set
+  `src/reachaq/app/model/firmware_compatibility.py`. The name is legacy: set
   it to mean "the finite GPIO pulse command is implemented", covering STIM2 and
   STIM3.
 
@@ -224,19 +224,19 @@ capability reporting does.
 
 ## Host changes, once firmware ships
 
-1. `auto-trainer-device/src/autotrainer/device/can_interface.py` —
+1. `src/reachaq/device/can_interface.py` —
    `pulse_digital_output` currently raises unless the target is `STIMULUS_4`.
    Widen it to `STIMULUS_3` and `STIMULUS_4` (board STIM2 and STIM3), still
    rejecting `STIMULUS_1`/`STIMULUS_2` with the tone-contention reason.
-2. `auto-trainer-device/src/autotrainer/device/emulation_interface.py` — the
+2. `src/reachaq/device/emulation_interface.py` — the
    same widening, so the emulator keeps matching the board.
-3. `tools/acquisition/model/firmware_compatibility.py` and
+3. `src/reachaq/app/model/firmware_compatibility.py` and
    `config/pellet-firmware-compatibility.yaml` — add the new firmware version
    and list the capability.
-4. `tools/acquisition/model/trial_action.py` — add line selection to
+4. `src/reachaq/app/model/trial_action.py` — add line selection to
    `LaserPulseProfile` so a profile can name STIM2 or STIM3, defaulting to
    STIM3 for every existing profile.
-5. `tools/acquisition/view/laser_control_content.py` — expose the line on the
+5. `src/reachaq/app/view/laser_control_content.py` — expose the line on the
    bench stim test.
 6. **Make the silent failure loud.** `pulse_digital_output` returns success for
    a frame the board may drop. Once `GPIO_PULSE_STATUS` exists, wait for it and

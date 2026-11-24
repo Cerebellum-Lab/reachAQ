@@ -9,12 +9,12 @@ import h5py
 import numpy as np
 import pytest
 
-from autotrainer.core import ProjectInfo
-from autotrainer.core.latency import LatencyStreamWriter, latency_stream_path
-from autotrainer.core.latency.schema import CAMERA_FRAME_DTYPE, RECORD_BATCH_DTYPE
-from tools.acquisition.model.session_data_recorder import SessionDataRecorder
-from tools.latency import finalize
-from tools.session_validation import engine
+from reachaq.core import ProjectInfo
+from reachaq.core.latency import LatencyStreamWriter, latency_stream_path
+from reachaq.core.latency.schema import CAMERA_FRAME_DTYPE, RECORD_BATCH_DTYPE
+from reachaq.app.model.session_data_recorder import SessionDataRecorder
+from reachaq.latency import finalize
+from reachaq.session_validation import engine
 
 
 def _nidaq_chunk():

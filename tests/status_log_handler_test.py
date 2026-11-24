@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QObject, Slot  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from tools.acquisition.view.status_log_handler import StatusLogHandler  # noqa: E402
+from reachaq.app.view.status_log_handler import StatusLogHandler  # noqa: E402
 
 
 @pytest.fixture(scope="module")

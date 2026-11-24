@@ -3,7 +3,7 @@ import sys
 
 import cv2
 
-from autotrainer.video import VideoManager
+from reachaq.video import VideoManager
 
 
 def acquire_image(camera_url: str):

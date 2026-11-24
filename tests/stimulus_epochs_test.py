@@ -1,6 +1,6 @@
 import pytest
 
-from tools.acquisition.model.stimulus_epochs import (
+from reachaq.app.model.stimulus_epochs import (
     BASELINE,
     DEFAULT_EPOCH_BLOCK_SIZE,
     MAX_EPOCH_BLOCK_SIZE,
@@ -10,7 +10,7 @@ from tools.acquisition.model.stimulus_epochs import (
     epoch_assignment,
     epoch_kind,
 )
-from tools.acquisition.model.trial_protocol_schedule import (
+from reachaq.app.model.trial_protocol_schedule import (
     TrialProtocolDocument,
 )
 
