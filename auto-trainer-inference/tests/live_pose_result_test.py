@@ -65,6 +65,7 @@ def inference_data_proc(pose_algo, capture_multiprocess_logs, monkeypatch, caplo
 
     proc = InferenceMonitorDataProc(
         project=ProjectInfo(camera_names=("left", "right")),
+        camera_names=("left", "right"),
         pose_data_queue=multiprocessing.Queue(),
         cmd_queue=multiprocessing.Queue(),
         msg_queue=multiprocessing.Queue(),

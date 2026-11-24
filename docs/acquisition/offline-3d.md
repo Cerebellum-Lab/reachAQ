@@ -56,7 +56,10 @@ left-right failure then stands as before.
   (`ProjectInfo.get_intersession_pose_path(camera, suffix="_live")`), so a
   camera named `left` never takes `far_left`'s file. Frames from different
   cameras are paired by the files' `frame_idx`. A frame that a camera did not
-  pose counts as not seen by that camera.
+  pose counts as not seen by that camera. Live pose writes this file for each
+  camera that is both in the live inference queue and record-enabled, named by
+  that camera; a posed camera that does not record, and a recording
+  stimulation-mode stimCam, which is never posed, have none.
 - **The pixel space.** Each camera's 2D points are in the pixels of its
   configured base capture: binning, width, height and ROI offset from the
   session metadata's `configuration.cameras`. This is read the same way as the

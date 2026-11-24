@@ -19,7 +19,7 @@ def _offline():
         stop_recorded=multiprocessing.Event(),
         frame_shape=(256, 256),
         frames_per_cam=1,
-        nr_cams=2,
+        camera_names=("left", "right"),
         msg_queue=multiprocessing.Queue(),
         event_cb_ack=multiprocessing.Event(),
     )

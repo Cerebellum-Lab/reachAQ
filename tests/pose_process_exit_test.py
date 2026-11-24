@@ -216,7 +216,7 @@ _LIVE_QUEUE = _LiveQueue()
 def test_inference_is_loading_from_the_moment_its_process_is_spawned(monkeypatch):
     model = _spawning_inference(monkeypatch)
 
-    assert model.start(_LIVE_QUEUE)
+    assert model.start(_LIVE_QUEUE, camera_names=("left", "right"))
 
     assert model._pose_process.started
     assert model.status == InferenceStatus.loading
@@ -224,7 +224,7 @@ def test_inference_is_loading_from_the_moment_its_process_is_spawned(monkeypatch
 
 def test_a_stop_before_the_model_reports_loading_still_stops_the_process(monkeypatch):
     model = _spawning_inference(monkeypatch)
-    model.start(_LIVE_QUEUE)
+    model.start(_LIVE_QUEUE, camera_names=("left", "right"))
     process = model._pose_process
     model._cmd_queue.process = process
 
@@ -263,7 +263,7 @@ def test_a_process_being_stopped_cannot_make_inference_active_again(status, mess
 
 def test_a_process_that_dies_before_the_model_reports_loading_is_caught(monkeypatch):
     model = _spawning_inference(monkeypatch)
-    model.start(_LIVE_QUEUE)
+    model.start(_LIVE_QUEUE, camera_names=("left", "right"))
     process = model._pose_process
     process.exitcode = 1  # an import failed in the child, say
 
@@ -285,7 +285,7 @@ def test_a_process_that_dies_before_the_model_reports_loading_is_caught(monkeypa
 def test_stopping_inference_tells_the_live_queue_nothing_reads_it(monkeypatch):
     model = _spawning_inference(monkeypatch)
     live_queue = _LiveQueue()
-    model.start(live_queue)
+    model.start(live_queue, camera_names=("left", "right"))
     model._cmd_queue.process = model._pose_process
 
     model.stop()
@@ -296,7 +296,7 @@ def test_stopping_inference_tells_the_live_queue_nothing_reads_it(monkeypatch):
 def test_a_pose_process_that_dies_leaves_the_live_queue_closed(monkeypatch):
     model = _spawning_inference(monkeypatch)
     live_queue = _LiveQueue()
-    model.start(live_queue)
+    model.start(live_queue, camera_names=("left", "right"))
     model._pose_process.exitcode = 0  # raised in predict, and returned
 
     model._check_pose_process_exited()
@@ -308,7 +308,7 @@ def test_a_live_queue_is_not_closed_while_its_reader_runs(monkeypatch):
     model = _spawning_inference(monkeypatch)
     live_queue = _LiveQueue()
 
-    model.start(live_queue)
+    model.start(live_queue, camera_names=("left", "right"))
 
     assert not live_queue.consumer_closed
 

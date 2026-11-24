@@ -9413,7 +9413,10 @@ class AppModel(ObservableObject):
             reason="starting live inference",
         )
         try:
-            if not self._inference.start(self._inference_queue):
+            if not self._inference.start(
+                self._inference_queue,
+                camera_names=tuple(camera.name for camera in self._inference_cameras),
+            ):
                 raise RuntimeError("live inference process did not start")
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
