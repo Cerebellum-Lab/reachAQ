@@ -711,13 +711,14 @@ class CanDevice(Device):
         waiters and tokens end. Returns whether the frame reached the bus.
         """
         sent = self._write_estop(True, reason)
+        # The listener first: a waiter that sees its command stopped finds the stage stopped.
+        self._notify_estop(reason, sent)
         try:
             # Not _put_to_cmd_queue: no shutdown check and no liveness raise.
             # A disconnect clears what is pending anyway.
             self._commands_queue.put((_estop_abort, str(reason), None))
         except Exception:
             logger.exception("Could not queue the ESTOP's clean-up")
-        self._notify_estop(reason, sent)
         return sent
 
     def release_estop(self) -> None:
@@ -759,8 +760,8 @@ class CanDevice(Device):
     def _estop_in_loop(self, reason: str, cur_commands: list) -> None:
         """An ESTOP the command loop itself decided on: write it, then end what it stopped."""
         sent = self._write_estop(True, reason)
+        self._notify_estop(reason, sent)  # first, as in estop()
         self._end_stopped_commands(reason, cur_commands)
-        self._notify_estop(reason, sent)
 
     def _end_stopped_commands(self, reason: str, cur_commands: list) -> None:
         """End, with the ESTOP's reason, the pellet command in flight and every queued motion command.
