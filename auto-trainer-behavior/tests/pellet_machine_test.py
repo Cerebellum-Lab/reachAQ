@@ -719,3 +719,46 @@ def test_a_protocol_cover_policy_is_sent_while_a_refused_cover_holds(machine, mo
         pellet_m.prepare_cover_policy(policy, timeout=0.05)
 
     getattr(device, command).assert_called_once()
+
+
+def _stopped(token, command, command_class):
+    from autotrainer.core import Motor
+    from autotrainer.device import CommandRefusal
+
+    return CommandRefusal(
+        token=token, error=-1, command=command, step=str(command), command_class=command_class,
+        motors=(Motor.PELLET_X_MOTOR, Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR),
+        estop_reason="SEND_TO_FIXED_XYZ was not acknowledged within 3 s",
+    )
+
+
+@pytest.mark.parametrize("attr, command, command_class", [
+    ("_token_pellet_send", "SEND_PELLET", "FIXED_XYZ"),
+    ("_token_pellet_load", "LOAD_PELLET", "STEPPER_MOVE"),
+    ("_token_move_retract", "SEND_RETRACT", "STEPPER_MOVE"),
+    ("_token_move_home", "SEND_HOME", "STEPPER_HOME"),
+    ("_token_cover_pellet", "COVER_PELLET", "SERVO_MOVE"),
+    ("_token_release_pellet", "RELEASE_PELLET", "SERVO_MOVE"),
+])
+def test_a_command_an_estop_stopped_clears_its_token_and_the_machine_is_free_again(
+    machine, attr, command, command_class,
+):
+    from autotrainer.core import SystemCommandKind
+    from autotrainer.device import RefusedCommandClass
+
+    pellet_m = machine.pellet
+    token = f"stopped-{attr}"
+    setattr(pellet_m, attr, token)
+    pellet_m._api_status_token = token
+    if attr in ("_token_cover_pellet", "_token_release_pellet"):
+        pellet_m._servo_token_forced[attr] = True
+    assert not pellet_m.can_use_pellet_command()
+
+    # Through the message handler, as CanDevice delivers an ESTOP's end of a command.
+    pellet_m._message_handler.command_refused(token, perf_c=None, refusal=_stopped(
+        token, getattr(SystemCommandKind, command), getattr(RefusedCommandClass, command_class)))
+
+    assert getattr(pellet_m, attr) is None
+    assert pellet_m._api_status_token is None
+    assert pellet_m.can_use_pellet_command(), "the machine must not wedge after a stop"
+    assert attr not in pellet_m._servo_token_forced
