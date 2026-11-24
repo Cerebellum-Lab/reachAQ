@@ -390,8 +390,14 @@ def build_report(
         add("baseline_mm", pair, float(np.linalg.norm(_centre(fit.cameras[second]) - _centre(fit.cameras[first]))),
             "mm")
         epipolar, square, stereo_note = _stereo_checks(fit, observations, board, first, second)
-        add("epipolar_error_px", pair, epipolar, "sensor px", stereo_note)
-        add("square_size_rel_error", pair, square, "ratio", stereo_note)
+        for name, value, unit in (("epipolar_error_px", epipolar, "sensor px"), ("square_size_rel_error", square, "ratio")):
+            if value is None:
+                # Undetermined, as the triangulation check without two other cameras: it
+                # neither passes nor fails.
+                warn, fail = (_as_limit(limit) for limit in thresholds[name])
+                metrics.append(Metric(name, pair, None, unit, warn, fail, UNDETERMINED, stereo_note))
+            else:
+                add(name, pair, value, unit, stereo_note)
     if not pairs:
         # Undetermined, so the pair checks cannot pass.
         stereo_note = (
@@ -631,11 +637,20 @@ def _max_distortion_shift(model: CameraModel, roi) -> float:
 
 def _stereo_checks(fit: MotorFrameFit, observations, board: BoardSpec, first: str, second: str):
     """(mean symmetric epipolar distance in sensor px, |mean triangulated square - square_mm| /
-    square_mm, note) over the waypoints where both cameras found the board."""
+    square_mm, note) over the waypoints where both cameras found the board.
+
+    A ChArUco pair can share waypoints but no corner (each sees its own part of the board):
+    the epipolar and square checks are then None, undetermined, as the triangulation check
+    is with too few cameras. The square check is also None when no two neighbouring corners
+    were both found by both cameras."""
     both = [o for o in observations if first in o.corners and second in o.corners
             and usable_view(o.corners[first], board) and usable_view(o.corners[second], board)]
     if not both:
         return math.inf, math.inf, f"no waypoint has the board in both {first} and {second}"
+    # The waypoints where the two found a corner in common: every one, for a checkerboard.
+    both = [o for o in both if (valid_corners(o.corners[first]) & valid_corners(o.corners[second])).any()]
+    if not both:
+        return None, None, f"{first} and {second} found no board corner in common"
     a, b = fit.cameras[first], fit.cameras[second]
     # The corners both cameras detected: every corner of a checkerboard.
     common = np.concatenate([valid_corners(o.corners[first]) & valid_corners(o.corners[second]) for o in both])
@@ -664,7 +679,7 @@ def _stereo_checks(fit: MotorFrameFit, observations, board: BoardSpec, first: st
         np.linalg.norm(grid[:, 1:, :] - grid[:, :-1, :], axis=-1).ravel(),  # down each column
     ])
     steps = steps[np.isfinite(steps)]  # the neighbours both ends of which both cameras found
-    square = abs(float(steps.mean()) - board.square_mm) / board.square_mm
+    square = abs(float(steps.mean()) - board.square_mm) / board.square_mm if len(steps) else None
     return epipolar, square, f"{len(both)} waypoints with {first} and {second}"
 
 

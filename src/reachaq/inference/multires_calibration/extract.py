@@ -451,19 +451,12 @@ def extract_observations(
                 rejected.append((index, cam, _NOT_FOUND))
                 continue
             if board.kind == CHARUCO:
-                median, spread = _charuco_median(np.stack(found), board)
+                median, reason, scatter_px = charuco_waypoint(np.stack(found), board)
                 if median is None:
-                    rejected.append((index, cam, _TOO_FEW_CORNERS))
-                    continue
-                # Only the corners whose detections disagree are dropped, not the view: the
-                # rest still place it.
-                kept = np.flatnonzero(valid_corners(median))
-                median[kept[spread > _MAX_CORNER_STD_PX]] = np.nan
-                if not usable_view(median, board):
-                    rejected.append((index, cam, _INCONSISTENT))
+                    rejected.append((index, cam, reason))
                     continue
                 corners[i][cam] = median
-                kept_scatter.append(float(np.median(spread[spread <= _MAX_CORNER_STD_PX])))
+                kept_scatter.append(scatter_px)
                 continue
             if reference is None:
                 reference = found[0]
@@ -492,6 +485,24 @@ def extract_observations(
         segmentation_stats=stats,
         segments_from=FROM_MOTION if dwells is None else FROM_DWELLS,
     )
+
+
+def charuco_waypoint(stack: np.ndarray, board: BoardSpec) -> Tuple[Optional[np.ndarray], Optional[str], Optional[float]]:
+    """One camera's ChArUco corners at one waypoint from its (frames, corners, 2) detections:
+    (median, None, median spread in px), or (None, reason, None) when they are not a view.
+
+    The median is median_corners'. A corner whose detections disagree by more than
+    _MAX_CORNER_STD_PX is dropped, not the view: the rest still place it. The reason is
+    "too few corners" when the median is not a usable view, "inconsistent" when it is not
+    once the disagreeing corners are dropped."""
+    median, spread = _charuco_median(stack, board)
+    if median is None:
+        return None, _TOO_FEW_CORNERS, None
+    kept = np.flatnonzero(valid_corners(median))
+    median[kept[spread > _MAX_CORNER_STD_PX]] = np.nan
+    if not usable_view(median, board):
+        return None, _INCONSISTENT, None
+    return median, None, float(np.median(spread[spread <= _MAX_CORNER_STD_PX]))
 
 
 def _charuco_median(stack: np.ndarray, board: BoardSpec) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:

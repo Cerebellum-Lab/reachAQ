@@ -30,7 +30,7 @@ from reachaq.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from reachaq.device import MotorConfigurationFile
 from reachaq.inference.multires_calibration import store
 from reachaq.inference.multires_calibration.extract import distinct_waypoints
-from reachaq.inference.multires_calibration.fit import BoardSpec, CaptureCamera
+from reachaq.inference.multires_calibration.fit import RIG_CHARUCO_BOARD, BoardSpec, CaptureCamera
 from reachaq.inference.multires_calibration.geometry import PresetGeometry, PresetSet, presets_for_cameras
 from reachaq.inference.multires_calibration.pipeline import (
     WAYPOINT_LOG,
@@ -1478,7 +1478,7 @@ def test_a_saved_list_outside_todays_box_is_scouted_again(tmp_path, monkeypatch)
     # 14 points, one-axis moves, the last outside today's box (motor x 0.6-20).
     points = [(1.0 + i, 20.0, 60.0) for i in range(13)] + [(500.0, 20.0, 60.0)]
     save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
-                   datetime(2026, 11, 20))
+                   datetime(2026, 11, 20), RIG_CHARUCO_BOARD)
     run()
     assert seen["scouts"] == 1
 
@@ -1491,7 +1491,7 @@ def test_the_saved_list_is_checked_against_the_configured_travel(tmp_path, monke
     app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(14, z=30.0)])
     points = [(1.0 + i, 20.0, 30.0) for i in range(14)]
     save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
-                   datetime(2026, 11, 20))
+                   datetime(2026, 11, 20), RIG_CHARUCO_BOARD)
     run()
     assert seen["scouts"] == 0
     assert [motor for *_, motor in seen["plans"][-1]] == points
@@ -1499,10 +1499,24 @@ def test_the_saved_list_is_checked_against_the_configured_travel(tmp_path, monke
     # Outside the travel (z 36): scouted again, with the travel.
     points = [(1.0 + i, 20.0, 36.0) for i in range(14)]
     save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
-                   datetime(2026, 11, 20))
+                   datetime(2026, 11, 20), RIG_CHARUCO_BOARD)
     run()
     assert seen["scouts"] == 1
     assert seen["travel"] == ((None, None), (None, None), (0.0, 35.0))
+
+
+@pytest.mark.parametrize("saved_board", [None, BoardSpec()], ids=["no_board", "checkerboard"])
+def test_a_list_scouted_with_another_board_is_scouted_again(tmp_path, monkeypatch, saved_board):
+    # A list from before the ChArUco board names none, so it was scouted with the checkerboard,
+    # whose views are whole-board ones; the ChArUco board, the default now, is usable in more.
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(14)])
+    points = [(1.0 + i, 20.0, 60.0) for i in range(14)]
+    save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
+                   datetime(2026, 11, 20), saved_board)
+    run()
+    assert seen["scouts"] == 1
+    saved = yaml.safe_load((tmp_path / "calibrations" / "scout_move_list.yaml").read_text())
+    assert saved["board"]["kind"] == "charuco"
 
 
 def test_a_fault_before_waypoint_0_sends_no_waypoint_command():
@@ -1603,7 +1617,8 @@ def test_a_camera_the_chosen_list_leaves_short_gets_advice(tmp_path, monkeypatch
 def test_a_saved_list_with_fewer_than_12_points_is_not_used(tmp_path, monkeypatch):
     app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(14)])
     save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml",
-                   [(1.0 + i, 20.0, 60.0) for i in range(11)], ["left", "right"], datetime(2026, 11, 20))
+                   [(1.0 + i, 20.0, 60.0) for i in range(11)], ["left", "right"], datetime(2026, 11, 20),
+                   RIG_CHARUCO_BOARD)
     run()
     assert seen["scouts"] == 1
 

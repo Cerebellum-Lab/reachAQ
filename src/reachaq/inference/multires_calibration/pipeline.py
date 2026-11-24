@@ -359,7 +359,7 @@ def calibrate_capture(
     *,
     output_dir: Path,
     presets: Sequence[PresetGeometry],
-    board: BoardSpec = BoardSpec(),
+    board: Optional[BoardSpec] = None,
     previous_dir: Optional[Path] = None,
     refine: str = "subpix",
     preset_sets: Optional[Sequence[PresetSet]] = None,
@@ -387,8 +387,7 @@ def calibrate_capture(
     every camera's verdict. Raises CalibrationRefused, writing nothing, when fewer than 2 do.
     """
     capture_dir, output_dir = Path(capture_dir), Path(output_dir)
-    fit_mode = default_fit_mode(board) if fit_mode is None else fit_mode
-    if fit_mode not in FIT_MODES:
+    if fit_mode is not None and fit_mode not in FIT_MODES:
         raise ValueError(f"fit_mode must be one of {FIT_MODES}, got {fit_mode!r}")
     # Refused before minutes of extraction and fitting, not after.
     if output_dir.exists():
@@ -397,6 +396,9 @@ def calibrate_capture(
     if not presets:
         raise ValueError("no presets to calibrate")
     log = load_waypoint_log(capture_dir / WAYPOINT_LOG)
+    if board is None:
+        board = capture_board(log)
+    fit_mode = default_fit_mode(board) if fit_mode is None else fit_mode
     cameras = tuple(capture_cameras(log))
     if not MIN_CAMERAS <= len(cameras) <= MAX_CAMERAS:
         raise ValueError(f"a capture has {MIN_CAMERAS} to {MAX_CAMERAS} cameras, the log lists {len(cameras)}")
@@ -544,6 +546,18 @@ def calibrate_capture(
         )
     logger.info("calibration %s written to %s: %s", index.id, output_dir, report.verdict)
     return index, report
+
+
+# The board a capture was made with, in its waypoints.yaml capture_settings (make_3d_calib
+# writes it); a capture without one was made with the checkerboard.
+CAPTURE_BOARD_KEY = "board"
+
+
+def capture_board(log: WaypointLog) -> BoardSpec:
+    """The board `log` records under capture_settings, or BoardSpec(), the checkerboard, when it
+    records none (every capture before the ChArUco board)."""
+    plain = log.capture_settings.get(CAPTURE_BOARD_KEY)
+    return BoardSpec() if plain is None else BoardSpec(**dict(plain))
 
 
 def calibrated_preset_sets(live: Mapping[str, PresetGeometry], calibrated: Sequence[str]) -> List[PresetSet]:

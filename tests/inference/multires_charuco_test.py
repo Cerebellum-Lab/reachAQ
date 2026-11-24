@@ -184,6 +184,105 @@ def test_too_few_or_collinear_corners_are_no_view():
     assert usable_view(np.zeros((48, 2)), BoardSpec())
 
 
+def _stack_of(rig, cam, frames=5, keep=None, noise=0.05, seed=0):
+    """(frames, 48, 2) detections of the rig's first waypoint by `cam`, `keep` (a mask) found."""
+    rng = np.random.default_rng(seed)
+    truth = rig.observations[0].corners[cam]
+    stack = np.repeat(truth[None], frames, axis=0) + rng.normal(0, noise, (frames, 48, 2))
+    if keep is not None:
+        stack[:, ~keep] = np.nan
+    return stack
+
+
+def test_an_inconsistent_corner_is_dropped_not_the_view():
+    from reachaq.inference.multires_calibration.extract import charuco_waypoint
+
+    rig = synthetic_rig(noise_px=0.0)
+    stack = _stack_of(rig, "left")
+    stack[2, 7] += 5.0  # corner 7 jumps 5 px in one frame: its detections disagree
+    median, reason, scatter = charuco_waypoint(stack, CHARUCO_BOARD)
+    assert reason is None and median is not None
+    assert np.isnan(median[7]).all()
+    assert int(np.isfinite(median).all(axis=1).sum()) == 47
+    assert scatter < 0.2
+
+
+def test_too_few_or_inconsistent_corners_reject_the_waypoint():
+    from reachaq.inference.multires_calibration.extract import charuco_waypoint
+
+    rig = synthetic_rig(noise_px=0.0)
+    keep = np.zeros(48, bool)
+    keep[:11] = True
+    assert charuco_waypoint(_stack_of(rig, "left", keep=keep), CHARUCO_BOARD)[:2] == (None, "too few corners")
+    keep[:14] = True  # 14 corners, two rows; 3 of them inconsistent leave 11
+    stack = _stack_of(rig, "left", keep=keep)
+    stack[0, :3] += 5.0
+    assert charuco_waypoint(stack, CHARUCO_BOARD)[:2] == (None, "inconsistent")
+
+
+def test_a_pair_sharing_no_corner_is_undetermined_not_a_crash():
+    # Left sees columns 0-3 of the board and right 4-7 at every waypoint: they share
+    # waypoints but no corner, so the epipolar and square checks have nothing to measure.
+    rig = synthetic_rig(noise_px=0.1)
+    k = np.arange(48)
+    keep = {"left": k % 8 < 4, "right": k % 8 >= 4}
+    observations = [
+        WaypointObservation(index=o.index, motor_mm=o.motor_mm,
+                            corners={cam: np.where(keep[cam][:, None], c, np.nan) for cam, c in o.corners.items()})
+        for o in rig.observations
+    ]
+    fit = fit_motor_frame(observations, CHARUCO_BOARD, SIZE, CAMERAS)
+    n = len(observations)
+    capture = CaptureSummary(waypoints_total=n, waypoints_verified=n, waypoints_unreached=0,
+                             views_kept={cam: n for cam in CAMERAS}, rejections={cam: {} for cam in CAMERAS})
+    report = build_report(fit, observations, CHARUCO_BOARD, BASE.sensor_roi(), capture, [], None)
+    for name in ("epipolar_error_px", "square_size_rel_error"):
+        (metric,) = [m for m in report.metrics if m.name == name]
+        assert metric.status == "undetermined" and metric.value is None, metric
+        assert "no board corner in common" in metric.note
+
+
+def test_a_charuco_board_too_small_for_a_view_is_refused():
+    with pytest.raises(ValueError, match="rows"):
+        BoardSpec(kind=CHARUCO, rows=2, cols=4, marker_mm=3.0, dictionary="DICT_4X4_50")
+
+
+def test_a_view_with_no_neighbouring_corners_has_no_aspect():
+    from reachaq.inference.multires_calibration.scout import ScoutView, board_aspect, diagnose
+
+    corners = np.full((48, 2), np.nan)
+    corners[0::2] = np.arange(48)[0::2, None] * 10.0  # every other corner: no two neighbours
+    assert math.isnan(board_aspect(corners, CHARUCO_BOARD))
+    view = ScoutView("left", True, corners, None, math.nan, True)
+    assert view == ScoutView("left", True, corners.copy(), None, math.nan, True)  # NaN is equal to NaN here
+    # A NaN aspect neither makes the camera grazing nor breaks the median.
+    assert diagnose({0: {"left": view}}, ["left"], min_views=1) == {}
+
+
+def test_the_scout_says_board_type_mismatch_when_a_checkerboard_is_mounted():
+    from reachaq.inference.multires_calibration.scout import ADVICE_OTHER_BOARD, diagnose
+
+    model = RIG.truth.cameras["left"]
+    motor = RIG.observations[0].motor_mm
+    checkerboard = render_board_frame(model, RIG.world_corners(motor), SIZE, BoardSpec())
+    view = scout_view("left", checkerboard, CHARUCO_BOARD)
+    assert not view.found and view.board_pixels and view.other_board
+    advice = diagnose({0: {"left": view}}, ["left"], min_views=1, board=CHARUCO_BOARD)
+    assert advice["left"] == ADVICE_OTHER_BOARD.format(seen="checkerboard", configured="the ChArUco board")
+    # The reverse needs no advice: the checkerboard detector finds a ChArUco board's squares.
+    assert scout_view("left", render(model, motor), BoardSpec()).found
+
+
+def test_the_capture_records_its_board():
+    from reachaq.inference.multires_calibration.pipeline import capture_board
+
+    log = WaypointLog(motor=[], reported=[], verified=[], dcs_moves=[], times=[], capture_settings={})
+    assert capture_board(log) == BoardSpec()  # a capture from before the ChArUco board
+    log.capture_settings["board"] = {"kind": "charuco", "square_mm": 4.0, "rows": 6, "cols": 8,
+                                     "marker_mm": 3.0, "dictionary": "DICT_4X4_50"}
+    assert capture_board(log) == CHARUCO_BOARD
+
+
 def test_the_median_keeps_a_corner_seen_in_half_the_frames():
     stack = np.tile(np.arange(96, dtype=float).reshape(48, 2), (4, 1, 1))
     stack[:2, 0] = np.nan  # seen in 2 of 4 frames: kept
@@ -408,13 +507,12 @@ def _e2e_frames(model):
             yield still
 
 
-@pytest.fixture(scope="module")
-def charuco_run(tmp_path_factory):
-    folder = tmp_path_factory.mktemp("charuco")
+def _calibrate_rendered(folder, models, *, board=None, capture_settings=None):
+    """Render `models`' capture of the E2E waypoints into `folder` and calibrate it."""
     capture = folder / "capture"
     (capture / SOURCE_VIDEOS).mkdir(parents=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    for cam, model in E2E_MODELS.items():
+    for cam, model in models.items():
         writer = cv2.VideoWriter(str(capture / SOURCE_VIDEOS / f"{cam}.mp4"), fourcc, E2E_FPS, SIZE, isColor=False)
         assert writer.isOpened()
         for image in _e2e_frames(model):
@@ -428,13 +526,38 @@ def charuco_run(tmp_path_factory):
         verified=[True] * n,
         dcs_moves=[("xyz"[i % 3], float(i)) for i in range(n)],
         times=[(1000.0 + i, 1000.75 + i) for i in range(n)],
-        capture_settings={},
+        capture_settings=dict(capture_settings or {}),
     )
     write_waypoint_log(capture / WAYPOINT_LOG, log)
     output = folder / "out" / "calibration"
-    index, report = calibrate_capture(capture, output_dir=output, presets=presets_from_base(BASE),
-                                      board=CHARUCO_BOARD)
+    index, report = calibrate_capture(capture, output_dir=output, presets=presets_from_base(BASE), board=board)
     return output, index, report
+
+
+@pytest.fixture(scope="module")
+def charuco_run(tmp_path_factory):
+    return _calibrate_rendered(tmp_path_factory.mktemp("charuco"), E2E_MODELS, board=CHARUCO_BOARD)
+
+
+@pytest.fixture(scope="module")
+def charuco_full_run(tmp_path_factory):
+    """Both cameras as the rig has them, the board whole in each; the board is not passed but
+    read from the capture's waypoints.yaml, as make_3d_calib writes it."""
+    models = {cam: RIG.truth.cameras[cam] for cam in CAMERAS}
+    settings = {"board": {"kind": "charuco", "square_mm": 4.0, "rows": 6, "cols": 8, "marker_mm": 3.0,
+                          "dictionary": "DICT_4X4_50"}}
+    return _calibrate_rendered(tmp_path_factory.mktemp("charuco_full"), models, capture_settings=settings)
+
+
+def test_a_charuco_capture_calibrates_and_cross_checks(charuco_full_run):
+    output, index, report = charuco_full_run
+    assert index.board == CHARUCO_BOARD  # read from the capture
+    assert index.capture["fit"] == "per_view"
+    # Every preset's direct per-view fit succeeds and agrees with the mapped sensor fit.
+    deltas = {m.note: m for m in report.metrics if m.name == "cross_check_delta_px"}
+    assert set(deltas) == {"preset 256x256_bin4", "preset 512x512_bin2"}
+    assert all(math.isfinite(m.value) for m in deltas.values()), report.to_text()
+    assert report.verdict != "fail", report.to_text()
 
 
 def test_the_pipeline_calibrates_a_charuco_capture_with_partial_views(charuco_run):
@@ -449,6 +572,16 @@ def test_the_pipeline_calibrates_a_charuco_capture_with_partial_views(charuco_ru
         assert abs(fit.cameras[cam].K[0, 2] - model.K[0, 2]) < 10.0, cam
         assert fit.rms_px[cam] < 0.2, cam
     assert fit.motor_scale == pytest.approx(1.0, abs=3e-3)
+    # A ChArUco board takes the per-view fit, the per-preset cross-checks included.
+    assert index.capture["fit"] == "per_view"
+    deltas = {m.note: m.value for m in report.metrics if m.name == "cross_check_delta_px"}
+    assert set(deltas) == {"preset 256x256_bin4", "preset 512x512_bin2"}
+    assert any(n.startswith("motor placement (per-view fit)") for n in report.notes)
+    # It fails, by design: the right camera's principal point is moved 700 px, far outside
+    # the ROI, and its views cover little of it.
+    assert report.verdict == "fail"
+    failing = {(m.name, m.camera) for m in report.metrics if m.status == "fail"}
+    assert ("principal_point_offset_frac", "right") in failing
 
 
 def test_every_usable_view_feeds_the_fit(charuco_run):

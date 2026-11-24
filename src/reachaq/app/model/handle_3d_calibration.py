@@ -23,6 +23,7 @@ from reachaq.inference.multires_calibration.fit import BoardSpec, CaptureCamera
 from reachaq.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
 from reachaq.inference.multires_calibration.library import add_entry, entry_path, read_settings
 from reachaq.inference.multires_calibration.pipeline import (
+    CAPTURE_BOARD_KEY,
     MAX_CAMERAS,
     MIN_CAMERAS,
     REFERENCE_DIR,
@@ -46,6 +47,7 @@ from reachaq.inference.multires_calibration.scout import (
     Travel,
     bounds_from_plan,
     choose_move_list,
+    board_plain,
     configured_board,
     configured_bounds,
     diagnose,
@@ -822,7 +824,7 @@ def run_scout(
     views = scout_views_from_capture(videos, frame_times, log.motor, log.times, board)
     sizes = video_sizes(videos)
     selection, path = choose_move_list(grid, views, names, image_sizes=sizes, max_path=max_path)
-    diagnosis = diagnose(views, names, sizes)
+    diagnosis = diagnose(views, names, sizes, board=board)
     logger.info("scout chose %d points (a path of %d waypoints); views per camera %s; cameras joined: %s",
                 len(selection.points), len(path), selection.per_camera, selection.connected)
     for camera, advice in diagnosis.items():
@@ -830,14 +832,14 @@ def run_scout(
     return ScoutResult(points=path, selection=selection, diagnosis=diagnosis, views=views)
 
 
-def saved_scout_list(root: Optional[Path], identities: Sequence[str], bounds: Bounds):
+def saved_scout_list(root: Optional[Path], identities: Sequence[str], bounds: Bounds, board: Optional[BoardSpec] = None):
     """The scout list saved in the library `root` for these cameras, or None when there is
     none, it has fewer than MIN_SCOUT_POINTS points, a point lies outside `bounds` (today's
     scout box: the configured travel, or the hand-written box the DCS may have moved) or two
     in a row differ in other than one axis."""
     if root is None:
         return None
-    points = load_move_list(Path(root, SCOUT_MOVE_LIST_FILE), identities)
+    points = load_move_list(Path(root, SCOUT_MOVE_LIST_FILE), identities, board)
     if points is None:
         return None
     if len(points) < MIN_SCOUT_POINTS:
@@ -1134,7 +1136,7 @@ def make_3d_calib(
         identities = [camera.serial or camera.name for camera in capture_list]
         configured = None if root is None else configured_bounds(read_settings(root))
         targets = [motor for *_, motor in plan]
-        saved = None if rescout else saved_scout_list(root, identities, bounds_from_plan(targets, configured, travel))
+        saved = None if rescout else saved_scout_list(root, identities, bounds_from_plan(targets, configured, travel), board)
         if rescout:
             logger.notice("Scouting again, as asked: any saved scout move list is not used this time")
         if saved is not None:
@@ -1157,10 +1159,14 @@ def make_3d_calib(
             if advice and confirm_scout is not None and not confirm_scout(advice):
                 raise ScoutCancelled("cancelled at the scout's advice; nothing was captured")
             if used == SCOUT and root is not None and not advice and scout.selection.connected:
-                save_move_list(Path(root, SCOUT_MOVE_LIST_FILE), scout.points, identities, datetime.now())
+                save_move_list(Path(root, SCOUT_MOVE_LIST_FILE), scout.points, identities, datetime.now(), board)
 
     log = _record_plan(app_model, cameras, cams_before_cfg, cam_params, record_mode, project, plan, capture_list,
                        src_dir)
+    # The board goes into waypoints.yaml with the capture, so the capture can be calibrated
+    # again offline without being told it (pipeline.capture_board).
+    if isinstance(log, WaypointLog):
+        log.capture_settings[CAPTURE_BOARD_KEY] = board_plain(board)
 
     if capture_references:
         if confirm_references is None or confirm_references():

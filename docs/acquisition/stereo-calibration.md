@@ -1103,6 +1103,16 @@ always to the legacy reader.
    configuration folder; use your own if the configuration location was
    changed). A rollback may need it.
 2. Note the version now installed, so you know what to roll back to.
+3. **The calibration board changes with this code.** It calibrates with the
+   ChArUco board unless `calibrations/settings.yaml` names another (see
+   [The calibration board](#the-calibration-board)). Deploy it together with
+   mounting the ChArUco board, or, to keep the checkerboard for now, add
+   `board: {kind: checkerboard}` to settings.yaml before the next calibration.
+   With the checkerboard still mounted and no `board` setting, the scout finds
+   no board and says "board type mismatch?"; a capture would find no views.
+   A scout list saved before this code was scouted with the checkerboard and is
+   scouted again once. A rollback reads a ChArUco calibration.yaml as a
+   checkerboard (the board is only informational after the fit).
 
 **Rolling back to v3.1.0, in order.**
 

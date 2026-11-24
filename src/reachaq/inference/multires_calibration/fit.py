@@ -113,6 +113,9 @@ class BoardSpec:
             if self.marker_mm is not None or self.dictionary is not None:
                 raise ValueError("marker_mm and dictionary are for a charuco board, not a checkerboard")
             return
+        if self.rows * self.cols < MIN_CHARUCO_CORNERS:
+            raise ValueError(f"rows: a {self.rows} x {self.cols} ChArUco board has fewer than the"
+                             f" {MIN_CHARUCO_CORNERS} inner corners a view needs")
         if self.marker_mm is None or not 0.0 < float(self.marker_mm) < float(self.square_mm):
             raise ValueError(f"marker_mm: {self.marker_mm!r} must be above 0 and below square_mm {self.square_mm}")
         if not isinstance(self.dictionary, str) or not self.dictionary.startswith("DICT_") or not isinstance(
