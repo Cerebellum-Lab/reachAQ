@@ -18,8 +18,10 @@ reachAQ environment.
     python3 spinnaker_download.py extract-python --dir D --dest T --sdk-version V \\
         --python cp310 --machine x86_64
 
-extract-* print the unpacked path on stdout. Exit 0 on success, 1 when nothing
-usable is found (with what to download on stderr), 2 on a bad argument.
+extract-* print the unpacked path on stdout. Exit 0 on success; 1 when the
+version is not supported or nothing usable is found (with what to download on
+stderr); 2 on a bad argument or when the check itself fails. The installer
+acts on 1 and treats 2 as a broken check.
 """
 
 from __future__ import annotations
@@ -33,7 +35,11 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterator, List, Optional, Sequence, Tuple
 
-from platform_check import DEFAULT_SPEC, load_spec
+try:
+    from platform_check import DEFAULT_SPEC, load_spec
+except ImportError as error:  # an incomplete checkout; exit 1 would read as "unsupported"
+    print(f"spinnaker_download.py cannot load platform_check.py: {error}", file=sys.stderr)
+    sys.exit(2)
 
 DOWNLOAD_PAGE = "https://www.teledynevisionsolutions.com/products/spinnaker-sdk/"
 VERSION = r"(\d+(?:\.\d+){3})"
@@ -199,7 +205,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     binding.add_argument("--python", required=True)
     binding.add_argument("--machine", required=True)
     args = parser.parse_args(argv)
-    spec = load_spec(args.spec)
+    try:
+        spec = load_spec(args.spec)
+    except (OSError, ValueError, KeyError) as error:
+        print(f"cannot read the supported platform list: {error}", file=sys.stderr)
+        return 2
 
     version_text = {"supported": getattr(args, "version", None),
                     "extract-python": getattr(args, "sdk_version", None)}.get(args.command)
@@ -247,4 +257,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as error:  # noqa: BLE001 - exit 1 must keep its meaning
+        print(f"spinnaker_download.py failed: {error!r}", file=sys.stderr)
+        sys.exit(2)

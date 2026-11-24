@@ -135,6 +135,18 @@ def test_the_check_exits_1_for_unsupported_and_2_for_a_broken_list(tmp_path):
     assert completed.returncode == 2
     assert "unknown schema" in completed.stderr
 
+    # Exit 1 is the only result REACHAQ_INSTALL_UNSUPPORTED may accept, so an
+    # incomplete list must not crash with it.
+    incomplete = tmp_path / "incomplete.json"
+    incomplete.write_text('{"schema": 1}')
+    for script in ("platform_check.py", "spinnaker_download.py"):
+        args = ["--spec", str(incomplete)] + (["supported", "3.2.0.57"]
+                                              if script == "spinnaker_download.py" else [])
+        completed = subprocess.run([sys.executable, str(INSTALL_DIR / script), *args],
+                                   capture_output=True, text=True, check=False)
+        assert completed.returncode == 2, (script, completed.stderr)
+        assert "operating_systems" in completed.stderr, script
+
 
 def test_the_platform_list_is_data_with_a_reason_for_each_limit():
     raw = json.loads(SPEC_FILE.read_text())

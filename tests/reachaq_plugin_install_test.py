@@ -154,7 +154,9 @@ def test_plugin_installer_warns_before_installing_yolo(tmp_path):
     assert function.index(AGPL_NOTICE) < function.index('pip install -e "$INSTALL_REPO/plugins/')
 
     conda, envs, env = _fake_conda(tmp_path)
-    _make_env(envs, "reachaq")
+    root = _make_env(envs, "reachaq", packages=("torch",))
+    # The one-CUDA-runtime check that ends the run reads torch.version.cuda.
+    (root / "torch" / "__init__.py").write_text("class version:\n    cuda = '12.8'\n")
     env["REACHAQ_INSTALL_ENV"] = "reachaq"
 
     completed = _run_plugin_script("yolo", env=env)
@@ -165,6 +167,7 @@ def test_plugin_installer_warns_before_installing_yolo(tmp_path):
     assert pip_line in completed.stdout
     assert completed.stdout.index(AGPL_NOTICE) < completed.stdout.index(pip_line)
     assert "PASS  Pose plugins | Install yolo pose plugin" in completed.stdout
+    assert "PASS  Pose plugins | Verify one CUDA runtime per engine" in completed.stdout
     # yolo needs no TensorFlow; only deeplabcut brings those steps.
     assert "TensorFlow" not in completed.stdout
 

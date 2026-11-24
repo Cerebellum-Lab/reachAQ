@@ -17,7 +17,6 @@
   },
   "spinnaker": {
     "versions": ["3.2"],
-    "python_tag": "cp310",
-    "why": "Spinnaker 3.2 is the SDK the reference rig runs (3.2.0.57) and the 3.2 Python binding imports against it. Major.minor must match between the SDK and the binding."
+    "why": "Spinnaker 3.2 is the SDK the reference rig runs (3.2.0.57) and the 3.2 Python binding imports against it. Major.minor must match between the SDK and the binding; the binding is the build for the environment's Python (3.10, cp310)."
   }
 }

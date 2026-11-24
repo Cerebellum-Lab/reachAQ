@@ -91,6 +91,7 @@ begin_category "Pose plugins"
 for name in "$@"; do
     run_step "Install $name pose plugin" install_pose_plugin "$name"
 done
+run_step "Verify one CUDA runtime per engine" conda_run python "$SCRIPT_DIR/cuda_runtime_check.py"
 
 print_report
 exit 0

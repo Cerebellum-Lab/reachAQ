@@ -25,8 +25,8 @@
 # checkout; on the first update after the plugins existed, an environment with
 # deeplabcut or ultralytics installed gets the matching plugin.
 # REACHAQ_INSTALL_SYSTEM=0 skips the steps that need root (apt packages, groups,
-# limits, systemd, the Spinnaker SDK), for rerunning on a host that already
-# has them.
+# limits, systemd, installing the Spinnaker SDK and camera access), for
+# rerunning on a host that already has them; an installed SDK is still checked.
 #
 # The first failed step stops the install, and the report names it and its
 # command (run_step in plugin-install-lib.sh). `set -e` is not used, so the
@@ -76,6 +76,16 @@ if [ "$#" -ne 0 ]; then
     exit 2
 fi
 
+# Run as the operator: it asks sudo for the steps that need root. Under sudo,
+# HOME is /root, so conda, the environment, the launcher, the settings and the
+# Spinnaker download folder would all be root's.
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+    printf '%s\n' \
+        'Do not run reachaq-linux-install.sh with sudo. Run it as the operator' \
+        "($SUDO_USER); it asks for sudo itself for the steps that need root." >&2
+    exit 2
+fi
+
 # shellcheck source=plugin-install-lib.sh
 if ! . "$SCRIPT_DIR/plugin-install-lib.sh"; then
     printf 'Cannot load %s; the checkout is incomplete.\n' "$SCRIPT_DIR/plugin-install-lib.sh" >&2
@@ -106,6 +116,8 @@ check_supported_platform() {
     fi
     python3 "$SCRIPT_DIR/platform_check.py"
     local result=$?
+    # 1 is "not on the list", the only result the override may accept; 2 or a
+    # crash is a broken check and always stops.
     if [ "$result" -ne 1 ]; then
         return "$result"
     fi
@@ -472,21 +484,30 @@ verify_single_cuda_runtime() {
 # operator's own download from Teledyne FLIR (docs/linux-install/flir-spinnaker.md),
 # found in $SPINNAKER_DOWNLOADS by spinnaker_download.py.
 
-# The installed libspinnaker version, or nothing.
+# The installed libspinnaker version as FLIR numbers it (3.2.0.57), or
+# nothing. A Debian epoch ("1:") or revision ("-1") is dropped.
 spinnaker_sdk_version() {
-    dpkg-query -W -f='${Status} ${Version}\n' libspinnaker 2>/dev/null \
-        | sed -n 's/^install ok installed //p'
+    local version
+    version=$(dpkg-query -W -f='${Status} ${Version}\n' libspinnaker 2>/dev/null \
+        | sed -n 's/^install ok installed //p')
+    version=${version#*:}
+    printf '%s' "${version%%-*}"
 }
 
 install_spinnaker_sdk() {
     local installed
     installed=$(spinnaker_sdk_version)
     if [ -n "$installed" ]; then
-        if ! python3 "$SCRIPT_DIR/spinnaker_download.py" supported "$installed"; then
+        python3 "$SCRIPT_DIR/spinnaker_download.py" supported "$installed"
+        local supported=$?
+        if [ "$supported" -eq 1 ]; then
             printf '%s\n' \
                 "Remove Spinnaker $installed with the remove_spinnaker.sh of its own download," \
                 'then rerun, and the installer installs a supported release from the download.' >&2
             return 1
+        elif [ "$supported" -ne 0 ]; then
+            printf 'The Spinnaker version check itself failed (exit %d); see above.\n' "$supported" >&2
+            return "$supported"
         fi
         printf 'Spinnaker SDK %s is already installed.\n' "$installed"
         return 0
@@ -509,17 +530,24 @@ install_spinnaker_sdk() {
     deb_dir=$(python3 "$SCRIPT_DIR/spinnaker_download.py" extract-sdk \
         --dir "$SPINNAKER_DOWNLOADS" --dest "$work" --ubuntu "$ubuntu" --arch "$arch")
     result=$?
+    if [ "$result" -eq 0 ] && ! { [ -t 0 ] && [ -t 1 ]; }; then
+        printf '%s\n' \
+            'Installing the Spinnaker SDK shows the FLIR licence agreement, which the operator' \
+            'must read and accept, so it needs a terminal. Run the installer from a terminal.' >&2
+        result=1
+    fi
     if [ "$result" -eq 0 ]; then
-        # Not DEBIAN_FRONTEND=noninteractive: the FLIR packages ask, through
-        # debconf, for the FLIR Spinnaker SDK licence to be accepted, and that
-        # is the operator's decision. Declining it fails this step.
+        # Not DEBIAN_FRONTEND=noninteractive, and not one inherited either: the
+        # FLIR packages ask, through debconf, for the FLIR Spinnaker SDK licence
+        # to be accepted, and that is the operator's decision. Declining it
+        # fails this step (the licence question defaults to decline).
         printf '%s\n' \
             '' \
             'The FLIR packages now show the FLIR Spinnaker SDK licence agreement.' \
             'Read it and accept it to continue; declining stops the install.' \
             'Note: the libspinnaker package reports the install to FLIR (Google Analytics).' \
             ''
-        run_as_root apt-get install -y "$deb_dir"/*.deb
+        run_as_root env -u DEBIAN_FRONTEND apt-get install -y "$deb_dir"/*.deb
         result=$?
         if [ "$result" -ne 0 ]; then
             printf '%s\n' \
@@ -571,8 +599,62 @@ configure_flir_camera_access() {
     fi
 }
 
-# The binding must match the SDK's major.minor; an installed one that does is
-# kept, so a rerun needs no download.
+# The binding must match the SDK's major.minor; one the environment already
+# has is kept, so a rerun needs no download.
+installed_spinnaker_binding_matches() {
+    local sdk=$1 have
+    [ -n "$CONDA_BIN" ] || return 1
+    conda_env_exists "$INSTALL_ENV" || return 1
+    have=$(conda_run python -c \
+        'from importlib.metadata import version; print(version("spinnaker-python"))' \
+        2>/dev/null | tail -n 1)
+    if [ -z "$have" ] || [ "${have%.*.*}" != "${sdk%.*.*}" ]; then
+        return 1
+    fi
+    printf 'Spinnaker Python binding %s is installed for SDK %s.\n' "$have" "$sdk"
+}
+
+spinnaker_python_tag() {
+    printf 'cp%s' "$(printf '%s' "$INSTALL_PYTHON" | cut -d. -f1-2 | tr -d .)"
+}
+
+# extract_spinnaker_binding <sdk version> <dest>: prints the wheel's path.
+extract_spinnaker_binding() {
+    python3 "$SCRIPT_DIR/spinnaker_download.py" extract-python \
+        --dir "$SPINNAKER_DOWNLOADS" --dest "$2" --sdk-version "$1" \
+        --python "$(spinnaker_python_tag)" --machine "$(uname -m)"
+}
+
+# Before the long conda build, where a missing download is cheap to report:
+# an environment on the wanted Python that already has a matching binding
+# needs nothing; otherwise the download must hold one.
+check_spinnaker_binding_available() {
+    local sdk existing work result
+    sdk=$(spinnaker_sdk_version)
+    if [ -z "$sdk" ]; then
+        printf 'The Spinnaker SDK is not installed; see the Install Spinnaker SDK step.\n' >&2
+        return 1
+    fi
+    local conda_bin
+    conda_bin=$(find_conda)
+    if [ -n "$conda_bin" ]; then
+        CONDA_BIN=$conda_bin
+        if conda_env_exists "$INSTALL_ENV"; then
+            existing=$(conda_run python -c 'import sys; print("%d.%d" % sys.version_info[:2])' \
+                2>/dev/null | tail -n 1)
+            if [ "$existing" = "$(printf '%s' "$INSTALL_PYTHON" | cut -d. -f1-2)" ] \
+                    && installed_spinnaker_binding_matches "$sdk"; then
+                return 0
+            fi
+        fi
+    fi
+    work=$(mktemp -d) || return
+    extract_spinnaker_binding "$sdk" "$work" >/dev/null
+    result=$?
+    rm -rf "$work"
+    return "$result"
+}
+
 install_spinnaker_binding() {
     local sdk
     sdk=$(spinnaker_sdk_version)
@@ -580,20 +662,12 @@ install_spinnaker_binding() {
         printf 'The Spinnaker SDK is not installed; see the Install Spinnaker SDK step.\n' >&2
         return 1
     fi
-    local have
-    have=$(conda_run python -c \
-        'from importlib.metadata import version; print(version("spinnaker-python"))' \
-        2>/dev/null | tail -n 1)
-    if [ -n "$have" ] && [ "${have%.*.*}" = "${sdk%.*.*}" ]; then
-        printf 'Spinnaker Python binding %s is already installed for SDK %s.\n' "$have" "$sdk"
+    if installed_spinnaker_binding_matches "$sdk"; then
         return 0
     fi
-    local python_tag work wheel result
-    python_tag="cp$(printf '%s' "$INSTALL_PYTHON" | cut -d. -f1-2 | tr -d .)"
+    local work wheel result
     work=$(mktemp -d) || return
-    wheel=$(python3 "$SCRIPT_DIR/spinnaker_download.py" extract-python \
-        --dir "$SPINNAKER_DOWNLOADS" --dest "$work" --sdk-version "$sdk" \
-        --python "$python_tag" --machine "$(uname -m)")
+    wheel=$(extract_spinnaker_binding "$sdk" "$work")
     result=$?
     if [ "$result" -eq 0 ]; then
         conda_run python -m pip install "$wheel"
@@ -792,6 +866,7 @@ run_focused_tests() {
             tests/install_preflight_test.py \
             tests/instance_lock_test.py \
             tests/nidaq_port_configuration_dialog_test.py \
+            tests/reachaq_install_steps_test.py \
             tests/reachaq_linux_install_test.py \
             tests/reachaq_plugin_install_test.py \
             tests/rfid_app_model_test.py \
@@ -837,12 +912,13 @@ else
     run_step "Install CPU governor unit" install_cpu_governor_unit
 fi
 
-# Before the conda environment, so a missing download stops the install
-# before the long environment build rather than after it.
+# Before the conda environment, so a missing download (SDK or binding) stops
+# the install before the long environment build rather than after it.
 begin_category "FLIR Spinnaker SDK"
 if [ "$INSTALL_SPINNAKER" = "0" ]; then
     skip_step "Install Spinnaker SDK" "$SPINNAKER_SKIPPED"
     skip_step "Configure FLIR camera access" "$SPINNAKER_SKIPPED"
+    skip_step "Find Spinnaker Python binding" "$SPINNAKER_SKIPPED"
 else
     run_step "Install Spinnaker SDK" install_spinnaker_sdk
     if [ "$INSTALL_SYSTEM" = "0" ]; then
@@ -850,6 +926,7 @@ else
     else
         run_step "Configure FLIR camera access" configure_flir_camera_access
     fi
+    run_step "Find Spinnaker Python binding" check_spinnaker_binding_available
 fi
 
 begin_category "Conda runtime"

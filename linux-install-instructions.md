@@ -103,8 +103,12 @@ the kernel driver or install a system-wide CUDA toolkit.
   `pip uninstall reachaq-pose-yolo ultralytics`) before rerunning the
   installer, otherwise it restores the plugin.
 - `REACHAQ_INSTALL_SYSTEM=0` skips the steps that need root (apt packages,
-  groups, limits, systemd, the Spinnaker SDK) and reports them as `SKIP`. Use
+  groups, limits, systemd, FLIR camera access) and reports them as `SKIP`. Use
   it to rerun on a rig that already has them, for example after `reachaq-sync`.
+  An installed Spinnaker SDK is still checked; one that is missing stops the
+  install, because installing it needs root.
+- Run it as the operator, not with `sudo`: it asks for sudo itself, and under
+  sudo every per-user path would be root's. It refuses to run under `sudo`.
 - `REACHAQ_INSTALL_SPINNAKER=0` leaves out the Spinnaker steps on a host
   without FLIR cameras; `REACHAQ_SPINNAKER_DOWNLOADS` names the folder holding
   the Spinnaker download (default `~/Downloads`).

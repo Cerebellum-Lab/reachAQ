@@ -7,7 +7,7 @@ installed, so it needs only the standard library and must not import reachAQ.
 
 Prints one line per check, "ok: ..." or "unsupported: ...", and exits 0 when
 every check passed, 1 when any found an unsupported platform and 2 when the
-list itself cannot be read.
+list cannot be read or the check itself fails. Only 1 may be overridden.
 """
 
 from __future__ import annotations
@@ -34,8 +34,22 @@ Finding = Tuple[bool, str]
 def load_spec(path: Path) -> dict:
     with open(path, encoding="utf-8") as stream:
         spec = json.load(stream)
-    if spec.get("schema") != 1:
-        raise ValueError(f"{path}: unknown schema {spec.get('schema')!r}")
+    schema = spec.get("schema") if isinstance(spec, dict) else None
+    if schema != 1:
+        raise ValueError(f"{path}: unknown schema {schema!r}")
+    required = {
+        "operating_systems": list,
+        "architectures": list,
+        "nvidia": dict,
+        "spinnaker": dict,
+    }
+    for key, kind in required.items():
+        if not isinstance(spec.get(key), kind):
+            raise ValueError(f"{path}: {key!r} is missing or not a {kind.__name__}")
+    for key in ("min_driver", "min_compute_capability", "max_compute_capability"):
+        version_tuple(str(spec["nvidia"].get(key, "")))  # ValueError when absent or malformed
+    if not spec["spinnaker"].get("versions"):
+        raise ValueError(f"{path}: 'spinnaker.versions' is empty")
     return spec
 
 
@@ -156,9 +170,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     try:
         os_release = parse_os_release(args.os_release.read_text(encoding="utf-8"))
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         os_release = {}
-    findings = check_host(spec, os_release, args.machine, query_nvidia())
+    # Exit 1 must mean "not on the list" and nothing else: the installer's
+    # override accepts exactly that. A check that breaks is exit 2.
+    try:
+        findings = check_host(spec, os_release, args.machine, query_nvidia())
+    except Exception as error:  # noqa: BLE001 - any failure here is a broken check
+        print(f"the platform check failed: {error!r}", file=sys.stderr)
+        return 2
     return 0 if print_findings(findings) else 1
 
 
