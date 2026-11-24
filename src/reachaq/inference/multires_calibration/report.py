@@ -60,10 +60,13 @@ import cv2
 import numpy as np
 
 from reachaq.inference.multires_calibration.fit import (
+    CHARUCO,
     BoardSpec,
     CameraModel,
     MotorFrameFit,
     WaypointObservation,
+    usable_view,
+    valid_corners,
 )
 from reachaq.inference.multires_calibration.geometry import PresetGeometry
 
@@ -332,12 +335,15 @@ def build_report(
         return graded
 
     fitted = list(fit.cameras)
-    # The fitted cameras that found the board at each waypoint.
-    seen = [{cam for cam in o.corners if cam in fit.cameras} for o in observations]
+    # The fitted cameras that found the board at each waypoint: for a ChArUco board, those
+    # whose corners there are a view (fit.usable_view), so a co-visible view is one where
+    # both cameras pass that minimum.
+    seen = [{cam for cam, c in o.corners.items() if cam in fit.cameras and usable_view(c, board)}
+            for o in observations]
 
     # The capture.
     for cam in fitted:
-        counted = sum(cam in o.corners for o in observations)
+        counted = sum(cam in s for s in seen)
         add("views_kept", cam, capture.views_kept.get(cam, counted), "views")
         add("covisible_views", cam, sum(cam in s and len(s) > 1 for s in seen), "views")
     add("waypoints_unverified", None, capture.waypoints_total - capture.waypoints_verified, "waypoints",
@@ -348,6 +354,10 @@ def build_report(
         if rejected:
             detail = ", ".join(f"{reason} {count}" for reason, count in reasons.items())
             notes.append(f"{cam}: {rejected} views rejected ({detail})")
+    if board.kind == CHARUCO:
+        # A ChArUco view may be partial, so how much of the board each view held is shown.
+        for cam in fitted:
+            notes.append(_views_used_note(cam, fit, observations))
 
     # Each camera: its residual, its coverage and the sanity of its intrinsics.
     frame = (0.0, 0.0, float(fit.image_size[0]), float(fit.image_size[1]))
@@ -434,6 +444,18 @@ def build_report(
     )
 
 
+def _views_used_note(cam: str, fit: MotorFrameFit, observations: Sequence[WaypointObservation]) -> str:
+    """"{cam}: views used N of M waypoints, median K corners per view": N the views the fit
+    used, M the distinct waypoints, K the median of the corners fitted per view."""
+    used = fit.per_view_rms_px.get(cam, {})
+    counts = (fit.corner_counts or {}).get(cam)
+    if counts is None:
+        by_index = {o.index: o.corners[cam] for o in observations if cam in o.corners}
+        counts = {i: int(valid_corners(by_index[i]).sum()) for i in used if i in by_index}
+    median = float(np.median(list(counts.values()))) if counts else 0.0
+    return f"{cam}: views used {len(used)} of {len(observations)} waypoints, median {median:g} corners per view"
+
+
 def coverage_fraction(
     observations: Sequence[WaypointObservation], camera: str, roi_sensor: Tuple[float, float, float, float]
 ) -> float:
@@ -467,7 +489,8 @@ def write_coverage_images(
         cv2.rectangle(image, corner_a, corner_b, (0, 210, 255), 2)
         seen = [o for o in observations if cam in o.corners]
         for o in seen:
-            for u, v in np.asarray(o.corners[cam], float):
+            corners = np.asarray(o.corners[cam], float)
+            for u, v in corners[valid_corners(corners)]:
                 cv2.circle(image, (int(round(u)), int(round(v))), 2, (80, 80, 255), -1)
         label = f"{cam}: {coverage_fraction(observations, cam, roi_sensor):.2f} of ROI covered, {len(seen)} views"
         cv2.putText(image, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
@@ -518,7 +541,11 @@ def _hull_mask(observations, camera, origin, shape, scale) -> np.ndarray:
     for o in observations:
         if camera not in o.corners:
             continue
-        hull = cv2.convexHull(np.asarray(o.corners[camera], np.float32)).reshape(-1, 2).astype(float)
+        corners = np.asarray(o.corners[camera], np.float32)
+        corners = corners[valid_corners(corners)]  # a ChArUco view's detected corners
+        if len(corners) < 3:
+            continue
+        hull = cv2.convexHull(corners).reshape(-1, 2).astype(float)
         vertices = ((hull + 0.5 - offset) / scale - 0.5) * (1 << _FILL_SHIFT)
         cv2.fillPoly(mask, [np.round(vertices).astype(np.int32)], 255, lineType=cv2.LINE_8, shift=_FILL_SHIFT)
     return mask
@@ -562,12 +589,15 @@ def _max_distortion_shift(model: CameraModel, roi) -> float:
 def _stereo_checks(fit: MotorFrameFit, observations, board: BoardSpec, first: str, second: str):
     """(mean symmetric epipolar distance in sensor px, |mean triangulated square - square_mm| /
     square_mm, note) over the waypoints where both cameras found the board."""
-    both = [o for o in observations if first in o.corners and second in o.corners]
+    both = [o for o in observations if first in o.corners and second in o.corners
+            and usable_view(o.corners[first], board) and usable_view(o.corners[second], board)]
     if not both:
         return math.inf, math.inf, f"no waypoint has the board in both {first} and {second}"
     a, b = fit.cameras[first], fit.cameras[second]
-    na = _normalised(np.concatenate([o.corners[first] for o in both]), a)
-    nb = _normalised(np.concatenate([o.corners[second] for o in both]), b)
+    # The corners both cameras detected: every corner of a checkerboard.
+    common = np.concatenate([valid_corners(o.corners[first]) & valid_corners(o.corners[second]) for o in both])
+    na = _normalised(np.concatenate([o.corners[first] for o in both])[common], a)
+    nb = _normalised(np.concatenate([o.corners[second] for o in both])[common], b)
     ha = np.column_stack([na, np.ones(len(na))])
     hb = np.column_stack([nb, np.ones(len(nb))])
 
@@ -583,11 +613,14 @@ def _stereo_checks(fit: MotorFrameFit, observations, board: BoardSpec, first: st
     epipolar = float(np.mean((d_a + d_b) / 2))
 
     X = cv2.triangulatePoints(_projection(a), _projection(b), na.T, nb.T)
-    grid = (X[:3] / X[3]).T.reshape(len(both), board.rows, board.cols, 3)
+    points = np.full((len(common), 3), np.nan)
+    points[common] = (X[:3] / X[3]).T
+    grid = points.reshape(len(both), board.rows, board.cols, 3)
     steps = np.concatenate([
         np.linalg.norm(grid[:, :, 1:] - grid[:, :, :-1], axis=-1).ravel(),  # along each row
         np.linalg.norm(grid[:, 1:, :] - grid[:, :-1, :], axis=-1).ravel(),  # down each column
     ])
+    steps = steps[np.isfinite(steps)]  # the neighbours both ends of which both cameras found
     square = abs(float(steps.mean()) - board.square_mm) / board.square_mm
     return epipolar, square, f"{len(both)} waypoints with {first} and {second}"
 
@@ -640,10 +673,16 @@ def _leave_one_out(fit: MotorFrameFit, observations, cam: str) -> Tuple[Optional
         seen = [c for c in others if c in o.corners]
         if cam not in o.corners or len(seen) < 2:
             continue
-        X = _triangulate([fit.cameras[c] for c in seen], [o.corners[c] for c in seen])
+        # The corners every one of them detected: every corner of a checkerboard.
+        common = valid_corners(o.corners[cam])
+        for c in seen:
+            common = common & valid_corners(o.corners[c])
+        if not common.any():
+            continue
+        X = _triangulate([fit.cameras[c] for c in seen], [np.asarray(o.corners[c], float)[common] for c in seen])
         projected = cv2.projectPoints(X, np.asarray(model.rvec, float), np.asarray(model.tvec, float),
                                       model.K, model.dist)[0].reshape(-1, 2)
-        distances.append(np.linalg.norm(projected - np.asarray(o.corners[cam], float), axis=1))
+        distances.append(np.linalg.norm(projected - np.asarray(o.corners[cam], float)[common], axis=1))
         waypoints += 1
     if not distances:
         return None, ""
@@ -668,7 +707,13 @@ def _triangulate(models: Sequence[CameraModel], pixels: Sequence[np.ndarray]) ->
 def _joint_rms(fit: MotorFrameFit) -> float:
     """The RMS reprojection distance over every corner of every camera together, in sensor
     px: the residual of the joint fit itself. Every view has the same corners, so the mean
-    of the per-view mean squares is the mean over the corners. Infinite with no views."""
+    of the per-view mean squares is the mean over the corners. Infinite with no views.
+    Partial views (fit.corner_counts) are weighted by the corners each held."""
+    if fit.corner_counts:
+        weighted = [(v * v * fit.corner_counts.get(cam, {}).get(i, 1), fit.corner_counts.get(cam, {}).get(i, 1))
+                    for cam, views in fit.per_view_rms_px.items() for i, v in views.items()]
+        total = sum(n for _, n in weighted)
+        return math.sqrt(sum(s for s, _ in weighted) / total) if total else math.inf
     squares = [v * v for views in fit.per_view_rms_px.values() for v in views.values()]
     return math.sqrt(sum(squares) / len(squares)) if squares else math.inf
 
