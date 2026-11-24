@@ -325,6 +325,37 @@ def alert_for_pellet_axes(kind: str, axes: Tuple[str, ...]) -> Optional[Operator
     )
 
 
+def alert_for_pellet_estop(record: Optional[Mapping]) -> Optional[OperatorAlert]:
+    """The alert for a stopped pellet stage (HardwareModel.pellet_estop), or None once homed.
+
+    A condition: it clears itself when a home succeeds. A stop the host decided
+    on asks for a dialog; the operator's own STOP does not, and is not called a
+    failure.
+    """
+    if not record:
+        return None
+    remedy = "Check nothing blocks the pellet axes, then Hardware Control ▸ Home."
+    if record.get("operator"):
+        return OperatorAlert(
+            key="pellet:estop",
+            severity=AlertSeverity.WARNING,
+            title="Pellet stage stopped by the operator",
+            message="STOP was pressed in Hardware Control. Home before continuing.",
+            remedy=remedy,
+            is_condition=True,
+        )
+    sent = "" if record.get("sent", True) else " The ESTOP could not be written to the CAN bus."
+    return OperatorAlert(
+        key="pellet:estop",
+        severity=AlertSeverity.ERROR,
+        title="Pellet stage stopped",
+        message=f"Pellet stage stopped: {record.get('reason', 'unknown reason')}. Home before continuing.{sent}",
+        remedy=remedy,
+        needs_dialog=True,
+        is_condition=True,
+    )
+
+
 Listener = Callable[[], None]
 DialogListener = Callable[[OperatorAlert], None]
 
@@ -519,6 +550,13 @@ class OperatorAlertBridge:
     @_guarded
     def _on_hardware_property_changed(self, name, value, _previous) -> None:
         hardware = self._app_model.hardware
+        if name == getattr(hardware, "PELLET_ESTOP_PROPERTY", None):
+            alert = alert_for_pellet_estop(value)
+            if alert is None:
+                self.center.clear("pellet:estop")
+            else:
+                self.center.raise_alert(alert)
+            return
         kinds = {
             getattr(hardware, "PELLET_NEEDS_HOME_PROPERTY", None): "needs_home",
             getattr(hardware, "PELLET_DRIVER_FAULT_PROPERTY", None): "driver_fault",
@@ -591,6 +629,7 @@ __all__ = [
     "alert_for_early_stop",
     "alert_for_error",
     "alert_for_pellet_axes",
+    "alert_for_pellet_estop",
     "alert_for_subsystem",
     "subsystem_display_name",
 ]
