@@ -208,7 +208,16 @@ ReachAQ checks each stage target against the travel before it sends anything:
   recorded as applied: the last processed shift (the `applied_shift` of later
   pellet-cycle records) keeps its previous value, the `intertrialPelletShift`
   event carries `applied: false` and the `refusal` reason, and a tongue-eaten
-  shift's y-limit is not saved to the animal.
+  shift's y-limit is not saved to the animal. A shift whose SETs fail with an
+  error (for example a relative SET before any SET since the connect) is
+  posted the same way, with the error as the reason. `applied` is true only
+  when every shifted axis was sent to the board. A shift that is disabled (in
+  Preferences or by a training-plan phase), that has no pellet device, or
+  whose SET was not queued is posted with `applied: false` and that reason,
+  and is not recorded as the last processed shift.
+- **Changed with this:** a tongue-eaten y-limit is saved to the animal only
+  when its shift was applied. While the intersession shift is disabled, a
+  tongue-eaten result no longer sets the animal's y-limit.
 - **The `move_config.yaml` sequences** (`load_pellet`, `send_pellet`,
   `cover_pellet`, `release_pellet`, `move_retract`, or their built-in
   defaults). Every stepper step is checked before the sequence starts, as
