@@ -423,6 +423,23 @@ class StepperConfig(MotorSource):
         self._maximum_position = value
 
 
+def stepper_travel_refusal(axis: str, target: float, config) -> Optional[str]:
+    """The error to log when `target` (mm) lies outside the travel of the stepper `config`
+    (StepperConfig.minimum_position / maximum_position), else None. An unset side is not
+    limited, so a config without travel never refuses. A non-finite target is refused once
+    any side is set."""
+    minimum = getattr(config, "minimum_position", None)
+    maximum = getattr(config, "maximum_position", None)
+    if minimum is None and maximum is None:
+        return None
+    low = -math.inf if minimum is None else minimum
+    high = math.inf if maximum is None else maximum
+    if low <= target <= high:
+        return None
+    return (f"Axis-{axis.upper()}: move to {target:.3f} refused: "
+            f"outside the configured travel {low:g}-{high:g} mm")
+
+
 #: STEPPER_STATUS.status bits (pellet firmware 2.3.1). A v1.2 board always sends 0.
 STEPPER_STATUS_DRIVER_FAULT = 0x01  # this motor's driver raised DIAG; latched until a re-home
 STEPPER_STATUS_ENABLE_OFF = 0x02  # the shared enable is off, for any reason

@@ -24,7 +24,7 @@ from autotrainer.device import (CanTransportConfiguration, CanTransportKind, Dev
                                 DeviceConnection, CanDevice, CanFailure, CanFailureKind, CommandRefusedError,
                                 StepperConfig, ServoConfig, Device, ColorLed, Target, EmulationInterface,
                                 capture_can_diagnostics)
-from autotrainer.device.device_interface import BOARD_STIM_LINE_OUTPUTS
+from autotrainer.device.device_interface import BOARD_STIM_LINE_OUTPUTS, stepper_travel_refusal
 from autotrainer.behavior import PelletDeviceProtocol
 from tools.acquisition.model.firmware_compatibility import FirmwareCompatibilityPolicy
 
@@ -365,6 +365,21 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     def requires_connection(self) -> bool:
         return self._can_enabled and self._pellet_controller_enabled
 
+    def _refuse_outside_travel(self, coord_idx: int, target: float) -> bool:
+        """True, after logging an error, when the absolute `target` (mm) of axis `coord_idx`
+        lies outside its travel in the loaded motor configurations (min_pos / max_pos in
+        motor_config.yaml). False when it is inside, or when no travel is configured."""
+        configurations = self._motor_configurations
+        if configurations is None:
+            return False
+        coord = "xyz"[coord_idx]
+        _, config = getattr(configurations, f"{coord}_config")
+        refusal = stepper_travel_refusal(coord, target, config)
+        if refusal is None:
+            return False
+        logger.error(refusal)
+        return True
+
     def _set_axis(self, value: float, *, absolute: bool = True,
                   system_set_cmd: SystemCommandKind, coord_idx: int, sender: str="NA") -> Optional[UUID]:
         coord = "xyz"[coord_idx]
@@ -385,6 +400,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             new_value = 0
             logger.verbose("Axis-%s: limited move to 0 ; value=%.3f absolute=%s",
                          coord.upper(), value, absolute)
+        if self._refuse_outside_travel(coord_idx, new_value):
+            return None
         res = self._send_with_token(self._device_conn, system_set_cmd,
                                     SystemDataArgsKwargs(value, relative=not absolute))
         if res is not None:
@@ -427,6 +444,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                                "XYZ"[coord_idx])
                 return None
             value += prev_value
+        if self._refuse_outside_travel(coord_idx, value):
+            return None
         res = self._send_with_token(self._device_conn, system_move_cmd, value)
         return res
 

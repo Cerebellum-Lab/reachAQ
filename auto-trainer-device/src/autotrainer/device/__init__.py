@@ -10,6 +10,7 @@ from .can_interface import (CanInterface, motor_to_str, target_to_str, is_steppe
 from .device_connection import DeviceConnection
 from .device_connection_protocol import DeviceConnectionProtocol
 from .device_interface import (DeviceInterface, Target, Motor, ServoConfig, StepperConfig,
+                               stepper_travel_refusal,
                                Heartbeat, DigitalOutputs, PelletDigitalInputs,
                                BoardTimeSync, BoardCapabilities, DigitalPulseStatus,
                                SyncClapObservation, SyncBarcodeReport,
