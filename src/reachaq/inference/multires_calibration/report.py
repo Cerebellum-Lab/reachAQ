@@ -358,6 +358,8 @@ def build_report(
         # A ChArUco view may be partial, so how much of the board each view held is shown.
         for cam in fitted:
             notes.append(_views_used_note(cam, fit, observations))
+    if fit.placement is not None:
+        notes.extend(placement_notes(fit.placement))
 
     # Each camera: its residual, its coverage and the sanity of its intrinsics.
     frame = (0.0, 0.0, float(fit.image_size[0]), float(fit.image_size[1]))
@@ -442,6 +444,47 @@ def build_report(
         cameras=verdicts,
         verdict_note=verdict_note,
     )
+
+
+# A view whose board stood further than this from its commanded position is named in the report.
+PLACEMENT_FLAG_MM = 1.0
+
+
+def placement_notes(placement) -> List[str]:
+    """The per-view fit's stage diagnostics (fit.MotorPlacement) as report notes: the
+    similarity's scale and RMS, each view placed more than PLACEMENT_FLAG_MM from its commanded
+    position, by name, the board tilt, and every view's residual. They are stage-accuracy
+    warnings; the calibration does not depend on them."""
+    residual = placement.residual_mm
+    inliers = len(residual) - len(placement.outliers)
+    notes = [
+        f"motor placement (per-view fit): similarity scale {placement.scale:.4f}, RMS {placement.rms_mm:.2f} mm"
+        f" over {inliers} of {len(residual)} views"
+        + (f"; left out of it (more than 3 MAD off): waypoints {', '.join(str(w) for w in placement.outliers)}"
+           if placement.outliers else "")
+    ]
+    for w, r in residual.items():
+        if math.hypot(*r) > PLACEMENT_FLAG_MM:
+            axis = int(np.argmax(np.abs(r)))
+            side = "short of" if r[axis] < 0 else "past"
+            notes.append(
+                f"waypoint {w}: board {abs(r[axis]):.1f} mm {side} commanded {'xyz'[axis]}"
+                f" (x {r[0]:+.2f}, y {r[1]:+.2f}, z {r[2]:+.2f} mm; tilt {placement.tilt_deg.get(w, 0.0):.2f} deg)"
+            )
+    if placement.tilt_deg:
+        worst = max(placement.tilt_deg, key=placement.tilt_deg.get)
+        notes.append(
+            f"board tilt from its mean rotation: median {float(np.median(list(placement.tilt_deg.values()))):.2f} deg,"
+            f" max {placement.tilt_deg[worst]:.2f} deg (waypoint {worst}); the stage turned the board between waypoints"
+        )
+    axes = getattr(placement, "tilt_axis", {}) or {}
+    notes.append("board tilt per waypoint, deg (axis in motor x, y, z): " + "; ".join(
+        f"{w} {placement.tilt_deg[w]:.2f}"
+        + (" ({:+.2f}, {:+.2f}, {:+.2f})".format(*axes[w]) if w in axes else "")
+        for w in placement.tilt_deg))
+    notes.append("per-view motor residual, mm (x, y, z): " + "; ".join(
+        f"{w} ({r[0]:+.2f}, {r[1]:+.2f}, {r[2]:+.2f})" for w, r in residual.items()))
+    return notes
 
 
 def _views_used_note(cam: str, fit: MotorFrameFit, observations: Sequence[WaypointObservation]) -> str:

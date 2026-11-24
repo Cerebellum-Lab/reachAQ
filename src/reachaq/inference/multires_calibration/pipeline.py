@@ -25,7 +25,9 @@ calibrate_capture turns it into a calibration folder (store.py):
    than 2 calibrated cameras refuse the calibration (CalibrationRefused).
 3. Every calibrated camera is put in one 180-degree board order
    (fit.reconcile_corner_order); the report notes a camera that had to be reversed.
-4. The calibrated cameras are fitted jointly, once, in sensor pixels (fit.fit_motor_frame),
+4. The calibrated cameras are fitted jointly, once, in sensor pixels: by default with a free
+   board pose per view for a ChArUco board (per_view.fit_per_view), with the motor-frame
+   model for a checkerboard (fit.fit_motor_frame); `fit_mode` picks either,
    and every preset's intrinsics are mapped from that fit (geometry.map_intrinsics) when
    the store writes it: an anipose TOML for every calibrated camera in sensor pixels and
    for each preset set, plus the left-right extras where left and right share a geometry.
@@ -96,6 +98,12 @@ from reachaq.inference.multires_calibration.geometry import (
     map_intrinsics,
     presets_for_cameras,
     sensor_to_preset_points,
+)
+from reachaq.inference.multires_calibration.per_view import (
+    FIT_MODES,
+    FIT_MOTOR_FRAME,
+    default_fit_mode,
+    fit_per_view,
 )
 from reachaq.inference.multires_calibration.report import (
     CameraVerdict,
@@ -355,6 +363,7 @@ def calibrate_capture(
     refine: str = "subpix",
     preset_sets: Optional[Sequence[PresetSet]] = None,
     live_geometries: Optional[Mapping[str, PresetGeometry]] = None,
+    fit_mode: Optional[str] = None,
 ) -> Tuple[CalibrationIndex, QualityReport]:
     """Calibrate every preset in `presets` from the capture in `capture_dir` and write the
     calibration to `output_dir`, which must not exist yet.
@@ -368,12 +377,16 @@ def calibrate_capture(
     fit from the calibrated cameras only (calibrated_preset_sets), so a camera left 2D only
     neither duplicates a set nor costs the others a binning; it must name every camera.
     `previous_dir` is the calibration this one replaces, if any. `refine` is
-    extract.detect_board's corner refinement.
+    extract.detect_board's corner refinement. `fit_mode` is per_view.FIT_PER_VIEW or
+    FIT_MOTOR_FRAME; None is per_view.default_fit_mode(board). The cross-checks use the same.
 
     Only the cameras that meet per_camera_rule are fitted; the report's `cameras` gives
     every camera's verdict. Raises CalibrationRefused, writing nothing, when fewer than 2 do.
     """
     capture_dir, output_dir = Path(capture_dir), Path(output_dir)
+    fit_mode = default_fit_mode(board) if fit_mode is None else fit_mode
+    if fit_mode not in FIT_MODES:
+        raise ValueError(f"fit_mode must be one of {FIT_MODES}, got {fit_mode!r}")
     # Refused before minutes of extraction and fitting, not after.
     if output_dir.exists():
         raise FileExistsError(f"{output_dir} already exists; a calibration folder is never overwritten")
@@ -430,11 +443,12 @@ def calibrate_capture(
     observations, reversed_order = reconcile_corner_order(kept, board, image_size, calibrated)
     logger.info("calibration capture: %d distinct waypoints; fitting %d of %d cameras",
                 len(observations), len(calibrated), len(cameras))
-    fit = fit_motor_frame(observations, board, image_size, calibrated)
+    fit = _fit(fit_mode, observations, board, image_size, calibrated)
 
     notes: List[str] = []
     cross_checks = _cross_checks(
-        {cam: videos[cam] for cam in calibrated}, extraction.segments, observations, fit, presets, board, refine, notes
+        {cam: videos[cam] for cam in calibrated}, extraction.segments, observations, fit, presets, board, refine, notes,
+        fit_mode,
     )
     for cam, flipped in reversed_order.items():
         if flipped:
@@ -498,6 +512,9 @@ def calibrate_capture(
         # install copies again and every backup keeps (two 1440x1080 videos a month).
         "capture_folder": str(capture_dir.resolve()),
     }
+    if fit_mode != FIT_MOTOR_FRAME:
+        # Recorded only when it is not the motor-frame fit, so those calibrations read as before.
+        capture["fit"] = fit_mode
     with tempfile.TemporaryDirectory(prefix="calibration_coverage_") as tmp:
         # Every camera's, from extraction: a 2D-only camera's shows what it did see. The
         # hulls do not depend on the corner order.
@@ -536,6 +553,13 @@ def calibrated_preset_sets(live: Mapping[str, PresetGeometry], calibrated: Seque
     return presets_for_cameras({cam: live[cam] for cam in calibrated})
 
 
+def _fit(mode: str, *args, **kwargs) -> MotorFrameFit:
+    """fit_motor_frame or fit_per_view, by `mode` (per_view.fit_cameras, through this module's names)."""
+    if mode == FIT_MOTOR_FRAME:
+        return fit_motor_frame(*args, **kwargs)
+    return fit_per_view(*args, **kwargs)
+
+
 def _cross_checks(
     videos: Mapping[str, Path],
     segments: Mapping[str, List[Tuple[int, int]]],
@@ -545,6 +569,7 @@ def _cross_checks(
     board: BoardSpec,
     refine: str,
     notes: List[str],
+    fit_mode: str = FIT_MOTOR_FRAME,
 ) -> List[PresetCrossCheck]:
     """A PresetCrossCheck per binned preset, in the order of `presets`; a failed fit adds a note.
 
@@ -602,8 +627,8 @@ def _cross_checks(
             # synthetic capture ran out of evaluations. The start does not move the optimum:
             # from the mapped K, from one 1 % and 2 px off, and from the edge-convention
             # mapping, the fit reached the same K to 1e-4 px.
-            direct = fit_motor_frame(
-                preset_observations, board, (g.width, g.height), tuple(videos), initial=_mapped_fit(fit, g)
+            direct = _fit(
+                fit_mode, preset_observations, board, (g.width, g.height), tuple(videos), initial=_mapped_fit(fit, g)
             )
         except (RuntimeError, ValueError) as error:
             logger.warning("cross-check %s: the direct fit failed: %s", g.name, error)

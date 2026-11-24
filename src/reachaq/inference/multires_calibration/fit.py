@@ -28,7 +28,7 @@ covered area no better.
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -219,6 +219,9 @@ class MotorFrameFit:
     # camera -> waypoint index -> corners fitted in that view, when the views were partial
     # (a ChArUco board); None when every view held every corner. Not stored with the fit.
     corner_counts: Optional[Dict[str, Dict[int, int]]] = None
+    # How the per-view fit (per_view.fit_per_view) placed its views in the motor frame; None
+    # for the motor-frame fit, whose model places them exactly. Not stored with the fit.
+    placement: Optional["MotorPlacement"] = None
 
     def stereo(self, first: str, second: str) -> Tuple[np.ndarray, np.ndarray]:
         """(R, T) with X_second = R @ X_first + T, T in mm, for cameras `first` and `second`."""
@@ -227,6 +230,23 @@ class MotorFrameFit:
         R_b = cv2.Rodrigues(np.asarray(b.rvec, float))[0]
         R = R_b @ R_a.T
         return R, np.asarray(b.tvec, float).reshape(3) - R @ np.asarray(a.tvec, float).reshape(3)
+
+
+@dataclass
+class MotorPlacement:
+    """The similarity that places a per-view fit in the motor frame: each view's board origin
+    o_w (in the reference camera's frame, mm) ~ scale * R @ m_w + t for commanded motor
+    position m_w. Stage-accuracy diagnostics, not calibration quality."""
+
+    scale: float
+    rms_mm: float  # RMS of the inlier views' residuals
+    # waypoint index -> where the board was minus where it was commanded, in motor mm (x, y, z)
+    residual_mm: Dict[int, Tuple[float, float, float]]
+    # waypoint index -> the board's rotation from the mean board rotation, degrees
+    tilt_deg: Dict[int, float]
+    outliers: List[int]  # waypoints left out of the similarity (more than 3 MAD off)
+    # waypoint index -> the unit axis of that rotation in the motor frame (zero for none)
+    tilt_axis: Dict[int, Tuple[float, float, float]] = field(default_factory=dict)
 
 
 @dataclass
