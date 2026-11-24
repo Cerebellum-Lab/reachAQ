@@ -389,7 +389,8 @@ The per-view fit adds stage-accuracy notes to the report: the similarity's scale
 and RMS, each waypoint more than 1 mm from its commanded position by name (for
 example `waypoint 13: board 3.3 mm short of commanded z`), each waypoint's board
 tilt and its axis in the motor frame, and every waypoint's residual. They are
-warnings about the stage, not the calibration; `motor_scale_dev` stays a warning.
+warnings about the stage, not the calibration. The report's stage-accuracy block
+grades them (see The quality report): it warns and never fails.
 
 `fit_principal_point: centre` holds every camera's principal point at the image
 centre in the per-view fit (default `free`). The board only translates, so its
@@ -976,6 +977,28 @@ possible with 2 cameras` (always so with 2 calibrated cameras), or `... not
 possible for any camera` with 3 or more. The JSON keeps the same text as
 `verdict_note`.
 
+Each camera has two reprojection RMS values, and only one of them is graded:
+
+- `reprojection_rms_px` grades the camera. It comes from the camera's own planar
+  fit: `cv2.calibrateCamera` on its corners, with every view's board pose free.
+  It uses the joint fit's distortion model (k1 k2 p1 p2, k3 held at 0). With
+  `fit_principal_point: centre`, the principal point is held where the joint fit
+  put it. Because the poses are free, stage error cannot enter it. It measures
+  the camera model and the corner detection alone.
+- `joint_reprojection_rms_px` is the same camera's RMS in the stage-tied joint
+  fit. There, each view's board is held to its commanded position through the
+  stage model. Any board placement that the stage model does not describe adds
+  to it, so it only warns: it grades the stage model, not the camera. When it is
+  well above `reprojection_rms_px`, read the stage-accuracy block.
+
+The stage-accuracy block reports measured numbers only. It names no cause.
+
+The text report lists the stage-accuracy metrics after the others, under
+`Stage accuracy (the stage, not the calibration; warns, never fails):`. They are
+`motor_scale_dev`, `stage_slack_rms_mm` and `stage_repeat_mm`. The last two
+come from the per-view fit's placement, so a motor-frame fit has only
+`motor_scale_dev`.
+
 Only the calibrated cameras are graded. A pair metric is graded for every pair
 of them that saw the board at the same position, and its camera is the pair,
 for example `left-right`.
@@ -984,8 +1007,9 @@ for example `left-right`.
 | --- | --- | --- | --- | --- |
 | `views_kept` | camera | < 20 | < 10 | Distinct positions where this camera's board detection was kept (at most 36) |
 | `covisible_views` | camera | < 8 | < 4 | Its views that another calibrated camera also saw. The fit does not need them; they expose stage geometry the model leaves out (axis skew) |
-| `reprojection_rms_px` | camera | > 0.5 | > 1.0 | RMS distance between detected corners and the fit's projection, sensor px |
-| `preset_reprojection_rms_px` | camera, per preset | none | none | Informational. The same RMS in that preset's pixels (sensor RMS / binning); the note names the preset |
+| `reprojection_rms_px` | camera | > 0.5 | > 1.0 | RMS distance between detected corners and the camera's own planar fit (every view's board pose free), sensor px |
+| `joint_reprojection_rms_px` | camera | > 1.0 | none | RMS distance between detected corners and the stage-tied joint fit's projection, sensor px. Includes stage error, so it only warns |
+| `preset_reprojection_rms_px` | camera, per preset | none | none | Informational. The joint RMS in that preset's pixels (sensor RMS / binning); the note names the preset |
 | `coverage_roi_fraction` | camera | < 0.5 | < 0.25 | Fraction of the base preset's sensor window inside the union of the detected-corner hulls |
 | `coverage_frame_fraction` | camera | none | none | Informational. The same coverage as a fraction of the full 1440 x 1080 sensor frame |
 | `fx_fy_ratio_dev` | camera | > 0.01 | > 0.03 | \|fx/fy - 1\|; a large value is a sign of a poorly constrained fit |
@@ -998,7 +1022,9 @@ for example `left-right`.
 | `epipolar_error_px` | pair | > 0.5 | > 1.0 | Mean symmetric epipolar distance, sensor px, over positions both cameras saw |
 | `square_size_rel_error` | pair | > 0.01 | > 0.03 | \|mean triangulated square - 4 mm\| / 4 mm |
 | `loo_triangulation_px` | camera, 3 or more cameras | > 0.5 | > 1.0 | Median distance, sensor px, between this camera's corners and the points the other calibrated cameras triangulate, projected into it, over positions it and at least two others saw |
-| `motor_scale_dev` | capture | > 0.01 | none | \|motor scale - 1\|: true travel (from the board's squares) against commanded travel |
+| `motor_scale_dev` | capture | > 0.01 | none | Stage accuracy. \|motor scale - 1\|: true travel (from the board's squares) against commanded travel |
+| `stage_slack_rms_mm` | motor axis (x, y, z) | > 1.0 | none | Stage accuracy, per-view fit only. RMS over every view of where the board was minus where the stage model put it, along that motor axis |
+| `stage_repeat_mm` | waypoint pair | > 0.5 | none | Stage accuracy, per-view fit only, for a position visited twice. Distance the board moved between the two visits; the note gives it per axis |
 | `waypoints_unverified` | capture | > 0 | none | Positions where the motor's reported position did not come within 0.05 mm of the command in time. Verified means the motor reported the commanded position, not a traced arrival |
 | `waypoints_unreached` | capture | none | > 0 | Positions where the reported position was more than 0.1 mm from the commanded one on some axis. The fit places the board at the commanded position, so any such view is in the wrong place. A position with no finite reported position is not counted |
 | `cross_check_delta_px` | binned preset | > 1.5 | none | Largest difference in fx, fy, cx or cy between a direct fit in the preset's own pooled frames and the mapped sensor fit, preset px. Informational: the direct fit has a noise floor near 0.5 px |

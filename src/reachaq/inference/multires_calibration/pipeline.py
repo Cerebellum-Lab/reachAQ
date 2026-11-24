@@ -513,7 +513,8 @@ def calibrate_capture(
         "lenses": lenses.by_camera(log.cameras), "pixel_um": lenses.pixel_um}
     # The capture records the full sensor at binning 1, so a fitted px is a sensor px.
     report = build_report(fit, observations, board, base.sensor_roi(), summary, cross_checks, previous,
-                          presets=presets, cameras=verdicts, **lens_options)
+                          presets=presets, cameras=verdicts,
+                          fix_principal_point="fix_principal_point" in per_view_options, **lens_options)
     report.notes.extend(notes)
 
     capture = {

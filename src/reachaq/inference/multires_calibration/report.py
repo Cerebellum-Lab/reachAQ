@@ -24,6 +24,14 @@ status UNDETERMINED and value None: it is neither a pass nor a fail and does not
 verdict. When no camera can be checked (always so with 2 fitted cameras), the report's
 verdict_note says so, so the verdict does not read as a fully checked pass.
 
+Two RMS per camera. reprojection_rms_px, which grades the camera, is its own planar fit's
+(planar_rms_px): its intrinsics against its corners with every view's board pose free, so it
+measures the camera model and the corner detection alone. joint_reprojection_rms_px is the
+same camera's RMS in the stage-tied joint fit, where each view's board is held to its
+commanded position through the stage model; any board placement the model does not describe
+adds to it, so it only warns. The
+stage itself is graded in its own block (STAGE_METRICS), which warns and never fails.
+
 The fit has 2 to 6 cameras. Per-camera metrics are graded for every fitted camera, and the
 pair metrics for every co-visible pair (two cameras that saw the board at a common
 waypoint), with the pair named "a-b" in the fit's camera order. A camera the pipeline's
@@ -79,7 +87,12 @@ DEFAULT_THRESHOLDS: Thresholds = {
     # The views a camera shares with another fitted camera; the fit does not need them, but
     # they expose stage geometry the model leaves out (axis skew).
     "covisible_views": (8.0, 4.0),
+    # Each camera's own planar fit (planar_rms_px): its corners against its intrinsics with
+    # every view's board pose free, so stage error cannot enter it.
     "reprojection_rms_px": (0.5, 1.0),
+    # The same camera's RMS in the stage-tied joint fit: the planar residual plus whatever the
+    # stage model leaves (board placement, tilt). A warning about the stage model, never a fail.
+    "joint_reprojection_rms_px": (1.0, None),
     "coverage_roi_fraction": (0.5, 0.25),
     "fx_fy_ratio_dev": (0.01, 0.03),
     "focal_rel_std": (0.005, 0.02),
@@ -97,6 +110,11 @@ DEFAULT_THRESHOLDS: Thresholds = {
     # the other cameras triangulate, projected into it.
     "loo_triangulation_px": (0.5, 1.0),
     "motor_scale_dev": (0.01, None),
+    # Stage accuracy (STAGE_METRICS), per-view fit only: per motor axis, the RMS over every
+    # view of where the board was minus where the stage model put it; and, for a position
+    # visited twice, how far apart the board was on the two visits. UNFINALIZED: 1.0 and 0.5 mm.
+    "stage_slack_rms_mm": (1.0, None),
+    "stage_repeat_mm": (0.5, None),
     "waypoints_unverified": (0.0, None),
     # A waypoint the motor reported elsewhere than commanded puts its view where the board
     # was not: the fit takes the commanded position, so any such waypoint fails.
@@ -120,6 +138,11 @@ DEFAULT_THRESHOLDS: Thresholds = {
     "baseline_mm": (None, None),
     "coverage_frame_fraction": (None, None),
 }
+# The stage-accuracy metrics: how well the stage put the board where it was commanded. They
+# warn and never fail, and the text report lists them in a block of their own after the
+# calibration's metrics.
+STAGE_METRICS = ("motor_scale_dev", "stage_slack_rms_mm", "stage_repeat_mm")
+STAGE_HEADING = "Stage accuracy (the stage, not the calibration; warns, never fails):"
 # The metrics where a smaller value is worse; see the module docstring.
 LOWER_IS_WORSE = frozenset({"views_kept", "covisible_views", "coverage_roi_fraction", "coverage_frame_fraction"})
 NO_PREVIOUS_NOTE = "no comparable previous calibration"
@@ -241,7 +264,7 @@ class QualityReport:
 
     def to_text(self) -> str:
         """A summary for the operator: every camera that is not calibrated, then the verdict,
-        then every metric, failures first."""
+        then every calibration metric, failures first, then the stage-accuracy block."""
         counts = {s: sum(m.status == s for m in self.metrics) for s in _DISPLAY_ORDER}
         undetermined = f", {counts[UNDETERMINED]} {UNDETERMINED}" if counts[UNDETERMINED] else ""
         lines = [f"{NOT_CALIBRATED}: {v.name}: {v.reason}" for v in self.cameras.values() if not v.calibrated]
@@ -255,11 +278,15 @@ class QualityReport:
             details = ", ".join(f"{key} {value}" for key, value in self.override.items())
             lines.append(f"Override recorded: {details}")
         lines.append("")
-        # sorted is stable, so metrics of one status keep the order they were graded in.
-        for m in sorted(self.metrics, key=lambda m: _DISPLAY_ORDER.index(m.status)):
-            value = "-" if m.value is None else f"{_format_value(m.value)} {m.unit}"
-            line = f"{m.status.upper():<5} {m.name:<30}{m.camera or '-':<7}{value}  [{_format_limits(m)}]"
-            lines.append(f"{line}  {m.note}" if m.note else line)
+        stage = [m for m in self.metrics if m.name in STAGE_METRICS]
+        for block in ([m for m in self.metrics if m.name not in STAGE_METRICS], stage):
+            if block is stage and stage:
+                lines.extend(["", STAGE_HEADING])
+            # sorted is stable, so metrics of one status keep the order they were graded in.
+            for m in sorted(block, key=lambda m: _DISPLAY_ORDER.index(m.status)):
+                value = "-" if m.value is None else f"{_format_value(m.value)} {m.unit}"
+                line = f"{m.status.upper():<5} {m.name:<30}{m.camera or '-':<7}{value}  [{_format_limits(m)}]"
+                lines.append(f"{line}  {m.note}" if m.note else line)
         if self.notes:
             lines.append("")
             lines.append("Notes:")
@@ -313,13 +340,19 @@ def build_report(
     lenses: Optional[Mapping[str, float]] = None,
     pixel_um: Optional[float] = None,
     binning: int = 1,
+    fix_principal_point: bool = False,
 ) -> QualityReport:
     """Grade `fit` and its capture against `thresholds`.
 
     roi_sensor is the base preset's sensor_roi(), in pixel edges. Only the fit's cameras are
     graded, and only their corners in `observations` are used. The pair checks cover every
-    pair of them that saw the board at a common waypoint. Each camera's RMS is also reported
-    in the pixels of every preset in `presets`.
+    pair of them that saw the board at a common waypoint.
+
+    Each camera's graded reprojection_rms_px is its own planar fit's (planar_rms_px), which
+    holds the principal point at the fit's when `fix_principal_point` (the per-view fit's
+    `fit_principal_point: centre`). Its RMS in the joint fit is joint_reprojection_rms_px,
+    which only warns, and is also reported in the pixels of every preset in `presets`. A
+    per-view fit's placement adds the stage-accuracy metrics (STAGE_METRICS).
 
     `cameras` is every capture camera's verdict, in capture order; a fitted camera it leaves
     out is calibrated, and by default every fitted camera is. The verdict is "fail" if any
@@ -374,8 +407,10 @@ def build_report(
     for cam in fitted:
         model = fit.cameras[cam]
         fx, fy = model.K[0, 0], model.K[1, 1]
+        planar, planar_note = planar_rms_px(observations, board, fit.image_size, cam, model, fix_principal_point)
+        add("reprojection_rms_px", cam, planar, "sensor px", planar_note)
         rms = fit.rms_px.get(cam, math.inf)
-        add("reprojection_rms_px", cam, rms, "sensor px")
+        add("joint_reprojection_rms_px", cam, rms, "sensor px", JOINT_RMS_NOTE)
         for g in presets:
             # A binned pixel is b sensor pixels wide, so a distance in sensor px is 1/b of it in preset px.
             add("preset_reprojection_rms_px", cam, rms / g.binning, "preset px", f"preset {g.name}")
@@ -443,7 +478,18 @@ def build_report(
             else:
                 loo_checked = True
                 add("loo_triangulation_px", cam, loo, "sensor px", loo_note)
+    # Stage accuracy.
     add("motor_scale_dev", None, abs(fit.motor_scale - 1.0), "ratio")
+    if fit.placement is not None:
+        residual = fit.placement.residual_mm
+        r = np.array(list(residual.values()), float).reshape(-1, 3)
+        for axis, name in enumerate("xyz"):
+            add("stage_slack_rms_mm", name, float(np.sqrt(np.mean(r[:, axis] ** 2))) if len(r) else math.inf, "mm",
+                f"motor {name}, over all {len(r)} views")
+        for a, b, commanded, d in repeat_visits(observations, residual):
+            add("stage_repeat_mm", f"{a}-{b}", float(np.linalg.norm(d)), "mm",
+                f"waypoints {a} and {b} at commanded {_format_xyz_mm(commanded)}:"
+                f" board moved x {d[0]:+.2f}, y {d[1]:+.2f}, z {d[2]:+.2f} mm between visits")
     for check in cross_checks:
         add("cross_check_delta_px", None, check.max_intrinsic_delta_px, "preset px", f"preset {check.geometry.name}")
         add("cross_check_corner_offset_px", None, check.corner_offset_px, "preset px", f"preset {check.geometry.name}")
@@ -478,6 +524,75 @@ def build_report(
 
 # A view whose board stood further than this from its commanded position is named in the report.
 PLACEMENT_FLAG_MM = 1.0
+# A planar fit needs views of the board in this many poses to separate the intrinsics.
+_PLANAR_MIN_VIEWS = 3
+_PLANAR_CRITERIA = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 100, 1e-10)
+PLANAR_RMS_NOTE = "the camera's own planar fit, every view's board pose free"
+JOINT_RMS_NOTE = "the stage-tied joint fit: the planar residual plus what the stage model leaves"
+
+
+def planar_rms_px(
+    observations: Sequence[WaypointObservation],
+    board: BoardSpec,
+    image_size: Tuple[int, int],
+    camera: str,
+    model: CameraModel,
+    fix_principal_point: bool = False,
+) -> Tuple[float, str]:
+    """(RMS px, note) of `camera`'s own planar calibration: cv2.calibrateCamera on its valid
+    corners in every view (fit.usable_view), each view's board pose free, with the joint fit's
+    distortion model (k1 k2 p1 p2, k3 held at 0), started from `model`'s intrinsics and, with
+    `fix_principal_point`, holding its principal point there.
+
+    Every view is a near-parallel plane, so the planar fit cannot pin the focal length; its
+    RMS is still the camera model's own residual, since the free poses take up any stage
+    error. +inf, with a note, when the camera has fewer than _PLANAR_MIN_VIEWS views or the
+    fit fails."""
+    obj = board.object_points().astype(np.float32)
+    image_points, object_points = [], []
+    for o in observations:
+        corners = o.corners.get(camera)
+        if corners is None or not usable_view(corners, board):
+            continue
+        ok = valid_corners(corners)
+        image_points.append(np.asarray(corners, float)[ok].astype(np.float32).reshape(-1, 1, 2))
+        object_points.append(obj[ok])
+    if len(image_points) < _PLANAR_MIN_VIEWS:
+        return math.inf, f"planar fit not possible: {len(image_points)} views, {_PLANAR_MIN_VIEWS} needed"
+    K = np.array(model.K, float)
+    dist = np.zeros(5)
+    dist[:4] = np.asarray(model.dist, float).ravel()[:4]
+    flags = cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_K3
+    note = PLANAR_RMS_NOTE
+    if fix_principal_point:
+        flags |= cv2.CALIB_FIX_PRINCIPAL_POINT
+        note += ", principal point held at the fit's"
+    try:
+        rms = cv2.calibrateCamera(object_points, image_points, tuple(int(v) for v in image_size), K, dist,
+                                  flags=flags, criteria=_PLANAR_CRITERIA)[0]
+    except cv2.error as err:
+        return math.inf, f"planar fit failed: {str(err).strip().splitlines()[-1]}"
+    return float(rms), note
+
+
+def repeat_visits(
+    observations: Sequence[WaypointObservation], residual_mm: Mapping[int, Sequence[float]], tol_mm: float = 1e-6
+) -> List[Tuple[int, int, np.ndarray, np.ndarray]]:
+    """(waypoint a, waypoint b, commanded mm, board at b minus board at a in motor mm) for every
+    pair of placed views at the same commanded position, in waypoint order. The commanded
+    position is the same, so the difference of the placement residuals is how far the board
+    moved between the two visits."""
+    placed = [(o.index, np.asarray(o.motor_mm, float).reshape(3)) for o in observations if o.index in residual_mm]
+    out = []
+    for i, (a, m_a) in enumerate(placed):
+        for b, m_b in placed[i + 1:]:
+            if np.max(np.abs(m_a - m_b)) <= tol_mm:
+                out.append((a, b, m_a, np.asarray(residual_mm[b], float) - np.asarray(residual_mm[a], float)))
+    return out
+
+
+def _format_xyz_mm(xyz) -> str:
+    return "({:.2f}, {:.2f}, {:.2f}) mm".format(*np.asarray(xyz, float).reshape(3))
 
 
 # The library settings that give each camera's nominal lens (configured_lenses). UNFINALIZED:

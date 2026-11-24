@@ -260,6 +260,11 @@ def test_downstream_products_load(tmp_path, stage_rig):
         values = [m.value for m in report.metrics if m.name == name]
         assert values and all(v is not None and v < limit for v in values), (name, values)
     assert any(note.startswith("motor placement (per-view fit)") for note in report.notes)
+    # The graded RMS is each camera's own planar fit; the synthetic stage's three offsets show in the stage block.
+    assert all(m.status == "pass" for m in report.metrics if m.name in ("reprojection_rms_px", "joint_reprojection_rms_px"))
+    slack = {m.camera: m for m in report.metrics if m.name == "stage_slack_rms_mm"}
+    assert set(slack) == {"x", "y", "z"} and all(m.fail is None for m in slack.values())
+    assert slack["z"].value > slack["y"].value
 
 
 def test_the_projection_matches_cv2():
