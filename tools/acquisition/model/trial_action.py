@@ -959,7 +959,21 @@ class TrialActionExecutor:
         with self._lock:
             operation = self._require_current()
             self._cancel_cue_pair()
-            self._await_laser_terminal_for_cycle()
+            handle = self._laser_handle
+            wait_seconds = self._laser_cycle_wait_seconds(operation, handle)
+        if wait_seconds:
+            # With the lock let go of: Stop's cancel() needs it before it
+            # reaches the laser's cancel and its shutter close, and a train
+            # still running would otherwise run on to its end (prod41-06).
+            try:
+                handle.wait(timeout=wait_seconds)
+            except Exception:
+                pass
+        with self._lock:
+            if self._operation is not operation or operation.state in operation.TERMINAL:
+                # Cancelled or failed while this waited, which also cleaned up.
+                return operation
+            self._require_laser_completed(operation, handle)
             if operation.state is PreparedState.SEND_ACCEPTED:
                 operation.transition(PreparedState.ACTIVE, "cycle completion")
             operation.transition(PreparedState.COMPLETED, detail)
@@ -1221,21 +1235,23 @@ class TrialActionExecutor:
         if to_record is not None:
             operation.set_action_record("laser", to_record())
 
-    def _await_laser_terminal_for_cycle(self):
-        handle = self._laser_handle
+    @staticmethod
+    def _laser_cycle_wait_seconds(operation, handle) -> float:
+        """How long the cycle's end waits for its laser; 0 for no wait."""
+        if handle is None or getattr(handle, "wait", None) is None:
+            return 0.0
+        state = getattr(getattr(handle, "state", None), "value", None)
+        if state not in {"armed", "triggered"}:
+            return 0.0
+        profile = operation.recipe.laser_profile
+        duration = 0.0 if profile is None else profile.waveform_seconds
+        return max(1.0, duration + 1.0)
+
+    def _require_laser_completed(self, operation, handle):
+        """Fail the operation, and raise, unless its laser completed."""
         if handle is None:
             return
-        state = getattr(getattr(handle, "state", None), "value", None)
-        if state in {"armed", "triggered"}:
-            profile = self._require_current().recipe.laser_profile
-            duration = 0.0 if profile is None else profile.waveform_seconds
-            wait = getattr(handle, "wait", None)
-            if wait is not None:
-                try:
-                    wait(timeout=max(1.0, duration + 1.0))
-                except Exception:
-                    self._snapshot_laser_action()
-        self._snapshot_laser_action()
+        self._snapshot_laser_action(handle)
         state = getattr(getattr(handle, "state", None), "value", None)
         if state not in {None, "completed"}:
             error = getattr(handle, "error", None)

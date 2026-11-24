@@ -759,3 +759,65 @@ def test_a_laser_armed_as_the_cancel_lands_is_cancelled_by_preparation():
 
     assert calls == [("cancel_laser", "handle")]
     assert executor.operation.state is PreparedState.CANCELLED
+
+
+class _RunningLaser:
+    """A started train: its wait ends when it is cancelled, or times out."""
+
+    def __init__(self):
+        self.state = SimpleNamespace(value="triggered")
+        self.cancelled = threading.Event()
+        self.waiting = threading.Event()
+
+    def wait(self, timeout):
+        self.waiting.set()
+        if not self.cancelled.wait(timeout):
+            raise TimeoutError("still running")
+
+    def cancel(self):
+        self.state = SimpleNamespace(value="cancelled")
+        self.cancelled.set()
+
+    def to_record(self):
+        return {"state": self.state.value}
+
+
+def test_a_stop_reaches_the_laser_while_the_cycle_waits_for_its_train(monkeypatch):
+    # complete() held the executor's lock while it waited, up to the
+    # waveform and a second, for a train still running; Stop's cancel needs
+    # that lock before it reaches the laser's cancel and its shutter close,
+    # so the train ran on to its end (audit prod41-06).
+    monkeypatch.setattr(LaserPulseProfile, "waveform_seconds", property(lambda _self: 5.0))
+    row = TrialProtocolRow(trial_id=1).with_updates({
+        "enabled": True,
+        "laser_profile_id": "pulse",
+        "laser_phase": "pellet_presentation",
+        "laser_trigger_route": "hardware_stim3",
+        "laser_channel_id": 1,
+        "stimulus_assignment": "always",
+        "stimulus_trigger": "tone_1",
+    })
+    recipe = _compiler().compile(row, _context())
+    laser = _RunningLaser()
+    executor = TrialActionExecutor(
+        move_absolute=lambda target: None,
+        configure_cover=lambda policy, recipe: None,
+        play_tone=lambda profile, phase: None,
+        prepare_laser=lambda profile, recipe: laser,
+        cancel_laser=lambda handle: handle.cancel(),
+    )
+    executor.prepare(recipe)
+    executor.bind_send(recipe.operation_id, 4, "can-context")
+    executor.acknowledge_presentation("can-context")
+
+    completer, outcome = _in_thread(executor.complete, "pellet cycle completed")
+    assert laser.waiting.wait(5.0)
+    started = time.monotonic()
+    executor.cancel(reason="stop")
+
+    assert time.monotonic() - started < 1.0
+    assert laser.cancelled.is_set()
+    completer.join(5.0)
+    assert not completer.is_alive()
+    assert outcome == [executor.operation]
+    assert executor.operation.state is PreparedState.CANCELLED
