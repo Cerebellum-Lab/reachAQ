@@ -10,6 +10,10 @@
 * The QSettings files in ~/.config/Colorado are copied to ~/.config/reachAQ
   ("Auto Trainer.conf" becomes "reachAQ.conf"), with the same rewrite. The
   originals stay, so v3 still finds its preferences after a rollback.
+* The launcher's own file, ~/.config/reachaq/launcher.conf, gets the same rewrite
+  in place (kept as launcher.conf.bak-reachaq-migration). The desktop installer
+  rewrites it again later; this keeps the launcher working if an install stops
+  between the two.
 
 What was done is recorded in ~/reachAQ/.settings-migration.json, which
 --reverse reads to put everything back byte for byte. --dry-run prints the plan
@@ -42,6 +46,9 @@ RECORD_NAME = ".settings-migration.json"
 #: Never rewritten (multires_calibration.library.LIBRARY_DIR_NAME).
 IMMUTABLE_DIRS = ("calibrations",)
 LIVE_SUFFIXES = (".yaml", ".yml")
+#: Files outside the settings directory that name it, relative to the config home
+#: (install-reachaq-desktop.sh writes the launcher's).
+OUTSIDE_FILES = ("reachaq/launcher.conf",)
 #: The exit status of a reachAQ start refused by unmigrated_settings_message.
 UNMIGRATED_SETTINGS_EXIT = 4
 
@@ -58,6 +65,8 @@ class Plan:
     rewrites: List[Path] = field(default_factory=list)
     #: QSettings files to copy, (source, target).
     copies: List[Tuple[Path, Path]] = field(default_factory=list)
+    #: Files outside the settings directory that name it, rewritten in place (absolute).
+    outside: List[Path] = field(default_factory=list)
 
 
 def config_home(home: Path, environ=os.environ) -> Path:
@@ -112,6 +121,13 @@ def make_plan(home: Path, cfg_home: Path) -> Optional[Plan]:
             if target.exists():
                 raise MigrationError(f"{target} already exists")
             plan.copies.append((source, target))
+    for name in OUTSIDE_FILES:
+        path = cfg_home / name
+        if path.is_file() and not path.is_symlink() and pattern.search(path.read_bytes()):
+            backup = path.with_name(path.name + BACKUP_SUFFIX)
+            if backup.exists():
+                raise MigrationError(f"{backup} already exists")
+            plan.outside.append(path)
     return plan
 
 
@@ -124,7 +140,8 @@ def migrate(plan: Plan) -> None:
         os.rename(plan.old, plan.new)
     except OSError as error:
         raise MigrationError(f"cannot rename {plan.old} to {plan.new}: {error}") from error
-    record = {"version": 1, "old": str(plan.old), "new": str(plan.new), "rewritten": [], "copied": []}
+    record = {"version": 1, "old": str(plan.old), "new": str(plan.new), "rewritten": [], "copied": [],
+              "outside": []}
     record_path = plan.new / RECORD_NAME
 
     def save():
@@ -146,6 +163,14 @@ def migrate(plan: Plan) -> None:
         target.write_bytes(data)
         record["copied"].append({"source": str(source), "target": str(target), "sha256": _sha256(data)})
         save()
+    for path in plan.outside:
+        data = path.read_bytes()
+        path.with_name(path.name + BACKUP_SUFFIX).write_bytes(data)
+        record["outside"].append(str(path))
+        save()
+        staging = path.with_name(path.name + ".reachaq-migration-tmp")
+        staging.write_bytes(_rewritten(data, plan.old, plan.new))
+        os.replace(staging, path)
 
 
 def reverse(home: Path) -> List[str]:
@@ -179,6 +204,14 @@ def reverse(home: Path) -> List[str]:
             os.replace(backup, new / rel)
     for staging in new.rglob("*.reachaq-migration-tmp"):
         staging.unlink()
+    for name in record.get("outside", []):
+        path = Path(name)
+        backup = path.with_name(path.name + BACKUP_SUFFIX)
+        if backup.exists():
+            os.replace(backup, path)
+        staging = path.with_name(path.name + ".reachaq-migration-tmp")
+        if staging.exists():
+            staging.unlink()
     record_path.unlink()
     os.rename(new, old)
     return warnings
@@ -217,7 +250,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.reverse:
             if args.dry_run:
                 print(f"would move {home / NEW_DIR_NAME} back to {home / OLD_DIR_NAME}, restore the rewritten"
-                      f" files from their {BACKUP_SUFFIX} copies and remove the copied QSettings files")
+                      f" files (launcher.conf too) from their {BACKUP_SUFFIX} copies and remove the copied"
+                      f" QSettings files")
                 return 0
             for warning in reverse(home):
                 print(f"warning: {warning}", file=sys.stderr)
@@ -233,6 +267,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"{verb} rewrite {plan.new / rel} (kept as {rel}{BACKUP_SUFFIX})")
         for source, target in plan.copies:
             print(f"{verb} copy {source} to {target}")
+        for path in plan.outside:
+            print(f"{verb} rewrite {path} (kept as {path.name}{BACKUP_SUFFIX})")
         if not args.dry_run:
             migrate(plan)
             print("done; undo with --reverse")

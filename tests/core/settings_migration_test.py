@@ -43,6 +43,13 @@ def home(tmp_path):
     (colorado / "PelletDeliveryUI.conf").write_bytes(b"[General]\nport=/dev/ttyACM0\n")
     (colorado / "autotrainer_running_status.env").write_bytes(b"RUNNING=0\n")
     (colorado / "Auto Trainer.conf.bak-before-phase1").write_bytes(b"[system]\n")
+    # The launcher's file as christielab10 had it (install-reachaq-desktop.sh writes it).
+    launcher = home / ".config" / "reachaq"
+    launcher.mkdir(parents=True)
+    (launcher / "launcher.conf").write_bytes(
+        f"CONDA_BIN=/home/x/anaconda3/bin/conda\nREPO=/home/x/Documents/reachAQ\n"
+        f"SYSTEM_CONFIG={prefix}/system_configuration.yaml\n".encode())
+    (launcher / "runtime.env").write_bytes(b"REACHAQ_CAN_FD=true\n")
     return home
 
 
@@ -85,6 +92,29 @@ def test_migrate_moves_rewrites_and_copies(home):
     assert (home / ".config" / "Colorado" / "Auto Trainer.conf").read_bytes().count(prefix) == 1  # kept for v3
 
 
+def test_migrate_points_the_launcher_at_the_new_directory(home, capsys):
+    """An install that stops after the move must not leave the launcher naming ~/Autotrainer."""
+    launcher = home / ".config" / "reachaq" / "launcher.conf"
+    before = launcher.read_bytes()
+    assert _run(home, "--dry-run") == 0
+    assert "launcher.conf" in capsys.readouterr().out
+    assert _run(home) == 0
+    new_prefix = (home / "reachAQ").as_posix().encode()
+    assert launcher.read_bytes() == before.replace((home / "Autotrainer").as_posix().encode(), new_prefix)
+    assert b"SYSTEM_CONFIG=" + new_prefix + b"/system_configuration.yaml\n" in launcher.read_bytes()
+    assert launcher.with_name("launcher.conf" + sm.BACKUP_SUFFIX).read_bytes() == before
+    # A file there that names nothing is left alone.
+    assert not (home / ".config" / "reachaq" / f"runtime.env{sm.BACKUP_SUFFIX}").exists()
+
+
+def test_a_launcher_naming_nothing_is_left_alone(home):
+    launcher = home / ".config" / "reachaq" / "launcher.conf"
+    launcher.write_bytes(b"SYSTEM_CONFIG=/srv/lab/system_configuration.yaml\n")
+    assert _run(home) == 0
+    assert launcher.read_bytes() == b"SYSTEM_CONFIG=/srv/lab/system_configuration.yaml\n"
+    assert not launcher.with_name("launcher.conf" + sm.BACKUP_SUFFIX).exists()
+
+
 def test_reverse_restores_every_byte(home):
     before = _tree(home)
     assert _run(home) == 0
@@ -104,7 +134,8 @@ def test_reverse_keeps_preferences_changed_since(home, capsys):
 
 
 @pytest.mark.parametrize("blocker", ["reachAQ", ".config/reachAQ/reachAQ.conf",
-                                     f"Autotrainer/demo/demo_sources.yaml{sm.BACKUP_SUFFIX}"])
+                                     f"Autotrainer/demo/demo_sources.yaml{sm.BACKUP_SUFFIX}",
+                                     f".config/reachaq/launcher.conf{sm.BACKUP_SUFFIX}"])
 def test_refuses_without_changing_anything(home, blocker, capsys):
     path = home / blocker
     path.parent.mkdir(parents=True, exist_ok=True)

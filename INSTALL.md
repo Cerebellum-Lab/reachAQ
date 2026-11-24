@@ -108,6 +108,9 @@ Before anything else it runs `reachaq-migrate-settings`, which
 - copies `~/.config/Colorado/Auto Trainer.conf` to
   `~/.config/reachAQ/reachAQ.conf`, and the pellet tool's
   `PelletDeliveryUI.conf` beside it. The originals stay where they are.
+- rewrites `~/.config/reachaq/launcher.conf` the same way (kept as
+  `launcher.conf.bak-reachaq-migration`), so the launcher still finds the
+  settings if the install stops before it regenerates that file.
 
 The installer then uninstalls every `auto-trainer*` distribution (including
 `auto-trainer-api` and `auto-trainer-training` where a rig still has them and
