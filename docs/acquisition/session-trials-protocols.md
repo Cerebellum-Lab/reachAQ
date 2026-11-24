@@ -113,6 +113,17 @@ board before cover release; Direct NI is rejected for that phase. First Reach
 uses the 900 Hz stim-camera transition detector, not pose inference. ROI1/ROI2
 remain schema/UI framework only and are rejected as runnable.
 
+Tone 2 of a cue pair is gated on the pellet still being there at its
+deadline. `REACHAQ_PELLET_PRESENCE_SOURCE` picks the evidence: `live_tracking`
+(the default; live pose's own `pellet_seen`, so live inference must run),
+`roi` (the mean pixel value in a rectangle of one camera's image, set by that
+camera's `pellet_roi_*` params, see the example system configuration), or
+`none`. The answer carries its frame's capture time and is refused once older
+than the cue policy's gate staleness limit (500 ms). With no fresh answer at
+the deadline Tone 2 is skipped and reset, and a warning is logged. The ROI's
+rectangle, threshold, hysteresis and polarity are rig calibration: nothing
+sets them for you.
+
 A trial's laser is armed at preparation, before SEND, and stays armed for the
 whole trial, up to 120 s (`PROTOCOL_LASER_ARM_WINDOW_S`). A First Reach laser
 that no reach triggered by the end of the pellet cycle is cancelled and the

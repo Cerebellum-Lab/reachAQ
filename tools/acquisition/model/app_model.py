@@ -357,8 +357,9 @@ from tools.acquisition.model.intertrial_analysis import (
     classify_pellet_state,
 )
 from tools.acquisition.model.reach_state_source import (
-    LiveTrackingPelletPresenceProvider,
     LiveTrackingReachProvider,
+    make_pellet_presence_provider,
+    pellet_presence_source_from_environment,
     ReachStateConfiguration,
     ReachStateResolver,
 )
@@ -1338,6 +1339,8 @@ class AppModel(ObservableObject):
                 on_observe=self._session_data_recorder.latency_events.record_gate_observation,
             ),
         )
+        # Tone 2's pellet gate: live pose, a camera's pellet ROI, or none.
+        self._pellet_presence_source = pellet_presence_source_from_environment()
         self._trial_action_executor = TrialActionExecutor(
             move_absolute=self._move_protocol_motor_target,
             configure_cover=self._configure_protocol_cover,
@@ -1353,7 +1356,11 @@ class AppModel(ObservableObject):
             reach_state_resolver=self._reach_state_resolver,
             # Without it presence is unknown on every evaluation, which the cue
             # policy reads as stale, so no cued Tone 2 could ever fire.
-            pellet_presence_provider=LiveTrackingPelletPresenceProvider(self._live_tracking),
+            pellet_presence_provider=make_pellet_presence_provider(
+                self._pellet_presence_source,
+                live_tracking=self._live_tracking,
+                roi_states=self._pellet_roi_states,
+            ),
         )
         # One holder, several holders-of-holds. intertrial analysis and
         # inter-trial timing both block the send, and BehaviorAlgorithm reads
@@ -7076,6 +7083,14 @@ class AppModel(ObservableObject):
         # Reach can come long after the controller's own waveform + 5 s.
         return prepare(
             profile, firing, recipe, armed_window_seconds=PROTOCOL_LASER_ARM_WINDOW_S)
+
+    def _pellet_roi_states(self):
+        """Pellet ROI states of the enabled cameras that have one, in camera order."""
+        return tuple(
+            camera.pellet_roi_state
+            for camera in self._reach_cameras
+            if camera.is_enabled and camera.pellet_roi_state is not None
+        )
 
     def _withdraw_protocol_laser_trigger(self, handle) -> bool:
         withdraw = getattr(self._laser, "withdraw_direct_trigger", None)

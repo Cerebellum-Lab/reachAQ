@@ -50,6 +50,7 @@ from .frame_fit import QueueFit
 from .record_backlog import RecordBacklog
 from .video_record import VideoRecord, VideoRecordProperties, VideoRecordMode
 from .stim_camera import StimCameraDetectionConfiguration, StimCameraDetector, StimEvidenceWriter
+from .pellet_roi import PelletRoiConfiguration, PelletRoiDetector, PelletRoiState
 from .realtime_priority import apply_realtime_priority
 
 logger = get_verbose_logger(__name__)
@@ -197,6 +198,10 @@ class CaptureAttrs:
     stim_trigger_queue: Optional[multiprocessing.Queue] = None
     """Bounded direct stim-camera-to-laser trigger channel."""
 
+    pellet_roi: Optional[PelletRoiConfiguration] = None
+    pellet_roi_state: Optional[PelletRoiState] = None
+    """Pellet presence from an ROI of this camera's frames, for the cue gate."""
+
 
 class VideoCapture(Process):
     """
@@ -258,6 +263,11 @@ class VideoCapture(Process):
             else StimCameraDetector(attrs.stim_detection)
         )
         self._stim_evidence_writer = None
+        self._pellet_roi = (
+            None
+            if attrs.pellet_roi is None or attrs.pellet_roi_state is None
+            else PelletRoiDetector(attrs.pellet_roi, attrs.pellet_roi_state)
+        )
         self._stim_session_active = False
         self._stim_clip_prebuffer = deque(
             maxlen=(
@@ -821,6 +831,9 @@ class VideoCapture(Process):
                     frame_perf_c,
                     count_missed_frames=count_missed_frames,
                 )
+                if self._pellet_roi is not None:
+                    # Its own failures are published as unknown, not raised.
+                    self._pellet_roi.process(frame, frame_perf_c)
                 # perf_frame_dropped = (
                 #     0
                 #     if not math.isfinite(prev_frame_perf_now)

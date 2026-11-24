@@ -426,3 +426,22 @@ def test_tone_2_skipped_for_want_of_pellet_evidence_is_a_warning(caplog):
                 if record.levelno == logging.WARNING]
     assert any("Tone 2 was skipped" in message and "pellet" in message
                for message in warnings)
+
+
+
+@pytest.mark.parametrize("present, fires", [(True, True), (False, False)])
+def test_a_pellet_roi_answers_the_gate(present, fires):
+    from tools.acquisition.model.reach_state_source import RoiPelletPresenceProvider
+
+    class _State:
+        def latest(self):
+            return present, 100.35, 150.0
+
+    harness = _Harness(pellet_presence_provider=RoiPelletPresenceProvider(lambda: (_State(),)))
+    operation = _prepare(harness, _recipe(cue_interval_ms=400))
+
+    harness.timer.fire()
+
+    assert (("tone2", "tone_2") in harness.tones) is fires
+    if not fires:
+        assert any("pellet_missing" in detail for detail in _details(operation))

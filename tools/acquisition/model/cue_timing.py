@@ -11,9 +11,10 @@ re-block restarts that delay.  A trial that was never blocked receives no
 extension.
 
 The gate in reachAQ is pose-derived reach state plus pellet presence evidence
-from the board, not a camera ROI.  Evidence older than the configured staleness
-bound is treated as unknown rather than as clear, so a stalled evidence source
-cannot silently authorize a cue.
+from live pose or a camera's pellet ROI (REACHAQ_PELLET_PRESENCE_SOURCE).
+Evidence older than the configured staleness bound is treated as unknown
+rather than as clear, so a stalled evidence source cannot silently authorize a
+cue.
 
 The policy owns no clock and touches no hardware.  Callers pass monotonic
 ``perf_counter`` values, matching
