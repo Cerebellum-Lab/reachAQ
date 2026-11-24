@@ -641,7 +641,9 @@ def _disable_timers():
 
 @pytest.fixture
 def pellet_device() -> PelletDeviceProtocol:
-    return mock.create_autospec(PelletDeviceProtocol)
+    device = mock.create_autospec(PelletDeviceProtocol)
+    device.refuse_shift_outside_travel.return_value = False  # no travel configured
+    return device
 
 
 @pytest.fixture

@@ -306,11 +306,32 @@ class StepperConfig(MotorSource):
     _maximum_acceleration: float = 244  # mm/sec^2
     _flip_limit_orientation: bool = False
     _homing_velocity: float = 60  # mm/sec
+    # Travel limits (mm), min_pos / max_pos in motor_config.yaml. None: that side is not limited.
+    _minimum_position: Optional[float] = None
+    _maximum_position: Optional[float] = None
     uuid_ack_timeout: Optional[float] = None
+
+    @staticmethod
+    def _travel_value(data: dict, key: str) -> Optional[float]:
+        if key not in data:
+            return None
+        value = data[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{key} must be a number of mm, got {value!r}")
+        if not math.isfinite(value):
+            raise ValueError(f"{key} must be finite, got {value!r}")
+        return float(value)
 
     @classmethod
     def from_dict(cls, data: dict):
         config = StepperConfig()
+
+        minimum = cls._travel_value(data, "min_pos")
+        maximum = cls._travel_value(data, "max_pos")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise ValueError(f"min_pos {minimum:g} is above max_pos {maximum:g}")
+        config.minimum_position = minimum
+        config.maximum_position = maximum
 
         if "microsteps" in data:
             config.microsteps = data["microsteps"]
@@ -382,6 +403,46 @@ class StepperConfig(MotorSource):
     @flip_limit_orientation.setter
     def flip_limit_orientation(self, value: bool):
         self._flip_limit_orientation = value
+
+    @property
+    def minimum_position(self) -> Optional[float]:
+        """Lowest allowed target (mm), or None when not limited."""
+        return self._minimum_position
+
+    @minimum_position.setter
+    def minimum_position(self, value: Optional[float]):
+        self._minimum_position = value
+
+    @property
+    def maximum_position(self) -> Optional[float]:
+        """Highest allowed target (mm), or None when not limited."""
+        return self._maximum_position
+
+    @maximum_position.setter
+    def maximum_position(self, value: Optional[float]):
+        self._maximum_position = value
+
+
+#: How far past a travel limit (mm) a target may lie and still be sent: a DCS conversion of a
+#: nominal 35.0 can come out as 35.0000000001. Far below a microstep (about 1e-3 mm).
+TRAVEL_TOLERANCE_MM = 1e-6
+
+
+def stepper_travel_refusal(axis: str, target: float, config) -> Optional[str]:
+    """The error to log when `target` (mm) lies outside the travel of the stepper `config`
+    (StepperConfig.minimum_position / maximum_position), else None. An unset side is not
+    limited, so a config without travel never refuses. A non-finite target is refused once
+    any side is set. A target within TRAVEL_TOLERANCE_MM of a limit is inside."""
+    minimum = getattr(config, "minimum_position", None)
+    maximum = getattr(config, "maximum_position", None)
+    if minimum is None and maximum is None:
+        return None
+    low = -math.inf if minimum is None else minimum
+    high = math.inf if maximum is None else maximum
+    if low - TRAVEL_TOLERANCE_MM <= target <= high + TRAVEL_TOLERANCE_MM:
+        return None
+    return (f"Axis-{axis.upper()}: move to {target:.3f} refused: "
+            f"outside the configured travel {low:g}-{high:g} mm")
 
 
 #: STEPPER_STATUS.status bits (pellet firmware 2.3.1). A v1.2 board always sends 0.

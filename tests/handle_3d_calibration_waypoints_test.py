@@ -442,6 +442,18 @@ def test_a_move_that_is_not_queued_stops_the_capture():
 # see the stage still moving: the settle alone has to cover the move, as if the ack meant
 # only "received".
 
+CHRISTIELAB10_MOTOR_CONFIG = Path(__file__).parents[1] / "auto-trainer-device" / "tests" / "christielab10_motor_config.yaml"
+
+
+@pytest.fixture(autouse=True)
+def _no_motor_config_file(tmp_path_factory, monkeypatch):
+    """The scout reads the stage travel from ~/Autotrainer/motor_config.yaml; these tests do
+    not see the computer's own file. A test that wants one writes it to the location."""
+    location = tmp_path_factory.mktemp("autotrainer") / "motor_config.yaml"
+    monkeypatch.setattr(MotorConfigurationFile, "DEFAULT_LOCATION", location)
+    return location
+
+
 def _motor_configurations(**axes):
     """Motor configurations as HardwareModel keeps them from connect; axis -> (max_vel mm/s, max_acc mm/s^2)."""
     pellet = {axis: {"max_vel": v, "max_acc": a} for axis, (v, a) in axes.items()}
@@ -1175,6 +1187,58 @@ def test_run_scout_records_the_grid_as_a_short_capture(tmp_path, monkeypatch):
     assert result.points == [] and set(result.diagnosis) == {"left", "right"}
 
 
+def test_motor_travel_is_read_from_the_motor_config_file(_no_motor_config_file):
+    assert h3d.motor_travel() == ((None, None),) * 3  # no file: no travel
+    _no_motor_config_file.write_bytes(CHRISTIELAB10_MOTOR_CONFIG.read_bytes())
+    assert h3d.motor_travel() == ((0.0, 35.0),) * 3
+    _no_motor_config_file.write_text(yaml.safe_dump({"pellet": {"y": {"max_pos": 30}}}))
+    assert h3d.motor_travel() == ((None, None), (None, 30.0), (None, None))
+    _no_motor_config_file.write_text(yaml.safe_dump({"pellet": {"z": {"min_pos": 40, "max_pos": 35}}}))
+    with pytest.raises(ValueError, match="pellet-z"):
+        h3d.motor_travel()
+
+
+def test_run_scout_searches_the_configured_travel_without_a_connect(tmp_path, monkeypatch, _no_motor_config_file):
+    # christielab10's motor_config.yaml: 0-35 mm on every axis. The hardware has not
+    # connected, so it holds no motor configurations: the scout reads the file.
+    _no_motor_config_file.write_bytes(CHRISTIELAB10_MOTOR_CONFIG.read_bytes())
+    calls, clock = [], _Clock()
+    app_model = _scout_app_model(tmp_path, calls, clock)
+    app_model.hardware.motor_configurations = None
+    cameras = [app_model.left_camera, app_model.right_camera]
+    seen = {}
+
+    def views_from_capture(videos, frame_times, targets, dwells, board):
+        seen["targets"] = targets
+        return {i: {} for i in range(len(targets))}
+
+    monkeypatch.setattr(h3d, "scout_views_from_capture", views_from_capture)
+    monkeypatch.setattr(h3d, "video_sizes", lambda videos: {name: (1440, 1080) for name in videos})
+    targets = [(10.0, 20.0, 30.0), (14.0, 26.0, 34.0)]
+    h3d.run_scout(app_model, cameras, targets, **_scout_kwargs(app_model, tmp_path, clock, cameras))
+
+    # The low edges keep SCOUT_HOME_MARGIN_MM (1 mm) clear of the home stop.
+    assert seen["targets"] == scout_grid(Bounds((1.0, 1.0, 1.0), (35.0, 35.0, 35.0)), counts=(2, 2, 2))
+    commanded = app_model.hardware.commands
+    assert commanded, "the scout moved the stage"
+    for axis, value in commanded:
+        assert 0.0 <= value <= 35.0, (axis, value)
+        assert not 0.0 < value < 1.0, (axis, value)
+    # It reaches the margin and the top of the travel on every axis.
+    for axis in "xyz":
+        values = {value for a, value in commanded if a == axis}
+        assert min(values) == 1.0 and max(values) == 35.0
+
+    # scoutBounds still narrows the travel.
+    seen.clear()
+    for name in ("left", "right"):  # the first scout moved the recordings away
+        (tmp_path / "session" / f"{name}_recording.mp4").write_bytes(b"")
+        (tmp_path / "session" / f"{name}_recording_timestamps.txt").write_text("1000.0,0\n")
+    h3d.run_scout(app_model, cameras, targets, configured=Bounds((5.0, 0.0, 31.0), (99, 20.0, 99)),
+                  **_scout_kwargs(app_model, tmp_path, clock, cameras))
+    assert seen["targets"] == scout_grid(Bounds((5.0, 1.0, 31.0), (35.0, 20.0, 35.0)), counts=(2, 2, 2))
+
+
 def test_an_aborted_scout_stops_the_cameras_and_moves_no_video(tmp_path, monkeypatch):
     calls, clock = [], _Clock()
     app_model = _scout_app_model(tmp_path, calls, clock)
@@ -1189,9 +1253,9 @@ def test_an_aborted_scout_stops_the_cameras_and_moves_no_video(tmp_path, monkeyp
     assert not (tmp_path / "session" / "scout").exists()
 
 
-def _scout_result(n_selected, diagnosis=None, *, per_camera=None, groups=None):
+def _scout_result(n_selected, diagnosis=None, *, per_camera=None, groups=None, z=60.0):
     # inside the hand-written list's box on _dcs(): motor x 0.6-20, y 5-30, z 52-65
-    points = [(1.0 + i, 20.0, 60.0) for i in range(n_selected)]
+    points = [(1.0 + i, 20.0, z) for i in range(n_selected)]
     per_camera = {"left": n_selected, "right": n_selected} if per_camera is None else per_camera
     selection = Selection(points=points, per_camera=per_camera, connected=groups is None or len(groups) == 1,
                           groups=groups)
@@ -1229,6 +1293,7 @@ def _scout_capture(tmp_path, monkeypatch, results, *, confirm=None):
     def fake_run_scout(app_model_, cameras, targets, **kwargs):
         seen["scouts"] += 1
         seen["targets"] = targets
+        seen["travel"] = kwargs.get("travel")
         return results.pop(0)
 
     def fake_run_waypoints(hard, plan, **kwargs):
@@ -1317,6 +1382,28 @@ def test_a_saved_list_outside_todays_box_is_scouted_again(tmp_path, monkeypatch)
                    datetime(2026, 11, 20))
     run()
     assert seen["scouts"] == 1
+
+
+def test_the_saved_list_is_checked_against_the_configured_travel(tmp_path, monkeypatch, _no_motor_config_file):
+    # The saved list lies outside the hand-written box (motor z 52-65 on _dcs()) but inside
+    # the configured travel: it is used, and the scout is passed the travel.
+    _no_motor_config_file.write_text(yaml.safe_dump({"pellet": {"z": {"min_pos": 0, "max_pos": 35}}}))
+    # The scout searches the travel, so the list it chooses lies inside it (z 30).
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(14, z=30.0)])
+    points = [(1.0 + i, 20.0, 30.0) for i in range(14)]
+    save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
+                   datetime(2026, 11, 20))
+    run()
+    assert seen["scouts"] == 0
+    assert [motor for *_, motor in seen["plans"][-1]] == points
+
+    # Outside the travel (z 36): scouted again, with the travel.
+    points = [(1.0 + i, 20.0, 36.0) for i in range(14)]
+    save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
+                   datetime(2026, 11, 20))
+    run()
+    assert seen["scouts"] == 1
+    assert seen["travel"] == ((None, None), (None, None), (0.0, 35.0))
 
 
 def test_a_fault_before_waypoint_0_sends_no_waypoint_command():
@@ -1420,3 +1507,29 @@ def test_a_saved_list_with_fewer_than_12_points_is_not_used(tmp_path, monkeypatc
                    [(1.0 + i, 20.0, 60.0) for i in range(11)], ["left", "right"], datetime(2026, 11, 20))
     run()
     assert seen["scouts"] == 1
+
+
+def test_a_hand_written_list_outside_the_travel_is_refused_before_anything_moves(tmp_path, _no_motor_config_file):
+    # _dcs() puts the hand-written list's motor z at 52-65 mm, past a 0-35 mm z travel.
+    _no_motor_config_file.write_text(yaml.safe_dump({"pellet": {"z": {"min_pos": 0, "max_pos": 35}}}))
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    with pytest.raises(RuntimeError, match=r"hand-written move list leaves the configured travel: .*z"):
+        make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert calls == []  # no camera prepared, no home, no move
+
+
+def test_a_scout_falling_back_to_a_hand_written_list_outside_the_travel_is_refused(
+        tmp_path, monkeypatch, _no_motor_config_file):
+    _no_motor_config_file.write_text(yaml.safe_dump({"pellet": {"z": {"min_pos": 0, "max_pos": 35}}}))
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(11)])
+    with pytest.raises(RuntimeError, match="hand-written move list leaves the configured travel"):
+        run()
+    assert seen["scouts"] == 1 and seen["plans"] == []
+
+
+def test_a_hand_written_list_inside_the_travel_is_captured(tmp_path, monkeypatch, _no_motor_config_file):
+    _no_motor_config_file.write_text(yaml.safe_dump({"pellet": {"z": {"min_pos": 0, "max_pos": 70}}}))
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(11)])
+    run()
+    assert seen["plans"] == [plan_waypoints(start, moves, _dcs())]

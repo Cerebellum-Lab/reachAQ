@@ -24,11 +24,34 @@ from autotrainer.device import (CanTransportConfiguration, CanTransportKind, Dev
                                 DeviceConnection, CanDevice, CanFailure, CanFailureKind, CommandRefusedError,
                                 StepperConfig, ServoConfig, Device, ColorLed, Target, EmulationInterface,
                                 capture_can_diagnostics)
-from autotrainer.device.device_interface import BOARD_STIM_LINE_OUTPUTS
+from autotrainer.device.device_interface import BOARD_STIM_LINE_OUTPUTS, stepper_travel_refusal
+from autotrainer.device.can_device import (default_cover_pellet, default_load_pellet, default_move_retract,
+                                           default_release_pellet, default_send_pellet, sequence_stepper_targets)
+from autotrainer.device.compound_movement_file import CompoundMovements
+from autotrainer.device.motor_steps import MotorSteps
 from autotrainer.behavior import PelletDeviceProtocol
 from tools.acquisition.model.firmware_compatibility import FirmwareCompatibilityPolicy
 
 logger = get_verbose_logger(__name__)
+
+
+def _pellet_sequences(movements=None) -> Dict[str, MotorSteps]:
+    """The compound sequences CanDevice runs for LOAD_PELLET, SEND_PELLET, COVER_PELLET,
+    RELEASE_PELLET and SEND_RETRACT: those of `movements` (move_config.yaml) that are not empty,
+    else CanDevice's built-in defaults, as DeviceConnection.use_compound_movements applies them."""
+    sequences = {
+        "load_pellet": default_load_pellet(),
+        "send_pellet": default_send_pellet(),
+        "cover_pellet": default_cover_pellet(),
+        "release_pellet": default_release_pellet(),
+        "move_retract": default_move_retract(),
+    }
+    if isinstance(movements, CompoundMovements):
+        for name in sequences:
+            steps = getattr(movements, name)
+            if not steps.is_empty:
+                sequences[name] = steps
+    return sequences
 
 _nans_offset3dTuple = Offset3DTuple.get_nan()
 
@@ -51,6 +74,21 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     PELLET_NEEDS_HOME_PROPERTY = "pellet_needs_home"
     PELLET_DRIVER_FAULT_PROPERTY = "pellet_driver_fault"
     LAST_COMMAND_REFUSAL_PROPERTY = "last_command_refusal"
+
+    # Per axis x, y, z: the token of the latest SET queued, so a refusal of an older SET does
+    # not roll back a newer one (_forget_refused_set).
+    _latest_set_tokens: Tuple[Optional[UUID], Optional[UUID], Optional[UUID]] = (None, None, None)
+    # After a refused base position (block_presentation): the axes not SET since, and why.
+    # send_pellet is refused until none is left.
+    _presentation_blocked_axes: frozenset = frozenset()
+    _presentation_block_reason: str = ""
+    # token -> axis of each queued SET that lifts the block once the board acknowledges it.
+    _block_lifting_sets: Dict[UUID, int] = {}  # replaced, never mutated in place
+    # Incremented by every block_presentation: a SET sent under one block cannot lift another.
+    _block_generation: int = 0
+    # SETs that only move the stage for a while, or shift it from where it is: they do not
+    # stand in for the refused base position.
+    _SENDERS_NOT_CLEARING_THE_BLOCK = frozenset({"ordered_protocol", "processed_shift_xyz"})
 
     DEVICE_ACK_TIMEOUT_ENGAGED = "device_ack_timeout_engaged"
     DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED = "device_pellet_status_timeout_engaged"
@@ -96,6 +134,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self._device_conn: Optional[DeviceConnectionProtocol] = None
         # What the last connect wrote to the pellet controller (WRITE_MOTOR_CONFIGURATION).
         self._motor_configurations: Optional[MotorConfigurations] = None
+        # The compound sequences the last connect applied (move_config.yaml, else the built-in ones).
+        self._pellet_sequences: Dict[str, MotorSteps] = _pellet_sequences()
         self._can_device: Optional[CanDevice] = None
         self._can_latency_observer = None
         self._device_uuid_ack_timeout_engaged = False
@@ -365,6 +405,93 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     def requires_connection(self) -> bool:
         return self._can_enabled and self._pellet_controller_enabled
 
+    def _refuse_outside_travel(self, coord_idx: int, target: float) -> bool:
+        """True, after logging an error, when the absolute `target` (mm) of axis `coord_idx`
+        lies outside its travel in the loaded motor configurations (min_pos / max_pos in
+        motor_config.yaml). False when it is inside, or when no travel is configured."""
+        configurations = self._motor_configurations
+        if configurations is None:
+            return False
+        coord = "xyz"[coord_idx]
+        _, config = getattr(configurations, f"{coord}_config")
+        refusal = stepper_travel_refusal(coord, target, config)
+        if refusal is None:
+            return False
+        logger.error(refusal)
+        return True
+
+    def _axis_has_travel(self, coord_idx: int) -> bool:
+        """True when the loaded motor configurations limit axis `coord_idx` on either side."""
+        configurations = self._motor_configurations
+        if configurations is None:
+            return False
+        _, config = getattr(configurations, f"{'xyz'[coord_idx]}_config")
+        return (getattr(config, "minimum_position", None) is not None
+                or getattr(config, "maximum_position", None) is not None)
+
+    def refuse_xyz_outside_travel(self, xyz) -> bool:
+        """True, after logging an error per axis, when an absolute SET of `xyz` (motor mm)
+        would be refused on any axis: the caller then sets none of them, so the stage is never
+        left with some axes at the new position and the others at the previous one. The SET's
+        clamp to 0 applies first, as in _set_axis."""
+        refused = False
+        for coord_idx, value in enumerate(xyz):
+            target = 0 if value < 0 else value
+            if self._refuse_outside_travel(coord_idx, target):
+                refused = True
+        return refused
+
+    def refuse_shift_outside_travel(self, delta) -> bool:
+        """True, after logging an error per axis, when the relative SETs that the
+        intersession shift sends (`delta`, motor mm per axis; 0 sends nothing) would be
+        refused on any axis: the caller then shifts none of them. Each target is the
+        requested position plus the delta, with the SET's clamp to 0, as _set_axis computes it."""
+        refused = False
+        for coord_idx, value in enumerate(delta):
+            if value == 0:
+                continue
+            target = self._last_requested_set_coordinates[coord_idx] + value
+            if self._refuse_outside_travel(coord_idx, 0 if target < 0 else target):
+                refused = True
+        return refused
+
+    def block_presentation(self, reason: str) -> None:
+        """Refuse send_pellet, logging `reason`, until the board has accepted a SET of each of
+        x, y and z, from anything but a protocol target or the intersession shift. Called
+        after the animal's base position was refused, so the previous animal's position is
+        not used. A SET the board refuses, or never acknowledges, leaves its axis blocked.
+
+        The block state is read and written under _lock here, in _lift_presentation_block and
+        where _set_axis records a lifting SET, so an ack handled on the reader thread cannot
+        lift an axis of a block raised while it ran. Each call starts a new block generation:
+        _set_axis records a SET only when the generation it read before sending is still
+        current, so a SET sent under an earlier block lifts nothing of this one, whether its
+        ack arrives before or after the record. Those sections call nothing back."""
+        with self._lock:
+            self._presentation_blocked_axes = frozenset(range(3))
+            self._presentation_block_reason = str(reason)
+            self._block_lifting_sets = {}
+            self._block_generation += 1
+
+    def _lift_presentation_block(self, token) -> None:
+        """The board acknowledged `token`: when it is a SET that lifts the block, its axis is
+        no longer blocked."""
+        with self._lock:
+            coord_idx = self._block_lifting_sets.get(token)
+            if coord_idx is None:
+                return
+            self._block_lifting_sets = {t: i for t, i in self._block_lifting_sets.items() if t != token}
+            if coord_idx not in self._presentation_blocked_axes:
+                return
+            self._presentation_blocked_axes = self._presentation_blocked_axes - {coord_idx}
+            allowed = not self._presentation_blocked_axes
+        if allowed:
+            logger.notice("Pellet presentation allowed again: the board accepted x, y and z")
+
+    @property
+    def presentation_blocked(self) -> bool:
+        return bool(self._presentation_blocked_axes)
+
     def _set_axis(self, value: float, *, absolute: bool = True,
                   system_set_cmd: SystemCommandKind, coord_idx: int, sender: str="NA") -> Optional[UUID]:
         coord = "xyz"[coord_idx]
@@ -385,9 +512,36 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             new_value = 0
             logger.verbose("Axis-%s: limited move to 0 ; value=%.3f absolute=%s",
                          coord.upper(), value, absolute)
-        res = self._send_with_token(self._device_conn, system_set_cmd,
-                                    SystemDataArgsKwargs(value, relative=not absolute))
+        if self._refuse_outside_travel(coord_idx, new_value):
+            return None
+        if self._axis_has_travel(coord_idx):
+            # The board adds a relative SET to its own reported send position, which can
+            # differ from the requested one checked here (a SET it refused, a save_as_fixed
+            # step): send the checked absolute target, so it cannot add a different base.
+            data = SystemDataArgsKwargs(new_value, relative=False)
+        else:
+            data = SystemDataArgsKwargs(value, relative=not absolute)
+        block_generation = self._block_generation  # read before the send: see block_presentation
+        res = self._send_with_token(self._device_conn, system_set_cmd, data)
         if res is not None:
+            tokens = list(self._latest_set_tokens)
+            tokens[coord_idx] = res
+            self._latest_set_tokens = tuple(tokens)
+            if sender not in self._SENDERS_NOT_CLEARING_THE_BLOCK and coord_idx in self._presentation_blocked_axes:
+                # Lifted on the board's ack (_lift_presentation_block), not here. The ack can be
+                # handled before this records the token (_send_with_token's listeners run in
+                # between): _ack_received writes the outcome under _lock before it lifts, so
+                # either it finds the token here or this finds the outcome. The token is
+                # recorded only under the block it was sent under: a block raised during or
+                # after the send (a new generation) is not lifted by it, early ack or late.
+                with self._lock:
+                    recorded = (block_generation == self._block_generation
+                                and coord_idx in self._presentation_blocked_axes)
+                    if recorded:
+                        self._block_lifting_sets = {**self._block_lifting_sets, res: coord_idx}
+                    acked = recorded and self._command_outcomes.get(res, ("",))[0] == "acknowledged"
+                if acked:
+                    self._lift_presentation_block(res)
             self._last_requested_set_coordinates = self._last_requested_set_coordinates.replace(**{coord: new_value})
             self._on_property_changed(f"set_{coord}", new_value, prev_value)
         return res
@@ -427,6 +581,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                                "XYZ"[coord_idx])
                 return None
             value += prev_value
+        if self._refuse_outside_travel(coord_idx, value):
+            return None
         res = self._send_with_token(self._device_conn, system_move_cmd, value)
         return res
 
@@ -443,7 +599,53 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         return self._send_with_token(self._device_conn, SystemCommandKind.SEND_TO_LIMITS,
                                      [Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR, Motor.PELLET_X_MOTOR])
 
+    def _refuse_sequence_outside_travel(self, name: str) -> bool:
+        """True, after logging an error per step, when a stepper target of the compound
+        sequence `name` (move_config.yaml) lies outside the configured travel: the whole
+        sequence is then refused before its first step. Targets are taken from the last
+        reported stepper position and the requested send position (the reported one before
+        any SET); a step relative to a position the host does not know is not checked,
+        CanDevice and CanInterface send nothing for it.
+
+        The send-position steps are checked from the board's reported send position too, the
+        base CanDevice adds send_*_rel to and the one predefined send goes to, when it differs
+        from the requested one (a SET the board refused, a save_as_fixed step). A predefined
+        send is refused while the send position of an axis with travel is not known at all."""
+        if self._motor_configurations is None:
+            return False
+        reported_send = self._last_motor_send_coordinates
+        send_position = Offset3DTuple(*(
+            requested if math.isfinite(requested) else reported
+            for requested, reported in zip(self._last_requested_set_coordinates, reported_send)
+        ))
+        steps = self._pellet_sequences[name].steps
+        refused = False
+        # Both walks yield the same steps in the same order; only the send-based values differ.
+        for (axis, target), (_, device_target) in zip(
+            sequence_stepper_targets(steps, self._last_motor_coordinates, send_position),
+            sequence_stepper_targets(steps, self._last_motor_coordinates, reported_send),
+        ):
+            coord_idx = "xyz".index(axis)
+            if math.isfinite(target) and self._refuse_outside_travel(coord_idx, target):
+                refused = True
+            if (math.isfinite(device_target) and device_target != target
+                    and self._refuse_outside_travel(coord_idx, device_target)):
+                refused = True
+        unknown = [
+            "XYZ"[idx] for idx, value in enumerate(send_position)
+            if not math.isfinite(value) and self._axis_has_travel(idx)
+        ]
+        if unknown and any(step.get("predefined") == "send" for step in steps):
+            logger.error("Pellet sequence %s refused: the send position of %s is not known",
+                         name, ", ".join(unknown))
+            return True
+        if refused:
+            logger.error("Pellet sequence %s refused: a step lies outside the configured travel", name)
+        return refused
+
     def send_retract(self) -> Optional[UUID]:
+        if self._refuse_sequence_outside_travel("move_retract"):
+            return None
         return self._send_with_token(self._device_conn, SystemCommandKind.SEND_RETRACT)
 
     def send_home(self) -> Optional[UUID]:
@@ -457,6 +659,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         return token
 
     def load_pellet(self) -> Optional[UUID]:
+        if self._refuse_sequence_outside_travel("load_pellet"):
+            return None
         return self._send_with_token(self._device_conn, SystemCommandKind.LOAD_PELLET)
 
     def send_pellet(
@@ -470,6 +674,11 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             data["embedded_tone"] = embedded_tone
         if pre_reveal_stimulus is not None:
             data["pre_reveal_stimulus"] = pre_reveal_stimulus
+        if self._presentation_blocked_axes:
+            logger.error("Pellet presentation refused: %s", self._presentation_block_reason)
+            return None
+        if self._refuse_sequence_outside_travel("send_pellet"):
+            return None
         return self._send_with_token(
             self._device_conn,
             SystemCommandKind.SEND_PELLET,
@@ -477,9 +686,13 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         )
 
     def release_pellet(self) -> Optional[UUID]:
+        if self._refuse_sequence_outside_travel("release_pellet"):
+            return None
         return self._send_with_token(self._device_conn, SystemCommandKind.RELEASE_PELLET)
 
     def cover_pellet(self) -> Optional[UUID]:
+        if self._refuse_sequence_outside_travel("cover_pellet"):
+            return None
         return self._send_with_token(self._device_conn, SystemCommandKind.COVER_PELLET)
 
     def attach_servo(self, servo: Motor) -> Optional[UUID]:
@@ -763,7 +976,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         # 2)
         config_started = time.perf_counter()
         log_hardware_initialization(logger, "START | pellet move configuration")
-        device_conn.load_default_move_config()
+        self._pellet_sequences = _pellet_sequences(device_conn.load_default_move_config())
         log_hardware_initialization(
             logger,
             "READY | pellet move configuration | elapsed=%.3fs",
@@ -1467,8 +1680,16 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         )
 
     def set_motors_drift(self, drift: Offset3DTuple):
-        """Apply the pellet motor drift"""
+        """Apply the pellet motor drift. CanInterface moves the saved send position to
+        SET - drift, so that is refused, with nothing sent, when it lies outside the travel."""
         if self._device_conn is None:
+            return
+        refused = False
+        for coord_idx, (requested, axis_drift) in enumerate(zip(self._last_requested_set_coordinates, drift)):
+            target = requested - axis_drift
+            if math.isfinite(target) and self._refuse_outside_travel(coord_idx, target):
+                refused = True
+        if refused:
             return
         self._send_with_token(self._device_conn, SystemCommandKind.SET_MOTOR_DRIFT, drift)
         # this ensure the next send_to_fixed_pos command will get the corrected position:
@@ -1518,6 +1739,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 "Received unexpected ack token: %s", token)
         else:
             self._refresh_cmd_in_progress(commands_in_prog)
+            self._lift_presentation_block(token)
             if popped[0] in {SystemCommandKind.SEND_HOME, SystemCommandKind.SEND_TO_LIMITS}:
                 # Both home all three axes, and only the whole sequence is acknowledged.
                 self._set_axes_needing_home(())
@@ -1531,6 +1753,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             commands_in_prog = list(self._pending_tokens.values())
         if popped is not None:
             self._refresh_cmd_in_progress(commands_in_prog)
+            self._forget_refused_set(popped[0], token, refusal)
         # Below ERROR: the device has logged it at ERROR already, and every
         # ERROR record lands in the footer, where AppModel shows the notice.
         logger.warning("Pellet board refused command %s (token=%s): %s",
@@ -1564,6 +1787,24 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             category="board_refusal",
             error_code=int(refusal.error),
         ))
+
+    def _forget_refused_set(self, command, token, refusal) -> None:
+        """A refused SET_X/Y/Z left the board's send position where it was: put the requested
+        one back to the reported one (nan when that is not known), so the travel checks of the
+        next relative SET and sequence use the base the board really has.
+
+        Only on an axis with travel configured; without one the requested position is left as
+        it always was. Not when the outcome is unknown (-EBUSY on a resend), nor when a newer
+        SET of the axis was queued since. Silent: set_<axis> is not notified, since AppModel
+        saves every set_<axis> change into the selected animal as an operator edit."""
+        coord_idx = {SystemCommandKind.SET_X: 0, SystemCommandKind.SET_Y: 1, SystemCommandKind.SET_Z: 2}.get(command)
+        if coord_idx is None or not self._axis_has_travel(coord_idx):
+            return
+        if getattr(refusal, "outcome_unknown", False) or self._latest_set_tokens[coord_idx] != token:
+            return
+        coord = "xyz"[coord_idx]
+        reported = self._last_motor_send_coordinates[coord_idx]
+        self._last_requested_set_coordinates = self._last_requested_set_coordinates.replace(**{coord: reported})
 
     def _set_axes_needing_home(self, axes: Tuple[str, ...]) -> None:
         prev, self._axes_needing_home = self._axes_needing_home, tuple(axes)

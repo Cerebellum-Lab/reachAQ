@@ -20,6 +20,7 @@ from autotrainer.inference.multires_calibration.fit import BoardSpec, CameraMode
 from autotrainer.inference.multires_calibration.scout import (
     Bounds,
     ScoutView,
+    SCOUT_HOME_MARGIN_MM,
     bounds_from_plan,
     diagnose,
     load_move_list,
@@ -92,11 +93,12 @@ def _subset(views, cameras):
 def test_bounds_never_exceed_the_plan_box():
     targets = [(0.0, 0.1, 19.8), (17.7, 25.1, 32.8), (5.0, 12.0, 25.0)]
     box = bounds_from_plan(targets, None)
-    assert box == Bounds((0.0, 0.1, 19.8), (17.7, 25.1, 32.8))
+    # x and y start within SCOUT_HOME_MARGIN_MM of the home stop: raised to it.
+    assert box == Bounds((1.0, 1.0, 19.8), (17.7, 25.1, 32.8))
 
     # A configured box narrows the plan's, and never widens it.
     narrower = bounds_from_plan(targets, Bounds((2.0, -5.0, 21.0), (40.0, 20.0, 50.0)))
-    assert narrower == Bounds((2.0, 0.1, 21.0), (17.7, 20.0, 32.8))
+    assert narrower == Bounds((2.0, 1.0, 21.0), (17.7, 20.0, 32.8))
     for got, plan_lo, plan_hi in zip(zip(narrower.lo, narrower.hi), box.lo, box.hi):
         assert plan_lo <= got[0] <= got[1] <= plan_hi
 
@@ -108,6 +110,69 @@ def test_bounds_never_exceed_the_plan_box():
         bounds_from_plan(targets, Bounds((20.0, 0.0, 0.0), (30.0, 30.0, 40.0)))
     with pytest.raises(ValueError):
         bounds_from_plan([], None)
+
+
+def test_the_configured_travel_replaces_the_plan_box():
+    targets = [(0.0, 0.1, 19.8), (17.7, 25.1, 32.8), (5.0, 12.0, 25.0)]
+    travel = ((0.0, 35.0), (0.0, 35.0), (0.0, 35.0))
+    box = bounds_from_plan(targets, None, travel)
+    assert box == Bounds((1.0, 1.0, 1.0), (35.0, 35.0, 35.0))
+    # Every point of the grid lies inside the travel, and none just off the home stop.
+    for point in scout_grid(box):
+        assert all(0.0 <= v <= 35.0 for v in point)
+        assert not any(0.0 < v < SCOUT_HOME_MARGIN_MM for v in point)
+
+    # scoutBounds still narrows it, and the travel caps a wider scoutBounds.
+    narrowed = bounds_from_plan(targets, Bounds((2.0, -5.0, 21.0), (40.0, 20.0, 50.0)), travel)
+    assert narrowed == Bounds((2.0, 1.0, 21.0), (35.0, 20.0, 35.0))
+    for point in scout_grid(narrowed):
+        assert all(0.0 <= v <= 35.0 for v in point)
+
+    # An axis without travel keeps the plan's side; a one-sided travel replaces only its side.
+    partial = bounds_from_plan(targets, None, ((None, None), (3.0, None), (None, 30.0)))
+    assert partial == Bounds((1.0, 3.0, 19.8), (17.7, 25.1, 30.0))
+    assert bounds_from_plan(targets, None, None) == bounds_from_plan(targets, None)
+
+    with pytest.raises(ValueError, match="no overlap"):
+        bounds_from_plan(targets, Bounds((40.0, 0.0, 0.0), (50.0, 30.0, 30.0)), travel)
+
+
+def test_the_scout_box_keeps_clear_of_the_home_stop():
+    # 2026-11-23, christielab10: the scout commanded y 0.133 mm from home and the stage
+    # stayed at 0.000, so its strict arrival check aborted at the first grid point.
+    assert SCOUT_HOME_MARGIN_MM == 1.0
+    plan = [(0.0, 0.133, 0.5), (17.7, 25.1, 32.8)]
+    for travel in (None, ((0.0, 35.0),) * 3, ((None, None), (0.0, None), (None, 35.0))):
+        box = bounds_from_plan(plan, None, travel)
+        assert all(lo >= SCOUT_HOME_MARGIN_MM for lo in box.lo), (travel, box)
+        for point in scout_grid(box):
+            assert not any(0.0 < v < SCOUT_HOME_MARGIN_MM for v in point), (travel, point)
+    # A low edge already past the margin, and the upper edges, are left alone.
+    assert bounds_from_plan(plan, None, ((2.5, 35.0),) * 3) == Bounds((2.5, 2.5, 2.5), (35.0, 35.0, 35.0))
+    # An axis that sits on the home stop stays there: a move to the stop itself is made.
+    on_stop = bounds_from_plan([(0.0, 5.0, 20.0), (0.0, 10.0, 30.0)], None)
+    assert on_stop == Bounds((0.0, 5.0, 20.0), (0.0, 10.0, 30.0))
+    assert {p[0] for p in scout_grid(on_stop)} == {0.0}
+    # So does one whose whole box lies within the margin.
+    assert bounds_from_plan([(0.0, 5.0, 20.0), (0.6, 10.0, 30.0)], None).lo[0] == 0.0
+    assert bounds_from_plan([(0.0, 5.0, 20.0), (0.6, 10.0, 30.0)], None).hi[0] == 0.0
+    # Not onto the stop when a configured min_pos above 0 rules it out.
+    near = bounds_from_plan([(0.0, 5.0, 20.0), (0.6, 10.0, 30.0)], None, ((0.4, 0.6), (None, None), (None, None)))
+    assert (near.lo[0], near.hi[0]) == (0.4, 0.6)
+
+
+def test_the_home_margin_never_takes_the_box_outside_scout_bounds():
+    # scoutBounds y 0.5-0.8 with the travel's min_pos 0: putting y on the stop (0) would leave
+    # the operator's bounds, so the box stays as configured.
+    plan = [(0.0, 0.0, 20.0), (17.7, 25.1, 32.8)]
+    configured = Bounds((0.0, 0.5, 0.0), (35.0, 0.8, 35.0))
+    box = bounds_from_plan(plan, configured, ((0.0, 35.0),) * 3)
+    assert (box.lo[1], box.hi[1]) == (0.5, 0.8)
+    for k in range(3):
+        assert configured.lo[k] <= box.lo[k] <= box.hi[k] <= configured.hi[k], (k, box)
+    # scoutBounds that reach 0 still allow the stop.
+    on_stop = bounds_from_plan(plan, Bounds((0.0, 0.0, 0.0), (35.0, 0.8, 35.0)), ((0.0, 35.0),) * 3)
+    assert (on_stop.lo[1], on_stop.hi[1]) == (0.0, 0.0)
 
 
 def test_grid_moves_one_axis_at_a_time():

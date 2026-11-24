@@ -1,7 +1,8 @@
 """The scout pass: choose a move list that every ticked camera sees well.
 
-Before a capture the stage visits a coarse grid inside the box the hand-written move list
-already travels (bounds_from_plan), and each ticked camera looks for the board at every
+Before a capture the stage visits a coarse grid inside the stage's configured travel, or on
+an axis without one the box the hand-written move list already travels (bounds_from_plan),
+and each ticked camera looks for the board at every
 grid point (scout_view). From what each camera saw, select_waypoints picks up to 36 points
 that join the cameras through shared views and give each one 12 or more views, spread over
 its image and over depth; order_path turns them into a path of one-axis moves. A camera
@@ -146,22 +147,58 @@ class ScoutResult:
     views: Dict[int, Dict[str, ScoutView]] = field(default_factory=dict)
 
 
-def bounds_from_plan(plan_targets: Sequence[Sequence[float]], configured: Optional[Bounds]) -> Bounds:
-    """The box the plan's commanded targets span, intersected with `configured` when given.
+# How far the scout box's low edge keeps from the home stop at 0, in motor mm. On
+# 2026-11-23 the christielab10 scout commanded y 0.133 mm from home and the stage reported
+# 0.000: a sub-millimetre move just off the stop is not reliably made, and the strict arrival
+# check aborted the scout at its first grid point. A move to the stop itself is made, so only
+# targets in (0, margin) are avoided. The rule is the simplest one: a low edge below the
+# margin is raised to it, whether it came from min_pos, the plan or scoutBounds. A min_pos
+# above the margin is not a stop and is kept as it is. The upper edges keep no margin: the
+# arrival failure is at the home stop, and the far end has no switch for the stage to sit on.
+SCOUT_HOME_MARGIN_MM = 1.0
 
-    Never wider than either. Raises ValueError when there are no targets or the two boxes
-    do not overlap on some axis.
+#: Per axis x, y, z, the stage's configured travel (min_pos, max_pos) in mm; None on a side
+#: that is not configured (motor_config.yaml, HardwareModel refuses moves outside it).
+Travel = Sequence[Tuple[Optional[float], Optional[float]]]
+
+
+def bounds_from_plan(
+    plan_targets: Sequence[Sequence[float]], configured: Optional[Bounds], travel: Optional[Travel] = None
+) -> Bounds:
+    """The scout box: per axis the configured `travel`, a side without one the box the plan's
+    commanded targets span; then intersected with `configured` (scoutBounds) when given.
+    Last, a low edge below SCOUT_HOME_MARGIN_MM is raised to it; an axis whose whole box lies
+    below the margin is put on the home stop (0, 0) instead, a move the stage does make,
+    unless a configured min_pos above 0, or scoutBounds above 0, rules the stop out (it is
+    then left as it is).
+
+    Never wider than the travel or `configured`. Without travel it is the plan's box, never
+    wider. Raises ValueError when there are no targets or the boxes do not overlap on some axis.
     """
     targets = np.asarray(plan_targets, float).reshape(-1, 3)
     if len(targets) == 0:
         raise ValueError("the scout bounds need the hand-written plan's targets; there are none")
     lo, hi = targets.min(axis=0), targets.max(axis=0)
+    for k, (minimum, maximum) in enumerate(travel or ()):
+        if minimum is not None:
+            lo[k] = minimum
+        if maximum is not None:
+            hi[k] = maximum
+    box = (tuple(float(v) for v in lo), tuple(float(v) for v in hi))
     if configured is not None:
         lo = np.maximum(lo, np.asarray(configured.lo, float))
         hi = np.minimum(hi, np.asarray(configured.hi, float))
     if np.any(lo > hi):
-        raise ValueError(f"the configured scout bounds {configured} have no overlap with the hand-written"
-                         f" list's box {tuple(targets.min(axis=0))} - {tuple(targets.max(axis=0))}")
+        raise ValueError(f"the configured scout bounds {configured} have no overlap with the box"
+                         f" {box[0]} - {box[1]} (the configured travel, else the hand-written list's)")
+    minima = [minimum for minimum, _ in travel] if travel else [None] * 3
+    for k in range(3):
+        if lo[k] < SCOUT_HOME_MARGIN_MM:
+            if hi[k] >= SCOUT_HOME_MARGIN_MM:
+                lo[k] = SCOUT_HOME_MARGIN_MM
+            elif ((minima[k] is None or minima[k] <= 0.0)  # never onto a stop below a configured min
+                  and (configured is None or configured.lo[k] <= 0.0)):  # nor outside scoutBounds
+                lo[k] = hi[k] = 0.0
     return Bounds(tuple(float(v) for v in lo), tuple(float(v) for v in hi))
 
 

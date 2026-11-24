@@ -44,6 +44,9 @@ The full schema is in the docstring of `training/schema.py`. In short:
 
 - **device**: optional settings applied when the phase becomes current:
   `pelletDelivery`, `pelletCover`, `pelletShift` (between-trial pellet shift).
+  With `pelletShift: false` no shift is applied, so a tongue-eaten result in
+  that phase no longer raises the subject's y floor (`minimum_y_dcs`) that a
+  later automatic-shift phase uses.
   A missing key leaves the configuration's value, also when an earlier phase
   set it. The configuration's values come back when the plan is detached
   (unless the operator changed the setting meanwhile), and saving the

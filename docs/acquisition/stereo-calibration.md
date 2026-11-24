@@ -194,12 +194,31 @@ only re-aiming the camera helps.
 
 **The scout pass.**
 
-1. **Grid.** 4 x 4 x 3 = 48 points evenly spaced inside the box the hand-written
+1. **Grid.** 4 x 4 x 3 = 48 points evenly spaced inside the stage's configured
+   travel: `min_pos` and `max_pos` under `pellet.x`, `pellet.y` and `pellet.z`
+   in `~/Autotrainer/motor_config.yaml` (0-35 mm on every axis on
+   christielab10; see [Motor travel limits](../linux-install/runtime-configuration.md#motor-travel-limits)).
+   The scout reads that file itself, so it has the travel before any connect.
+   On an axis with no travel configured, the box is the one the hand-written
    list already travels (its commanded motor positions, after the lower-limit
-   clamp; about x 0-17.7, y 0.1-25.1, z 19.8-32.8 mm on christielab10). The box
-   is never widened. An optional `scoutBounds` entry in the library's
-   `settings.yaml`, `{lo: [x, y, z], hi: [x, y, z]}` in motor mm, can narrow it;
-   any other form is ignored with a warning.
+   clamp; about x 0-17.7, y 0.1-25.1, z 19.8-32.8 mm on christielab10); an axis
+   with only one side configured takes that side from the travel and the other
+   from the list. An optional `scoutBounds` entry in the library's
+   `settings.yaml`, `{lo: [x, y, z], hi: [x, y, z]}` in motor mm, can narrow the
+   box; any other form is ignored with a warning. The grid never leaves the
+   travel. A low edge below 1 mm is then raised to 1 mm (`SCOUT_HOME_MARGIN_MM`):
+   on 2026-11-23 christielab10 was commanded y 0.133 mm from home, stayed at
+   0.000, and the scout stopped at its first point. A move onto the home stop
+   itself is made, so an axis whose whole box is below 1 mm is scouted at 0,
+   unless `scoutBounds` (or a `min_pos` above 0) excludes 0: the box is then
+   left as configured. The upper edges keep no margin. A saved scout list with
+   a point outside today's box is scouted again.
+   A move list with a waypoint outside the travel is refused before anything is
+   homed or recorded: the hand-written list at the start of a hand-written
+   capture, and the list a scout run ends with (its own, a saved one, or the
+   hand-written fallback) before the capture. The error names up to three
+   waypoints, for example "the hand-written move list leaves the configured
+   travel: waypoint 4 z 52.000 mm (travel 0-35 mm)".
    The points are visited in serpentine order, so every move is one axis.
 2. **Short capture.** The scout records like the capture itself (same camera
    settings, TRIGGER mode, home first), pausing 0.3 s at each point after the
