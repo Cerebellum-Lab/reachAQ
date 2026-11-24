@@ -396,27 +396,70 @@ Keep the live DLC model's dataset directory (the path in its `test/pose_cfg.yaml
 `~/reachaq_probe` (see the rig clean-up keep list). `~/p1val` was already removed on
 2026-11-19.
 
-## Addendum: the v4 rename
+## Addendum: deploying v4.0.0 (the rename)
 
-This runbook describes the v3.1 deploy and is kept as it was. Deploying v4 on
-christielab10 is: reachAQ closed, `reachaq-sync`, then the installer, which
-does the settings move before anything else (see "Upgrading from v3" in
-[INSTALL.md](../../INSTALL.md)).
+This runbook describes the v3.1 deploy and is kept as it was. v4.0.0 renames the
+project (see "Upgrading from v3" in [INSTALL.md](../../INSTALL.md)). On
+christielab10, as the operator, nothing needing root (the installer's root steps
+are already in place, hence `REACHAQ_INSTALL_SYSTEM=0`):
 
-A dry run against the rig's own settings on 2026-11-23
-(`python3 - --dry-run < src/reachaq/core/settings_migration.py` over ssh, which
-writes nothing) planned:
+1. Close reachAQ (GUI and any headless run; stop by PID, never by pattern).
+2. Stop the SoftMouse publisher. Its installed unit runs
+   `python -m tools.acquisition.model.animal_sources.cli`, which v4 no longer has,
+   until the installer replaces it:
 
-- the rename `~/Autotrainer` -> `~/reachAQ`;
-- 6 rewrites: `demo/demo_sources.yaml`, the mouseGYM DeepLabCut `config.yaml` and
-  its `dlc-models-pytorch/.../train/pytorch_config.yaml`, and the three versioned
-  `system_configuration_v5x_*.yaml` snapshots;
-- 1 copy: `~/.config/Colorado/Auto Trainer.conf` -> `~/.config/reachAQ/reachAQ.conf`.
+   ```bash
+   systemctl --user stop reachaq-softmouse-publisher.timer reachaq-softmouse-publisher.service
+   ```
+3. Back up the settings:
+   `tar czf ~/autotrainer-settings-$(date +%Y%m%d-%H%M).tgz -C ~ Autotrainer .config/Colorado .config/reachaq .config/systemd/user`
+4. `cd ~/Documents/reachAQ`, check `git status --short` is empty, then `reachaq-sync`.
+5. Dry run of the settings move, which writes nothing:
+   `python3 src/reachaq/core/settings_migration.py --dry-run`. On 2026-11-24 it planned:
+   - the rename `~/Autotrainer` -> `~/reachAQ`;
+   - 6 rewrites: `demo/demo_sources.yaml`, the mouseGYM DeepLabCut `config.yaml` and its
+     `dlc-models-pytorch/.../train/pytorch_config.yaml`, and the three versioned
+     `system_configuration_v5x_*.yaml` snapshots;
+   - 1 copy: `~/.config/Colorado/Auto Trainer.conf` -> `~/.config/reachAQ/reachAQ.conf`;
+   - the rewrite of `~/.config/reachaq/launcher.conf` (`SYSTEM_CONFIG` named `~/Autotrainer`).
 
-The JetNet1 project names `/home/agx004/Autotrainer` (another machine) and is
-left alone. The installed `reachaq-softmouse-publisher.service` runs
-`python -m tools.acquisition.model.animal_sources.cli` and is replaced (its
-drop-in stays). `~/Documents/rawdatalocal` holds 2026 sessions only, so
-`reachaq-convert-pose-h5` is not needed there.
+   Stop if it plans anything else. The JetNet1 project names `/home/agx004/Autotrainer`
+   (another machine) and is left alone.
+6. `REACHAQ_INSTALL_SYSTEM=0 ./tools/install/reachaq-linux-install.sh`. It moves the
+   settings first, uninstalls every `auto-trainer*` distribution (including
+   `auto-trainer-api` and `auto-trainer-training`), installs `reachaq` and the plugins
+   the environment had, regenerates the launchers, the desktop entry and
+   `launcher.conf`, and replaces the installed SoftMouse unit (kept as
+   `reachaq-softmouse-publisher.service.bak`; its drop-in stays). It must end with no
+   FAIL; it is safe to rerun.
+7. Check:
+   - only `~/reachAQ` exists;
+   - `grep -c Autotrainer ~/.config/reachaq/launcher.conf` gives 0;
+   - `conda run -n reachaq python -m pip list | grep -iE "auto.?trainer"` is empty;
+   - `grep ExecStart ~/.config/systemd/user/reachaq-softmouse-publisher.service` names
+     `reachaq.app.model.animal_sources.cli`.
+8. `systemctl --user start reachaq-softmouse-publisher.timer`, then start reachAQ from the
+   desktop entry (title `christielab10 - reachAQ - Acquisition v4.0.0`) and record a
+   short check session.
 
-Rollback: `reachaq-migrate-settings --reverse`, then the v3.2.2 checkout (the last v3 release) and its installer.
+`~/Documents/rawdatalocal` holds 2026 sessions only, so `reachaq-convert-pose-h5` is not
+needed there.
+
+### Rollback to v3.2.2 (the last v3 release)
+
+With reachAQ closed and the publisher stopped (step 2):
+
+1. `reachaq-migrate-settings --reverse`, while v4 is still installed. It restores
+   `~/Autotrainer`, every rewritten file and `launcher.conf` byte for byte, and removes the
+   copied `~/.config/reachAQ/*.conf`.
+2. `conda run -n reachaq python -m pip uninstall -y reachaq reachaq-pose-deeplabcut reachaq-pose-yolo`
+3. `git checkout v3.2.2`, then `REACHAQ_INSTALL_SYSTEM=0 ./tools/install/reachaq-linux-install.sh`.
+4. Put the v3 SoftMouse unit back, since v3's installer does not replace installed units:
+
+   ```bash
+   cp ~/.config/systemd/user/reachaq-softmouse-publisher.service.bak ~/.config/systemd/user/reachaq-softmouse-publisher.service
+   systemctl --user daemon-reload
+   systemctl --user start reachaq-softmouse-publisher.timer
+   ```
+5. If anything is off, the step-3 tarball holds the pre-deploy settings. Return to
+   `devel` (`git switch devel`) before deploying v4 again.

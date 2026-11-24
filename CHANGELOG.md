@@ -48,7 +48,8 @@ installer, which migrates the settings; see "Upgrading from v3" in
 
 - `reachaq-migrate-settings` moves a v3 installation's settings: it renames
   `~/Autotrainer`, rewrites the old directory in the live yaml files there
-  (keeping each original), and copies the QSettings files. `--dry-run` shows the
+  (keeping each original) and in `~/.config/reachaq/launcher.conf`, and copies the
+  QSettings files. `--dry-run` shows the
   plan; `--reverse` restores the v3 layout byte for byte.
 - `reachaq-convert-pose-h5` rewrites the pickled `SceneElement` labels of
   pre-2025-06-25 pose files as plain strings (`--check`, `--in-place` with
