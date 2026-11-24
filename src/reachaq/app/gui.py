@@ -56,7 +56,7 @@ def main():
     # otherwise it can be set by some other 3rd party dependency.
     from reachaq.core.logging import setup_logging, stop_multiproc_logging, repr_all_loggers
 
-    app_start_log_level = os.getenv("AUTOTRAINER_LOG_LEVEL", "NOTSET")
+    app_start_log_level = os.getenv("REACHAQ_LOG_LEVEL", "NOTSET")
     if app_start_log_level.isdigit():
         app_start_log_level = int(app_start_log_level)
 

@@ -40,7 +40,7 @@ logger = get_verbose_logger(__name__)
 AvailableShiftXYZ = numpy.array([[-5, 5], [-5, 5], [-5, 5]])
 
 
-_segment_reach_debug: int = int(os.getenv("AUTOTRAINER_SEGMENT_REACH_DEBUG", 0))
+_segment_reach_debug: int = int(os.getenv("REACHAQ_SEGMENT_REACH_DEBUG", 0))
 
 _CALIB_DIR_HINT = "pass --calib-dir to choose the calibration folder"
 # The live3dDisabledReason the app records while the operator has switched live 3D off

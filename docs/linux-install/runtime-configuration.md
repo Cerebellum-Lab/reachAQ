@@ -132,7 +132,7 @@ The boot service and application use different variable namespaces:
 
 - `/etc/default/reachaq-can` supplies `REACHAQ_CAN_*` values to
   `reachaq-can.service`, which configures and brings up the Linux interface.
-- The launching process supplies `AUTOTRAINER_CAN_*` values to reachAQ, which
+- The launching process supplies `REACHAQ_CAN_*` values to reachAQ, which
   opens the already-active interface.
 
 The service does not export its values into user applications. Source the
@@ -142,16 +142,16 @@ application channel must match:
 
 ```bash
 . /etc/default/reachaq-can
-test "$AUTOTRAINER_CAN_CHANNEL" = "$REACHAQ_CAN_INTERFACE"
+test "$REACHAQ_CAN_CHANNEL" = "$REACHAQ_CAN_INTERFACE"
 systemctl is-enabled reachaq-can.service
 systemctl is-active reachaq-can.service
-ip -details link show "$AUTOTRAINER_CAN_CHANNEL"
+ip -details link show "$REACHAQ_CAN_CHANNEL"
 ```
 
 The retired Anschutz hardware profile has been removed. ReachAQ targets the
 pellet board through the selected JerryCAN, SocketCAN, or emulation transport;
 transport selection does not change the pellet-board command model. Use
-`AUTOTRAINER_CAN_TRANSPORT=emulation` only for software testing.
+`REACHAQ_CAN_TRANSPORT=emulation` only for software testing.
 
 ## Pellet motor coordinates
 
@@ -328,7 +328,7 @@ The default installed files are:
 The installer replaces an obsolete `ReachAQ-startup` shell fragment in that
 same desktop directory.
 Launcher paths are stored in `~/.config/reachaq/launcher.conf`. Optional
-`AUTOTRAINER_*` and `REACHAQ_*` runtime values can be placed as literal
+`REACHAQ_*` and `REACHAQ_*` runtime values can be placed as literal
 `KEY=VALUE` lines in `~/.config/reachaq/runtime.env`; the launcher parses this
 file as data and does not source it as shell code. Re-run the launcher installer
 after moving the repository, changing the Conda environment, or changing the

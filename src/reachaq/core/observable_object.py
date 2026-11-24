@@ -11,7 +11,7 @@ logger = get_verbose_logger(__name__)
 
 
 _debug_properties_change = {
-    v.strip() for v in os.getenv("AUTOTRAINER_DEBUG_PROPERTIES", "").split(",")
+    v.strip() for v in os.getenv("REACHAQ_DEBUG_PROPERTIES", "").split(",")
 }
 
 

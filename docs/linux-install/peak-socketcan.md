@@ -18,7 +18,7 @@ The application requests a 4 MiB receive buffer by default, drains up to 512
 frames per pass on legacy hardware (and up to 2,000 where pyjerrycan is not in
 use), and logs aggregate receive throughput once per minute. It does not log
 every raw frame. Override the requested buffer with
-`AUTOTRAINER_CAN_RECEIVE_BUFFER_BYTES` only after measuring an endurance run.
+`REACHAQ_CAN_RECEIVE_BUFFER_BYTES` only after measuring an endurance run.
 
 ## Configuration ownership
 
@@ -29,10 +29,10 @@ separate environment files:
 |---|---|---|
 | Kernel/driver | `peak_pciefd` and SocketCAN | Expose PEAK channels as network devices such as `can0` |
 | Boot service | `/etc/default/reachaq-can` | Select one application channel and configure its bitrate, CAN FD mode, queue length, and `UP` state |
-| Application | `AUTOTRAINER_CAN_*` environment variables | Select the already-configured channel and open a SocketCAN socket |
+| Application | `REACHAQ_CAN_*` environment variables | Select the already-configured channel and open a SocketCAN socket |
 | Confirmed-failure recovery | `/usr/local/sbin/reachaq-reset-can` | Serialized, debounced restart of only `reachaq-can.service` after local reopen fails |
 
-`REACHAQ_CAN_INTERFACE` and `AUTOTRAINER_CAN_CHANNEL` must name the same
+`REACHAQ_CAN_INTERFACE` and `REACHAQ_CAN_CHANNEL` must name the same
 interface. Values in `/etc/default/reachaq-can` are visible to systemd only;
 sourcing `reachaq_hardware.env.example` affects the application shell only.
 
@@ -344,14 +344,14 @@ reachAQ, or put equivalent variables in the launcher/service environment.
 Confirm the effective values:
 
 ```bash
-env | grep '^AUTOTRAINER_CAN_' | sort
+env | grep '^REACHAQ_CAN_' | sort
 ```
 
 The application channel must match `/etc/default/reachaq-can`:
 
 ```bash
 . /etc/default/reachaq-can
-test "$AUTOTRAINER_CAN_CHANNEL" = "$REACHAQ_CAN_INTERFACE"
+test "$REACHAQ_CAN_CHANNEL" = "$REACHAQ_CAN_INTERFACE"
 ```
 
 Do not source `/etc/default/reachaq-can` as the application configuration; its
@@ -434,7 +434,7 @@ out-of-tree PCAN driver and `/dev/pcan*` exists.
 | Channel already owned | Close the other reachAQ/validator process; do not bypass the ownership lock |
 | Reset suppressed | Expected within the 15-second debounce window or while another process owns the channel |
 | RX `dropped` rises | Save before/after interface statistics, one-minute reader throughput, CPU load, and effective receive-buffer log |
-| Application and service use different channels | Match `AUTOTRAINER_CAN_CHANNEL` to `REACHAQ_CAN_INTERFACE` |
+| Application and service use different channels | Match `REACHAQ_CAN_CHANNEL` to `REACHAQ_CAN_INTERFACE` |
 | `REQUEST_VERSION` times out while RX traffic continues | Host startup/ACK handling issue, not proof of a dead board; retain the complete application log |
 | Validator opens bus but misses board | Correct interface, board power, bitrate, and target firmware |
 | Another backend is selected | Source `src/reachaq/hardware/reachaq_hardware.env.example` |

@@ -16,7 +16,7 @@ class MotorPelletBackend(Protocol):
 
     `CanDevice._make_device_interface` is the one selection point: it returns
     `CanInterface` for a real transport and `EmulationInterface` for
-    `AUTOTRAINER_CAN_TRANSPORT=emulation` or a missing driver. `DeviceInterface`
+    `REACHAQ_CAN_TRANSPORT=emulation` or a missing driver. `DeviceInterface`
     stays the base class; this lists only what the app relies on.
 
     Threads: `open`, `close`, `can_read` and `read` run on DeviceConnection's

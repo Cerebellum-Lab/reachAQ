@@ -2,12 +2,12 @@
 set -euo pipefail
 
 interface="${REACHAQ_CAN_INTERFACE:-can0}"
-bitrate="${REACHAQ_CAN_BITRATE:-${AUTOTRAINER_CAN_BITRATE:-1000000}}"
+bitrate="${REACHAQ_CAN_BITRATE:-1000000}"
 restart_ms="${REACHAQ_CAN_RESTART_MS:-100}"
 txqueuelen="${REACHAQ_CAN_TXQUEUELEN:-1000}"
 wait_seconds="${REACHAQ_CAN_WAIT_SECONDS:-30}"
 driver="${REACHAQ_CAN_DRIVER:-peak_pciefd}"
-can_fd="${REACHAQ_CAN_FD:-${AUTOTRAINER_CAN_FD:-false}}"
+can_fd="${REACHAQ_CAN_FD:-false}"
 dbitrate="${REACHAQ_CAN_DBITRATE:-$bitrate}"
 
 if [[ "$(id -u)" != "0" ]]; then

@@ -53,8 +53,8 @@ Everything is set up in `main()` before `AppModel` exists, because the NI-DAQ
 worker runs in a forkserver child that keeps the environment it started with.
 The variables are `REACHAQ_SIMULATION=1`, `REACHAQ_SIM_BUS`, `REACHAQ_SIM_EPOCH`,
 `REACHAQ_SIM_CAMERA_FPS`, `REACHAQ_SIM_CAMERA_EXPOSURE_S`,
-`REACHAQ_SIM_LINE_ALIASES`, `AUTOTRAINER_DIAMOND_TRIANGLE_CONFIG` and
-`AUTOTRAINER_CAN_TRANSPORT=emulation`. Use the
+`REACHAQ_SIM_LINE_ALIASES`, `REACHAQ_DIAMOND_TRIANGLE_CONFIG` and
+`REACHAQ_CAN_TRANSPORT=emulation`. Use the
 flag rather than setting them by hand: by hand, the configuration, preferences,
 data and lock are not moved into a sim home.
 

@@ -62,7 +62,7 @@ MEASURED_FASTER_IN_FP16: typing.FrozenSet[str] = frozenset()
 SUPPORTED_PRECISIONS = frozenset({"fp32", "fp16"})
 
 # Per-rig override, for benchmarking a card before it earns an entry above.
-PRECISION_ENVIRONMENT_VARIABLE = "AUTOTRAINER_POSE_PRECISION"
+PRECISION_ENVIRONMENT_VARIABLE = "REACHAQ_POSE_PRECISION"
 
 
 @dataclasses.dataclass(frozen=True)

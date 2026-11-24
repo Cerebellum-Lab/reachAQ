@@ -56,12 +56,12 @@ def test_can_transport_configuration_rejects_data_bitrate_without_fd():
 
 
 def test_can_transport_configuration_reads_environment(monkeypatch):
-    monkeypatch.setenv("AUTOTRAINER_CAN_TRANSPORT", "socketcan")
-    monkeypatch.setenv("AUTOTRAINER_CAN_CHANNEL", "can1")
-    monkeypatch.setenv("AUTOTRAINER_CAN_BITRATE", "500000")
-    monkeypatch.setenv("AUTOTRAINER_CAN_DATA_BITRATE", "2000000")
-    monkeypatch.setenv("AUTOTRAINER_CAN_FD", "true")
-    monkeypatch.setenv("AUTOTRAINER_CAN_RECEIVE_BUFFER_BYTES", "8388608")
+    monkeypatch.setenv("REACHAQ_CAN_TRANSPORT", "socketcan")
+    monkeypatch.setenv("REACHAQ_CAN_CHANNEL", "can1")
+    monkeypatch.setenv("REACHAQ_CAN_BITRATE", "500000")
+    monkeypatch.setenv("REACHAQ_CAN_DATA_BITRATE", "2000000")
+    monkeypatch.setenv("REACHAQ_CAN_FD", "true")
+    monkeypatch.setenv("REACHAQ_CAN_RECEIVE_BUFFER_BYTES", "8388608")
 
     config = CanTransportConfiguration.from_environment()
 
@@ -83,7 +83,7 @@ def test_can_transport_configuration_defaults_linux_x86_to_socketcan_fd(monkeypa
         "FD",
         "RECEIVE_TIMEOUT_SECONDS",
     ):
-        monkeypatch.delenv(f"AUTOTRAINER_CAN_{name}", raising=False)
+        monkeypatch.delenv(f"REACHAQ_CAN_{name}", raising=False)
     monkeypatch.setattr(can_transport.platform, "system", lambda: "Linux")
     monkeypatch.setattr(can_transport.platform, "machine", lambda: "x86_64")
 
@@ -97,8 +97,8 @@ def test_can_transport_configuration_defaults_linux_x86_to_socketcan_fd(monkeypa
 
 
 def test_can_transport_configuration_keeps_legacy_default_on_linux_arm(monkeypatch):
-    monkeypatch.delenv("AUTOTRAINER_CAN_TRANSPORT", raising=False)
-    monkeypatch.delenv("AUTOTRAINER_CAN_TYPE", raising=False)
+    monkeypatch.delenv("REACHAQ_CAN_TRANSPORT", raising=False)
+    monkeypatch.delenv("REACHAQ_CAN_TYPE", raising=False)
     monkeypatch.setattr(can_transport.platform, "system", lambda: "Linux")
     monkeypatch.setattr(can_transport.platform, "machine", lambda: "aarch64")
 

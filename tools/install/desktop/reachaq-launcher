@@ -50,7 +50,7 @@ if [ -n "$runtime_env" ] && [ -r "$runtime_env" ]; then
     while IFS='=' read -r key value || [ -n "${key:-}" ]; do
         value=${value%$'\r'}
         case "$key" in
-            AUTOTRAINER_*|REACHAQ_*) export "$key=$value" ;;
+            REACHAQ_*) export "$key=$value" ;;
         esac
     done < "$runtime_env"
 fi

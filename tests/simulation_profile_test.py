@@ -191,7 +191,7 @@ def test_environment_set(home, tmp_path):
     assert os.environ["REACHAQ_SIMULATION"] == "1"
     assert os.environ["REACHAQ_SIM_BUS"] == run.bus_path.as_posix()
     assert float(os.environ["REACHAQ_SIM_EPOCH"]) > 0
-    assert os.environ["AUTOTRAINER_CAN_TRANSPORT"] == "emulation"
+    assert os.environ["REACHAQ_CAN_TRANSPORT"] == "emulation"
     assert float(os.environ["REACHAQ_SIM_CAMERA_FPS"]) == 150.0
     assert float(os.environ["REACHAQ_SIM_CAMERA_EXPOSURE_S"]) == pytest.approx(0.002)
     assert os.environ["REACHAQ_SIM_LINE_ALIASES"] == "{}"

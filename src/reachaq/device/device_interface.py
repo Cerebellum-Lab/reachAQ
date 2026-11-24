@@ -584,7 +584,7 @@ class Acknowledge(Source):
 _zero_position = Offset3DTuple(0, 0, 0)
 
 
-_device_float_precision = os.getenv("AUTOTRAINER_DEVICE_FLOAT_PRECISION", "2")
+_device_float_precision = os.getenv("REACHAQ_DEVICE_FLOAT_PRECISION", "2")
 if _device_float_precision is not None and len(_device_float_precision) > 0:
     _device_float_precision = int(_device_float_precision)
 else:

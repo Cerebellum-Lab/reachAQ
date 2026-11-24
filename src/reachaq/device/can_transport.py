@@ -60,7 +60,7 @@ class CanTransportConfiguration:
         return cls(**values)
 
     @classmethod
-    def from_environment(cls, prefix: str = "AUTOTRAINER_CAN_") -> "CanTransportConfiguration":
+    def from_environment(cls, prefix: str = "REACHAQ_CAN_") -> "CanTransportConfiguration":
         values = {}
         env = os.environ
         kind = env.get(f"{prefix}TRANSPORT", env.get(f"{prefix}TYPE"))

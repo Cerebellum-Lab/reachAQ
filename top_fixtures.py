@@ -57,7 +57,7 @@ fake_perf_now = 0  # used to control time.perf_counter() in BehaviorAlgo/SystemM
 @pytest.fixture(autouse=True)
 def isolate_host_can(monkeypatch):
     """Never let an automated test control the workstation's SocketCAN link."""
-    monkeypatch.setenv("AUTOTRAINER_CAN_TRANSPORT", "emulation")
+    monkeypatch.setenv("REACHAQ_CAN_TRANSPORT", "emulation")
 
 
 # ~/Documents/rawdatalocal, where christielab10 records its real sessions.

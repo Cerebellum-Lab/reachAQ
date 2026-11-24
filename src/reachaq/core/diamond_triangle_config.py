@@ -17,7 +17,7 @@ logger = get_verbose_logger(__name__)
 
 
 DEFAULT_DIAMOND_TRIANGLE_CONFIG_PATH = Path(
-    os.getenv("AUTOTRAINER_DIAMOND_TRIANGLE_CONFIG", DEFAULT_CONFIG_DIR / "diamond_triangle_offset.yaml")
+    os.getenv("REACHAQ_DIAMOND_TRIANGLE_CONFIG", DEFAULT_CONFIG_DIR / "diamond_triangle_offset.yaml")
 ).expanduser()
 
 _offset_nans = Offset3DTuple(math.nan, math.nan, math.nan)

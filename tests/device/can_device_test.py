@@ -1472,7 +1472,7 @@ def test_a_stepper_status_that_changes_only_its_status_byte_is_forwarded():
         required_targets=(Target.PELLET_DEVICE,),
     )
     # Fix the refresh window, so the result depends neither on the wall clock
-    # nor on AUTOTRAINER_DEVICE_SIMILAR_DATA_REFRESH_DELAY.
+    # nor on REACHAQ_DEVICE_SIMILAR_DATA_REFRESH_DELAY.
     device.same_data_refresh_delay = 3600.0
 
     for status in (0x00, 0x02, 0x03, 0x03):  # same position each time

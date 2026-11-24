@@ -92,7 +92,7 @@ def app_model(
     # for now:
     monkeypatch.setattr(BehaviorAlgorithm, "_no_handler_thread", True)
     assert BehaviorAlgorithm._no_handler_thread is True  # to be safe to start with
-    monkeypatch.setenv("AUTOTRAINER_CAN_TRANSPORT", "emulation")
+    monkeypatch.setenv("REACHAQ_CAN_TRANSPORT", "emulation")
     #
     app = AppModel(user_pref, calib_dir=calib_dir)
     try:
@@ -2277,9 +2277,9 @@ def test_launch_cli(system_config, config_file_path, user_pref, calib_dir, diamo
     system_config.save_file(config_file_path, as_yaml=True)
     config_bytes = config_file_path.read_bytes()
     env = app_launch_env  # its own HOME, so its default data folder is under tmp too
-    env['AUTOTRAINER_DIAMOND_TRIANGLE_CONFIG'] = diamond_config_path.as_posix()  # same for this !
-    env['AUTOTRAINER_FORCE_CAN_EMULATION_IFACE'] = "1"
-    env['AUTOTRAINER_CAN_TRANSPORT'] = "emulation"
+    env['REACHAQ_DIAMOND_TRIANGLE_CONFIG'] = diamond_config_path.as_posix()  # same for this !
+    env['REACHAQ_FORCE_CAN_EMULATION_IFACE'] = "1"
+    env['REACHAQ_CAN_TRANSPORT'] = "emulation"
     proc = subprocess.Popen([
         sys.executable,
         "-m", "reachaq.app.headless",

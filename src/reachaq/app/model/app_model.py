@@ -10080,7 +10080,7 @@ class AppModel(ObservableObject):
 
         self._register_ready_camera_watchdogs()
 
-        if __debug__ and os.getenv("_AUTOTRAINER_TEST_WATCHDOG") == "1":
+        if __debug__ and os.getenv("_REACHAQ_TEST_WATCHDOG") == "1":
             def fake_watchdog(t_end):
                 return t_end
             watchdog_mon_register("test-watchdog", lambda t=time.perf_counter() + 180: fake_watchdog(t))

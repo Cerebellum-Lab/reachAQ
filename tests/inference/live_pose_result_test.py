@@ -170,7 +170,7 @@ def test_live_source_frames_without_times_reports_none_rather_than_inventing_the
 
 
 def test_renew_workers(request, monkeypatch, caplog, capture_multiprocess_logs):
-    # os.environ["AUTOTRAINER_LIVE_WORKERS_RENEW_TIMER_DELAY"] = "3"
+    # os.environ["REACHAQ_LIVE_WORKERS_RENEW_TIMER_DELAY"] = "3"
     proc = request.getfixturevalue("inference_data_proc")
     proc._live_generation_renew_age = 3
     proc.start()

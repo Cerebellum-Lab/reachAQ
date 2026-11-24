@@ -157,7 +157,7 @@ That guide installs these root-owned system artifacts:
 Adding the operator to the `reachaq` group requires a full logout/login before
 the application can use its non-interactive safety reset. The service
 configuration and application environment are separate; make
-`REACHAQ_CAN_INTERFACE` and `AUTOTRAINER_CAN_CHANNEL` select the same channel.
+`REACHAQ_CAN_INTERFACE` and `REACHAQ_CAN_CHANNEL` select the same channel.
 
 ### NVIDIA live inference
 
@@ -205,7 +205,7 @@ operator selects Running.
   succeeds without prompting.
 - [ ] Root-owned installed CAN files match the reviewed repository versions;
   `/etc/default/reachaq-can` retains any intentional rig-specific values.
-- [ ] The application `AUTOTRAINER_CAN_CHANNEL` matches service
+- [ ] The application `REACHAQ_CAN_CHANNEL` matches service
   `REACHAQ_CAN_INTERFACE`.
 - [ ] If inference is enabled, the report passes the PyTorch GPU check, and,
   with the DeepLabCut plugin, the TensorFlow and both-engines GPU checks.

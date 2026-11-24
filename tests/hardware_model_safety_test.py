@@ -24,7 +24,7 @@ from reachaq.app.model.hardware_model import HardwareModel
 
 
 def test_test_harness_forces_can_emulation():
-    assert os.environ["AUTOTRAINER_CAN_TRANSPORT"] == "emulation"
+    assert os.environ["REACHAQ_CAN_TRANSPORT"] == "emulation"
     assert (
         CanTransportConfiguration.from_environment().kind
         is CanTransportKind.EMULATION

@@ -86,7 +86,7 @@ def _default_paths(env):
 
 def _clean_env(**extra):
     env = {k: v for k, v in os.environ.items()
-           if k not in ("REACHAQ_CONFIG_DIR", "AUTOTRAINER_DIAMOND_TRIANGLE_CONFIG")}
+           if k not in ("REACHAQ_CONFIG_DIR", "REACHAQ_DIAMOND_TRIANGLE_CONFIG")}
     env.update(extra)
     return env
 

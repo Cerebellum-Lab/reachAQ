@@ -58,7 +58,7 @@ from .device_interface import (
 
 logger = get_verbose_logger(__name__)
 
-_force_emulation = os.getenv("AUTOTRAINER_FORCE_CAN_EMULATION_IFACE", "") == "1"
+_force_emulation = os.getenv("REACHAQ_FORCE_CAN_EMULATION_IFACE", "") == "1"
 if _force_emulation:
     HAVE_CAN_DEVICE = False
 else:
@@ -71,7 +71,7 @@ else:
 
 
 # this is used to reduce the rate of messages sent to "clients/listeners" to the property changed callback:
-_similar_data_refresh_delay = os.getenv("AUTOTRAINER_DEVICE_SIMILAR_DATA_REFRESH_DELAY") or 2.5
+_similar_data_refresh_delay = os.getenv("REACHAQ_DEVICE_SIMILAR_DATA_REFRESH_DELAY") or 2.5
 _similar_data_refresh_delay = float(_similar_data_refresh_delay)
 
 # some sentinels object:
@@ -724,8 +724,8 @@ class CanDevice(Device):
                 has_read_from_queue = False
 
             p_now = get_perf_now()
-            if __debug__ and os.getenv("_AUTOTRAINER_SIMULATE_CAN_WRITER_THREAD_CRASH") == "1":
-                if p_now > p_before_loop + int(os.getenv("_AUTOTRAINER_SIMULATE_CAN_WRITER_THREAD_CRASH_TIMEOUT", "180")):
+            if __debug__ and os.getenv("_REACHAQ_SIMULATE_CAN_WRITER_THREAD_CRASH") == "1":
+                if p_now > p_before_loop + int(os.getenv("_REACHAQ_SIMULATE_CAN_WRITER_THREAD_CRASH_TIMEOUT", "180")):
                     1 / 0
 
             # always update watchdog_perf_c:

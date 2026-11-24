@@ -81,7 +81,7 @@ from . import socketcan_jerrycan
 
 logger = get_verbose_logger(__name__)
 
-_debug_path_fake_status_timeout = Path("/tmp/autotrainer_fake_device_timeout")
+_debug_path_fake_status_timeout = Path("/tmp/reachaq_fake_device_timeout")
 
 #: Stimulus outputs that can carry a firmware-timed finite pulse, mapped to the
 #: generic-GPIO index the board expects. The index is offset by the board's

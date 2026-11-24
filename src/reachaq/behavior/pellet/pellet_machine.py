@@ -24,7 +24,7 @@ from . import PelletState
 logger = get_verbose_logger(__name__)
 
 
-DEFAULT_LOAD_RETRACT_COUNT_FORCE_HOME = int(os.getenv("AUTOTRAINER_LOAD_RETRACT_COUNT_FORCE_HOME", "12"))
+DEFAULT_LOAD_RETRACT_COUNT_FORCE_HOME = int(os.getenv("REACHAQ_LOAD_RETRACT_COUNT_FORCE_HOME", "12"))
 
 
 class PelletLoadFailedEventT(Protocol):

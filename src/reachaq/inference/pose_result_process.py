@@ -44,7 +44,7 @@ logger = get_verbose_logger(__name__)
 
 
 # default 1 hour renew delay:
-LIVE_WORKERS_RENEW_TIMER_DELAY = float(os.getenv("AUTOTRAINER_LIVE_WORKERS_RENEW_TIMER_DELAY",
+LIVE_WORKERS_RENEW_TIMER_DELAY = float(os.getenv("REACHAQ_LIVE_WORKERS_RENEW_TIMER_DELAY",
                                                  60 * 60))
 
 
