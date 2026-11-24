@@ -548,6 +548,11 @@ def placement_notes(placement) -> List[str]:
         + (f"; left out of it (more than 3 MAD off): waypoints {', '.join(str(w) for w in placement.outliers)}"
            if placement.outliers else "")
     ]
+    scales, angles = getattr(placement, "axis_scale", None), getattr(placement, "axis_angle_deg", None)
+    if scales is not None and angles is not None:
+        notes.append(
+            "stage axes: scale x {:.4f}, y {:.4f}, z {:.4f} (true mm per commanded mm);"
+            " angles xy {:.2f}, xz {:.2f}, yz {:.2f} deg".format(*scales, *angles))
     for w, r in residual.items():
         if math.hypot(*r) > PLACEMENT_FLAG_MM:
             axis = int(np.argmax(np.abs(r)))

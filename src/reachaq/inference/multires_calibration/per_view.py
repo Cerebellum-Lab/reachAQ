@@ -119,6 +119,27 @@ def configured_fit(settings, board: BoardSpec) -> str:
     return str(value)
 
 
+# The library setting that picks the stage model the per-view fit holds the views to
+# (configured_placement): "similarity" (the default), s R m + t, one scale for every axis; or
+# "affine", A m + t with A any 3x3: a scale per motor axis and the angles between the axes.
+# UNFINALIZED.
+PLACEMENT_SETTING = "placement"
+PLACEMENT_SIMILARITY = "similarity"
+PLACEMENT_AFFINE = "affine"
+PLACEMENT_MODES = (PLACEMENT_SIMILARITY, PLACEMENT_AFFINE)
+
+
+def configured_placement(settings) -> str:
+    """The library settings' `placement` (similarity or affine); similarity when unset or null.
+    Raises ValueError naming the key for any other value."""
+    value = settings.get(PLACEMENT_SETTING) if settings else None
+    if value is None:
+        return PLACEMENT_SIMILARITY
+    if value not in PLACEMENT_MODES:
+        raise ValueError(f"{PLACEMENT_SETTING}: {value!r} is not one of {', '.join(PLACEMENT_MODES)}")
+    return str(value)
+
+
 def configured_principal_point(settings) -> bool:
     """Whether the library settings hold the per-view fit's principal points at the image
     centre (`fit_principal_point: centre`); False when unset or "free". Raises ValueError
@@ -141,6 +162,7 @@ def fit_per_view(
     prior_mm: Optional[float] = -1.0,
     tilt: bool = True,
     fix_principal_point: bool = False,
+    placement: str = PLACEMENT_SIMILARITY,
 ) -> MotorFrameFit:
     """Fit every camera in `camera_names` with a free board pose per view (module docstring).
 
@@ -160,6 +182,11 @@ def fit_per_view(
     `initial`, a fit in this image's pixels, is the only start when given: its intrinsics and
     relative camera poses, with each view's pose from solvePnP.
 
+    `placement` is the stage model the views are held to: PLACEMENT_SIMILARITY, s R m + t, or
+    PLACEMENT_AFFINE, A m + t (a scale per motor axis and the angles between the axes; the
+    motor frame's orientation is then A's polar rotation, and motor_scale the cube root of
+    det A).
+
     `fix_principal_point` holds every camera's (cx, cy): at `initial`'s when given (the
     cross-check's mapped sensor fit), else at the image centre ((w - 1) / 2, (h - 1) / 2).
     Near-parallel views barely separate the principal point from the camera's position; on
@@ -169,13 +196,15 @@ def fit_per_view(
     when a camera shares no view with the cameras already placed; RuntimeError when no start
     converges.
     """
+    if placement not in PLACEMENT_MODES:
+        raise ValueError(f"placement must be one of {PLACEMENT_MODES}, got {placement!r}")
     obj = board.object_points()
     names = tuple(camera_names)
     data = {cam: _camera_data(observations, cam, len(obj), board) for cam in names}
     ref = max(names, key=lambda cam: len(data[cam].indices))
     if prior_mm is not None and prior_mm < 0:
         prior_mm = MOTOR_PRIOR_MM
-    problem = _Problem(obj, data, names, ref, observations, prior_mm, tilt)
+    problem = _Problem(obj, data, names, ref, observations, prior_mm, tilt, affine=placement == PLACEMENT_AFFINE)
     if fix_principal_point:
         width, height = int(image_size[0]), int(image_size[1])
         problem.fixed_pp = {
@@ -235,8 +264,11 @@ class _Problem:
         + [rvec, tvec per view], views in waypoint order.
     """
 
-    def __init__(self, obj, data: Dict[str, _CameraData], names, ref, observations, prior_mm=None, tilt=True):
+    def __init__(self, obj, data: Dict[str, _CameraData], names, ref, observations, prior_mm=None, tilt=True,
+                 affine=False):
         self.obj, self.data, self.names, self.ref = obj, data, names, ref
+        # The stage model: A m + t, A any 3x3 (12 parameters), or s R m + t (7)
+        self.affine = affine
         self.prior_mm = prior_mm
         # The board point the prior holds to the motor similarity: the point the board turns
         # about, its mount, which is fitted (3 parameters shared by every view, in the board's
@@ -275,7 +307,7 @@ class _Problem:
         self._groups = self._sparsity = None
         self.n_params = _N_INTRINSICS * len(names) + 6 * len(self.posed) + 6 * len(self.views)
         if prior_mm is not None:
-            self.n_params += 7  # the similarity: rvec, t, s
+            self.n_params += self._n_sim()  # the stage model: rvec, t, s; or A, t
             if tilt:
                 self.n_params += 3  # the pivot, in the board's frame
         self.observed = np.concatenate([px.ravel() for cam in names for _, _, px in self.blocks[cam]])
@@ -299,9 +331,26 @@ class _Problem:
         start = _N_INTRINSICS * len(self.names) + 6 * len(self.posed) + 6 * p
         return slice(start, start + 6)
 
+    def _n_sim(self) -> int:
+        return 12 if self.affine else 7
+
     def _sim(self):
         start = _N_INTRINSICS * len(self.names) + 6 * len(self.posed) + 6 * len(self.views)
-        return slice(start, start + 7)
+        return slice(start, start + self._n_sim())
+
+    def stage_map(self, x) -> Tuple[np.ndarray, np.ndarray]:
+        """(A, t) of the stage model in x: A m + t is a view's held point for motor position m."""
+        sim = x[self._sim()]
+        if self.affine:
+            return sim[:9].reshape(3, 3), sim[9:12]
+        return sim[6] * _rodrigues(sim[None, :3])[0], sim[3:6]
+
+    def _set_stage_map(self, x, A: np.ndarray, t: np.ndarray) -> None:
+        if self.affine:
+            x[self._sim()] = np.concatenate([np.asarray(A, float).ravel(), t])
+        else:
+            R, s = _polar(A)
+            x[self._sim()] = np.concatenate([cv2.Rodrigues(R)[0].ravel(), t, [s]])
 
     def _pivot(self):
         """The pivot's 3 parameters (prior and tilt only)."""
@@ -349,8 +398,8 @@ class _Problem:
         reprojection = np.concatenate(out) - self.observed
         if self.prior_mm is None:
             return reprojection
-        sim = x[self._sim()]
-        predicted = sim[6] * self.motor @ _rodrigues(sim[None, :3])[0].T + sim[3:6]
+        A, t = self.stage_map(x)
+        predicted = self.motor @ A.T + t
         e = (self._centres(views, R_views, self.pivot(x)) - predicted) / self.scale_mm
         e[self.prior_off] = 0.0
         if not self.robust:
@@ -482,8 +531,8 @@ class _Problem:
     def slack_mm(self, x) -> np.ndarray:
         """(views, 3) each view's board centre minus s R m + t, in the reference frame, mm."""
         views, R_views = self._views(x)
-        sim = x[self._sim()]
-        return self._centres(views, R_views, self.pivot(x)) - (sim[6] * self.motor @ _rodrigues(sim[None, :3])[0].T + sim[3:6])
+        A, t = self.stage_map(x)
+        return self._centres(views, R_views, self.pivot(x)) - (self.motor @ A.T + t)
 
     def common_cost(self, results):
         """A key that scores each converged result over the same outlier set, the union of
@@ -614,7 +663,7 @@ class _Problem:
             if similarity is None:
                 similarity = _similarity(self.motor, self._centres(*self._views(x), self.anchor))
             R, s, t = similarity
-            x[self._sim()] = np.concatenate([cv2.Rodrigues(R)[0].ravel(), t, [s]])
+            self._set_stage_map(x, s * R, t)
         return x
 
     # The result.
@@ -636,8 +685,8 @@ class _Problem:
         centres = self._centres(views, R_all, pivot)
         fixed = None
         if self.prior_mm is not None:
-            sim = x[self._sim()]
-            fixed = (cv2.Rodrigues(sim[:3])[0], float(sim[6]), sim[3:6].copy())
+            A, t_fit = self.stage_map(x)
+            fixed = (np.array(A, float), np.array(t_fit, float))
         R, s, t_centre, placement = _place(self.views, views_R, centres, self.motor, fixed)
         # The similarity holds the pivot; the motor frame's origin is corner 0 at motor
         # position 0 (fit.py), so X_ref = R @ X_motor + t with t = t_centre - R @ R_b @ pivot.
@@ -707,16 +756,24 @@ def _project(X: np.ndarray, intrinsics: np.ndarray) -> np.ndarray:
 
 
 def _place(views, views_R, views_t, motor, fixed=None) -> Tuple[np.ndarray, float, np.ndarray, MotorPlacement]:
-    """(R, s, t) with board centre o_v ~ s R m_v + t, robust to outlying views, and the
-    MotorPlacement: per-view residuals in motor mm, tilts, scale, inlier RMS, outliers.
-    `fixed`, an (R, s, t) the fit already solved, is used as it is; the outliers are then
-    only those more than 3 MAD off it."""
+    """(R, s, t) of the stage model o_v ~ A m_v + t, with R the polar rotation of A and s the
+    cube root of det A (A = s R for a similarity), robust to outlying views, and the
+    MotorPlacement: per-view residuals in motor mm, tilts, scale, per-axis scales and axis
+    angles, inlier RMS, outliers. `fixed`, an (A, t) the fit already solved, is used as it is;
+    the outliers are then only those more than 3 MAD off it."""
     o = np.asarray(views_t, float)
     m = np.asarray(motor, float)
     inliers = np.ones(len(o), bool)
+
+    def model(keep):
+        if fixed is not None:
+            return fixed
+        R_, s_, t_ = _similarity(m[keep], o[keep])
+        return s_ * R_, t_
+
     for _ in range(10):
-        R, s, t = fixed if fixed is not None else _similarity(m[inliers], o[inliers])
-        residual = (o - t) @ R / s - m  # rows: R^T (o - t) / s - m
+        A, t = model(inliers)
+        residual = (o - t) @ np.linalg.inv(A).T - m  # rows: A^-1 (o - t) - m
         distance = np.linalg.norm(residual, axis=1)
         median = float(np.median(distance[inliers]))
         mad = max(1.4826 * float(np.median(np.abs(distance[inliers] - median))), _MAD_FLOOR_MM)
@@ -726,8 +783,9 @@ def _place(views, views_R, views_t, motor, fixed=None) -> Tuple[np.ndarray, floa
         if np.array_equal(keep, inliers):
             break
         inliers = keep
-    R, s, t = fixed if fixed is not None else _similarity(m[inliers], o[inliers])
-    residual = (o - t) @ R / s - m
+    A, t = model(inliers)
+    residual = (o - t) @ np.linalg.inv(A).T - m
+    R, s = _polar(A)
     board_motor = [R.T @ Rv for Rv in views_R]
     mean = _mean_rotation(np.array(board_motor))
     # Each view's turn from the mean board rotation, B = mean @ dR, as an angle and its axis in
@@ -743,8 +801,22 @@ def _place(views, views_R, views_t, motor, fixed=None) -> Tuple[np.ndarray, floa
         tilt_deg=tilt,
         tilt_axis=axis,
         outliers=[w for w, keep in zip(views, inliers) if not keep],
+        axis_scale=tuple(float(v) for v in np.linalg.norm(A, axis=0)),
+        axis_angle_deg=tuple(float(_angle(A[:, i], A[:, j])) for i, j in ((0, 1), (0, 2), (1, 2))),
     )
     return R, float(s), t, placement
+
+
+def _polar(A: np.ndarray) -> Tuple[np.ndarray, float]:
+    """(R, s): the rotation of A's polar decomposition A = R S, and the cube root of det A."""
+    U, _, Vt = np.linalg.svd(A)
+    R = U @ np.diag([1.0, 1.0, np.sign(np.linalg.det(U @ Vt))]) @ Vt
+    return R, float(np.cbrt(np.linalg.det(A)))
+
+
+def _angle(a: np.ndarray, b: np.ndarray) -> float:
+    """The angle between two vectors, degrees."""
+    return math.degrees(math.atan2(np.linalg.norm(np.cross(a, b)), float(np.dot(a, b))))
 
 
 def _similarity(m: np.ndarray, o: np.ndarray) -> Tuple[np.ndarray, float, np.ndarray]:

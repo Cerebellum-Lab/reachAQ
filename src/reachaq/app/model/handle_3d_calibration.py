@@ -59,7 +59,12 @@ from reachaq.inference.multires_calibration.scout import (
     scout_views_from_capture,
     video_sizes,
 )
-from reachaq.inference.multires_calibration.per_view import configured_fit, configured_principal_point
+from reachaq.inference.multires_calibration.per_view import (
+    PLACEMENT_SIMILARITY,
+    configured_fit,
+    configured_placement,
+    configured_principal_point,
+)
 from reachaq.inference.multires_calibration.store import INDEX_FILE, CalibrationIndex, load_index
 
 from reachaq.app.model.app_model import AppModel
@@ -570,6 +575,7 @@ def calibrate_waypoint_capture(
     fit_mode: Optional[str] = None,
     fix_principal_point: bool = False,
     lenses=None,
+    placement: Optional[str] = None,
 ) -> Tuple[Path, CalibrationIndex, QualityReport]:
     """Write `log` as the capture's waypoints.yaml beside its source_videos, then calibrate
     every preset into <session_dir>/<DEFAULT_3D_CALIB_DIR_NAME>.new. With `live_geometries`
@@ -590,6 +596,8 @@ def calibrate_waypoint_capture(
         extra["fit_mode"] = fit_mode
     if fix_principal_point:
         extra["fix_principal_point"] = True
+    if placement is not None and placement != PLACEMENT_SIMILARITY:
+        extra["placement"] = placement
     if lenses is not None and lenses.lens_mm:
         extra["lenses"] = lenses
     index, report = calibrate_capture(
@@ -1127,6 +1135,7 @@ def make_3d_calib(
     board = configured_board(library_settings)
     fit_mode = configured_fit(library_settings, board)
     fix_principal_point = configured_principal_point(library_settings)
+    placement = configured_placement(library_settings)
     lenses = configured_lenses(library_settings)
     if board.kind == BoardSpec().kind:
         logger.notice("Calibration board: checkerboard, %d x %d inner corners, %g mm squares",
@@ -1193,6 +1202,7 @@ def make_3d_calib(
         fit_mode=fit_mode,
         fix_principal_point=fix_principal_point,
         lenses=lenses,
+        placement=placement,
     )
 
     logger.success("Successfully calibrated the capture: %s, verdict %s", index.id, report.verdict)

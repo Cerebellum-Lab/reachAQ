@@ -95,6 +95,7 @@ def synthetic_rig(
     stage_seed: int = 7,
     stage_offsets: Optional[Mapping[int, Sequence[float]]] = None,
     tilt_pivot_mm: Sequence[float] = (0.0, 0.0, 0.0),
+    axis_scale: Sequence[float] = (1.0, 1.0, 1.0),
 ) -> SyntheticRig:
     """`cameras` (up to 6, left and right by default), 37 waypoints, and Gaussian corner
     noise of `noise_px` per coordinate.
@@ -156,7 +157,10 @@ def synthetic_rig(
     stage = np.random.default_rng(stage_seed)
     view_poses = {}
     offsets = {} if stage_offsets is None else {int(w): np.asarray(v, float) for w, v in stage_offsets.items()}
-    if tilt_deg or stage_error_mm or offsets:
+    # A stage whose steps per mm are off per axis: it moves axis_scale[i] true mm (times
+    # motor_scale) per commanded mm on motor axis i.
+    scale_axes = np.asarray(axis_scale, float)
+    if tilt_deg or stage_error_mm or offsets or np.any(scale_axes != 1.0):
         R_b = cv2.Rodrigues(board_rvec)[0]
         for w, m in enumerate(motor):
             phi = stage.uniform(0, 2 * np.pi)
@@ -168,7 +172,7 @@ def synthetic_rig(
             # default): its mount, wherever that is, stays put.
             pivot = np.asarray(tilt_pivot_mm, float)
             R_v = R_b @ R_tilt
-            view_poses[w] = (R_v, motor_scale * (np.asarray(m, float) + error) + R_b @ pivot - R_v @ pivot)
+            view_poses[w] = (R_v, motor_scale * (scale_axes * np.asarray(m, float) + error) + R_b @ pivot - R_v @ pivot)
     rng = np.random.default_rng(seed)
     observations, sq_err = [], {cam: {} for cam in models}
     for w, m in enumerate(motor):

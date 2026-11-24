@@ -367,6 +367,7 @@ def calibrate_capture(
     live_geometries: Optional[Mapping[str, PresetGeometry]] = None,
     fit_mode: Optional[str] = None,
     fix_principal_point: bool = False,
+    placement: str = "similarity",
     lenses: Optional[LensSettings] = None,
 ) -> Tuple[CalibrationIndex, QualityReport]:
     """Calibrate every preset in `presets` from the capture in `capture_dir` and write the
@@ -383,7 +384,8 @@ def calibrate_capture(
     `previous_dir` is the calibration this one replaces, if any. `refine` is
     extract.detect_board's corner refinement. `fit_mode` is per_view.FIT_PER_VIEW or
     FIT_MOTOR_FRAME; None is per_view.default_fit_mode(board). The cross-checks use the same.
-    `fix_principal_point` holds the per-view fit's principal points (per_view.fit_per_view).
+    `fix_principal_point` holds the per-view fit's principal points, and `placement` picks its
+    stage model, "similarity" or "affine" (per_view.fit_per_view).
     `board` defaults to the one the capture's waypoints.yaml records (capture_board).
     `lenses` (report.configured_lenses) gives the cameras' nominal lenses, which the report
     compares the fitted focal lengths with.
@@ -453,7 +455,12 @@ def calibrate_capture(
     observations, reversed_order = reconcile_corner_order(kept, board, image_size, calibrated)
     logger.info("calibration capture: %d distinct waypoints; fitting %d of %d cameras",
                 len(observations), len(calibrated), len(cameras))
-    per_view_options = {"fix_principal_point": True} if fix_principal_point and fit_mode != FIT_MOTOR_FRAME else {}
+    per_view_options = {}
+    if fit_mode != FIT_MOTOR_FRAME:
+        if fix_principal_point:
+            per_view_options["fix_principal_point"] = True
+        if placement != "similarity":
+            per_view_options["placement"] = placement
     fit = _fit(fit_mode, observations, board, image_size, calibrated, **per_view_options)
 
     notes: List[str] = []
@@ -531,6 +538,8 @@ def calibrate_capture(
         capture["fit"] = fit_mode
         if per_view_options:
             capture["fit_principal_point"] = "centre"
+        if "placement" in per_view_options:
+            capture["placement"] = placement
     with tempfile.TemporaryDirectory(prefix="calibration_coverage_") as tmp:
         # Every camera's, from extraction: a 2D-only camera's shows what it did see. The
         # hulls do not depend on the corner order.

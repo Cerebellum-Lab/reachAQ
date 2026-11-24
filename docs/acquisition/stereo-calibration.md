@@ -397,6 +397,13 @@ views barely separate the principal point from the camera's position: on
 christielab10's session002 (2026-11-24) the free principal points landed 0.9-1.4
 ROI half-sides off centre.
 
+`placement: affine` (default `similarity`) holds the views to an affine stage
+model, A m + t, instead of s R m + t: a scale per motor axis and the angles
+between the axes, which the report gives as `stage axes: scale x ..., y ..., z
+...; angles xy ..., xz ..., yz ...`. Use it with `fit_principal_point: centre`:
+with the principal point free, the z scale trades against the focal length and
+the principal point, and a synthetic fit came out 2 % short in fx.
+
 **Nominal lenses.** The report compares each camera's fitted focal length with
 its lens when `calibrations/settings.yaml` gives one:
 

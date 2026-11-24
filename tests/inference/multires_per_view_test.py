@@ -277,6 +277,38 @@ def test_the_projection_matches_cv2():
     np.testing.assert_allclose(_project(X, intrinsics), expected, atol=1e-8)
 
 
+def test_an_affine_placement_recovers_a_stage_with_a_scale_per_axis():
+    # The stage moves 3 % long in x, 4 % short in y and 6 % long in z: one scale for all three
+    # cannot place the views, a scale per axis can. With the principal point held (variant f):
+    # with it free, the z scale trades against the focal length and principal point, and the
+    # affine fit left fx 2 % short with its std undetermined.
+    from reachaq.inference.multires_calibration.per_view import PLACEMENT_AFFINE
+
+    cams = ("left", "right", "top")
+    scales = (1.03, 0.96, 1.06)
+    rig = synthetic_rig(cameras=cams, noise_px=0.1, stage_error_mm=0.05, axis_scale=scales)
+    affine = fit_per_view(rig.observations, BOARD, SIZE, cams, tilt=False, placement=PLACEMENT_AFFINE,
+                          fix_principal_point=True)
+    assert_cameras_match(affine, rig.truth, cams)
+    np.testing.assert_allclose(affine.placement.axis_scale, scales, atol=3e-3)
+    np.testing.assert_allclose(affine.placement.axis_angle_deg, (90.0, 90.0, 90.0), atol=0.2)
+    assert affine.placement.rms_mm < 0.15
+    similarity = fit_per_view(rig.observations, BOARD, SIZE, cams, tilt=False, fix_principal_point=True)
+    assert similarity.placement.rms_mm > 3 * affine.placement.rms_mm
+    assert any(note.startswith("stage axes: scale x 1.02") or note.startswith("stage axes: scale x 1.03") for note in placement_notes(affine.placement))
+
+
+def test_the_placement_setting():
+    from reachaq.inference.multires_calibration.per_view import configured_placement
+
+    assert configured_placement({}) == "similarity"
+    assert configured_placement({"placement": "affine"}) == "affine"
+    with pytest.raises(ValueError, match="placement"):
+        configured_placement({"placement": "projective"})
+    with pytest.raises(ValueError, match="placement"):
+        fit_per_view([], BOARD, SIZE, CAMERAS, placement="projective")
+
+
 def test_the_principal_point_can_be_held_at_the_image_centre(stage_rig):
     cams = ("left", "right", "top")
     fit = fit_per_view(stage_rig.observations, BOARD, SIZE, cams, fix_principal_point=True)

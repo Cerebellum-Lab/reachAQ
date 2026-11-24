@@ -253,6 +253,10 @@ class MotorPlacement:
     # The board point the similarity holds (the fitted pivot, or the board centre), in the
     # board's frame, mm
     pivot_mm: Optional[Tuple[float, float, float]] = None
+    # The stage model's scale along each motor axis (x, y, z: true mm per commanded mm) and the
+    # angles between the axes (xy, xz, yz), degrees: one scale and 90 degrees for a similarity
+    axis_scale: Optional[Tuple[float, float, float]] = None
+    axis_angle_deg: Optional[Tuple[float, float, float]] = None
 
 
 @dataclass
