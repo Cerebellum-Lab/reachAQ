@@ -728,7 +728,11 @@ class TrialActionExecutor:
         # Cue pair. The policy owns the decision, the timer owns the deadline,
         # and this owner only routes between them. All of it is inert unless a
         # recipe carries both a cue tone and a drawn cue interval.
-        self._cue_policy = CueTimingPolicy(cue_timing_configuration)
+        # The executor's configuration gives the gate staleness limit; each
+        # row's own Lock timing and post-clear delay are applied at its arm.
+        self._cue_base_configuration = (
+            cue_timing_configuration or CueTimingConfiguration())
+        self._cue_policy = CueTimingPolicy(self._cue_base_configuration)
         self._reach_state = reach_state_resolver
         self._pellet_presence_provider = pellet_presence_provider
         self._cue_timer_factory = cue_timer_factory or CueTimer
@@ -1051,6 +1055,19 @@ class TrialActionExecutor:
             return
 
         self._cancel_cue_pair()
+        row = recipe.requested_row
+        try:
+            # The row's Lock timing and post-clear delay, which are what the
+            # trial record says was applied (prod41-03).
+            configuration = dataclasses.replace(
+                self._cue_base_configuration,
+                lock_timing=bool(row.get("cue_lock_timing", True)),
+                post_clear_delay_ms=int(row.get("cue_post_clear_delay_ms") or 0),
+            )
+        except (TypeError, ValueError) as error:
+            self._observe(f"cue pair not armed: {error}")
+            return
+        self._cue_policy = CueTimingPolicy(configuration)
         tone_1_perf_time = self._clock()
         deadline = self._cue_policy.start(tone_1_perf_time, interval_ms)
         self._cue_recipe = recipe

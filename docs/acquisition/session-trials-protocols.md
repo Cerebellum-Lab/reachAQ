@@ -124,6 +124,11 @@ the deadline Tone 2 is skipped and reset, and a warning is logged. The ROI's
 rectangle, threshold, hysteresis and polarity are rig calibration: nothing
 sets them for you.
 
+Each row's **Lock timing** and post-clear delay are applied to that trial's
+Tone 2. Locked, a blocked or stale gate at the deadline skips Tone 2 and
+resets. Unlocked, Tone 2 waits for the gate to clear, then for the post-clear
+delay, bounded by the executor's maximum wait.
+
 A trial's laser is armed at preparation, before SEND, and stays armed for the
 whole trial, up to 120 s (`PROTOCOL_LASER_ARM_WINDOW_S`). A First Reach laser
 that no reach triggered by the end of the pellet cycle is cancelled and the
