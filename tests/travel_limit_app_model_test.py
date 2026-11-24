@@ -3,6 +3,7 @@ configured travel refuses the whole position before any axis is SET, so the stag
 left with a mix of the new position and the previous one."""
 import logging
 import math
+import threading
 from types import SimpleNamespace
 from unittest import mock
 from uuid import uuid4
@@ -34,6 +35,8 @@ def _hardware():
 
     hardware._send_with_token = mock.Mock(side_effect=send_with_token)
     hardware.wait_pending_command_acked = mock.Mock()
+    hardware._lock = threading.RLock()
+    hardware._command_outcomes = {}
     return hardware
 
 

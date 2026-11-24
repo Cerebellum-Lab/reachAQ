@@ -535,6 +535,48 @@ def test_a_board_refusal_of_a_block_lifting_set_keeps_the_presentation_blocked(h
     assert not hardware_model.presentation_blocked
 
 
+def test_an_ack_that_lands_before_the_lift_token_is_recorded_still_lifts(hardware_model):
+    """N-11: the board's ack can be handled while _send_with_token's listeners still run,
+    before _set_axis records the token; the outcome table then already says acknowledged."""
+    _set_y_refused_setup(hardware_model)
+    hardware_model.block_presentation("m1's pellet position lies outside the configured travel")
+
+    def send_and_ack_at_once(_device, command, _data=None):
+        token = _pending(hardware_model, command)
+        hardware_model._ack_received(token)
+        return token
+
+    hardware_model._send_with_token = send_and_ack_at_once
+    for axis in "xyz":
+        getattr(hardware_model, f"set_{axis}")(12.0, sender="UI-Set-Button")
+
+    assert not hardware_model.presentation_blocked
+    assert hardware_model._block_lifting_sets == {}
+
+
+def test_the_ack_time_lift_waits_for_the_model_lock(hardware_model):
+    """N-12: the lift reads and rewrites the block under _lock, so block_presentation (also
+    under _lock) cannot run between its read and its write."""
+    _set_y_refused_setup(hardware_model)
+    hardware_model.block_presentation("first block")
+    token = hardware_model.set_y(25.0, sender="UI-Set-Button")
+    lifted = threading.Event()
+
+    def ack():
+        hardware_model._lift_presentation_block(token)
+        lifted.set()
+
+    with hardware_model._lock:
+        worker = threading.Thread(target=ack, daemon=True)
+        worker.start()
+        assert not lifted.wait(0.2), "the lift ran without the lock"
+        hardware_model.block_presentation("second block")  # re-entrant: same thread
+    worker.join(2.0)
+    assert lifted.is_set()
+    # The token belonged to the first block: the second one keeps every axis.
+    assert hardware_model._presentation_blocked_axes == frozenset({0, 1, 2})
+
+
 class _ConnectionWhoseHomeIsRefused:
     """Stands in for DeviceConnection: version and configuration succeed, the home is refused.
 
