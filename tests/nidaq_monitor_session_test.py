@@ -215,6 +215,46 @@ def test_a_laser_hold_still_returns_to_rest_when_the_hold_fails(session):
     assert "not armed" in session.error_message
 
 
+def test_a_laser_hold_closes_its_shutter_when_the_restore_fails(session):
+    # The restore and the shutter close shared one try: a refused restore
+    # left the shutter open on the held level, and the hold said it had
+    # driven the laser.
+    shutter = []
+
+    def set_voltage(channel, volts):
+        if volts == 0.2:
+            raise RuntimeError("-50103 the output is reserved")
+
+    session._app_model.laser = SimpleNamespace(
+        set_command_voltage=set_voltage,
+        set_shutter_open=lambda channel, state: shutter.append(state),
+        close_all_shutters=lambda: shutter.append("all"))
+
+    assert not session.hold_laser_command(1, 1.5, 0.05, open_shutter=True)
+
+    assert shutter[0] is True and False in shutter
+    assert "did not return to rest" in session.error_message
+
+
+def test_a_laser_hold_falls_back_to_closing_every_shutter(session):
+    shutter = []
+
+    def set_shutter(channel, state):
+        if state is False:
+            raise RuntimeError("shutter line refused")
+        shutter.append(state)
+
+    session._app_model.laser = SimpleNamespace(
+        set_command_voltage=lambda channel, volts: None,
+        set_shutter_open=set_shutter,
+        close_all_shutters=lambda: shutter.append("all"))
+
+    assert not session.hold_laser_command(1, 1.5, 0.05, open_shutter=True)
+
+    assert shutter == [True, "all"]
+    assert "shutter" in session.error_message
+
+
 def test_a_board_line_is_pulsed_through_the_existing_command_path(session):
     pulses = []
 
