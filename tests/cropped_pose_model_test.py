@@ -9,13 +9,13 @@ fail loudly.
 import numpy
 import pytest
 
-from autotrainer.inference.cropped_pose_model import (
+from reachaq.inference.cropped_pose_model import (
     INFERENCE_ROI_ENV_VAR,
     CroppedPoseModel,
     InferenceRoi,
     maybe_crop,
 )
-from autotrainer.inference.pose_model import PoseModel
+from reachaq.inference.pose_model import PoseModel
 
 
 PARTS = ["Pellet", "RH_grab", "Triangle"]
@@ -209,7 +209,7 @@ def test_a_fixed_scale_model_is_never_cropped_and_the_roi_is_said_to_be_ignored(
     """A graph that runs at its imgsz whatever it is handed gains no time from a
     crop and only changes the scale the model was trained at. It keeps running,
     on the full frame. (The YOLO model itself is checked in plugins/yolo/tests.)"""
-    from autotrainer.inference import cropped_pose_model
+    from reachaq.inference import cropped_pose_model
 
     warnings = []
     monkeypatch.setattr(cropped_pose_model.logger, "warning",

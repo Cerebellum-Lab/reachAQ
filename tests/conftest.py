@@ -4,23 +4,23 @@ from pathlib import Path
 import pytest
 
 # Tests here (calibration_install_test.py) import the synthetic rig, multires_synthetic, from
-# auto-trainer-inference/tests. That folder is on sys.path only once pytest has collected a test
+# tests/inference. That folder is on sys.path only once pytest has collected a test
 # from it, so such a test passed in the full-suite order and failed when run alone or per
 # directory. Appended, not inserted: a module of the same name here still wins. Not the pytest
 # `pythonpath` ini option, which pytest.ini does not use and which would apply to every directory.
-_INFERENCE_TESTS = str(Path(__file__).resolve().parents[1] / "auto-trainer-inference" / "tests")
+_INFERENCE_TESTS = str(Path(__file__).resolve().parents[1] / "tests" / "inference")
 if _INFERENCE_TESTS not in sys.path:
     sys.path.append(_INFERENCE_TESTS)
 
-from autotrainer.behavior import BehaviorAlgorithm
-from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
-from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
-from autotrainer.core import SystemConfiguration, CameraConfiguration, CameraId
-from autotrainer.core.logging import unregister_fatal_exception_callback
-from autotrainer.device import MotorConfigurationFile, CompoundMovements
+from reachaq.behavior import BehaviorAlgorithm
+from reachaq.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
+from reachaq.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from reachaq.core import SystemConfiguration, CameraConfiguration, CameraId
+from reachaq.core.logging import unregister_fatal_exception_callback
+from reachaq.device import MotorConfigurationFile, CompoundMovements
 
-from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.user_preferences import UserPreferences
+from reachaq.app.model.app_model import AppModel
+from reachaq.app.model.user_preferences import UserPreferences
 
 
 import top_fixtures
@@ -69,7 +69,7 @@ def config_file_path(trainer_config_dir):
 @pytest.fixture
 def calib_dir():
     # could be todo: copy it top-level, or generate new temporary one as above for system config.
-    return top_fixtures.repo_root_dir.joinpath(f"auto-trainer-inference/tests/{DEFAULT_3D_CALIB_DIR_NAME}")
+    return top_fixtures.repo_root_dir.joinpath(f"tests/inference/{DEFAULT_3D_CALIB_DIR_NAME}")
 
 
 @pytest.fixture

@@ -4,7 +4,7 @@ The NI laser no longer runs inside reachAQ's own process. When System Mode
 opens the laser, or the calibration ramp opens it in Idle, reachAQ starts a
 **laser process** that owns every laser NI-DAQ task: the command outputs (AO),
 the shutter and auxiliary lines, and every pulse train and ramp. reachAQ sends
-it commands over a pipe. Code: `autotrainer.device.laser_process`.
+it commands over a pipe. Code: `reachaq.device.laser_process`.
 
 The point is that the laser no longer depends on reachAQ living long enough to
 turn it off. The laser process watches reachAQ, and turns the laser off by
@@ -77,7 +77,7 @@ The Hardware Status panel and the log show `laser process failed: <reason>`:
 - **A hard death of the laser process.** Its outputs stay as the driver
   leaves them until the reset process reopens them. Whether a reopen actually
   resets a command left by a killed process is what the laser kill test
-  (`tools/hardware/qualify_laser_kill.py`) measures on the rig; it has not
+  (`src/reachaq/hardware/qualify_laser_kill.py`) measures on the rig; it has not
   been run yet.
 - **reachAQ and the laser process dying together** (power loss, a kernel
   panic, both killed at once). Only a hardware interlock covers that. It is
@@ -111,7 +111,7 @@ thread holding reachAQ's GIL, each thread hand-off waits for Python's 5 ms
 switch interval. The Qt thread can be held for that long after a Run Pulse
 click; the pulse has already started by then.
 
-Regenerate the table with `pytest --run-bench auto-trainer-device/tests/laser_process_latency_test.py`.
+Regenerate the table with `pytest --run-bench tests/device/laser_process_latency_test.py`.
 
 ## `hardwareTimed`
 
@@ -126,7 +126,7 @@ explicitly.
 
 ## Tests
 
-- `auto-trainer-device/tests/laser_process_test.py`: three processes (test,
+- `tests/device/laser_process_test.py`: three processes (test,
   stand-in application, laser process over the fake NI-DAQmx, which logs every
   write to a file). Covers the application SIGKILLed, the application stopped
   (heartbeat loss), an exception in the laser process, the laser process

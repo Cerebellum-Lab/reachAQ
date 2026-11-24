@@ -18,8 +18,8 @@ import textwrap
 
 import pytest
 
-from tools.acquisition import gui, headless
-from tools.acquisition.can_frame_logging import (
+from reachaq.app import gui, headless
+from reachaq.app.can_frame_logging import (
     CAN_FRAME_LOG_VARIABLE,
     limit_can_frame_logging,
 )
@@ -84,12 +84,12 @@ def _levels_after_setup_logging(multiprocess_enabled):
         import json, logging
 
         if __name__ == "__main__":
-            from tools.acquisition.can_frame_logging import limit_can_frame_logging
+            from reachaq.app.can_frame_logging import limit_can_frame_logging
             limit_can_frame_logging()
 
-            from autotrainer.core.logging import setup_logging, stop_multiproc_logging
+            from reachaq.core.logging import setup_logging, stop_multiproc_logging
             setup_logging(
-                "autotrainer",
+                "reachaq",
                 time_precision=6,
                 multiprocess_enabled={multiprocess_enabled!r},
             )

@@ -23,13 +23,13 @@ import pytest
 import yaml
 from PySide6.QtWidgets import QMessageBox
 
-from autotrainer.core import AnimalSubject, Offset3DTuple, ProjectInfo
-from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
-from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
-from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
-from autotrainer.inference.multires_calibration import library, store
-from autotrainer.inference.multires_calibration.fit import BoardSpec
-from autotrainer.inference.multires_calibration.store import CalibrationIndex, CalibrationResolutionError
+from reachaq.core import AnimalSubject, Offset3DTuple, ProjectInfo
+from reachaq.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
+from reachaq.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from reachaq.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
+from reachaq.inference.multires_calibration import library, store
+from reachaq.inference.multires_calibration.fit import BoardSpec
+from reachaq.inference.multires_calibration.store import CalibrationIndex, CalibrationResolutionError
 from reload_calib_multires_test import (
     BASE,
     BASE_PARAMS,
@@ -40,11 +40,11 @@ from reload_calib_multires_test import (
     _save_live_pair_params,
     _write_multires,
 )
-from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.calibration_install import install_calibration
-from tools.acquisition.model.dcs_state import DcsState, dcs_state
-from tools.acquisition.view import main_window as main_window_module
-from tools.acquisition.view.main_window import MainWindow
+from reachaq.app.model.app_model import AppModel
+from reachaq.app.model.calibration_install import install_calibration
+from reachaq.app.model.dcs_state import DcsState, dcs_state
+from reachaq.app.view import main_window as main_window_module
+from reachaq.app.view.main_window import MainWindow
 
 
 STALE_BLOCKER = (
@@ -185,7 +185,7 @@ def test_an_install_whose_reload_fails_turns_live_3d_off_and_blocks_recording(
     assert str(installed) in record["live3dDisabledReason"]
 
     # A session recorded meanwhile names the new calibration, and offline refuses it.
-    intersession = importlib.import_module("autotrainer.inference.analysis.intersession_process")
+    intersession = importlib.import_module("reachaq.inference.analysis.intersession_process")
     project = ProjectInfo(root=(tmp_path / "Data").as_posix(), device_id="rig", when=datetime.now(), session=1)
     metadata = Path(project.get_metadata_file() + ".json")
     metadata.parent.mkdir(parents=True, exist_ok=True)
@@ -524,7 +524,7 @@ def _reference_copy(app_model, source: Path, tmp_path: Path, *, other_fit: bool 
     import cv2
     import numpy as np
 
-    from tools.acquisition.model import handle_3d_calibration as h3d
+    from reachaq.app.model import handle_3d_calibration as h3d
 
     png = tmp_path / "left.png"
     cv2.imwrite(str(png), np.full((256, 256), 128, np.uint8))

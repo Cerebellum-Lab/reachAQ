@@ -6,15 +6,15 @@ import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
 
-from autotrainer.core import NotificationCenter, TriggerNotification
-from autotrainer.inference import PoseLocation, PoseResponse
-from autotrainer.pyside import PGWidget
-from autotrainer.pyside.content_widget import ContentWidget
-from tools.acquisition.view import main_content as main_content_module
-from tools.acquisition.view.behavior_content import inference_status_display
-from tools.acquisition.view.main_content import MainContent
-from tools.acquisition.view.main_window import _allow_bidirectional_window_resizing
-from tools.acquisition.view.persistent_splitter import PersistentSplitter
+from reachaq.core import NotificationCenter, TriggerNotification
+from reachaq.inference import PoseLocation, PoseResponse
+from reachaq.pyside import PGWidget
+from reachaq.pyside.content_widget import ContentWidget
+from reachaq.app.view import main_content as main_content_module
+from reachaq.app.view.behavior_content import inference_status_display
+from reachaq.app.view.main_content import MainContent
+from reachaq.app.view.main_window import _allow_bidirectional_window_resizing
+from reachaq.app.view.persistent_splitter import PersistentSplitter
 
 
 @pytest.fixture
@@ -26,7 +26,7 @@ def qapp():
 
 
 def test_post_session_inference_status_uses_operator_wording():
-    from autotrainer.inference import InferenceStatus
+    from reachaq.inference import InferenceStatus
 
     assert inference_status_display(InferenceStatus.intersession) == (
         "Post-session analysis"

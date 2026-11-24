@@ -48,7 +48,7 @@ class _Telemetry:
 
 
 def _panel(qapp, telemetry):
-    from tools.acquisition.view.capture_telemetry_panel import (
+    from reachaq.app.view.capture_telemetry_panel import (
         CaptureTelemetryPanel)
     panel = CaptureTelemetryPanel(telemetry)
     panel.set_expanded(True)
@@ -209,7 +209,7 @@ _PRE_LATENCY_RECORD_READOUTS = (
 def _pre_latency_record_expanded_width(qapp):
     """The expanded body's width before the latency record: one row, these five."""
     from PySide6.QtWidgets import QFrame, QHBoxLayout
-    from tools.acquisition.view.capture_telemetry_panel import (
+    from reachaq.app.view.capture_telemetry_panel import (
         CaptureTelemetryPanel)
     body = QFrame()
     row = QHBoxLayout(body)

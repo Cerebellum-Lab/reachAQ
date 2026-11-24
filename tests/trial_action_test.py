@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
+from reachaq.device import LaserChannelConfiguration, LaserSystemConfiguration
 
-from tools.acquisition.model.trial_action import (
+from reachaq.app.model.trial_action import (
     LaserPulseProfile,
     PreparedState,
     PreparedTrialOperation,
@@ -16,7 +16,7 @@ from tools.acquisition.model.trial_action import (
     TrialActionExecutor,
     TrialCompileContext,
 )
-from tools.acquisition.model.trial_protocol_schedule import TrialProtocolRow
+from reachaq.app.model.trial_protocol_schedule import TrialProtocolRow
 
 
 LASERS = LaserSystemConfiguration.from_channels((
@@ -567,9 +567,9 @@ def test_a_laser_the_controller_refuses_is_recorded_as_a_refusal(monkeypatch):
     # drove anything reads LaserPulseRefused, which says more than the
     # RuntimeError it read before d000df96; kept, and documented (controller
     # ruling, workstream D).
-    from autotrainer.device import (
+    from reachaq.device import (
         LaserChannelId, LaserPulseTrain, LaserSynchronizedPulseTrain)
-    from autotrainer.device.laser import LaserPulseRefused
+    from reachaq.device.laser import LaserPulseRefused
     from laser_model_test import _nidaq_model
 
     model, _daq = _nidaq_model(monkeypatch)
@@ -636,7 +636,7 @@ def test_a_direct_ni_first_reach_laser_is_not_started_by_its_phase(monkeypatch, 
     # armed. The phase only records the trigger point; First Reach starts it,
     # through the laser model's direct trigger receiver (audit prod41-01).
     from laser_model_test import _nidaq_model
-    from tools.acquisition.model.laser_model import wait_until_cancelled_ends
+    from reachaq.app.model.laser_model import wait_until_cancelled_ends
 
     model, daq = _nidaq_model(monkeypatch)
     row = TrialProtocolRow(trial_id=1).with_updates({

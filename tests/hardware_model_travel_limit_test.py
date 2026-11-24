@@ -8,10 +8,10 @@ from unittest import mock
 
 import pytest
 
-from autotrainer.core import Offset3DTuple, SystemCommandKind
-from autotrainer.core.message import SystemDataArgsKwargs
-from autotrainer.device import CompoundMovements, MotorConfigurationFile, MotorSteps
-from tools.acquisition.model.hardware_model import HardwareModel, _pellet_sequences
+from reachaq.core import Offset3DTuple, SystemCommandKind
+from reachaq.core.message import SystemDataArgsKwargs
+from reachaq.device import CompoundMovements, MotorConfigurationFile, MotorSteps
+from reachaq.app.model.hardware_model import HardwareModel, _pellet_sequences
 
 TRAVEL = {a: {"min_pos": 0, "max_pos": 35} for a in "xyz"}
 
@@ -252,7 +252,7 @@ def test_a_sequence_with_a_step_outside_the_travel_is_refused_whole(caplog, meth
 
 def test_every_out_of_range_step_is_logged():
     hardware = _with_sequence(_hardware(TRAVEL), "load_pellet", [{"x": 36.0}, {"z_rel": 30}])
-    with mock.patch("tools.acquisition.model.hardware_model.logger") as logger:
+    with mock.patch("reachaq.app.model.hardware_model.logger") as logger:
         assert hardware.load_pellet() is None
     messages = [c.args[0] for c in logger.error.call_args_list]
     # z_rel 30 from z 10 is clamped to CanInterface's 15 turns (36.548 mm): still refused.

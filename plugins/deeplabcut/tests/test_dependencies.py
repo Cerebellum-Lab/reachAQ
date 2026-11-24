@@ -1,7 +1,7 @@
 """What the DeepLabCut plugin distribution declares.
 
 DeepLabCut, and the TensorFlow extra that only its TensorFlow engine needs,
-left auto-trainer-inference with this plugin. The pins and their reasons came
+left reachaq with this plugin. The pins and their reasons came
 with them; see the comments beside the extra in this plugin's pyproject.toml.
 
 DeepLabCut 3.x still ships both engines, verified against the installed 3.0.2,
@@ -42,14 +42,14 @@ def _extras_block(text, name):
 
 def test_the_distribution_is_named_for_the_install_message():
     """PoseBackendNotInstalled tells the operator to install this name."""
-    assert re.search(r'^name\s*=\s*"auto-trainer-pose-deeplabcut"', _text(), re.M)
+    assert re.search(r'^name\s*=\s*"reachaq-pose-deeplabcut"', _text(), re.M)
 
 
 def test_it_depends_on_the_installed_application_not_a_sub_project():
-    """auto-trainer-inference is folded into auto-trainer and never installed alone."""
+    """reachaq is folded into reachaq and never installed alone."""
     requirements = _requirements(_dependencies_block(_text()))
-    assert "auto-trainer" in requirements
-    assert not [r for r in requirements if r.startswith("auto-trainer-")]
+    assert "reachaq" in requirements
+    assert not [r for r in requirements if r.startswith("reachaq-")]
 
 
 def test_deeplabcut_is_required_at_3_x():
@@ -68,9 +68,9 @@ def test_neither_framework_is_a_hard_dependency():
 
 def test_the_entry_point_names_the_plugin_instance():
     text = _text()
-    assert re.search(r'^\[project\.entry-points\."autotrainer\.pose_backends"\]', text, re.M)
+    assert re.search(r'^\[project\.entry-points\."reachaq\.pose_backends"\]', text, re.M)
     assert re.search(
-        r'^deeplabcut\s*=\s*"autotrainer\.pose_plugins\.deeplabcut\.plugin:DLC_PLUGIN"',
+        r'^deeplabcut\s*=\s*"reachaq\.pose_plugins\.deeplabcut\.plugin:DLC_PLUGIN"',
         text, re.M)
 
 

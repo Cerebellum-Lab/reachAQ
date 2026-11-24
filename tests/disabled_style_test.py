@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QLineEdit, QPushButton,
 )
 
-from tools.acquisition.view.disabled_style import (
+from reachaq.app.view.disabled_style import (
     DISABLED_BORDER, DISABLED_FILL, DISABLED_TEXT, DisabledVisibleStyle, disabled_palette,
 )
 

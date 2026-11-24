@@ -10,10 +10,10 @@ import dataclasses
 
 import pytest
 
-from autotrainer.inference.multires_calibration.geometry import PresetGeometry
+from reachaq.inference.multires_calibration.geometry import PresetGeometry
 from types import SimpleNamespace
 
-from tools.acquisition.model.calibration_geometry import (
+from reachaq.app.model.calibration_geometry import (
     NOT_IN_CALIBRATION,
     SPINCAM_DEFAULT_GEOMETRY,
     camera_serial,
@@ -69,7 +69,7 @@ def test_a_value_that_is_not_a_whole_number_raises(value):
 def test_defaults_mirror_spincam():
     # spinnaker_cam imports PySpin at load, so only a machine with the camera SDK checks this.
     pytest.importorskip("PySpin")
-    from autotrainer.video.camera.spinnaker_cam import SpinCamDefaultParams
+    from reachaq.video.camera.spinnaker_cam import SpinCamDefaultParams
 
     defaults = dataclasses.asdict(SpinCamDefaultParams())
     assert {key: defaults[key] for key in SPINCAM_DEFAULT_GEOMETRY} == SPINCAM_DEFAULT_GEOMETRY

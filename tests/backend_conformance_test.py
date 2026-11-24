@@ -17,31 +17,31 @@ from pathlib import Path
 import numpy
 import pytest
 
-from autotrainer.core import (
+from reachaq.core import (
     LaserChannelId,
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
 )
-from autotrainer.core.simulation import SimSignalBusReader
-from autotrainer.device import CanInterface, CanTransportConfiguration, LaserPulseTrain
-from autotrainer.device import nidaq_laser, nidaq_signal_stream
-from autotrainer.device.device_interface import Acknowledge, DigitalOutputs
-from autotrainer.device.emulation_interface import EmulationInterface
-from autotrainer.device.laser import LaserControllerProtocol, SimulatedLaserController
-from autotrainer.device.motor_pellet_backend import MotorPelletBackend
-from autotrainer.device.nidaq_input_backend import NidaqInputBackend
-from autotrainer.device.nidaq_signal_stream import NidaqSignalStreamController
-from autotrainer.device.nidaq_simulated import SimulatedNidaqStream
-from autotrainer.video.camera.camera_backend import CameraBackend
-from autotrainer.video.camera.camera_base import CameraBase
-from autotrainer.video.camera.sim_cam import SimulatedCam
+from reachaq.core.simulation import SimSignalBusReader
+from reachaq.device import CanInterface, CanTransportConfiguration, LaserPulseTrain
+from reachaq.device import nidaq_laser, nidaq_signal_stream
+from reachaq.device.device_interface import Acknowledge, DigitalOutputs
+from reachaq.device.emulation_interface import EmulationInterface
+from reachaq.device.laser import LaserControllerProtocol, SimulatedLaserController
+from reachaq.device.motor_pellet_backend import MotorPelletBackend
+from reachaq.device.nidaq_input_backend import NidaqInputBackend
+from reachaq.device.nidaq_signal_stream import NidaqSignalStreamController
+from reachaq.device.nidaq_simulated import SimulatedNidaqStream
+from reachaq.video.camera.camera_backend import CameraBackend
+from reachaq.video.camera.camera_base import CameraBase
+from reachaq.video.camera.sim_cam import SimulatedCam
 
-DEVICE_TESTS = Path(__file__).resolve().parents[1] / "auto-trainer-device" / "tests"
+DEVICE_TESTS = Path(__file__).resolve().parents[1] / "tests" / "device"
 WIDTH, HEIGHT = 64, 48
 
 
 def _device_test_module(name):
-    """A driver fake from auto-trainer-device/tests, where it lives beside its own tests."""
+    """A driver fake from tests/device, where it lives beside its own tests."""
     if str(DEVICE_TESTS) not in sys.path:
         sys.path.insert(0, str(DEVICE_TESTS))
     return importlib.import_module(name)
@@ -135,7 +135,7 @@ def spin_cam(monkeypatch):
     except ImportError:
         monkeypatch.setitem(sys.modules, "PySpin", _fake_pyspin())
         faked = True
-    spinnaker_cam = importlib.import_module("autotrainer.video.camera.spinnaker_cam")
+    spinnaker_cam = importlib.import_module("reachaq.video.camera.spinnaker_cam")
     if not faked:
         # The real SDK rejects the fake nodes (CCommandPtr(<SimpleNamespace>) raises),
         # so SpinCam reads its PySpin from the fake even where Spinnaker is installed.
@@ -161,7 +161,7 @@ def spin_cam(monkeypatch):
             if faked:
                 # Later tests must find Spinnaker missing again, not this module bound to the fake.
                 sys.modules.pop(spinnaker_cam.__name__, None)
-                camera_package = sys.modules["autotrainer.video.camera"]
+                camera_package = sys.modules["reachaq.video.camera"]
                 if getattr(camera_package, "spinnaker_cam", None) is spinnaker_cam:
                     delattr(camera_package, "spinnaker_cam")
 

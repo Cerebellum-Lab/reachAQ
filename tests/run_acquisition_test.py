@@ -1,4 +1,4 @@
-from tools.acquisition.run_acquisition import _show_default_window
+from reachaq.app.run_acquisition import _show_default_window
 
 
 class _WindowStub:

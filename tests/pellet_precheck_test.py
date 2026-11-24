@@ -1,7 +1,7 @@
 import pytest
 
-from autotrainer.behavior.pellet_trial import TrialOutcome
-from tools.acquisition.model.pellet_precheck import (
+from reachaq.behavior.pellet_trial import TrialOutcome
+from reachaq.app.model.pellet_precheck import (
     DEFAULT_AUTHORIZATION_TIMEOUT_MS,
     MAX_AUTHORIZATION_TIMEOUT_MS,
     MAX_PRESENCE_FRESHNESS_MS,

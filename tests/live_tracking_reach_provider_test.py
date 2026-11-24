@@ -19,12 +19,12 @@ raises must never be read as evidence the animal is still.
 
 import pytest
 
-from tools.acquisition.model.live_tracking_buffer import (
+from reachaq.app.model.live_tracking_buffer import (
     LiveTrackingBuffer,
     LiveTrackingSample,
     TrackingLocation,
 )
-from tools.acquisition.model.reach_state_source import (
+from reachaq.app.model.reach_state_source import (
     LiveTrackingReachProvider,
     ReachStateConfiguration,
     ReachStateResolver,

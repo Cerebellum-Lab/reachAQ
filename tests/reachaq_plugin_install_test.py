@@ -18,7 +18,7 @@ PLUGIN_SCRIPT = INSTALL_DIR / "reachaq-plugin-install.sh"
 PLUGIN_LIB = INSTALL_DIR / "plugin-install-lib.sh"
 MAIN_SCRIPT = INSTALL_DIR / "reachaq-linux-install.sh"
 
-AGPL_NOTICE = "auto-trainer-pose-yolo installs ultralytics, which is AGPL-3.0."
+AGPL_NOTICE = "reachaq-pose-yolo installs ultralytics, which is AGPL-3.0."
 
 FAKE_CONDA = r"""#!/usr/bin/env bash
 # Logs every call. `env list` lists $FAKE_ENVS; `run -n ENV python ...` runs
@@ -85,7 +85,7 @@ def _make_env(envs, name, *, entry_points=(), packages=()):
         (dist / "METADATA").write_text(
             "Metadata-Version: 2.1\nName: fake-plugins\nVersion: 1.0\n")
         (dist / "entry_points.txt").write_text(
-            "[autotrainer.pose_backends]\n"
+            "[reachaq.pose_backends]\n"
             + "".join(f"{name} = fake_module:THING\n" for name in entry_points))
     for package in packages:
         (root / package).mkdir()
@@ -219,6 +219,23 @@ def test_installed_pose_plugins_lists_known_entry_points(tmp_path):
     assert "with: deeplabcut yolo " in lines
     assert "bare: " in lines
     assert "missing: " in lines
+
+
+def test_installed_pose_plugins_reads_the_v3_group_too(tmp_path):
+    """v3 registered its plugins under autotrainer.pose_backends; the first update
+    after the rename must still restore them."""
+    conda, envs, env = _fake_conda(tmp_path)
+    dist = _make_env(envs, "v3") / "auto_trainer_pose_deeplabcut-1.0.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: auto-trainer-pose-deeplabcut\nVersion: 1.0\n")
+    (dist / "entry_points.txt").write_text(
+        "[autotrainer.pose_backends]\ndeeplabcut = fake_module:THING\n")
+
+    completed = _source_lib('echo "v3: $(installed_pose_plugins v3 | tr "\\n" " ")"\n', env, conda)
+
+    assert completed.returncode == 0, completed.stderr
+    assert "v3: deeplabcut " in completed.stdout.splitlines()
 
 
 def test_legacy_pose_engines_infers_plugins_from_old_packages(tmp_path):
@@ -367,7 +384,7 @@ def test_main_installer_verifies_each_restored_plugin():
 
     assert 'conda_run python - "$INSTALL_REPO" "${PLUGINS_TO_RESTORE[@]}"' in verify
     assert "import torch" in verify
-    assert 'f"autotrainer.pose_plugins.{name}.plugin"' in verify
+    assert 'f"reachaq.pose_plugins.{name}.plugin"' in verify
 
 
 def test_installer_scripts_parse():

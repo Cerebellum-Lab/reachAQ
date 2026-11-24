@@ -6,11 +6,11 @@ from types import SimpleNamespace
 import h5py
 import pytest
 
-from autotrainer.core.latency.schema import EVENT_TABLES
-from tools.acquisition.model import latency_event_log
-from tools.acquisition.model.latency_event_log import LatencyEventLog, _BlockTable
+from reachaq.core.latency.schema import EVENT_TABLES
+from reachaq.app.model import latency_event_log
+from reachaq.app.model.latency_event_log import LatencyEventLog, _BlockTable
 
-_LOG_NAME = "tools.acquisition.model.latency_event_log"
+_LOG_NAME = "reachaq.app.model.latency_event_log"
 
 
 def _response(sequence):

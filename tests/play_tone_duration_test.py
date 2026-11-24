@@ -4,9 +4,9 @@ from unittest import mock
 
 import pytest
 
-from autotrainer.core import SystemCommandKind
+from reachaq.core import SystemCommandKind
 
-from tools.acquisition.model.hardware_model import HardwareModel
+from reachaq.app.model.hardware_model import HardwareModel
 
 
 # A protocol tone passes profile.duration_ms / 1000.0, and 1.001 * 1000 is

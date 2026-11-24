@@ -1,3 +1,0 @@
-# Autotrainer - Model
-
-Todo

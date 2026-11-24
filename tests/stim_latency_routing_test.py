@@ -16,10 +16,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from autotrainer.core.latency import LATENCY_RECORD_ENV_VAR
-from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.latency_event_log import LatencyEventLog
-from tools.acquisition.model.stim_latency_budget import StimLatencyBudget
+from reachaq.core.latency import LATENCY_RECORD_ENV_VAR
+from reachaq.app.model.app_model import AppModel
+from reachaq.app.model.latency_event_log import LatencyEventLog
+from reachaq.app.model.stim_latency_budget import StimLatencyBudget
 
 
 @pytest.fixture

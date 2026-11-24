@@ -6,7 +6,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox  # noqa: E402
 
-from autotrainer.core import (  # noqa: E402
+from reachaq.core import (  # noqa: E402
     LaserChannelConfiguration,
     LaserSystemConfiguration,
     NidaqDeviceIdentity,
@@ -15,11 +15,11 @@ from autotrainer.core import (  # noqa: E402
     NidaqTimingRoute,
     SystemConfiguration,
 )
-from tools.acquisition.model.nidaq_channel_plan import (  # noqa: E402
+from reachaq.app.model.nidaq_channel_plan import (  # noqa: E402
     build_nidaq_acquisition_configuration,
 )
-from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts  # noqa: E402
-from tools.acquisition.view.nidaq_port_configuration_dialog import NidaqPortConfigurationDialog  # noqa: E402
+from reachaq.app.model.nidaq_discovery import NidaqDevicePorts  # noqa: E402
+from reachaq.app.view.nidaq_port_configuration_dialog import NidaqPortConfigurationDialog  # noqa: E402
 
 from nidaq_stream_lifecycle_test import _settle, nidaq_app  # noqa: E402,F401
 
@@ -792,8 +792,8 @@ def test_clearing_a_port_role_stops_it_being_recorded_for_good(
     # camFrames cleared in the dialog came back as a custom channel from the
     # live plan: saved, reloaded, recorded, and listed in Analysis as "no
     # longer mapped".
-    from autotrainer.core import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
-    from tools.acquisition.view.analysis_content import AnalysisContent
+    from reachaq.core import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
+    from reachaq.app.view.analysis_content import AnalysisContent
 
     system_config.nidaq_stream = NidaqSignalStreamConfiguration(
         channels=(NidaqSignalChannelConfiguration("stim_readback", "Dev1/ai5"),),
@@ -847,7 +847,7 @@ def test_a_bad_ni_line_is_fixed_in_the_dialog_and_the_stream_starts(
     qapp, nidaq_app, system_config, trainer_config_dir,
 ):
     from nidaq_stream_lifecycle_test import _nidaq_state, _with_bad_nidaq_line
-    from tools.acquisition.model.subsystem_status import SubsystemState
+    from reachaq.app.model.subsystem_status import SubsystemState
 
     _with_bad_nidaq_line(system_config, trainer_config_dir, tone1="Dev1/port1/line0")
     assert nidaq_app.load_configuration() is True
@@ -898,7 +898,7 @@ def test_analysis_offers_no_box_for_an_input_a_bad_ni_line_holds_back(
     import sys
 
     from nidaq_stream_lifecycle_test import _with_bad_nidaq_line
-    from tools.acquisition.view.analysis_content import AnalysisContent
+    from reachaq.app.view.analysis_content import AnalysisContent
 
     _with_bad_nidaq_line(system_config, trainer_config_dir, tone1="Dev1/port1/line0")
     assert nidaq_app.load_configuration() is True

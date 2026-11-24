@@ -9,7 +9,7 @@ like a success.
 
 import pytest
 
-from autotrainer.device.device_interface import Acknowledge
+from reachaq.device.device_interface import Acknowledge
 
 
 def test_an_acknowledgement_defaults_to_success():

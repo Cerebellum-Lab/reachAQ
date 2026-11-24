@@ -5,14 +5,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from autotrainer.core import (  # noqa: E402
+from reachaq.core import (  # noqa: E402
     LaserChannelConfiguration,
     LaserChannelId,
 )
-from tools.acquisition.model.trial_action import (  # noqa: E402
+from reachaq.app.model.trial_action import (  # noqa: E402
     LaserPulseProfile,
 )
-from tools.acquisition.view.laser_control_content import (  # noqa: E402
+from reachaq.app.view.laser_control_content import (  # noqa: E402
     _LaserChannelTab,
 )
 
@@ -224,7 +224,7 @@ def test_stim_test_is_unavailable_until_run_pulse_is(channel_tab):
 
 
 def test_the_pulse_builder_is_the_first_laser_control_tab(qapp, app_model):
-    from tools.acquisition.view.laser_control_content import LaserControlContent
+    from reachaq.app.view.laser_control_content import LaserControlContent
     content = LaserControlContent(app_model)
     try:
         assert content._tabs.tabText(0) == "Pulse Builder"
@@ -239,7 +239,7 @@ def test_a_laser_keeps_its_profile_when_laser_control_rebuilds(qapp, app_model, 
     # Every system Run/Stop and DAQ Ports save rebuilds the laser tabs. Each
     # new tab fell back to the builder draft, so a laser set to a saved
     # profile silently fired whatever was on the builder instead.
-    from tools.acquisition.view.laser_control_content import LaserControlContent
+    from reachaq.app.view.laser_control_content import LaserControlContent
     profile = a_profile()
     with_one_listed_profile(monkeypatch, app_model)
     with_saved_profile(monkeypatch, app_model, profile)
@@ -319,7 +319,7 @@ def test_a_laser_whose_profile_is_deleted_picks_nothing_and_says_so(
 def test_a_rebuilt_laser_whose_profile_vanished_picks_nothing_and_says_so(
     qapp, app_model, monkeypatch,
 ):
-    from tools.acquisition.view.laser_control_content import LaserControlContent
+    from reachaq.app.view.laser_control_content import LaserControlContent
     listed = [{"profile_id": "burst", "revision": 1, "summary": ""}]
     with_listed_profiles(monkeypatch, app_model, listed)
     with_saved_profile(monkeypatch, app_model, a_profile())
@@ -343,7 +343,7 @@ def test_a_rebuilt_laser_whose_profile_vanished_picks_nothing_and_says_so(
 
 
 def _set_pmt_line(app_model, line):
-    from autotrainer.core import LaserSystemConfiguration
+    from reachaq.core import LaserSystemConfiguration
 
     app_model.laser.set_configuration_offline(LaserSystemConfiguration.from_channels(
         (LaserChannelConfiguration(
@@ -458,7 +458,7 @@ def test_a_laser_event_leaves_the_trace_note_on_what_was_drawn(channel_tab):
     # A manual Run Pulse's request and outcome, like a protocol operation's
     # events, have nothing to draw. Taken as an empty trace, each set the
     # note to "calibration running", so every Run Pulse ended reading so.
-    from tools.acquisition.model.laser_model import LaserTraceBlock
+    from reachaq.app.model.laser_model import LaserTraceBlock
 
     tab, _started, _statuses = channel_tab
     tab._set_trace_streaming(True)

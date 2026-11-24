@@ -1,4 +1,4 @@
-# Autotrainer / reachAQ
+# reachAQ
 
 
 * [Overview](#overview)
@@ -11,24 +11,27 @@
 * [Additional Tools](#additional-tools)
 * [Testing](#testing)
 * [Modules](#modules)
-  * [autotrainer.core](#autotrainercore)
-  * [autotrainer.video](#autotrainervideo)
-  * [autotrainer.device](#autotrainerdevice)
-  * [autotrainer.inference](#autotrainerinference)
-  * [autotrainer.behavior](#autotrainerbehavior)
-  * [autotrainer.model](#autotrainermodel)
-  * [autotrainer.pyside](#autotrainerpyside)
+  * [reachaq.core](#reachaqcore)
+  * [reachaq.video](#reachaqvideo)
+  * [reachaq.device](#reachaqdevice)
+  * [reachaq.inference](#reachaqinference)
+  * [reachaq.behavior](#reachaqbehavior)
+  * [reachaq.model](#reachaqmodel)
+  * [reachaq.pyside](#reachaqpyside)
 * [Code Guidelines](#code-guidelines)
 
 ## Overview
-This repository contains the Autotrainer modules and reachAQ applications that are primarily used on-device.  A monorepo
-is used here primarily as a development convenience.  Individual modules and applications can and are installed
-in on devices independently.  This loose-coupling should be assumed when managing dependencies or refactoring
-common code.
+This repository contains reachAQ, installed as one distribution, `reachaq`, from `pyproject.toml`. Its
+packages live under `src/reachaq/` (`reachaq.core`, `.video`, `.device`, `.inference`, `.behavior`, `.model`,
+`.pyside`, the acquisition application `reachaq.app`, and the hardware and analysis tools beside it). The pose
+backends that bring heavy or AGPL-licensed engines are separate plugin distributions under
+[`plugins/`](plugins/README.md). Keep the lower-level packages loosely coupled, as listed under [Modules](#modules),
+when managing dependencies or refactoring common code. reachAQ grew out of upstream Autotrainer; see
+[CHANGELOG.md](CHANGELOG.md) for the 4.0 rename.
 
 For the current reachAQ Dell/Ubuntu runtime, use
 [linux-install-instructions.md](linux-install-instructions.md). The expected
-environment name is `reachaq`, the GUI entry point is `python -m reachAQ.app`,
+environment name is `reachaq`, the GUI entry point is `python -m reachaq.app`,
 and local acquisition data should be configured under
 `$HOME/Documents/rawdatalocal`.
 
@@ -50,7 +53,7 @@ permissions, and installs the tracked publisher systemd units. Setting up each
 user's animal metadata source (SoftMouse, a spreadsheet, a database or a shared
 publication) and enabling an optional nightly publisher remain explicit
 post-install steps in the
-[animal metadata and RFID checklist](tools/softmouse_sync/CONFIGURATION_GUIDE.md).
+[animal metadata and RFID checklist](src/reachaq/softmouse_sync/CONFIGURATION_GUIDE.md).
 
 ## Applications
 
@@ -64,13 +67,13 @@ from the core logic of the applications for two reasons:
 * Acquisition Application
   * The local user interface for integrated camera, pellet delivery, NI-DAQ,
     laser, and pose-inference modules
-  * `conda run --no-capture-output -n reachaq python -m reachAQ.app -c ~/Autotrainer/system_configuration.yaml`
+  * `conda run --no-capture-output -n reachaq python -m reachaq.app -c ~/reachAQ/system_configuration.yaml`
     * The GUI starts idle by default. Use `--start-mode running` only when immediate startup is intentional.
     * Use `--no-live-inference` or `--live-inference` to override the saved inference setting for one run.
     * Hardware startup progress is written to the log and launching terminal as `HARDWARE INIT` records.
     * The installed `reachAQ.desktop` mouse icon opens the same application in a terminal; `reachaq` starts it from any shell.
     * Only one instance runs per user, however it is started: a second start exits with status 3 and names the running PID.
-    * [Detailed Instructions](tools/acquisition/README.md)
+    * [Detailed Instructions](src/reachaq/app/README.md)
     * [Session recording, synchronization, persistence, and hardware isolation](docs/acquisition/session-recording-and-synchronization.md)
     * [Recording sessions, pellet trials, protocols, and schema migration](docs/acquisition/session-trials-protocols.md)
     * [Training plans](docs/acquisition/training-plans.md)
@@ -81,11 +84,11 @@ from the core logic of the applications for two reasons:
     * Use `--random-cameras` to start with software-generated frames when no physical cameras are configured.
     * Use `--simulate` to run with no hardware at all: [simulation mode](docs/acquisition/simulation-mode.md) and its [backend interfaces](docs/acquisition/backend-interfaces.md).
   * Headless implementation for command line only
-    * `auto-trainer-headless -c ~/Autotrainer/system_configuration.yaml`
+    * `reachaq-headless -c ~/reachAQ/system_configuration.yaml`
     * Headless mode continues to start acquisition by default because it has no UI start control.
 * Pellet Delivery Test Application
   * Standalone UI for interfacing with the pellet delivery system
-  * `python -m tools.pellet_delivery.gui`
+  * `python -m reachaq.pellet_delivery.gui`
 
 ## Scripts
 
@@ -108,30 +111,30 @@ utilities. Run them from the repository root in the configured environment.
 
 ## Additional Tools
 
-Current hardware bring-up tools live under `tools/hardware`:
+Current hardware bring-up tools live under `src/reachaq/hardware`:
 
-* `tools/hardware/validate_can_hardware.py` - discover the pellet CAN board,
+* `src/reachaq/hardware/validate_can_hardware.py` - discover the pellet CAN board,
   request status/configuration, or perform explicitly enabled motion tests.
   It exits 1, naming the code, when the board refuses a command (any ACK
   error other than 0 and -11). Exit 0 means only that no refusal arrived
   within the listen window (`--listen-seconds`, default 2.0 s); a slow
   command such as a home can outlast it.
-* `tools/hardware/validate_laser_hardware.py` - validate configured NI-DAQ laser
+* `src/reachaq/hardware/validate_laser_hardware.py` - validate configured NI-DAQ laser
   channels one controlled operation at a time.
-* `tools/hardware/verify_nidaq_wiring.py` - drive each board output and laser
+* `src/reachaq/hardware/verify_nidaq_wiring.py` - drive each board output and laser
   command in turn and record which NI-DAQ line followed; the same test as
   **Tools → DAQ Monitor → Wiring test**. See
   [Check the wiring](docs/linux-install/ni-daq-pxi.md#check-the-wiring).
-* `tools/hardware/qualify_pellet_firmware.py` - collect the rig evidence needed
+* `src/reachaq/hardware/qualify_pellet_firmware.py` - collect the rig evidence needed
   to qualify a new pellet firmware version. See
   [pellet firmware compatibility](docs/acquisition/pellet-firmware-compatibility.md#qualifying-a-new-firmware-version).
-* `tools/hardware/reachaq-bring-up-can.sh` and the accompanying systemd files -
+* `src/reachaq/hardware/reachaq-bring-up-can.sh` and the accompanying systemd files -
   configure and bring up the selected reachAQ SocketCAN interface (`can0` by
   default) automatically at boot.
-* `tools/hardware/reachaq-bring-down-can.sh` - service stop action that brings
+* `src/reachaq/hardware/reachaq-bring-down-can.sh` - service stop action that brings
   down only the configured application CAN channel.
-* `tools/hardware/reachaq-reset-can.sh` and
-  `tools/hardware/reachaq-can-reset.sudoers` - root-owned, narrowly permitted
+* `src/reachaq/hardware/reachaq-reset-can.sh` and
+  `src/reachaq/hardware/reachaq-can-reset.sudoers` - root-owned, narrowly permitted
   recovery helper used only after a confirmed CAN-domain failure. Ordinary
   application close only closes its own socket. The helper serializes and
   debounces service restart, refuses to reset a channel owned by another
@@ -140,7 +143,7 @@ Current hardware bring-up tools live under `tools/hardware`:
   set up where animal metadata comes from (SoftMouse, spreadsheet, database,
   shared publication, or a lab's own source), credentials, refresh, offline
   behaviour and the optional nightly publisher.
-* [`tools/softmouse_sync/README.md`](tools/softmouse_sync/README.md) - the
+* [`src/reachaq/softmouse_sync/README.md`](src/reachaq/softmouse_sync/README.md) - the
   SoftMouse source, USB RFID readers and metadata ownership.
 
 See [linux-install-instructions.md](linux-install-instructions.md) for the
@@ -153,8 +156,8 @@ and current invocation examples.
 
 PyTest testing is supported and configured via `./conftest.py`.
 
-Individual namespace packages (*e.g,* `auto-trainer-core`) contain a `tests` directory.  There are also unit and functional
-tests for high-level functionality in the applications and that combine elements of multiple packages.
+Each package's tests are in `tests/<package>` (`tests/core`, `tests/device`, ...); the tests of the applications
+and of anything that combines several packages are directly in `tests/`.
 
 Tests that are longer or require additional configuration are marked as `@pytest.mark.functional` and are not run
 by default.
@@ -184,9 +187,9 @@ Run all tests, including functional, from the root directory:
 
 To limit testing to an individual namespace package, issue still from the base repo main root directory:
 
-`pytest ./auto-trainer-device/tests ./auto-trainer-video/tests`
+`pytest ./tests/device ./tests/video`
 
-for instance. Alternatively you can `cd` into the subdir, and execute `pytest ./tests` too.
+for instance.
 
 To list all test cases, from repo base/root dir:
 
@@ -197,58 +200,58 @@ You can also give many at once.
 
 ## Modules
 
-### autotrainer.core
+### reachaq.core
 
-[Core](auto-trainer-core/README.md) is base module for functions and objects that used across most or all modules and applications.
+[Core](src/reachaq/core/README.md) is base module for functions and objects that used across most or all modules and applications.
 
-**Autotrainer Dependencies**
+**Depends on**
 * None
 
-### autotrainer.video
-[Video](auto-trainer-video/README.md) implements the camera interfaces for all supported cameras.
+### reachaq.video
+[Video](src/reachaq/video/README.md) implements the camera interfaces for all supported cameras.
 
-**Autotrainer Dependencies**
+**Depends on**
 * Core
 
 
-### autotrainer.device
+### reachaq.device
 
-[Device](auto-trainer-device/README.md) implements the shared interfaces for
+[Device](src/reachaq/device/README.md) implements the shared interfaces for
 pellet-board, NI-DAQ, laser, and related non-camera hardware. The primary
 purpose is to provide a consistent interface to applications.
 
 
-**Autotrainer Dependencies**
+**Depends on**
 * Core
 
-### autotrainer.inference
+### reachaq.inference
 
-[Inference](auto-trainer-inference/README.md) implements pose inference and any other low-level machine learning elements.
+[Inference](src/reachaq/inference/README.md) implements pose inference and any other low-level machine learning elements.
 Its primary purpose is to provide a implementation-agnostic interface to inference, such as the current dependency
 on DeepLapCut.
 
-**Autotrainer Dependencies**
+**Depends on**
 * Core
 
-### autotrainer.behavior
-[Behavior](auto-trainer-behavior/README.md) implements the behavior training state machine, algorithm, and real-time analysis.
+### reachaq.behavior
+[Behavior](src/reachaq/behavior/README.md) implements the behavior training state machine, algorithm, and real-time analysis.
 
-**Autotrainer Dependencies**
+**Depends on**
 * Core
 
-### autotrainer.pyside
-[PySide](auto-trainer-pyside/README.md) provides convenience classes on top of PySide.
+### reachaq.pyside
+[PySide](src/reachaq/pyside/README.md) provides convenience classes on top of PySide.
 
-**Autotrainer Dependencies**
+**Depends on**
 * Inference
 
-### autotrainer.model
+### reachaq.model
 
-[Model](auto-trainer-model/README.md) is a collection of models and providers that simplify common elements of
-Autotrainer applications.  Generally, common code that bridges across multiple Autotrainer modules is contained
+[Model](src/reachaq/model/README.md) is a collection of models and providers that simplify common elements of
+reachAQ applications.  Generally, common code that bridges across multiple reachAQ packages is contained
 here, rather than creating additional hard-coupling between the lower-level modules.
 
-**Autotrainer Dependencies**
+**Depends on**
 * Core
 * Device
 
@@ -258,8 +261,9 @@ _Note that the original code came from a different structure is not yet fully co
 guidelines are in place for future additions and changes to help with and improve consistency._
 
 * Style generally follows PEP8.  This is the default in most editors or lint tools.
-  * An exception is made for `autotrainer.pyside`.  Classes derived from PySide follow PySide conventions.
-* All modules are defined as namespace packages to allow for separation of modules under the same `autotrainer` namespace.
+  * An exception is made for `reachaq.pyside`.  Classes derived from PySide follow PySide conventions.
+* `reachaq` is a namespace package (there is no `src/reachaq/__init__.py`), so the pose plugins add
+  `reachaq.pose_plugins.*` from their own distributions.
 * Code, particularly in modules, should be as platform-agnostic as possible despite having a current reachAQ target of Ubuntu 22.04 on x86_64.
   * Fallback support does not need to match the target platform behavior where is can not (e.g. CUDA), but allow the code to run as correctly as possible.
   * This is primarily for automated testing in other environments such as GitHub Actions.

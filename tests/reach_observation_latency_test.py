@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from tools.acquisition.model.reach_state_source import LiveTrackingReachProvider
+from reachaq.app.model.reach_state_source import LiveTrackingReachProvider
 
 
 class _Buffer:

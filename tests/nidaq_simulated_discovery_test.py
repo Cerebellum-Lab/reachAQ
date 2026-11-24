@@ -1,14 +1,14 @@
-from autotrainer.core import (
+from reachaq.core import (
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
     NidaqTimingConfiguration,
 )
-from tools.acquisition.model import nidaq_discovery
-from tools.acquisition.model.nidaq_discovery import (
+from reachaq.app.model import nidaq_discovery
+from reachaq.app.model.nidaq_discovery import (
     discover_nidaq_devices,
     simulated_nidaq_devices,
 )
-from tools.acquisition.model.nidaq_timing import build_nidaq_timing_plan
+from reachaq.app.model.nidaq_timing import build_nidaq_timing_plan
 
 
 def test_simulation_discovery_returns_simdaq1_without_a_subprocess(monkeypatch):

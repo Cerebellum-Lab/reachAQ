@@ -1,10 +1,10 @@
 from types import SimpleNamespace
 from unittest import mock
 
-from autotrainer.behavior.pellet_trial import TrialOutcome
-from autotrainer.behavior.training import TrainingPlan, TrainingProgressState, parse_plan
+from reachaq.behavior.pellet_trial import TrialOutcome
+from reachaq.behavior.training import TrainingPlan, TrainingProgressState, parse_plan
 
-from tools.acquisition.model.trial_protocol_runner import TrialProtocolRunner
+from reachaq.app.model.trial_protocol_runner import TrialProtocolRunner
 
 
 def make_plan(*, advance_after=None, fallback_after=None, phases=2, pause=None):

@@ -8,10 +8,10 @@ from threading import Thread
 from copy import copy
 from enum import IntEnum
 
-from autotrainer.core import SystemStatusMessageKind, SystemCommandKind, EventManager
-from autotrainer.core.logging import setup_logging
-from autotrainer.core.message import SystemDataArgsKwargs
-from autotrainer.device import (
+from reachaq.core import SystemStatusMessageKind, SystemCommandKind, EventManager
+from reachaq.core.logging import setup_logging
+from reachaq.core.message import SystemDataArgsKwargs
+from reachaq.device import (
     CanDevice,
     DeviceConnection,
     Motor,
@@ -678,7 +678,7 @@ def main():
 
     args = parser.parse_args()
 
-    logging.getLogger("autotrainer").setLevel(args.log_level)  # can be changed with "logger" cli command
+    logging.getLogger("reachaq").setLevel(args.log_level)  # can be changed with "logger" cli command
     # logging.root.setLevel(args.log_level)
 
     output_file = args.output

@@ -5,8 +5,8 @@ import zipfile
 
 import pytest
 
-from tools.acquisition.model import diagnostic_bundle
-from tools.acquisition.model.diagnostic_bundle import (
+from reachaq.app.model import diagnostic_bundle
+from reachaq.app.model.diagnostic_bundle import (
     REDACTED,
     BundleSources,
     SecretLeakError,
@@ -51,14 +51,14 @@ def rig(tmp_path):
         (session / "streams" / "nidaq.h5").write_bytes(b"\0" * 1024)
         mtime = time.time() - (10 - index) * 60
         os.utime(session, (mtime, mtime))
-    config = tmp_path / "Autotrainer" / "system_configuration.yaml"
+    config = tmp_path / "reachAQ" / "system_configuration.yaml"
     config.parent.mkdir()
     config.write_text(
         "version: 59\npersistence: !PersistenceConfiguration\n"
         f"  outputLocation: {data.as_posix()}\n"
         f"apiPlugin:\n  api_key: {CONFIG_SECRET}\n  keypointCount: 12\n",
         encoding="utf-8")
-    preferences = tmp_path / "Auto Trainer.conf"
+    preferences = tmp_path / "reachAQ.conf"
     preferences.write_text(
         "[system]\nlog_level=20\n[softmouse]\n"
         f"token={PREFERENCES_SECRET}\nname_column=Physical Tag\n",
@@ -116,7 +116,7 @@ def test_no_planted_secret_reaches_the_bundle(rig, monkeypatch):
     assert result.redactions >= 6
     # Redaction keeps what support needs.
     assert "keypointCount: 12" in texts["configuration/system_configuration.yaml"]
-    assert "name_column=Physical Tag" in texts["preferences/Auto Trainer.conf"]
+    assert "name_column=Physical Tag" in texts["preferences/reachAQ.conf"]
     assert f"api_key: {REDACTED}" in texts["configuration/system_configuration.yaml"]
 
 
@@ -125,7 +125,7 @@ def test_bundle_contents_and_limits(rig):
     names = set(result.members)
     assert {"versions.json", "hardware_inventory.json", "manifest.json", "subsystem_statuses.json",
             "app_state.json", "configuration/system_configuration.yaml",
-            "preferences/Auto Trainer.conf", "logs/20261123/rig1/20261123_rig1_001.log"} <= names
+            "preferences/reachAQ.conf", "logs/20261123/rig1/20261123_rig1_001.log"} <= names
     assert "logs/20261123/rig1/20261101_rig1_001.log" not in names, "older than 7 days"
     sessions = {name.split("/")[3] for name in names if name.startswith("sessions/")}
     assert sessions == {f"session{index:03d}" for index in range(3, 8)}, "the 5 newest sessions"

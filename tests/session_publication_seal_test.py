@@ -4,8 +4,8 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from autotrainer.core import ObservableObject, ProjectInfo
-from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+from reachaq.core import ObservableObject, ProjectInfo
+from reachaq.app.model.session_data_recorder import SessionDataRecorder
 
 
 class _EventSource(ObservableObject):

@@ -10,8 +10,8 @@ from unittest import mock
 
 import pytest
 
-from autotrainer.core import SystemCommandKind
-from autotrainer.device import (
+from reachaq.core import SystemCommandKind
+from reachaq.device import (
     CanDevice,
     DeviceApi,
     DigitalOutputs,
@@ -20,13 +20,13 @@ from autotrainer.device import (
     Target,
 )
 
-from tools.acquisition.model.hardware_model import HardwareModel
-from tools.acquisition.model.trial_action import (
+from reachaq.app.model.hardware_model import HardwareModel
+from reachaq.app.model.trial_action import (
     LaserPulseProfile,
     TrialActionCompiler,
     TrialCompileContext,
 )
-from tools.acquisition.model.trial_protocol_schedule import TrialProtocolRow
+from reachaq.app.model.trial_protocol_schedule import TrialProtocolRow
 
 
 # christielab10's wiring: laser 1 on board STIM3, laser 2 on board STIM2.

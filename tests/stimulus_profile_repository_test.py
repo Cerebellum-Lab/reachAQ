@@ -2,12 +2,12 @@ import json
 
 import pytest
 
-from tools.acquisition.model.stimulus_profile_repository import (
+from reachaq.app.model.stimulus_profile_repository import (
     PROFILE_SCHEMA_VERSION,
     StimulusProfileLibrary,
     StimulusProfileRepository,
 )
-from tools.acquisition.model.trial_action import (
+from reachaq.app.model.trial_action import (
     CueIntervalProfile,
     LaserPulseProfile,
     StimulusTriggerProfile,

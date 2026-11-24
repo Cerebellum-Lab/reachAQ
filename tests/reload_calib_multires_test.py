@@ -25,18 +25,18 @@ import pytest
 import yaml
 
 import top_fixtures
-from autotrainer.behavior import BehaviorAlgorithm
-from autotrainer.core import CameraConfiguration, CameraId
-from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
-from autotrainer.core.logging import unregister_fatal_exception_callback
-from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
-from autotrainer.inference.multires_calibration import store
-from autotrainer.inference.multires_calibration.fit import BoardSpec, CaptureCamera
-from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
-from autotrainer.inference.multires_calibration.report import CameraVerdict, QualityReport
-from autotrainer.inference.multires_calibration import library
+from reachaq.behavior import BehaviorAlgorithm
+from reachaq.core import CameraConfiguration, CameraId
+from reachaq.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
+from reachaq.core.logging import unregister_fatal_exception_callback
+from reachaq.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
+from reachaq.inference.multires_calibration import store
+from reachaq.inference.multires_calibration.fit import BoardSpec, CaptureCamera
+from reachaq.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
+from reachaq.inference.multires_calibration.report import CameraVerdict, QualityReport
+from reachaq.inference.multires_calibration import library
 from multires_calibration_fakes import BASE, FIT
-from tools.acquisition.model.app_model import AppModel, SetupDifference
+from reachaq.app.model.app_model import AppModel, SetupDifference
 
 
 BASE_PARAMS = dict(hbin=4, vbin=4, width=256, height=256, offsetx=52, offsety=6)
@@ -631,7 +631,7 @@ def test_two_dcs_runs_keep_both_files_and_load_the_newer(app_model, tmp_path):
 def test_live_and_offline_read_the_same_offsets_file(app_model, tmp_path):
     from datetime import datetime, timezone
 
-    from autotrainer.inference.analysis.prepare_jetson_data import _load_saved_offsets
+    from reachaq.inference.analysis.prepare_jetson_data import _load_saved_offsets
 
     entry = _active_entry(app_model, tmp_path)
     _configure_with_serials(app_model, SERIALS)
@@ -789,7 +789,7 @@ def test_dcs_is_refused_without_an_active_calibration(app_model, user_pref):
 def _session_recording(tmp_path, offsets_file):
     from datetime import datetime
 
-    from autotrainer.core import ProjectInfo
+    from reachaq.core import ProjectInfo
 
     project = ProjectInfo(root=(tmp_path / "Data").as_posix(), device_id="rig", when=datetime(2026, 11, 20), session=3)
     path = Path(project.get_metadata_file() + ".json")
@@ -800,7 +800,7 @@ def _session_recording(tmp_path, offsets_file):
 
 
 def test_reprocessing_uses_the_offsets_the_session_recorded(app_model, tmp_path, caplog):
-    from autotrainer.inference.analysis.prepare_jetson_data import _load_saved_offsets, session_offsets_file
+    from reachaq.inference.analysis.prepare_jetson_data import _load_saved_offsets, session_offsets_file
 
     entry = _active_entry(app_model, tmp_path)
     _configure_with_serials(app_model, SERIALS)
@@ -822,7 +822,7 @@ def test_reprocessing_uses_the_offsets_the_session_recorded(app_model, tmp_path,
 
 
 def test_reprocessing_with_a_changed_recorded_file_falls_back_and_says_so(app_model, tmp_path, caplog):
-    from autotrainer.inference.analysis.prepare_jetson_data import _load_saved_offsets
+    from reachaq.inference.analysis.prepare_jetson_data import _load_saved_offsets
 
     entry = _active_entry(app_model, tmp_path)
     used = app_model.write_camera_offsets(entry, {"x_off": 1.0, "y_off": 1.0, "z_off": 1.0})

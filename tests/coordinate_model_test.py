@@ -1,9 +1,9 @@
-from autotrainer.core import Offset3DTuple
-from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
-from autotrainer.core.pose_elements import SceneElement
-from autotrainer.inference import PoseResponse
+from reachaq.core import Offset3DTuple
+from reachaq.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from reachaq.core.pose_elements import SceneElement
+from reachaq.inference import PoseResponse
 
-from tools.acquisition.model.coordinate_model import CoordinateModel
+from reachaq.app.model.coordinate_model import CoordinateModel
 
 
 def _configuration():

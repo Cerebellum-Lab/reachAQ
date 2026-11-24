@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from tools.acquisition.model.camera_timing_alignment import (
+from reachaq.app.model.camera_timing_alignment import (
     CameraTimestampInput,
     CameraTimestampIntegrityError,
     align_camera_timestamp_files,

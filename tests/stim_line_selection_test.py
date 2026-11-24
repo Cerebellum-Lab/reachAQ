@@ -1,6 +1,6 @@
 """Host readiness for a firmware that can pulse STIM2 as well as STIM3."""
 
-from autotrainer.device.device_interface import (
+from reachaq.device.device_interface import (
     BOARD_STIM_LINE_OUTPUTS,
     DigitalOutputs,
 )

@@ -3,8 +3,8 @@
 ReachAQ publishes its events and accepts a few commands on a local TCP port, so
 another program on the rig can follow a run or start and stop acquisition. The
 service starts with the GUI and with the headless runner
-(`tools/acquisition/headless.py`). It is implemented in
-`auto-trainer-core/src/autotrainer/core/api/`.
+(`src/reachaq/app/headless.py`). It is implemented in
+`src/reachaq/core/api/`.
 
 ## Configuration
 
@@ -39,7 +39,7 @@ The directory is `$XDG_RUNTIME_DIR/reachaq/api`, or
 `<tmp>/reachaq-runtime-<uid>/reachaq/api` without one (beside the application
 lock), and `%LOCALAPPDATA%eachAQpi` on Windows. A record whose process has
 ended, or whose pid now belongs to another process, is ignored and removed by the
-next reader. `autotrainer.core.api.discovery.list_api_instances()` lists the live
+next reader. `reachaq.core.api.discovery.list_api_instances()` lists the live
 ones. The log line "Local API listening on ..." names the port and the record.
 
 ## Protocol
@@ -95,13 +95,13 @@ by member name (`"mode": "RUNNING"`), times as ISO 8601, non-finite numbers as
 
 ## Client
 
-`autotrainer.core.api.client.ApiClient` is a small blocking client. With no
+`reachaq.core.api.client.ApiClient` is a small blocking client. With no
 `port` it connects to the one running instance, or to the one matching
 `simulated=True` or `False`; when none or several match it raises
 `ApiInstanceNotFound` listing them. `ApiClient(port=...)` skips discovery.
 
 ```python
-from autotrainer.core.api.client import ApiClient
+from reachaq.core.api.client import ApiClient
 
 with ApiClient() as client:
     print(client.request("GET_STATUS")["data"]["acquisition_state"])
@@ -113,7 +113,7 @@ with ApiClient() as client:
 ## Event ids
 
 Ids that reachAQ rigs have recorded are fixed: changing one would misread old
-event files. `auto-trainer-core/tests/api_recorded_events_test.py` checks every
+event files. `tests/core/api_recorded_events_test.py` checks every
 id, name and payload repr against rows copied from christielab10's event files.
 Members marked "assigned" in `kinds.py` had never been recorded when reachAQ
 took over the enum, so their ids are reachAQ's choice.

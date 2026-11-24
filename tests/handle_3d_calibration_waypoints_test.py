@@ -23,23 +23,23 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from autotrainer.core import CameraConfiguration, Offset3DTuple, SystemCommandKind
-from autotrainer.core.capture import CaptureProcessStatus
-from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
-from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
-from autotrainer.device import MotorConfigurationFile
-from autotrainer.inference.multires_calibration import store
-from autotrainer.inference.multires_calibration.extract import distinct_waypoints
-from autotrainer.inference.multires_calibration.fit import BoardSpec, CaptureCamera
-from autotrainer.inference.multires_calibration.geometry import PresetGeometry, PresetSet, presets_for_cameras
-from autotrainer.inference.multires_calibration.pipeline import (
+from reachaq.core import CameraConfiguration, Offset3DTuple, SystemCommandKind
+from reachaq.core.capture import CaptureProcessStatus
+from reachaq.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
+from reachaq.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from reachaq.device import MotorConfigurationFile
+from reachaq.inference.multires_calibration import store
+from reachaq.inference.multires_calibration.extract import distinct_waypoints
+from reachaq.inference.multires_calibration.fit import BoardSpec, CaptureCamera
+from reachaq.inference.multires_calibration.geometry import PresetGeometry, PresetSet, presets_for_cameras
+from reachaq.inference.multires_calibration.pipeline import (
     WAYPOINT_LOG,
     calibrated_preset_sets,
     load_waypoint_log,
     write_waypoint_log,
 )
-from autotrainer.inference.multires_calibration.report import QualityReport
-from autotrainer.inference.multires_calibration.scout import (
+from reachaq.inference.multires_calibration.report import QualityReport
+from reachaq.inference.multires_calibration.scout import (
     Bounds,
     ScoutAborted,
     ScoutResult,
@@ -48,11 +48,11 @@ from autotrainer.inference.multires_calibration.scout import (
     save_move_list,
     scout_grid,
 )
-from autotrainer.video.video_record import VideoRecordMode
-from tools.acquisition.model import handle_3d_calibration as h3d
-from tools.acquisition.model import hardware_model as hardware_model_module
-from tools.acquisition.model.hardware_model import HardwareModel
-from tools.acquisition.model.handle_3d_calibration import (
+from reachaq.video.video_record import VideoRecordMode
+from reachaq.app.model import handle_3d_calibration as h3d
+from reachaq.app.model import hardware_model as hardware_model_module
+from reachaq.app.model.hardware_model import HardwareModel
+from reachaq.app.model.handle_3d_calibration import (
     calibrate_waypoint_capture,
     capture_presets,
     default_params,
@@ -442,14 +442,14 @@ def test_a_move_that_is_not_queued_stops_the_capture():
 # see the stage still moving: the settle alone has to cover the move, as if the ack meant
 # only "received".
 
-CHRISTIELAB10_MOTOR_CONFIG = Path(__file__).parents[1] / "auto-trainer-device" / "tests" / "christielab10_motor_config.yaml"
+CHRISTIELAB10_MOTOR_CONFIG = Path(__file__).parents[1] / "tests" / "device" / "christielab10_motor_config.yaml"
 
 
 @pytest.fixture(autouse=True)
 def _no_motor_config_file(tmp_path_factory, monkeypatch):
-    """The scout reads the stage travel from ~/Autotrainer/motor_config.yaml; these tests do
+    """The scout reads the stage travel from ~/reachAQ/motor_config.yaml; these tests do
     not see the computer's own file. A test that wants one writes it to the location."""
-    location = tmp_path_factory.mktemp("autotrainer") / "motor_config.yaml"
+    location = tmp_path_factory.mktemp("reachaq") / "motor_config.yaml"
     monkeypatch.setattr(MotorConfigurationFile, "DEFAULT_LOCATION", location)
     return location
 
@@ -551,7 +551,7 @@ class _Subscribers:
 
 def test_the_hardware_model_keeps_the_motor_configurations_it_writes_at_connect(hardware_model, monkeypatch):
     # The capture times its settles from these, so they must be what connect sent the motors
-    # (WRITE_MOTOR_CONFIGURATION, from ~/Autotrainer/motor_config.yaml), not a package default.
+    # (WRITE_MOTOR_CONFIGURATION, from ~/reachAQ/motor_config.yaml), not a package default.
     written = _motor_configurations(x=(120.0, 600.0), y=(120.0, 600.0), z=(120.0, 600.0))
     assert hardware_model.motor_configurations is None, "nothing is written before a connect"
 
@@ -608,9 +608,9 @@ def test_capture_params_set_gain_1_db_and_turn_camera_gamma_off():
     assert "gamma" in default_params and default_params["gamma"] is None
     # spinnaker_cam imports PySpin when it loads; PySpin is on the rig.
     pytest.importorskip("PySpin")
-    from autotrainer.video.camera.camera_base import CameraBase
-    from autotrainer.video.camera.spinnaker_cam import SpinCam
-    from autotrainer.video.video_manager import VideoManager
+    from reachaq.video.camera.camera_base import CameraBase
+    from reachaq.video.camera.spinnaker_cam import SpinCam
+    from reachaq.video.video_manager import VideoManager
 
     # The camera URL as VideoCaptureModel.load_configuration builds it from the params, read
     # back the way the capture process reads it. SpinCam's own default gamma is 0.7, so a
@@ -660,7 +660,7 @@ def test_the_capture_is_calibrated_into_the_session_beside_its_sources(tmp_path,
     log = run_waypoints(_Motor(clock, travel=0.0), plan_waypoints(start, moves, _dcs()),
                         sleep=clock.sleep, now=clock.now, clock=clock.now)
     presets = capture_presets(LIVE_PARAMS)
-    previous = tmp_path / "Autotrainer" / DEFAULT_3D_CALIB_DIR_NAME
+    previous = tmp_path / "reachAQ" / DEFAULT_3D_CALIB_DIR_NAME
     calls = []
 
     def fake_calibrate_capture(capture, **kwargs):

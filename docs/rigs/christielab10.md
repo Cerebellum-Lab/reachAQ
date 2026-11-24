@@ -17,12 +17,12 @@ the values that used to be built in.
 ## Settings directory
 
 There is nothing to do. `REACHAQ_CONFIG_DIR` is unset on the rig, so it keeps
-`~/Autotrainer`.
+`~/reachAQ`.
 
 ## SoftMouse publication
 
 The publication on the lab's Isilon share used to be built in. It is now the
-`[softmouse]` preferences, in `~/.config/Colorado/Auto Trainer.conf`:
+`[softmouse]` preferences, in `~/.config/reachAQ/reachAQ.conf`:
 
 ```ini
 [softmouse]
@@ -59,14 +59,14 @@ that with a drop-in:
 mkdir -p ~/.config/systemd/user/reachaq-softmouse-publisher.service.d
 printf '[Unit]\nRequiresMountsFor=/mnt/isilon\n' \
   > ~/.config/systemd/user/reachaq-softmouse-publisher.service.d/isilon.conf
-cp tools/softmouse_sync/systemd/reachaq-softmouse-publisher.service ~/.config/systemd/user/
+cp src/reachaq/softmouse_sync/systemd/reachaq-softmouse-publisher.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user cat reachaq-softmouse-publisher.service | grep RequiresMountsFor
 ```
 
 ## Real-time priority
 
-`sudo bash tools/hardware/reachaq-latency-setup.sh rtprio-enable` used to fall
+`sudo bash src/reachaq/hardware/reachaq-latency-setup.sh rtprio-enable` used to fall
 back to the user `christielab10` when `SUDO_USER` was unset. It now refuses to
 run without `SUDO_USER`, so run it with `sudo` from the operator account.
 

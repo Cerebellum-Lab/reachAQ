@@ -9,18 +9,18 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from autotrainer.core import CameraId, HardwareConfiguration, ObservableObject  # noqa: E402
-from autotrainer.core.capture import CaptureProcessStatus  # noqa: E402
-from autotrainer.video import CaptureCameraAttrs  # noqa: E402
-from tools.acquisition.model.hardware_scan import HardwareScanEntry, scan_can_adapters, scan_gpus  # noqa: E402
-from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts  # noqa: E402
-from tools.acquisition.model.app_model import AppModel  # noqa: E402
-from tools.acquisition.model.subsystem_status import (  # noqa: E402
+from reachaq.core import CameraId, HardwareConfiguration, ObservableObject  # noqa: E402
+from reachaq.core.capture import CaptureProcessStatus  # noqa: E402
+from reachaq.video import CaptureCameraAttrs  # noqa: E402
+from reachaq.app.model.hardware_scan import HardwareScanEntry, scan_can_adapters, scan_gpus  # noqa: E402
+from reachaq.app.model.nidaq_discovery import NidaqDevicePorts  # noqa: E402
+from reachaq.app.model.app_model import AppModel  # noqa: E402
+from reachaq.app.model.subsystem_status import (  # noqa: E402
     SubsystemId,
     SubsystemState,
     SubsystemStatus,
 )
-from tools.acquisition.view.hardware_status_content import HardwareStatusContent  # noqa: E402
+from reachaq.app.view.hardware_status_content import HardwareStatusContent  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -332,7 +332,7 @@ def test_enabled_category_uses_warning_color_from_scan(qapp):
 
 
 def _patch_hardware_scans(app_model, monkeypatch):
-    from tools.acquisition.model import app_model as app_model_module
+    from reachaq.app.model import app_model as app_model_module
 
     camera_sources = (
         CaptureCameraAttrs("Random Image", "random://0?width=300&height=200"),
@@ -514,7 +514,7 @@ def test_can_adapter_scan_reports_peak_driver_and_interface(tmp_path):
 
 
 def test_gpu_scan_formats_compact_identity(monkeypatch):
-    from tools.acquisition.model import hardware_scan
+    from reachaq.app.model import hardware_scan
 
     monkeypatch.setattr(
         hardware_scan.subprocess,

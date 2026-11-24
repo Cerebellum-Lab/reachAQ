@@ -1,7 +1,7 @@
 # Pose backend plugins
 
 A pose engine ships as its own distribution under `plugins/<name>` and
-registers itself in the `autotrainer.pose_backends` entry-point group. reachAQ
+registers itself in the `reachaq.pose_backends` entry-point group. reachAQ
 core installs PyTorch for the built-in keypoint backend and no optional pose
 plugin, so TensorFlow arrives only with the DeepLabCut plugin. It finds the
 installed plugins, asks each whether it owns a model directory, and runs the model through the one that does. Core
@@ -9,9 +9,9 @@ never imports an engine to decide that.
 
 | Plugin | Distribution | Claims a model directory with | Runs on |
 |---|---|---|---|
-| (built in) `keypoint` | `auto-trainer-inference` | `keypoint_pose.yaml` | torch |
-| [`deeplabcut`](deeplabcut/README.md) | `auto-trainer-pose-deeplabcut` | `config.yaml` | tensorflow or torch |
-| [`yolo`](yolo/README.md) | `auto-trainer-pose-yolo` (AGPL-3.0) | `yolo_pose.yaml` | torch |
+| (built in) `keypoint` | `reachaq` | `keypoint_pose.yaml` | torch |
+| [`deeplabcut`](deeplabcut/README.md) | `reachaq-pose-deeplabcut` | `config.yaml` | tensorflow or torch |
+| [`yolo`](yolo/README.md) | `reachaq-pose-yolo` (AGPL-3.0) | `yolo_pose.yaml` | torch |
 
 Install one into an existing environment with
 `tools/install/reachaq-plugin-install.sh deeplabcut|yolo` (see
@@ -20,7 +20,7 @@ exits 2.
 
 ## The contract
 
-`autotrainer.inference.pose_plugins.PoseBackendPlugin`. Every method must be
+`reachaq.inference.pose_plugins.PoseBackendPlugin`. Every method must be
 cheap and import-free except `build()` and `pre_validate()`, which are only
 called for the plugin that claimed the model. `missing_requirements()` uses
 `find_spec`, not `import`, because importing TensorFlow to ask whether it is
@@ -40,23 +40,23 @@ present costs seconds and loads CUDA.
 | `build(model_path, runtime, *, shuffle_index, training_index, batch_size)` | Construct a `PoseModel`. The engine import happens here. |
 | `confidence_threshold(model_path, runtime)` | The confidence a keypoint needs to count as present, on this engine's scale. Measure it on held-out frames; do not borrow another engine's. |
 
-`build()` returns a `PoseModel` (`autotrainer.inference.pose_model`), so
+`build()` returns a `PoseModel` (`reachaq.inference.pose_model`), so
 callers never branch on the engine.
 
 ### Skeleton
 
 ```python
-# src/autotrainer/pose_plugins/myengine/plugin.py
+# src/reachaq/pose_plugins/myengine/plugin.py
 import os
 import typing
 
-from autotrainer.inference import pose_plugins
-from autotrainer.inference.pose_model import PoseModel
+from reachaq.inference import pose_plugins
+from reachaq.inference.pose_model import PoseModel
 
 
 class MyEnginePlugin(pose_plugins.PoseBackendPlugin):
     name = "myengine"
-    distribution = "auto-trainer-pose-myengine"
+    distribution = "reachaq-pose-myengine"
     requires = ("myengine",)
 
     SIDECAR = "myengine_pose.yaml"
@@ -96,23 +96,23 @@ that matter:
 
 ```toml
 [project]
-name = "auto-trainer-pose-myengine"
+name = "reachaq-pose-myengine"
 license = { text = "..." }          # the distribution's own licence, see below
 dependencies = [
-    "auto-trainer",                  # the installed application
+    "reachaq",                  # the installed application
     "myengine >= 1, < 2",
 ]
 
-[project.entry-points."autotrainer.pose_backends"]
-myengine = "autotrainer.pose_plugins.myengine.plugin:MYENGINE_PLUGIN"
+[project.entry-points."reachaq.pose_backends"]
+myengine = "reachaq.pose_plugins.myengine.plugin:MYENGINE_PLUGIN"
 ```
 
 - The entry point may name an instance, a plugin class, or a factory function;
   anything callable that is not already a `PoseBackendPlugin` is called once.
-- The `auto-trainer` dependency is required: the plugin imports
-  `autotrainer.inference`, which is folded into that distribution. Never
-  depend on `auto-trainer-inference` on its own.
-- The package lives in the `autotrainer.pose_plugins.<name>` namespace;
+- The `reachaq` dependency is required: the plugin imports
+  `reachaq.inference`, which is folded into that distribution. Never
+  depend on `reachaq` on its own.
+- The package lives in the `reachaq.pose_plugins.<name>` namespace;
   `[tool.setuptools.packages.find]` uses `namespaces = true` with an `include`
   for that package only.
 - Add the name to `KNOWN_PLUGINS` in `tools/install/plugin-install-lib.sh` so
@@ -147,13 +147,13 @@ run, or no model at all, it answers a recognised `REACHAQ_POSE_BACKEND`, then
 
 ## Adding a `KNOWN_LAYOUTS` entry
 
-`KNOWN_LAYOUTS` in `auto-trainer-inference/src/autotrainer/inference/pose_plugins.py`
+`KNOWN_LAYOUTS` in `src/reachaq/inference/pose_plugins.py`
 is what lets core say "this is a YOLO model, install `yolo`" when the plugin is
 not installed, without importing it. Once an adapter exists, add a
 `KnownLayout(engine, plugin, distribution, matches, hint="")`:
 
 ```python
-KnownLayout("MyEngine", "myengine", "auto-trainer-pose-myengine",
+KnownLayout("MyEngine", "myengine", "reachaq-pose-myengine",
             _is_myengine_layout)
 ```
 
@@ -187,7 +187,7 @@ share file basenames (`test_plugin.py`, `test_routing.py`), so run them
 separately:
 
 ```bash
-pytest tests auto-trainer-inference/tests -q   # core, with no plugin installed
+pytest tests tests/inference -q   # core, with no plugin installed
 pytest plugins/deeplabcut/tests -q             # needs the DeepLabCut plugin installed
 pytest plugins/yolo/tests -q                   # needs the YOLO plugin installed
 ```

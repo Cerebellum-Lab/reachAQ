@@ -2,7 +2,7 @@ import importlib.util, io, os, sys, time, dataclasses
 from types import SimpleNamespace
 from pathlib import Path
 import pytest
-from autotrainer.device import LaserChannelId, nidaq_laser
+from reachaq.device import LaserChannelId, nidaq_laser
 
 _REPO = Path(__file__).resolve().parents[1]
 
@@ -13,8 +13,8 @@ def _load(name, path):
     spec.loader.exec_module(module)
     return module
 
-fake = _load("nidaq_daqmx_fake", _REPO / "auto-trainer-device" / "tests" / "nidaq_daqmx_fake.py")
-victim = _load("laser_kill_victim", _REPO / "tools" / "hardware" / "laser_kill_victim.py")
+fake = _load("nidaq_daqmx_fake", _REPO / "tests" / "device" / "nidaq_daqmx_fake.py")
+victim = _load("laser_kill_victim", _REPO / "src" / "reachaq" / "hardware" / "laser_kill_victim.py")
 
 @pytest.fixture
 def daq(monkeypatch):

@@ -3,7 +3,7 @@ from email.message import Message
 
 import pytest
 
-from tools.ci.check_licences import (
+from ci.check_licences import (
     DistLicence,
     classify_licence,
     evaluate,
@@ -45,7 +45,7 @@ def test_allowlist_file_with_a_byte_order_mark_has_no_bom_entry(tmp_path, monkey
     allowlist.write_bytes(codecs.BOM_UTF8 + b"auto-trainer-api  # why\r\n")
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
     monkeypatch.setattr(
-        "tools.ci.check_licences.installed_licences", lambda: [d("auto-trainer-api", "AGPL")])
+        "ci.check_licences.installed_licences", lambda: [d("auto-trainer-api", "AGPL")])
     assert main(["--allowlist", str(allowlist)]) == 0
     assert "\ufeff" not in capsys.readouterr().out
 
@@ -137,7 +137,7 @@ def run_main(tmp_path, monkeypatch, capsys, dists, allowlist_text):
     allowlist = tmp_path / "allowlist.txt"
     allowlist.write_text(allowlist_text, encoding="utf-8")
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
-    monkeypatch.setattr("tools.ci.check_licences.installed_licences", lambda: dists)
+    monkeypatch.setattr("ci.check_licences.installed_licences", lambda: dists)
     code = main(["--allowlist", str(allowlist)])
     return code, capsys.readouterr().out
 

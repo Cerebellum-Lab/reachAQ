@@ -1,6 +1,6 @@
 import pytest
 
-from tools.acquisition.model.capture_binning import (
+from reachaq.app.model.capture_binning import (
     apply_capture_binning,
     base_binning,
     capture_binning_available,

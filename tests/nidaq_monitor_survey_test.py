@@ -6,7 +6,7 @@ than reasoned about, and each one took the whole survey down with it.
 
 from types import SimpleNamespace
 
-from tools.acquisition.model.nidaq_monitor_survey import (
+from reachaq.app.model.nidaq_monitor_survey import (
     build_survey,
     survey_stream_configuration,
 )

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from tools.acquisition.model.laser_kill_matrix import (
+from reachaq.app.model.laser_kill_matrix import (
     HELD_THROUGH_RESET, HELD_UNTIL_REOPEN, HELD_UNTIL_RESET, REFUSED_BY_DESIGN,
     SAFE_ON_DEATH, TRAIN_RAN_ON, UNKNOWN, KillCase, KillObservation,
     LevelReading, LevelSample, format_table, from_record, judge, kill_cases,

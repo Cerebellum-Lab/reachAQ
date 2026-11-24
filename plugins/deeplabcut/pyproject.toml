@@ -7,30 +7,29 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["autotrainer.pose_plugins.deeplabcut", "autotrainer.pose_plugins.deeplabcut.*"]
+include = ["reachaq.pose_plugins.deeplabcut", "reachaq.pose_plugins.deeplabcut.*"]
 namespaces = true
 
 [project]
-name = "auto-trainer-pose-deeplabcut"
+name = "reachaq-pose-deeplabcut"
 description = "DeepLabCut pose backend plugin for reachAQ"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
 
-    # The installed application; auto-trainer-inference is folded into it by
-    # its setup.py and is never installed on its own.
-    "auto-trainer",
+    # The installed application.
+    "reachaq",
 
     'deeplabcut >= 3.0, < 4',  # famous deeplab; 3.x carries both engines
 
 ]
 
-[project.entry-points."autotrainer.pose_backends"]
-deeplabcut = "autotrainer.pose_plugins.deeplabcut.plugin:DLC_PLUGIN"
+[project.entry-points."reachaq.pose_backends"]
+deeplabcut = "reachaq.pose_plugins.deeplabcut.plugin:DLC_PLUGIN"
 
 [project.optional-dependencies]
-# This extra and the torch extra of auto-trainer-inference are installed
+# This extra and the torch extra of reachaq are installed
 # together by tools/install/reachaq-linux-install.sh, which is the supported
 # way to build an environment. Three conditions make that work, each found on
 # the reference rig on 2026-09-24:

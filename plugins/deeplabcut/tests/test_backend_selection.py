@@ -14,9 +14,9 @@ properties matter more than the parsing:
 
 import pytest
 
-from autotrainer.inference import backend_selection
-from autotrainer.inference import pose_plugins
-from autotrainer.inference.backend_selection import (
+from reachaq.inference import backend_selection
+from reachaq.inference import pose_plugins
+from reachaq.inference.backend_selection import (
     DEFAULT_POSE_BACKEND,
     POSE_BACKEND_ENV_VAR,
     POSE_BACKENDS,
@@ -198,7 +198,7 @@ def test_available_backends_names_each_usable_plugin_with_its_runtimes(monkeypat
 
 
 def test_both_backends_satisfy_the_pose_model_contract(project):
-    from autotrainer.inference.pose_model import PoseModel
+    from reachaq.inference.pose_model import PoseModel
 
     for backend in POSE_BACKENDS:
         model = build_pose_model(project, backend=backend)

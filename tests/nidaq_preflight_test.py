@@ -1,10 +1,10 @@
 from types import SimpleNamespace
 
-from tools.acquisition.model.nidaq_preflight import (
+from reachaq.app.model.nidaq_preflight import (
     NidaqPreflightResult,
     _preflight_worker,
 )
-from autotrainer.core import NidaqTaskGraph, NidaqTaskSpecification, NidaqTimingPlan
+from reachaq.core import NidaqTaskGraph, NidaqTaskSpecification, NidaqTimingPlan
 
 
 class _Queue:
@@ -30,7 +30,7 @@ def test_exact_preflight_verifies_commits_and_closes(monkeypatch):
             calls.append(("close",))
 
     monkeypatch.setattr(
-        "tools.acquisition.model.nidaq_preflight.NidaqSignalStreamController",
+        "reachaq.app.model.nidaq_preflight.NidaqSignalStreamController",
         Controller,
     )
     result_queue = _Queue()
@@ -55,7 +55,7 @@ def test_exact_preflight_preserves_first_create_error(monkeypatch):
             raise DaqError("route unavailable")
 
     monkeypatch.setattr(
-        "tools.acquisition.model.nidaq_preflight.NidaqSignalStreamController",
+        "reachaq.app.model.nidaq_preflight.NidaqSignalStreamController",
         Controller,
     )
     result_queue = _Queue()
@@ -82,7 +82,7 @@ def test_auto_multidevice_falls_back_to_verified_per_device(monkeypatch):
             pass
 
     monkeypatch.setattr(
-        "tools.acquisition.model.nidaq_preflight.NidaqSignalStreamController",
+        "reachaq.app.model.nidaq_preflight.NidaqSignalStreamController",
         Controller,
     )
     configuration = SimpleNamespace(channels=(

@@ -10,7 +10,7 @@ _REPO_ROOT = Path(__file__).resolve().parent
 # This is established before importing any application modules. Individual
 # transport codec/backend tests may construct mocked hardware configurations,
 # but no pytest process may select or reset a host CAN interface implicitly.
-os.environ["AUTOTRAINER_CAN_TRANSPORT"] = "emulation"
+os.environ["REACHAQ_CAN_TRANSPORT"] = "emulation"
 os.environ["REACHAQ_PROHIBIT_PRIVILEGED_CAN_RESET"] = "1"
 # Tests replace NI-DAQmx in the test process, which a laser process would not
 # see, so the NI laser controller opens here; the laser process's own tests
@@ -23,13 +23,7 @@ if "REACHAQ_API_DISCOVERY_DIR" not in os.environ:
     os.environ["REACHAQ_API_DISCOVERY_DIR"] = tempfile.mkdtemp(prefix="reachaq-api-test-")
 for _source_dir in reversed((
     _REPO_ROOT,
-    _REPO_ROOT / "auto-trainer-behavior" / "src",
-    _REPO_ROOT / "auto-trainer-core" / "src",
-    _REPO_ROOT / "auto-trainer-device" / "src",
-    _REPO_ROOT / "auto-trainer-inference" / "src",
-    _REPO_ROOT / "auto-trainer-model" / "src",
-    _REPO_ROOT / "auto-trainer-pyside" / "src",
-    _REPO_ROOT / "auto-trainer-video" / "src",
+    _REPO_ROOT / "src",
 )):
     _source_text = str(_source_dir)
     if _source_text in sys.path:
@@ -39,7 +33,7 @@ for _source_dir in reversed((
 
 pytest_plugins = [
     # NB: having to use another name than "fixtures(.py)" given otherwise it's overridden by:
-    # ./auto-trainer-core/tests/fixtures
+    # ./tests/core/fixtures
     # notably/already.
     "top_fixtures",
 ]

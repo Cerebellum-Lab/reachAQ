@@ -3,14 +3,14 @@
 relative_files = true
 
 source_pkgs =
-    autotrainer.core
-    autotrainer.device
-    autotrainer.behavior
-    autotrainer.inference
-    # autotrainer.model
-    # autotrainer.pyside
-    autotrainer.video
-    tools.acquisition
+    reachaq.core
+    reachaq.device
+    reachaq.behavior
+    reachaq.inference
+    # reachaq.model
+    # reachaq.pyside
+    reachaq.video
+    reachaq.app
     # tools for the main acquisition app_model mainly
 
 omit =

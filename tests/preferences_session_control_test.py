@@ -6,9 +6,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QWidget
 
-from autotrainer.behavior import TrialCountBasis
-from autotrainer.core.configuration import SessionControlConfiguration
-from tools.acquisition.view.preferences_content import PreferencesContent
+from reachaq.behavior import TrialCountBasis
+from reachaq.core.configuration import SessionControlConfiguration
+from reachaq.app.view.preferences_content import PreferencesContent
 
 
 @pytest.fixture

@@ -53,7 +53,7 @@ used, see
    The settle after each move is `distance / v_max + v_max / a_max + 0.25 s`, at
    least 0.25 s, with `v_max` and `a_max` the moving axis's maximum velocity and
    acceleration as the app wrote them to the motors at connect (from
-   `~/Autotrainer/motor_config.yaml`). An axis without a usable configuration
+   `~/reachAQ/motor_config.yaml`). An axis without a usable configuration
    settles 1.0 s, and so does waypoint 0 when the motor has reported no position
    before it. On christielab10 (120 mm/s and 600 mm/s² on every axis) the settles
    run from 0.45 s to 0.59 s, the longest for the 17 mm x move. Each settle is
@@ -196,7 +196,7 @@ only re-aiming the camera helps.
 
 1. **Grid.** 4 x 4 x 3 = 48 points evenly spaced inside the stage's configured
    travel: `min_pos` and `max_pos` under `pellet.x`, `pellet.y` and `pellet.z`
-   in `~/Autotrainer/motor_config.yaml` (0-35 mm on every axis on
+   in `~/reachAQ/motor_config.yaml` (0-35 mm on every axis on
    christielab10; see [Motor travel limits](../linux-install/runtime-configuration.md#motor-travel-limits)).
    The scout reads that file itself, so it has the travel before any connect.
    On an axis with no travel configured, the box is the one the hand-written
@@ -529,7 +529,7 @@ The capture creates a session folder in the normal data location. In it:
   install as the session's record, and when a fail is kept out.
 
 An install adds `.new` to the **calibration library** (next section) as a new
-entry, `<configuration location>/calibrations/<id>/` (default `~/Autotrainer`),
+entry, `<configuration location>/calibrations/<id>/` (default `~/reachAQ`),
 and makes it the active entry; the app loads it from there. If the active
 pointer cannot be written, the entry is removed again and the previous
 calibration stays active, so the install can be retried. A `.new` folder holding
@@ -544,7 +544,7 @@ library took over.
 ## Calibration library
 
 Every calibration is kept as an immutable entry under
-`<configuration location>/calibrations/` (`~/Autotrainer/calibrations/`):
+`<configuration location>/calibrations/` (`~/reachAQ/calibrations/`):
 
 ```
 calibrations/
@@ -778,7 +778,7 @@ preset is never substituted, because its pixels are not the frames' pixels.
 **Offline analysis** resolves the calibration a session used from its metadata,
 `hardware.configured.calibration3d`:
 
-- `id` finds the calibration under `--calib-root` (default `~/Autotrainer`),
+- `id` finds the calibration under `--calib-root` (default `~/reachAQ`),
   whether it is the active folder or a dated backup. With no id, the session's
   start time picks the calibration that was active then.
 - `preset` names the preset to read. With a format-3 calibration, a session
@@ -957,7 +957,7 @@ lists the geometries.
 - **The anipose file is checked in aniposelib 0.8.0 itself, in a separate
   virtualenv.** aniposelib needs opencv-contrib-python, which would replace the
   reachaq environment's cv2, so reachaq never imports it.
-  `auto-trainer-inference/tests/multires_anipose_compat_check.py` writes a
+  `tests/inference/multires_anipose_compat_check.py` writes a
   calibration of the synthetic 3-camera rig in the reachaq environment, then
   loads each of its TOMLs with `CameraGroup.load` in the virtualenv and checks
   the cameras, the metadata keys and `CameraGroup.project` against the fit's
@@ -967,9 +967,9 @@ lists the geometries.
   python3 -m venv ~/anipose-check-venv
   ~/anipose-check-venv/bin/pip install aniposelib==0.8.0 toml
   PYTHONPATH=<the repo's package src dirs> python \
-      auto-trainer-inference/tests/multires_anipose_compat_check.py --write-inputs OUT
+      tests/inference/multires_anipose_compat_check.py --write-inputs OUT
   for t in OUT/*.toml; do ~/anipose-check-venv/bin/python \
-      auto-trainer-inference/tests/multires_anipose_compat_check.py "$t" "${t%.toml}.json"; done
+      tests/inference/multires_anipose_compat_check.py "$t" "${t%.toml}.json"; done
   ```
 
   It is not part of the pytest suite. The DeepLabCut pickle is tested against
@@ -984,7 +984,7 @@ always to the legacy reader.
 
 **Before deploying.**
 
-1. Back up `~/Autotrainer/diamond_triangle_offset.yaml` (the default
+1. Back up `~/reachAQ/diamond_triangle_offset.yaml` (the default
    configuration folder; use your own if the configuration location was
    changed). A rollback may need it.
 2. Note the version now installed, so you know what to roll back to.
@@ -993,7 +993,7 @@ always to the legacy reader.
 
 1. Stop the app.
 2. Install v3.1.0.
-3. If `~/Autotrainer/diamond_triangle_offset.yaml` contains a `calibration_id:`
+3. If `~/reachAQ/diamond_triangle_offset.yaml` contains a `calibration_id:`
    line, put back the backup from before the deploy, or remove the file.
    Otherwise v3.1.0 fails to load its configuration.
 4. Start the app.
@@ -1061,7 +1061,7 @@ a rig, the dialog's default becomes the scout.
 
 ## Where the maths lives
 
-`auto-trainer-inference/src/autotrainer/inference/multires_calibration/`:
+`src/reachaq/inference/multires_calibration/`:
 
 | Module | Holds |
 | --- | --- |
@@ -1074,7 +1074,7 @@ a rig, the dialog's default becomes the scout.
 | `library.py` | the calibration library: entries, the active pointer, decisions, import |
 | `pipeline.py` | `calibrate_capture`, which ties them together |
 
-Capture and install live in `tools/acquisition`: `model/handle_3d_calibration.py`
+Capture and install live in `src/reachaq/app`: `model/handle_3d_calibration.py`
 (waypoints, pauses, `capture_settings`), `model/calibration_install.py`,
 `model/dcs_state.py` (VALID, STALE or MISSING), `model/calibration_reminder.py`,
 `model/calibration_geometry.py` (the live preset from the camera configuration)
@@ -1172,8 +1172,8 @@ itself holds no videos.
 ```python
 from pathlib import Path
 
-from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
-from autotrainer.inference.multires_calibration.pipeline import calibrate_capture
+from reachaq.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
+from reachaq.inference.multires_calibration.pipeline import calibrate_capture
 
 base = PresetGeometry(binning=4, width=256, height=256, offset_x=52, offset_y=6)
 index, report = calibrate_capture(
@@ -1209,4 +1209,4 @@ print(report.to_text())
   `calibration3dFailed` API event; any other outcome posts
   `calibration3dCompleted`.
 - A synthetic rig for capture-free tests, with known K, dist, R and T, is in
-  `auto-trainer-inference/tests/multires_synthetic.py`.
+  `tests/inference/multires_synthetic.py`.

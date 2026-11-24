@@ -1,8 +1,8 @@
 import threading
 from types import SimpleNamespace
 
-from autotrainer.inference import InferenceMonitorDataMsg
-from tools.acquisition.model.inference_model import InferenceModel
+from reachaq.inference import InferenceMonitorDataMsg
+from reachaq.app.model.inference_model import InferenceModel
 
 
 def _make_model():

@@ -13,9 +13,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QMessageBox
 
-from tools.acquisition.model.app_model_status import SessionRecordingStatus
-from tools.acquisition.view import main_window as main_window_module
-from tools.acquisition.view.main_window import MainWindow
+from reachaq.app.model.app_model_status import SessionRecordingStatus
+from reachaq.app.view import main_window as main_window_module
+from reachaq.app.view.main_window import MainWindow
 
 
 class _ScriptedBox:

@@ -4,11 +4,11 @@ import pytest
 
 from softmouse_https_source_test import COLONY, Session  # noqa: E402
 
-from tools.acquisition.model.animal_sources import cli
-from tools.acquisition.model.animal_sources.config import load_source_configuration
-from tools.acquisition.model.animal_sources.credentials import KEYRING_SERVICE, CredentialStore
-from tools.acquisition.model.animal_sources.softmouse import SoftMouseSource
-from tools.acquisition.model.user_preferences import UserPreferences
+from reachaq.app.model.animal_sources import cli
+from reachaq.app.model.animal_sources.config import load_source_configuration
+from reachaq.app.model.animal_sources.credentials import KEYRING_SERVICE, CredentialStore
+from reachaq.app.model.animal_sources.softmouse import SoftMouseSource
+from reachaq.app.model.user_preferences import UserPreferences
 
 
 TAG = "360002353933099"
@@ -123,7 +123,7 @@ def test_publish_without_a_source_explains_setup(tmp_path, preferences, monkeypa
 
 
 def test_the_old_softmouse_command_forwards_setup_and_publish(monkeypatch):
-    from tools.softmouse_sync import cli as old_cli
+    from reachaq.softmouse_sync import cli as old_cli
 
     calls = []
     monkeypatch.setattr(old_cli, "animal_metadata_main", lambda argv: calls.append(argv) or 0)

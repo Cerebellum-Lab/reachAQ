@@ -54,13 +54,13 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from autotrainer.core.latency.schema import (
+from reachaq.core.latency.schema import (
     CAMERA_FRAME_DTYPE,
     CLOCK_LATCH_DTYPE,
     CLOCK_PAIR_DTYPE,
 )
-from tools.acquisition.model.session_boundary import SessionBoundary
-from tools.acquisition.model.session_data_recorder import _NidaqSpoolSnapshot
+from reachaq.app.model.session_boundary import SessionBoundary
+from reachaq.app.model.session_data_recorder import _NidaqSpoolSnapshot
 
 RATE = 10_000.0
 READ = 167

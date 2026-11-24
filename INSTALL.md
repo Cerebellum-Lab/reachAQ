@@ -74,15 +74,85 @@ installer again. Rerunning is always safe:
   gets the DeepLabCut plugin if it has `deeplabcut` installed and the YOLO
   plugin if it has `ultralytics`. To drop a plugin for good, uninstall both its
   distribution and its engine package (for example
-  `pip uninstall auto-trainer-pose-yolo ultralytics`) before rerunning the
+  `pip uninstall reachaq-pose-yolo ultralytics`) before rerunning the
   installer, otherwise it restores the plugin. If the installer cannot tell which plugins
   the environment has, it reports a FAIL for that step rather than restoring none.
 
 To run an archived environment instead:
 
 ```bash
-conda run --no-capture-output -n reachaq-py38-20260924 python -m reachAQ.app
+conda run --no-capture-output -n reachaq-py38-20260924 python -m reachaq.app
 ```
+
+## Upgrading from v3
+
+reachAQ 4.0 renamed the project. The eight `auto-trainer*` distributions are
+now one, `reachaq`; the code moved from `autotrainer.*` and `tools.*` to
+`reachaq.*` (`python -m reachaq.app`); `AUTOTRAINER_*` environment variables
+are `REACHAQ_*`; and the settings moved. There are no compatibility aliases:
+v3 names stop working.
+
+Pull the new checkout with `reachaq-sync`, then run the installer once:
+
+```bash
+./tools/install/reachaq-linux-install.sh
+```
+
+Before anything else it runs `reachaq-migrate-settings`, which
+
+- renames `~/Autotrainer` to `~/reachAQ` (one filesystem, so nothing is copied);
+- rewrites the old directory in the live yaml files there (DeepLabCut project
+  `config.yaml` files, `demo/demo_sources.yaml`, and any other `*.yaml` that names
+  it), keeping each original as `FILE.bak-reachaq-migration`. Backups, other
+  file types and the calibration library are not changed;
+- copies `~/.config/Colorado/Auto Trainer.conf` to
+  `~/.config/reachAQ/reachAQ.conf`, and the pellet tool's
+  `PelletDeliveryUI.conf` beside it. The originals stay where they are.
+- rewrites `~/.config/reachaq/launcher.conf` the same way (kept as
+  `launcher.conf.bak-reachaq-migration`), so the launcher still finds the
+  settings if the install stops before it regenerates that file.
+
+The installer then uninstalls every `auto-trainer*` distribution (including
+`auto-trainer-api` and `auto-trainer-training` where a rig still has them and
+the v3 `auto-trainer-pose-*` plugins), installs `reachaq`, reinstalls the pose
+plugins the environment had, and replaces installed SoftMouse user units that
+still start a v3 module (the old unit is kept as `.bak`). Recorded sessions are
+not changed.
+
+To see what the migration would do first, or to run it by hand:
+
+```bash
+python3 src/reachaq/core/settings_migration.py --dry-run
+```
+
+`reachaq` and `reachaq-headless` refuse to start while only `~/Autotrainer`
+exists, naming the command. `REACHAQ_CONFIG_DIR`, if set, names the settings
+directory outright, and then nothing is migrated or refused.
+
+**Pose files from before 2025-06-25.** Their column labels are pickled as
+`autotrainer.inference.pose_elements.SceneElement`, which no longer exists, so
+reachaq cannot read them. Convert them once before reprocessing:
+
+```bash
+reachaq-convert-pose-h5 --check /path/to/sessions        # lists them; exit 1 if any need converting
+reachaq-convert-pose-h5 --in-place /path/to/sessions     # converts, keeping FILE.bak
+reachaq-convert-pose-h5 --output-dir OUT /path/to/sessions  # or writes converted copies
+```
+
+The converter stores the labels as plain strings, the form reachAQ has written
+since 2025-06-25, so converted files still load in v3. Delete the `.bak` files
+once a converted session reprocesses. Sessions recorded since then need nothing.
+
+**Rolling back.** Undo the settings move, then check out the v3 release and run
+its installer:
+
+```bash
+reachaq-migrate-settings --reverse
+```
+
+It restores `~/Autotrainer` and every rewritten file byte for byte and removes
+the copied QSettings files; a copy changed since the migration is kept and
+named in a warning (v3 reads the original in `~/.config/Colorado`).
 
 ## Other ways to run it
 
@@ -92,18 +162,18 @@ Conda buffers the logs until the application exits.
 A software-only smoke test, with random cameras and no live inference:
 
 ```bash
-conda run --no-capture-output -n reachaq python -m reachAQ.app \
+conda run --no-capture-output -n reachaq python -m reachaq.app \
   --random-cameras --no-live-inference \
-  -c "$HOME/Autotrainer/system_configuration.yaml"
+  -c "$HOME/reachAQ/system_configuration.yaml"
 ```
 
 Headless mode starts acquisition immediately, because it has no control that
 could start an idle process later:
 
 ```bash
-conda run --no-capture-output -n reachaq auto-trainer-headless \
+conda run --no-capture-output -n reachaq reachaq-headless \
   --no-live-inference \
-  -c "$HOME/Autotrainer/system_configuration.yaml"
+  -c "$HOME/reachAQ/system_configuration.yaml"
 ```
 
 Omit `--no-live-inference` to honour the saved configuration, or use
@@ -114,7 +184,7 @@ and deliberately does not fall back to the CPU.
 
 - SoftMouse credentials and its optional nightly timer cannot be entered by an
   unattended installer; follow the
-  [SoftMouse/RFID checklist](tools/softmouse_sync/CONFIGURATION_GUIDE.md).
+  [SoftMouse/RFID checklist](src/reachaq/softmouse_sync/CONFIGURATION_GUIDE.md).
 - The latency tuning grants the stim loop real-time priority and sets the
   `performance` CPU governor at boot; both are measured, reversible, and
   described in the [latency tuning guide](docs/linux-install/latency-tuning.md).

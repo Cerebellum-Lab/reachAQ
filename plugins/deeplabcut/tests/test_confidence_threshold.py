@@ -16,16 +16,16 @@ error, so the same 0.9 would discard about 92% of correctly located keypoints.
 import pytest
 import yaml
 
-from autotrainer.inference import pose_plugins
-from autotrainer.inference.backend_selection import (
+from reachaq.inference import pose_plugins
+from reachaq.inference.backend_selection import (
     POSE_BACKEND_ENV_VAR,
     POSE_CONFIDENCE_THRESHOLD_ENV_VAR,
     TENSORFLOW_BACKEND,
     TORCH_BACKEND,
     confidence_threshold,
 )
-from autotrainer.inference.pose_algorithm import PoseAlgorithm
-from autotrainer.pose_plugins.deeplabcut.plugin import (
+from reachaq.inference.pose_algorithm import PoseAlgorithm
+from reachaq.pose_plugins.deeplabcut.plugin import (
     DEFAULT_CONFIDENCE_THRESHOLDS,
     TORCH_MODEL_CONFIDENCE_THRESHOLDS,
     trained_model_name,

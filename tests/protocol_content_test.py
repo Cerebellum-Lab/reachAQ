@@ -8,7 +8,7 @@ import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QComboBox, QDoubleSpinBox
 
-from tools.acquisition.view.protocol_content import ProtocolContent
+from reachaq.app.view.protocol_content import ProtocolContent
 
 
 class _Event:

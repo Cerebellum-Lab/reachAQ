@@ -13,11 +13,11 @@ import ast
 from types import SimpleNamespace
 
 import source_contract
-from autotrainer.inference import pose_result_process
-from tools.acquisition.model import app_model
-from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.app_model_status import SessionRecordingStatus
-from tools.acquisition.model.subsystem_status import SubsystemId
+from reachaq.inference import pose_result_process
+from reachaq.app.model import app_model
+from reachaq.app.model.app_model import AppModel
+from reachaq.app.model.app_model_status import SessionRecordingStatus
+from reachaq.app.model.subsystem_status import SubsystemId
 
 
 def _app(subsystem_id, recording_status):

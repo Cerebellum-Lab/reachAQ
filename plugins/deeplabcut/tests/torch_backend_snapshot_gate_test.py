@@ -14,7 +14,7 @@ torch merely to discover that it cannot run.
 
 import pytest
 
-from autotrainer.pose_plugins.deeplabcut import DlcTorchPoseModel
+from reachaq.pose_plugins.deeplabcut import DlcTorchPoseModel
 
 
 def _project(tmp_path, *, pytorch_snapshot=False, tensorflow_only=False):
@@ -95,10 +95,10 @@ def test_the_check_does_not_import_deeplabcut_or_torch(tmp_path):
     repo = plugin.parents[1]
     script = (
         "import sys\n"
-        f"sys.path[:0] = [r'{repo / 'auto-trainer-core' / 'src'}', "
-        f"r'{repo / 'auto-trainer-inference' / 'src'}', "
+        f"sys.path[:0] = [r'{repo / 'reachaq' / 'src'}', "
+        f"r'{repo / 'reachaq' / 'src'}', "
         f"r'{plugin / 'src'}']\n"
-        "from autotrainer.pose_plugins.deeplabcut import DlcTorchPoseModel\n"
+        "from reachaq.pose_plugins.deeplabcut import DlcTorchPoseModel\n"
         f"assert DlcTorchPoseModel.has_trained_snapshot(r'{project}')\n"
         "leaked = [n for n in ('deeplabcut', 'torch') if n in sys.modules]\n"
         "print(','.join(leaked))\n"
@@ -112,7 +112,7 @@ def test_the_check_does_not_import_deeplabcut_or_torch(tmp_path):
 
 def test_the_tensorflow_backend_is_unaffected(tmp_path):
     """A TensorFlow project must keep validating as it always did."""
-    from autotrainer.pose_plugins.deeplabcut import DlcPoseModel
+    from reachaq.pose_plugins.deeplabcut import DlcPoseModel
 
     project = _project(tmp_path, tensorflow_only=True)
     assert DlcPoseModel(str(project)).is_valid() is True

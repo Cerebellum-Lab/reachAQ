@@ -5,11 +5,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication
 
-from autotrainer.core.configuration.system_configuration import SystemConfiguration
-from tools.acquisition.model import first_run
-from tools.acquisition.model.first_run import HardwareCheck
-from tools.acquisition.view import first_run_dialog
-from tools.acquisition.view.first_run_dialog import FirstRunDialog
+from reachaq.core.configuration.system_configuration import SystemConfiguration
+from reachaq.app.model import first_run
+from reachaq.app.model.first_run import HardwareCheck
+from reachaq.app.view import first_run_dialog
+from reachaq.app.view.first_run_dialog import FirstRunDialog
 
 
 @pytest.fixture
@@ -22,7 +22,7 @@ def _no_hardware():
 
 
 def test_a_new_install_needs_the_first_run_step(tmp_path):
-    assessment = first_run.assess(tmp_path / "Autotrainer" / "system_configuration.yaml")
+    assessment = first_run.assess(tmp_path / "reachAQ" / "system_configuration.yaml")
     assert not assessment.configuration_exists
     assert assessment.needed
 
@@ -30,7 +30,7 @@ def test_a_new_install_needs_the_first_run_step(tmp_path):
 def test_an_existing_configuration_with_a_writable_folder_needs_nothing(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
-    config = first_run.create_configuration(tmp_path / "Autotrainer" / "system_configuration.yaml", data)
+    config = first_run.create_configuration(tmp_path / "reachAQ" / "system_configuration.yaml", data)
     assessment = first_run.assess(config)
     assert assessment.configuration_exists and assessment.data_check.ok
     assert not assessment.needed
@@ -114,7 +114,7 @@ def test_camera_check_reads_lsusb(monkeypatch):
 
 
 def test_dialog_creates_the_configuration(qapp, tmp_path):
-    config = tmp_path / "Autotrainer" / "system_configuration.yaml"
+    config = tmp_path / "reachAQ" / "system_configuration.yaml"
     dialog = FirstRunDialog(first_run.assess(config), hardware_checks=(_no_hardware,))
     dialog.data_edit.setText(str(tmp_path / "new data"))
     dialog._check_data_folder()

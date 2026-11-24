@@ -22,9 +22,9 @@ import sys
 
 import pytest
 
-from autotrainer.inference import backend_selection
-from autotrainer.inference import pose_plugins
-from autotrainer.inference.backend_selection import (
+from reachaq.inference import backend_selection
+from reachaq.inference import pose_plugins
+from reachaq.inference.backend_selection import (
     DEFAULT_POSE_BACKEND,
     POSE_BACKEND_ENV_VAR,
     POSE_BACKENDS,
@@ -35,7 +35,7 @@ from autotrainer.inference.backend_selection import (
     pre_validate_model,
     selected_backend,
 )
-from autotrainer.inference import gpu_runtime
+from reachaq.inference import gpu_runtime
 
 
 def _only(monkeypatch, *installed):
@@ -156,7 +156,7 @@ def test_a_deeplabcut_project_without_its_plugin_fails_where_the_operator_sees_i
 
     Real discovery and the real in-tree list, so this fails if anything core
     still ships claims the project. Only the plugin's own entry point is taken
-    away, so it means the same whether or not auto-trainer-pose-deeplabcut is
+    away, so it means the same whether or not reachaq-pose-deeplabcut is
     installed here.
     """
     installed = list(pose_plugins._entry_points())
@@ -168,10 +168,10 @@ def test_a_deeplabcut_project_without_its_plugin_fails_where_the_operator_sees_i
     try:
         with pytest.raises(PoseBackendNotInstalled) as raised:
             pre_validate_model(str(tmp_path))
-        assert raised.value.distribution == "auto-trainer-pose-deeplabcut"
+        assert raised.value.distribution == "reachaq-pose-deeplabcut"
         assert raised.value.missing == ()
         assert "reachaq-plugin-install.sh deeplabcut" in str(raised.value)
-        with pytest.raises(PoseBackendNotInstalled, match="auto-trainer-pose-deeplabcut"):
+        with pytest.raises(PoseBackendNotInstalled, match="reachaq-pose-deeplabcut"):
             build_pose_model(str(tmp_path))
     finally:
         pose_plugins.reset_discovery()
@@ -204,14 +204,14 @@ def test_importing_the_selector_pulls_in_neither_framework():
     build_pose_model. Checked in a fresh interpreter, because by the time this
     test runs the current one has imported plenty on its own account.
     """
-    # .../auto-trainer-inference/src/autotrainer/inference/backend_selection.py
+    # .../src/reachaq/inference/backend_selection.py
     inference_src = pathlib.Path(backend_selection.__file__).resolve().parents[2]
     repo_root = inference_src.parents[1]
-    source_dirs = [str(inference_src), str(repo_root / "auto-trainer-core" / "src")]
+    source_dirs = [str(inference_src), str(repo_root / "reachaq" / "src")]
     script = (
         "import sys\n"
         f"sys.path[:0] = {source_dirs!r}\n"
-        "import autotrainer.inference.backend_selection\n"
+        "import reachaq.inference.backend_selection\n"
         "leaked = [name for name in ('tensorflow', 'torch', 'deeplabcut') if name in sys.modules]\n"
         "print(','.join(leaked))\n"
     )
@@ -231,8 +231,8 @@ def test_importing_the_selector_pulls_in_neither_framework():
 def test_only_a_simulations_in_memory_model_skips_the_gpu_probe(
         monkeypatch, simulating, model_location, probed):
     from types import SimpleNamespace
-    from tools.acquisition.model import inference_model
-    from tools.acquisition.model.inference_model import InferenceModel
+    from reachaq.app.model import inference_model
+    from reachaq.app.model.inference_model import InferenceModel
 
     if simulating is None:
         monkeypatch.delenv("REACHAQ_SIMULATION", raising=False)

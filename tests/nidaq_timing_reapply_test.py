@@ -9,7 +9,7 @@ to say why.
 
 import pytest
 
-from tools.acquisition.model.nidaq_signal_monitor_model import (
+from reachaq.app.model.nidaq_signal_monitor_model import (
     NidaqSignalMonitorModel,
 )
 

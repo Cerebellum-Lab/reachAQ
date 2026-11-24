@@ -1,6 +1,6 @@
 from PySide6.QtCore import QRect
 
-from tools.acquisition.model.user_preferences import UserPreferences
+from reachaq.app.model.user_preferences import UserPreferences
 
 
 def test_a_fresh_install_has_no_softmouse_publication(tmp_path):

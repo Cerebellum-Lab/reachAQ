@@ -1,6 +1,6 @@
 import pytest
 
-from tools.acquisition.model.trial_protocol_set import (
+from reachaq.app.model.trial_protocol_set import (
     MAX_SET_REPEAT,
     ExperimentComposition,
     ExperimentSetEntry,

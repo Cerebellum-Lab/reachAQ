@@ -12,10 +12,10 @@ from pathlib import Path
 
 import pytest
 
-from tools.acquisition.model.animal_registry import AnimalRegistry
-from tools.acquisition.model.animal_sources import cli
-from tools.acquisition.model.animal_sources.credentials import CredentialStore
-from tools.acquisition.model.user_preferences import UserPreferences
+from reachaq.app.model.animal_registry import AnimalRegistry
+from reachaq.app.model.animal_sources import cli
+from reachaq.app.model.animal_sources.credentials import CredentialStore
+from reachaq.app.model.user_preferences import UserPreferences
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

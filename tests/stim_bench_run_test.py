@@ -2,10 +2,10 @@ import threading
 
 import pytest
 
-from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
+from reachaq.device import LaserChannelConfiguration, LaserSystemConfiguration
 
-from tools.acquisition.model.stim_bench_test import StimTestResult
-from tools.acquisition.model.trial_action import LaserPulseProfile
+from reachaq.app.model.stim_bench_test import StimTestResult
+from reachaq.app.model.trial_action import LaserPulseProfile
 
 
 class FakeOperation:
@@ -140,7 +140,7 @@ def test_no_profile_is_refused(bench):
 def test_a_recording_session_refuses_the_test_before_anything_is_armed(bench):
     # Run Pulse is allowed while a session records, and kept in it as a
     # manual event; Test stim stays refused (Ben, 2026-09-30).
-    from tools.acquisition.model.app_model_status import SessionRecordingStatus
+    from reachaq.app.model.app_model_status import SessionRecordingStatus
 
     model, laser, hardware, _operation = bench
     # Set directly: publishing the change reads recording blockers off
@@ -281,7 +281,7 @@ def test_a_board_test_on_a_laser_without_a_board_line_is_refused(bench):
 def test_a_waveform_that_never_ends_is_cancelled_before_the_result(bench, monkeypatch):
     # Board acknowledged, but the STIM edge never reached the trigger
     # terminal: the output stayed armed on it, and a later edge would fire it.
-    from tools.acquisition.model import app_model as app_model_module
+    from reachaq.app.model import app_model as app_model_module
 
     model, laser, hardware, operation = bench
     hardware.pulse_stim = lambda duration_us, stim_line=3: "token"

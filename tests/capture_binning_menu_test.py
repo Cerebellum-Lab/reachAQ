@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools.acquisition.view.main_window import MainWindow
+from reachaq.app.view.main_window import MainWindow
 
 
 class _Action:

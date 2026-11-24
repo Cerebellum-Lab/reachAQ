@@ -50,7 +50,7 @@ if [ -n "$runtime_env" ] && [ -r "$runtime_env" ]; then
     while IFS='=' read -r key value || [ -n "${key:-}" ]; do
         value=${value%$'\r'}
         case "$key" in
-            AUTOTRAINER_*|REACHAQ_*) export "$key=$value" ;;
+            REACHAQ_*) export "$key=$value" ;;
         esac
     done < "$runtime_env"
 fi
@@ -110,7 +110,7 @@ cd "$repository" || {
 printf 'Starting reachAQ from %s using Conda environment %s\n' \
     "$repository" "$conda_env"
 "$conda_bin" run --no-capture-output -n "$conda_env" \
-    python -m reachAQ.app -c "$system_config"
+    python -m reachaq.app -c "$system_config"
 status=$?
 if [ "$status" -ne 0 ]; then
     printf '\nreachAQ exited with status %d.\n' "$status" >&2

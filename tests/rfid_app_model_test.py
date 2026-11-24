@@ -1,11 +1,11 @@
 import logging
 import threading
 
-from autotrainer.core import AnimalSubject, ExternalAnimalRecord, ExternalIdentity
-from tools.acquisition.model.app_model_status import SessionRecordingStatus
-from tools.acquisition.model.rfid_resolution import RfidResolutionKind
-from tools.acquisition.model.subsystem_status import SubsystemId, SubsystemState
-from autotrainer.device.rfid_reader import RfidReaderState, RfidReaderStatus
+from reachaq.core import AnimalSubject, ExternalAnimalRecord, ExternalIdentity
+from reachaq.app.model.app_model_status import SessionRecordingStatus
+from reachaq.app.model.rfid_resolution import RfidResolutionKind
+from reachaq.app.model.subsystem_status import SubsystemId, SubsystemState
+from reachaq.device.rfid_reader import RfidReaderState, RfidReaderStatus
 
 
 TAG = "360002353933099"
@@ -52,7 +52,7 @@ def test_first_scan_waits_for_setup_then_links_existing_animal(app_model):
 
 
 def test_scan_creation_selection_and_link_are_logged(app_model, caplog):
-    caplog.set_level(logging.INFO, logger="tools.acquisition.model.app_model")
+    caplog.set_level(logging.INFO, logger="reachaq.app.model.app_model")
 
     pending = app_model.handle_rfid_scan(record(), scanned_rfid=TAG)
     result = app_model.complete_rfid_animal_setup(

@@ -1,0 +1,795 @@
+"""
+Interface classes that define the capabilities of the mouse gym hardware in a way
+that hardware can be swapped or emulated.
+
+There is a set of enumerations that define entities of the hardware:
++ Target - Pellet module
++ Motor - Motor that can be controlled
++ DigitalOutputs - Set of available digital outputs
++ AnalogOutputs - Set of available analog outputs
+
+There is a set of data classes that contain state and status of the gym hardware.
+
+There is a main interface class (DeviceInterface) that defines the API for access to the abstracted
+hardware.
+"""
+
+import dataclasses
+import math
+import os
+import typing
+from dataclasses import dataclass
+from enum import IntEnum
+from typing import List, Union, Optional, Dict, Any, Tuple
+
+from reachaq.core import Offset3DTuple, get_verbose_logger
+from reachaq.core.message import Motor
+from reachaq.core.message.system_status_message import StepperStatusMessage
+
+from .board_refusal import board_error_name, is_refusal
+
+logger = get_verbose_logger(__name__)
+
+
+_map_idx_motors = {
+    0: Motor.PELLET_X_MOTOR,
+    1: Motor.PELLET_Y_MOTOR,
+    2: Motor.PELLET_Z_MOTOR,
+}
+
+
+class Target(IntEnum):
+    """Target is also known as board"""
+    PELLET_DEVICE = 0
+
+
+class DigitalOutputs(IntEnum):
+    STIMULUS_1 = 1
+    STIMULUS_2 = 2
+    STIMULUS_3 = 3
+    STIMULUS_4 = 4
+
+
+#: Board stimulus line label to the output that drives it. The pellet board
+#: device tree names its four outputs STIM0..STIM3 while this enum counts from
+#: one, so board STIM2 is STIMULUS_3. This is the only place that off-by-one is
+#: written down; resolve board labels through here rather than restating it.
+#:
+#: STIM0 and STIM1 are deliberately absent. They carry the tone generator's
+#: TTL confirmations, which the NI-DAQ records as tone1 and tone2, so they
+#: cannot also carry a stimulus pulse - the firmware refuses a pulse
+#: addressed to either with -EPERM.
+#:
+#: The confirmation is gated on the exact frequency. The board's devicetree
+#: maps tone-output-frequencies-hz = <5000 6000> onto those two pins, and
+#: the driver asserts a pin only where the requested frequency equals its
+#: mapped one. So 5 kHz raises tone1, 6 kHz raises tone2, and every other
+#: frequency sounds a tone that no line confirms.
+#:
+#: Verified on the reference rig against firmware 2.2.0: 5000 Hz raised
+#: port0/line0, 6000 Hz raised port0/line1, and 8000 Hz raised nothing.
+#: Play a tone at any other frequency and the absence of a confirmation
+#: means the frequency was unmapped, not that the tone failed.
+BOARD_STIM_LINE_OUTPUTS = {
+    2: DigitalOutputs.STIMULUS_3,
+    3: DigitalOutputs.STIMULUS_4,
+}
+
+#: Tone frequency to the configuration field naming the line that confirms
+#: it. The board's devicetree carries tone-output-frequencies-hz against
+#: STIM0 and STIM1, and the tone generator driver asserts a pin only where
+#: the requested frequency equals its mapped one - an exact match, so a tone
+#: at any other frequency sounds with nothing to record it.
+#:
+#: Here rather than wherever it is needed, because it is a fact about the
+#: board and two copies of it would drift the moment the devicetree changes.
+#: If that mapping is edited, this is the line to edit with it.
+TONE_CONFIRMATION_FREQUENCIES_HZ = ((5_000, "tone1"), (6_000, "tone2"))
+
+
+def tone_confirmation_frequency(field: str):
+    """The frequency whose tone raises this confirmation line, or None.
+
+    For the handful of places that need to recognise a tone by its frequency
+    rather than play one. Asking here keeps them agreeing with the board:
+    the mapping is the devicetree's, and a literal copied into a comparison
+    is a copy that stops being true without anything failing.
+    """
+    for frequency, name in TONE_CONFIRMATION_FREQUENCIES_HZ:
+        if name == field:
+            return frequency
+    return None
+
+
+class AnalogOutputs(IntEnum):
+    STATUS_OUT = 1
+
+
+@dataclass
+class Source:
+    """
+    Base class of any data set received by the device
+    """
+    target: Target = None
+    timestamp_ns: int = dataclasses.field(init=False, default=0)  # realtime unix timestamp but in integer nanoseconds
+    index: int = dataclasses.field(init=False, default=0)  # perf counter in integer nanosecond
+    board_boot_id: Optional[int] = dataclasses.field(init=False, default=None)
+    board_sequence: Optional[int] = dataclasses.field(init=False, default=None)
+    board_time_us: Optional[int] = dataclasses.field(init=False, default=None)
+    board_timestamp_kind: Optional[str] = dataclasses.field(init=False, default=None)
+    board_aligned_perf_time: Optional[float] = dataclasses.field(init=False, default=None)
+    board_clock_model_id: Optional[str] = dataclasses.field(init=False, default=None)
+    board_clock_uncertainty_seconds: Optional[float] = dataclasses.field(init=False, default=None)
+    board_sequence_status: Dict[str, Any] = dataclasses.field(init=False, default_factory=dict)
+    event_perf_time: Optional[float] = dataclasses.field(init=False, default=None)
+    timestamp_method: str = dataclasses.field(init=False, default="host_receive_perf_time")
+    timing_confidence: str = dataclasses.field(init=False, default="host_timestamp")
+    # init=False: preserve the original behavior/semantic of constructor with position args
+    # for subclasses adding other fields.
+
+    @property
+    def perf_c(self) -> float:
+        return self.index / 1e9
+
+
+@dataclass
+class MotorSource(Source):
+    motor: Motor = Motor.NONE
+
+
+@dataclass
+class Heartbeat(Source):
+    unused: bool = False
+
+
+@dataclass
+class PelletDigitalInputs(Source):
+    stimulus_1: bool = False
+    stimulus_2: bool = False
+    stimulus_3: bool = False
+    stimulus_4: bool = False
+
+
+@dataclass
+class BoardTimeSync(Source):
+    request_id: int = 0
+    request_receive_time_us: int = 0
+    response_queue_time_us: int = 0
+    clock_model: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+@dataclass
+class BoardCapabilities(Source):
+    wire_schema_version: int = 0
+    capabilities: int = 0
+    boot_id: int = 0
+
+
+@dataclass
+class SyncClapObservation(Source):
+    """A board heard the timekeeper's CAN clap; its board timing (OBSERVED) says when."""
+    board_address: int = 0
+    tick: int = 0
+    clapper_node: int = 0
+
+
+@dataclass
+class SyncBarcodeReport(Source):
+    """The timekeeper started barcode `tick` on the NI-DAQ line; its board timing (PHYSICAL_START) says when."""
+    board_address: int = 0
+    tick: int = 0
+
+
+@dataclass
+class DigitalPulseStatus(Source):
+    # None when the board reported a line that is not a stimulus output.
+    channel: Optional[DigitalOutputs] = None
+    duration_us: int = 0
+    phase: str = ""
+    error: int = 0
+
+
+@dataclass
+class ServoConfig(MotorSource):
+    _minimum_position: float = 0  # (deg)
+    _maximum_position: float = 120  # (deg)
+    _minimum_pwm_duration: float = 1000  # (us)
+    _maximum_pwm_duration: float = 2000  # (us)
+    _maximum_velocity: float = 200  # (deg/sec)
+    _maximum_acceleration: float = 100.0  # (deg/sec^2)
+    _detach: bool = False
+    uuid_ack_timeout: Optional[float] = None
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]):
+        config = ServoConfig()
+        if "min_pos" in data:
+            config.minimum_position = data["min_pos"]
+        if "max_pos" in data:
+            config.maximum_position = data["max_pos"]
+        if "min_pwm" in data:
+            config.minimum_pwm_duration = data["min_pwm"]
+        if "max_pwm" in data:
+            config.maximum_pwm_duration = data["max_pwm"]
+        if "max_vel" in data:
+            config.maximum_velocity = data["max_vel"]
+        if "max_acc" in data:
+            config.maximum_acceleration = data["max_acc"]
+        if "detach" in data:
+            config.detach = data["detach"]
+        config.uuid_ack_timeout = data.get('uuid_ack_timeout')
+        return config
+
+    @property
+    def maximum_velocity(self) -> float:
+        return self._maximum_velocity
+
+    @maximum_velocity.setter
+    def maximum_velocity(self, value: float):
+        self._maximum_velocity = value
+
+    @property
+    def maximum_acceleration(self) -> float:
+        return self._maximum_acceleration
+
+    @maximum_acceleration.setter
+    def maximum_acceleration(self, value: float):
+        self._maximum_acceleration = value
+
+    @property
+    def minimum_position(self) -> float:
+        return self._minimum_position
+
+    @minimum_position.setter
+    def minimum_position(self, value: float):
+        self._minimum_position = value
+
+    @property
+    def maximum_position(self) -> float:
+        return self._maximum_position
+
+    @maximum_position.setter
+    def maximum_position(self, value: float):
+        self._maximum_position = value
+
+    @property
+    def minimum_pwm_duration(self) -> float:
+        return self._minimum_pwm_duration
+
+    @minimum_pwm_duration.setter
+    def minimum_pwm_duration(self, value: float):
+        self._minimum_pwm_duration = value
+
+    @property
+    def maximum_pwm_duration(self) -> float:
+        return self._maximum_pwm_duration
+
+    @maximum_pwm_duration.setter
+    def maximum_pwm_duration(self, value: float):
+        self._maximum_pwm_duration = value
+
+    @property
+    def detach(self) -> bool:
+        return self._detach
+
+    @detach.setter
+    def detach(self, value):
+        self._detach = value
+
+
+@dataclass
+class ServoStatus(Source):
+    motor: Motor = Motor.NONE
+    position: float = 0  # (deg)
+
+    def __init__(self, target: Target, motor: Motor, position: float):
+        super().__init__(target)
+        self.motor = motor
+        self.position = position
+
+    @property
+    def location(self) -> float:
+        """Current servo position in degrees."""
+        return self.position
+
+    @property
+    def status(self) -> int:
+        """Current servo status value."""
+        return 0
+
+
+@dataclass
+class StepperConfig(MotorSource):
+    _microsteps: int = 64
+    _steps_per_revolution: float = 48.0
+    _maximum_velocity: float = 61  # mm/sec
+    _maximum_acceleration: float = 244  # mm/sec^2
+    _flip_limit_orientation: bool = False
+    _homing_velocity: float = 60  # mm/sec
+    # Travel limits (mm), min_pos / max_pos in motor_config.yaml. None: that side is not limited.
+    _minimum_position: Optional[float] = None
+    _maximum_position: Optional[float] = None
+    uuid_ack_timeout: Optional[float] = None
+
+    @staticmethod
+    def _travel_value(data: dict, key: str) -> Optional[float]:
+        if key not in data:
+            return None
+        value = data[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{key} must be a number of mm, got {value!r}")
+        if not math.isfinite(value):
+            raise ValueError(f"{key} must be finite, got {value!r}")
+        return float(value)
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        config = StepperConfig()
+
+        minimum = cls._travel_value(data, "min_pos")
+        maximum = cls._travel_value(data, "max_pos")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise ValueError(f"min_pos {minimum:g} is above max_pos {maximum:g}")
+        config.minimum_position = minimum
+        config.maximum_position = maximum
+
+        if "microsteps" in data:
+            config.microsteps = data["microsteps"]
+        if "steps_per_revolution" in data:
+            config.steps_per_revolution = data["steps_per_revolution"]
+        if "max_vel" in data:
+            config.maximum_velocity = data["max_vel"]
+        if "max_acc" in data:
+            config.maximum_acceleration = data["max_acc"]
+        if "home_vel" in data:
+            config.homing_velocity = data["home_vel"]
+        if "flip_limit_orientation" in data:
+            config.flip_limit_orientation = data["flip_limit_orientation"] == 1
+        config.uuid_ack_timeout = data.get("uuid_ack_timeout")
+        return config
+
+    @property
+    def motor(self) -> Motor:
+        return self._motor
+
+    @motor.setter
+    def motor(self, value: Motor):
+        self._motor = value
+
+    @property
+    def maximum_velocity(self) -> float:
+        return self._maximum_velocity
+
+    @maximum_velocity.setter
+    def maximum_velocity(self, value: float):
+        self._maximum_velocity = value
+
+    @property
+    def maximum_acceleration(self) -> float:
+        return self._maximum_acceleration
+
+    @maximum_acceleration.setter
+    def maximum_acceleration(self, value: float):
+        self._maximum_acceleration = value
+
+    @property
+    def homing_velocity(self) -> float:
+        return self._homing_velocity
+
+    @homing_velocity.setter
+    def homing_velocity(self, value: float):
+        self._homing_velocity = value
+
+    @property
+    def microsteps(self) -> int:
+        return self._microsteps
+
+    @microsteps.setter
+    def microsteps(self, value: int):
+        self._microsteps = value
+
+    @property
+    def steps_per_revolution(self) -> float:
+        return self._steps_per_revolution
+
+    @steps_per_revolution.setter
+    def steps_per_revolution(self, value: float):
+        self._steps_per_revolution = value
+
+    @property
+    def flip_limit_orientation(self) -> bool:
+        return self._flip_limit_orientation
+
+    @flip_limit_orientation.setter
+    def flip_limit_orientation(self, value: bool):
+        self._flip_limit_orientation = value
+
+    @property
+    def minimum_position(self) -> Optional[float]:
+        """Lowest allowed target (mm), or None when not limited."""
+        return self._minimum_position
+
+    @minimum_position.setter
+    def minimum_position(self, value: Optional[float]):
+        self._minimum_position = value
+
+    @property
+    def maximum_position(self) -> Optional[float]:
+        """Highest allowed target (mm), or None when not limited."""
+        return self._maximum_position
+
+    @maximum_position.setter
+    def maximum_position(self, value: Optional[float]):
+        self._maximum_position = value
+
+
+#: How far past a travel limit (mm) a target may lie and still be sent: a DCS conversion of a
+#: nominal 35.0 can come out as 35.0000000001. Far below a microstep (about 1e-3 mm).
+TRAVEL_TOLERANCE_MM = 1e-6
+
+
+def stepper_travel_refusal(axis: str, target: float, config) -> Optional[str]:
+    """The error to log when `target` (mm) lies outside the travel of the stepper `config`
+    (StepperConfig.minimum_position / maximum_position), else None. An unset side is not
+    limited, so a config without travel never refuses. A non-finite target is refused once
+    any side is set. A target within TRAVEL_TOLERANCE_MM of a limit is inside."""
+    minimum = getattr(config, "minimum_position", None)
+    maximum = getattr(config, "maximum_position", None)
+    if minimum is None and maximum is None:
+        return None
+    low = -math.inf if minimum is None else minimum
+    high = math.inf if maximum is None else maximum
+    if low - TRAVEL_TOLERANCE_MM <= target <= high + TRAVEL_TOLERANCE_MM:
+        return None
+    return (f"Axis-{axis.upper()}: move to {target:.3f} refused: "
+            f"outside the configured travel {low:g}-{high:g} mm")
+
+
+#: STEPPER_STATUS.status bits (pellet firmware 2.3.1). A v1.2 board always sends 0.
+STEPPER_STATUS_DRIVER_FAULT = 0x01  # this motor's driver raised DIAG; latched until a re-home
+STEPPER_STATUS_ENABLE_OFF = 0x02  # the shared enable is off, for any reason
+
+
+@dataclass
+class StepperStatus(Source, StepperStatusMessage):
+    _motor: Motor = Motor.NONE
+    _position: float = 0  # (mm)
+    _send_position: float = 0 # (mm)
+    _limit_switch: bool = False
+    position_error: bool = False
+    status: int = 0  # STEPPER_STATUS_* bits
+
+    def __init__(
+        self,
+        target: Target,
+        motor: Motor,
+        position: float,
+        send_position: float,
+        limit_switch: bool,
+        *,
+        position_error: bool = False,
+        status: int = 0,
+    ):
+        super().__init__(target)
+
+        self._motor = motor
+        self._position = position
+        self._send_position = send_position
+        self._limit_switch = limit_switch
+        self.position_error = position_error
+        self.status = status
+
+    @property
+    def motor(self) -> Motor:
+        return self._motor
+
+    @property
+    def position(self) -> float:
+        """Current motor position in mm."""
+        return self._position
+    
+    @property
+    def send_position(self) -> float:
+        """Current send motor position in mm."""
+        return self._send_position
+
+    @property
+    def is_at_limit(self) -> bool:
+        return self._limit_switch
+
+    @property
+    def driver_fault(self) -> bool:
+        """True if this motor's driver has raised DIAG (latched until a re-home)."""
+        return bool(self.status & STEPPER_STATUS_DRIVER_FAULT)
+
+    @property
+    def enable_off(self) -> bool:
+        """True if the shared enable is off, for any reason."""
+        return bool(self.status & STEPPER_STATUS_ENABLE_OFF)
+
+
+@dataclass
+class Tone(Source):
+    time_remaining_ms: int = 0
+    frequency_hz: int = 0
+
+
+@dataclass
+class AnalogOutput(Source):
+    status_out_mv: int = 0
+
+
+@dataclass
+class PressureReading(Source):
+    """
+    One FSR pressure sample from a pellet-board analog input.
+
+    ``pressure`` is the raw 12-bit ADC count, in [0, 4095]; it is *not*
+    millivolts, despite the wording in the firmware's pressure.c.  Convert
+    host-side when a voltage is wanted: ``volts = pressure / 4095.0 * 3.3``.
+
+    ``instance`` selects the connector: 0 = J11 (PA0/ADC1_IN1),
+    1 = J21 (PA6/ADC2_IN3).
+    """
+
+    instance: int = 0
+    pressure: int = 0
+
+
+@dataclass
+class ColorLed(Source):
+    """As integer % [0, 100] value"""
+
+    red: int = 0  # [0, 100]
+    green: int = 0  # [0, 100]
+    blue: int = 0  # [0, 100]
+
+
+@dataclass
+class Status(Source):
+    unused: bool = True
+
+
+@dataclass
+class Version(Source):
+    version: str = "Unknown"
+
+
+@dataclass
+class Acknowledge(Source):
+    uuid: int = 0
+    #: The board's return code for the command it is acknowledging. Zero means
+    #: it ran. Negative is a system errno, which is how a board reports that it
+    #: refused: -EPERM for a pulse aimed at a tone confirmation line, -EBUSY for
+    #: a second pulse while one is in flight, -EINVAL for a duration out of
+    #: range, -ENOTSUP for a board with no pulse counter. An acknowledgement is
+    #: not by itself a success, so callers that care must read this. -EAGAIN
+    #: is the exception: the axis is already at the target (board_refusal).
+    error: int = 0
+
+    @property
+    def is_failure(self) -> bool:
+        return is_refusal(self.error)
+
+    @property
+    def failure_reason(self) -> str:
+        if not self.is_failure:
+            return ""
+        return (
+            f"the board refused the command with {board_error_name(self.error)}"
+            f" ({int(self.error)})"
+        )
+
+
+_zero_position = Offset3DTuple(0, 0, 0)
+
+
+_device_float_precision = os.getenv("REACHAQ_DEVICE_FLOAT_PRECISION", "2")
+if _device_float_precision is not None and len(_device_float_precision) > 0:
+    _device_float_precision = int(_device_float_precision)
+else:
+    _device_float_precision = None
+
+
+class DeviceInterface:
+    """Base class that provides low-level communication with a device, such as serial, or CAN"""
+
+    float_precision: Optional[int] = _device_float_precision
+
+    _motors_prev_warn_error = {
+        m: (False, False) for m in list(Motor)
+    }
+
+    def __init__(self):
+        super().__init__()
+        self._auto_correct_motor_drift = False
+        self._motors_drift = _zero_position
+        self._active_motors_drift = _zero_position
+        self._max_motor_drift_error_threshold = 2  # mm
+        self._motors_drift_error = [False, False, False]
+        self._pellet_status_perf_c = -math.inf
+
+    @classmethod
+    def uuid(cls) -> int:
+        raise NotImplementedError
+
+    @classmethod
+    def next_uuid(cls) -> int:
+        raise NotImplementedError
+
+    @property
+    def motors_position(self) -> Offset3DTuple:
+        raise NotImplementedError
+
+    def round_float(self, value: float) -> float:
+        return value if self.float_precision is None else round(value, self.float_precision)
+
+    def open(self) -> bool:
+        """ Opens the interface
+
+        This method should not raise an exception and return False instead.  Exception details may be logged.
+
+        :return: True if successfully opened
+        """
+        return False
+
+    def close(self):
+        pass
+
+    @property
+    def is_open(self) -> bool:
+        return False
+
+    def are_addresses_valid(self):
+        raise NotImplementedError
+
+    def can_read(self) -> bool:
+        pass
+
+    def read(self, max_count: int = 1, *, collect_ms: int = 0) -> typing.Any:
+        """ Reads the available number of values from the interface up to max_count
+
+        :param max_count: maximum number of values to read
+        :param collect_ms: maximum duration to read until, if <= 0 then only 1 attempt is made.
+        :returns typing.Any: the data
+        :rtype: typing.Any
+        """
+        pass
+
+    def write(self, value: typing.Any) -> int:
+        """ Writes the content value(s) to the interface
+
+        :param value: The content to be written
+        :return: the number of values written"""
+        pass
+
+    def write_str(self, value: str) -> int:
+        """ Writes the string to the interface
+
+        :param value: The string to be written
+        :return: the number of bytes written"""
+        pass
+
+    def get_motor_configuration(self, motor: Motor) -> Union[ServoConfig, StepperConfig]:
+        """Return current motor config"""
+        raise NotImplementedError
+
+    def set_auto_correct_motor_drift(self, value):
+        """Set the auto correct motor drift"""
+        prev = self._auto_correct_motor_drift
+        no_drift = Offset3DTuple(0, 0, 0)
+        # if not value and prev:
+        #     self.set_motors_drift(no_drift)
+        if value != prev:
+            logger.verbose("auto_correct_motor_drift: %s -> %s", prev, value)
+            self._auto_correct_motor_drift = value
+            if not value:
+                self._motors_drift = no_drift
+        return True
+
+    def move_motor_x(
+        self,
+        position: Union[float, Tuple[float, float]],
+        save_as_fixed: bool = False,
+        *,
+        relative: bool = False,
+    ) -> bool:
+        """
+         Move the X-direction motor
+
+        Args:
+            position: Either a position (float) or a (position, rate (%)) pair
+            save_as_fixed: Save the position as a new fixed location for this motor
+                If True then the position is only saved-as-fixed, the motor is not moved.
+            relative: Relative movement or absolute, default absolute.
+
+         Returns:
+             bool: True if successful else False
+         """
+        raise NotImplementedError
+
+    def move_motor_y(
+        self,
+        position: Union[float, Tuple[float, float]],
+        save_as_fixed: bool = False,
+        *,
+        relative: bool = False,
+    ) -> bool:
+        """
+         Move the Y-direction motor
+
+        Args:
+            position: Either a position (float) or a (position, rate (%)) pair
+            save_as_fixed: Save the position as a new fixed location for this motor
+                If True then the position is only saved-as-fixed, the motor is not moved.
+            relative: Relative movement or absolute, default absolute.
+
+         Returns:
+             bool: True if successful else False
+         """
+        raise NotImplementedError
+
+    def move_motor_z(
+        self,
+        position: Union[float, Tuple[float, float]],
+        save_as_fixed: bool = False,
+        *,
+        relative: bool = False,
+    ) -> bool:
+        """
+         Move the Z-direction motor
+
+        Args:
+            position: Either a position (float) or a (position, rate (%)) pair
+            save_as_fixed: Save the position as a new fixed location for this motor
+                If True then the position is only saved-as-fixed, the motor is not moved.
+            relative: Relative movement or absolute, default absolute.
+
+         Returns:
+             bool: True if successful else False
+         """
+        raise NotImplementedError
+
+    def set_motors_drift(self, drifts: Offset3DTuple):
+        prev_drifts = self._motors_drift
+        logger.debug("Received new motors drift: %s ; prev=%s",
+                     drifts.humanize(n_digits=3), prev_drifts.humanize(n_digits=3))
+        for motor_axis_idx, motor in enumerate((Motor.PELLET_X_MOTOR, Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR)):
+            axis_drift = drifts[motor_axis_idx]
+            if abs(axis_drift) > self._max_motor_drift_error_threshold:
+                logger.critical("%s drift over error threshold: %.3f", motor, axis_drift)
+                self._motors_drift_error[motor_axis_idx] = True
+                # hopefully keep same drift direction:
+                if axis_drift < 0:
+                    axis_drift = -self._max_motor_drift_error_threshold
+                else:
+                    axis_drift = self._max_motor_drift_error_threshold
+                drifts = drifts.replace(**{"xyz"[motor_axis_idx]: axis_drift})
+            else:
+                if self._motors_drift_error[motor_axis_idx]:
+                    logger.notice("%s recovered from axis position error ; new drift = %.3f prev = %.3f",
+                                  motor, drifts[motor_axis_idx], prev_drifts[motor_axis_idx])
+                    self._motors_drift_error[motor_axis_idx] = False
+            # Must be called via SystemCommandKind message:
+            # save-as-fixed with 0 relative,
+            # this will make the current saved-as-fixed to be auto-corrected:
+            # self.move_motor(motor, 0, relative=True, save_as_fixed=True)
+        # end motors loop
+        # previous loop could have modified drifts, so assign after the loop:
+        self._motors_drift = drifts
+        return True
+
+    def servo_attach(self, motor: Motor):
+        raise NotImplementedError
+
+    def servo_detach(self, motor: Motor):
+        raise NotImplementedError
+
+    @property
+    def pellet_status_perf_c(self) -> float:
+        return self._pellet_status_perf_c
+
+    @pellet_status_perf_c.setter
+    def pellet_status_perf_c(self, value):
+        self._pellet_status_perf_c = value
+

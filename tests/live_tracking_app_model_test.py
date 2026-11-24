@@ -4,12 +4,12 @@ from unittest import mock
 
 import pytest
 
-from autotrainer.core import Offset3DTuple
-from autotrainer.core.pose_elements import SceneElement
-from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.app_model_status import SessionRecordingStatus
-from tools.acquisition.model.live_tracking_buffer import LiveTrackingBuffer, LiveTrackingSample
-from tools.acquisition.model.session_boundary import SessionBoundary
+from reachaq.core import Offset3DTuple
+from reachaq.core.pose_elements import SceneElement
+from reachaq.app.model.app_model import AppModel
+from reachaq.app.model.app_model_status import SessionRecordingStatus
+from reachaq.app.model.live_tracking_buffer import LiveTrackingBuffer, LiveTrackingSample
+from reachaq.app.model.session_boundary import SessionBoundary
 
 
 # The camera's own frame count when recording began, taken from a real rig

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from autotrainer.core import (
+from reachaq.core import (
     LaserChannelConfiguration,
     LaserChannelId,
     LaserSystemConfiguration,
@@ -11,7 +11,7 @@ from autotrainer.core import (
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
 )
-from tools.acquisition.model.nidaq_channel_plan import (
+from reachaq.app.model.nidaq_channel_plan import (
     build_nidaq_acquisition_configuration,
     nidaq_channel_kind,
     with_display_channels,
@@ -784,14 +784,14 @@ def test_every_laser_claims_its_names_while_the_backend_is_enabled(name):
 
 #: christielab10's own nidaqPorts and nidaqStream blocks, deviceIdentities
 #: and timing included, copied read-only from the rig's
-#: ~/Autotrainer/system_configuration.yaml on 2026-09-25.
+#: ~/reachAQ/system_configuration.yaml on 2026-09-25.
 _CHRISTIELAB10_BLOCKS = Path(__file__).with_name("christielab10_nidaq_blocks.yaml")
 
 
 def _christielab10_from_yaml():
     import io
 
-    from autotrainer.core import SystemConfiguration
+    from reachaq.core import SystemConfiguration
 
     return SystemConfiguration.load_yaml(io.StringIO(
         f"!SystemConfiguration\nversion: {SystemConfiguration.version}\n"
@@ -871,7 +871,7 @@ def test_christielab10s_readbacks_take_over_its_custom_channels_in_place():
 def test_the_claimed_names_need_the_configured_lasers():
     # Defaulting to none configured, a caller that left them out had every
     # disabled laser's stored channels dropped, the configured ones too.
-    from tools.acquisition.model.nidaq_channel_plan import _claimed_role_names
+    from reachaq.app.model.nidaq_channel_plan import _claimed_role_names
 
     with pytest.raises(TypeError):
         _claimed_role_names(False)
@@ -904,8 +904,8 @@ _CHRISTIELAB10_LASER_BLOCK = Path(__file__).with_name("christielab10_laser_block
 def test_christielab10s_laser_block_loads_and_keeps_its_lines_apart():
     import io
 
-    from autotrainer.core import SystemConfiguration
-    from autotrainer.core.configuration.laser_configuration import clock_line_clashes
+    from reachaq.core import SystemConfiguration
+    from reachaq.core.configuration.laser_configuration import clock_line_clashes
 
     loaded = SystemConfiguration.load_yaml(io.StringIO(
         f"!SystemConfiguration\nversion: {SystemConfiguration.version}\n"

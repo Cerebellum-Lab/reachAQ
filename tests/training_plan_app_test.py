@@ -6,14 +6,14 @@ from unittest import mock
 
 import pytest
 
-from autotrainer.behavior.pellet_trial import TrialOutcome
-from autotrainer.behavior.training import TrainingPlan, parse_plan
-from autotrainer.core.animal.animal_subject import AnimalSubject
+from reachaq.behavior.pellet_trial import TrialOutcome
+from reachaq.behavior.training import TrainingPlan, parse_plan
+from reachaq.core.animal.animal_subject import AnimalSubject
 
-from tools.acquisition.model.app_model import TRAINING_PAUSE_BLOCK_NAME
-from tools.acquisition.model.app_model_status import SessionRecordingStatus
-from tools.acquisition.model.trial_protocol_repository import TrialProtocolRepository
-from tools.acquisition.model.trial_protocol_schedule import ProtocolPatch, TrialProtocolDocument
+from reachaq.app.model.app_model import TRAINING_PAUSE_BLOCK_NAME
+from reachaq.app.model.app_model_status import SessionRecordingStatus
+from reachaq.app.model.trial_protocol_repository import TrialProtocolRepository
+from reachaq.app.model.trial_protocol_schedule import ProtocolPatch, TrialProtocolDocument
 
 
 def _plan(actions, device=None):

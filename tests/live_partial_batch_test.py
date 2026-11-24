@@ -17,8 +17,8 @@ import numpy
 import source_contract
 import pytest
 
-from autotrainer.inference.cropped_pose_model import CroppedPoseModel, InferenceRoi
-from autotrainer.inference.pose_model import PoseModel
+from reachaq.inference.cropped_pose_model import CroppedPoseModel, InferenceRoi
+from reachaq.inference.pose_model import PoseModel
 
 PARTS = ["Pellet", "RH_grab", "Triangle"]
 
@@ -102,7 +102,7 @@ def test_pose_process_selects_the_input_once_not_per_frame():
     """
     import ast
 
-    from autotrainer.inference import pose_process
+    from reachaq.inference import pose_process
 
     reads = [node for node in ast.walk(source_contract.tree(pose_process))
              if isinstance(node, ast.Attribute)

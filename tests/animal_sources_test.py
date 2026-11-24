@@ -13,21 +13,21 @@ import types
 import openpyxl
 import pytest
 
-from tools.acquisition.model.animal_sources import base
-from tools.acquisition.model.animal_sources.base import (
+from reachaq.app.model.animal_sources import base
+from reachaq.app.model.animal_sources.base import (
     AnimalMetadataSource,
     SetupField,
     available_source_kinds,
 )
-from tools.acquisition.model.animal_sources.config import (
+from reachaq.app.model.animal_sources.config import (
     SourceConfiguration,
     build_source,
     load_source_configuration,
     save_source_configuration,
 )
-from tools.acquisition.model.animal_sources.credentials import KEYRING_SERVICE, CredentialStore
-from tools.acquisition.model.animal_sources.database import DatabaseSource
-from tools.acquisition.model.animal_sources.mapping import (
+from reachaq.app.model.animal_sources.credentials import KEYRING_SERVICE, CredentialStore
+from reachaq.app.model.animal_sources.database import DatabaseSource
+from reachaq.app.model.animal_sources.mapping import (
     AnimalTableMapper,
     ColumnMapping,
     SourceTable,
@@ -35,12 +35,12 @@ from tools.acquisition.model.animal_sources.mapping import (
     softmouse_mapping,
     table_sha256,
 )
-from tools.acquisition.model.animal_sources.source_setup import (
+from reachaq.app.model.animal_sources.source_setup import (
     read_columns,
     save_setup,
     suggest_mapping,
 )
-from tools.acquisition.model.animal_sources.spreadsheet import SpreadsheetSource
+from reachaq.app.model.animal_sources.spreadsheet import SpreadsheetSource
 
 
 TAG_A = "360002353933099"
@@ -575,7 +575,7 @@ def test_read_columns_uses_an_entered_secret_before_it_is_saved(tmp_path):
 
 
 def test_suggested_mapping_prefers_the_kinds_own_then_header_names():
-    from tools.acquisition.model.animal_sources.softmouse import SoftMouseSource
+    from reachaq.app.model.animal_sources.softmouse import SoftMouseSource
 
     softmouse_headers = ("SoftMouse ID", "Physical Tag", "Plate ID", "State", "Sex")
     assert suggest_mapping(SoftMouseSource, softmouse_headers)["rfid_column"] == "Plate ID"

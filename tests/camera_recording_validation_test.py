@@ -5,8 +5,8 @@ import cv2
 import numpy as np
 import pytest
 
-from tools.acquisition.model import camera_recording_validation as validation_module
-from tools.acquisition.model.camera_recording_validation import validate_closed_video
+from reachaq.app.model import camera_recording_validation as validation_module
+from reachaq.app.model.camera_recording_validation import validate_closed_video
 
 
 def test_closed_video_count_mismatch_is_warning_only(tmp_path, monkeypatch):

@@ -5,7 +5,7 @@ breaks one: their nvidia-* CUDA wheels share site-packages/nvidia, and on
 christielab10 the later install overwrote the earlier. The installer installs
 both deliberately, with TensorFlow's CUDA runtime kept apart.
 
-DeepLabCut and the tensorflow extra moved to the auto-trainer-pose-deeplabcut
+DeepLabCut and the tensorflow extra moved to the reachaq-pose-deeplabcut
 plugin, with the conditions recorded beside the extra; its own tests check
 them (plugins/deeplabcut/tests/test_dependencies.py). Core keeps the torch
 extra, which the built-in keypoint backend needs.
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-PYPROJECT = Path(__file__).resolve().parents[1] / "auto-trainer-inference" / "pyproject.toml"
+PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
 
 
 def _text():
@@ -50,7 +50,7 @@ def test_neither_framework_is_a_hard_dependency():
 
 
 def test_deeplabcut_is_not_a_hard_dependency():
-    """It ships in the auto-trainer-pose-deeplabcut plugin, installed on request.
+    """It ships in the reachaq-pose-deeplabcut plugin, installed on request.
 
     Requirement strings only: the comment saying where it went names it.
     """
@@ -61,13 +61,13 @@ def test_deeplabcut_is_not_a_hard_dependency():
 
 def test_core_pandas_and_numpy_stay_required():
     block = _dependencies_block(_text())
-    for package in ("auto-trainer-core", "pandas", "numpy"):
+    for package in ("pandas", "numpy"):
         assert package in block, f"{package} should remain a hard dependency"
 
 
 def test_core_declares_what_core_imports():
     """scipy and scikit-learn are imported by core code (every
-    `import autotrainer.inference` reaches scipy; app_model reaches sklearn).
+    `import reachaq.inference` reaches scipy; app_model reaches sklearn).
     They used to arrive only through deeplabcut, so a fresh install without
     the plugin lacked them."""
     requirements = re.findall(r"""^\s*['"]([^'"]+)['"]""", _dependencies_block(_text()), re.M)
@@ -86,7 +86,7 @@ def test_both_extras_are_declared():
 
 
 def test_core_has_no_yolo_extra():
-    """ultralytics is AGPL-3.0: it lives in the auto-trainer-pose-yolo plugin,
+    """ultralytics is AGPL-3.0: it lives in the reachaq-pose-yolo plugin,
     not in a core extra."""
     assert "ultralytics" not in _text()
     with pytest.raises(AssertionError, match="no 'yolo' extra"):

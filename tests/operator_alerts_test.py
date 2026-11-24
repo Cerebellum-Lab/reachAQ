@@ -2,16 +2,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from autotrainer.core.interfaces import RecordingEndingReason
-from tools.acquisition.model.app_model_status import SessionRecordingStatus
-from tools.acquisition.model.operator_alerts import (
+from reachaq.core.interfaces import RecordingEndingReason
+from reachaq.app.model.app_model_status import SessionRecordingStatus
+from reachaq.app.model.operator_alerts import (
     AlertSeverity,
     OperatorAlertBridge,
     OperatorAlertCenter,
     alert_for_error,
     alert_for_subsystem,
 )
-from tools.acquisition.model.subsystem_status import (
+from reachaq.app.model.subsystem_status import (
     SubsystemId,
     SubsystemState,
     SubsystemStatus,

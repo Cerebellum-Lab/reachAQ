@@ -14,10 +14,10 @@ from unittest import mock
 
 import pytest
 
-from tools.acquisition.model import app_model as app_model_module
-from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.session_telemetry import SessionTelemetry
-from tools.acquisition.model.stim_latency_budget import StimLatencyBudget
+from reachaq.app.model import app_model as app_model_module
+from reachaq.app.model.app_model import AppModel
+from reachaq.app.model.session_telemetry import SessionTelemetry
+from reachaq.app.model.stim_latency_budget import StimLatencyBudget
 
 
 def _trigger(total_seconds, base=1000.0):

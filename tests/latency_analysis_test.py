@@ -3,7 +3,7 @@ import math
 import numpy as np
 import pytest
 
-from autotrainer.core.latency.schema import (
+from reachaq.core.latency.schema import (
     CAN_EVENT_DTYPE,
     LIVE_POSE_DTYPE,
     POSE_FORWARD_DTYPE,
@@ -11,7 +11,7 @@ from autotrainer.core.latency.schema import (
     RECORD_WRITE_DTYPE,
     pose_batch_dtype,
 )
-from tools.latency import analysis
+from reachaq.latency import analysis
 
 
 def _stages(result):

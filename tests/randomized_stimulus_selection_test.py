@@ -1,12 +1,12 @@
 import pytest
 
-from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
+from reachaq.device import LaserChannelConfiguration, LaserSystemConfiguration
 
-from tools.acquisition.model.stimulus_profile_repository import (
+from reachaq.app.model.stimulus_profile_repository import (
     PROFILE_SCHEMA_VERSION,
     StimulusProfileLibrary,
 )
-from tools.acquisition.model.trial_action import (
+from reachaq.app.model.trial_action import (
     CueIntervalProfile,
     LaserPulseProfile,
     StimulusTriggerProfile,
@@ -14,7 +14,7 @@ from tools.acquisition.model.trial_action import (
     TrialActionCompiler,
     TrialCompileContext,
 )
-from tools.acquisition.model.trial_protocol_schedule import (
+from reachaq.app.model.trial_protocol_schedule import (
     StimulusTrigger,
     TrialProtocolRow,
 )

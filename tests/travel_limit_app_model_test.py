@@ -10,10 +10,10 @@ from uuid import uuid4
 
 import pytest
 
-from autotrainer.core import Offset3DTuple
-from autotrainer.device import MotorConfigurationFile
-from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.hardware_model import HardwareModel, _pellet_sequences
+from reachaq.core import Offset3DTuple
+from reachaq.device import MotorConfigurationFile
+from reachaq.app.model.app_model import AppModel
+from reachaq.app.model.hardware_model import HardwareModel, _pellet_sequences
 
 TRAVEL = {a: {"min_pos": 0, "max_pos": 35} for a in "xyz"}
 

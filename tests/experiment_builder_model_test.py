@@ -1,12 +1,12 @@
 import pytest
 
-from tools.acquisition.model.trial_protocol_schedule import ProtocolPatch
-from tools.acquisition.model.trial_protocol_set import (
+from reachaq.app.model.trial_protocol_schedule import ProtocolPatch
+from reachaq.app.model.trial_protocol_set import (
     ExperimentComposition,
     ExperimentSetEntry,
     TrialProtocolSet,
 )
-from tools.acquisition.model.trial_protocol_set_repository import (
+from reachaq.app.model.trial_protocol_set_repository import (
     ExperimentCompositionRepository,
     TrialProtocolSetRepository,
 )
@@ -127,7 +127,7 @@ def test_recompiling_the_selected_experiment_reselects_its_new_revision(stocked)
 
 
 def test_compiling_is_refused_while_a_session_records(stocked):
-    from tools.acquisition.model.app_model_status import SessionRecordingStatus
+    from reachaq.app.model.app_model_status import SessionRecordingStatus
 
     stocked.create_experiment("day3", "Day 3")
     stocked.save_experiment_entries(

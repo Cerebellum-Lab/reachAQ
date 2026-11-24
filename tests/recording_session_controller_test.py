@@ -1,8 +1,8 @@
-from tools.acquisition.model.app_model_status import SessionRecordingStatus
-from tools.acquisition.model.recording_session_controller import (
+from reachaq.app.model.app_model_status import SessionRecordingStatus
+from reachaq.app.model.recording_session_controller import (
     RecordingSessionController,
 )
-from tools.acquisition.model.session_boundary import SessionBoundary
+from reachaq.app.model.session_boundary import SessionBoundary
 
 
 def test_prepare_record_resets_session_scoped_state():

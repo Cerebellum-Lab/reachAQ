@@ -23,17 +23,17 @@ import pytest  # noqa: E402
 import yaml  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
-from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME  # noqa: E402
-from autotrainer.inference.multires_calibration import library, store  # noqa: E402
-from autotrainer.inference.multires_calibration.report import QualityReport  # noqa: E402
+from reachaq.core.configuration import DEFAULT_3D_CALIB_DIR_NAME  # noqa: E402
+from reachaq.inference.multires_calibration import library, store  # noqa: E402
+from reachaq.inference.multires_calibration.report import QualityReport  # noqa: E402
 from calibration_metadata_test import _saved_calibration3d  # noqa: E402
 from handle_3d_calibration_waypoints_test import _CaptureCamera, _capture_app_model  # noqa: E402
 from reload_calib_multires_test import BASE_PARAMS, _configure_live_pair, _write_multires  # noqa: E402
-from tools.acquisition.model import handle_3d_calibration as h3d  # noqa: E402
-from tools.acquisition.model import reference_image_check as ric  # noqa: E402
-from tools.acquisition.model.app_model import SetupDifference  # noqa: E402
-from tools.acquisition.view import calibration_dialog as dialog_module  # noqa: E402
-from tools.acquisition.view.behavior_content import BehaviorContent  # noqa: E402
+from reachaq.app.model import handle_3d_calibration as h3d  # noqa: E402
+from reachaq.app.model import reference_image_check as ric  # noqa: E402
+from reachaq.app.model.app_model import SetupDifference  # noqa: E402
+from reachaq.app.view import calibration_dialog as dialog_module  # noqa: E402
+from reachaq.app.view.behavior_content import BehaviorContent  # noqa: E402
 
 SIZE = 256
 ON = {"checks": {"reference_image": {"enabled": True}}}
@@ -307,7 +307,7 @@ def test_cant_tell_is_shown_but_does_not_ask(monkeypatch):
 
 
 def test_check_results_and_acknowledgement_reach_the_metadata(app_model, tmp_path):
-    folder = _write_multires(tmp_path / "Autotrainer-calib" / DEFAULT_3D_CALIB_DIR_NAME)
+    folder = _write_multires(tmp_path / "reachAQ-calib" / DEFAULT_3D_CALIB_DIR_NAME)
     (folder / "reference").mkdir()
     for camera in ("left", "right"):
         cv2.imwrite(str(folder / "reference" / f"{camera}.png"), REFERENCE)
@@ -345,7 +345,7 @@ def test_check_results_and_acknowledgement_reach_the_metadata(app_model, tmp_pat
 
 
 def test_a_declined_start_leaves_no_result_for_a_later_headless_start(app_model, tmp_path, monkeypatch):
-    folder = _write_multires(tmp_path / "Autotrainer-calib" / DEFAULT_3D_CALIB_DIR_NAME)
+    folder = _write_multires(tmp_path / "reachAQ-calib" / DEFAULT_3D_CALIB_DIR_NAME)
     (folder / "reference").mkdir()
     for camera in ("left", "right"):
         cv2.imwrite(str(folder / "reference" / f"{camera}.png"), REFERENCE)
@@ -522,7 +522,7 @@ def test_capture_now_records_the_primary_but_keeps_no_reference_for_it(tmp_path,
 # Preferences: each check's limits beside its switch.
 
 def _checks_ui(app_model):
-    from tools.acquisition.view.moved_camera_checks import MovedCameraChecks
+    from reachaq.app.view.moved_camera_checks import MovedCameraChecks
 
     return MovedCameraChecks(app_model)
 
@@ -587,7 +587,7 @@ def test_editing_a_threshold_saves_only_that_key(app_model):
 
 
 def test_pose_check_switch_saves_enabled(app_model):
-    from autotrainer.inference.analysis.offline_3d import read_pose_consistency_settings
+    from reachaq.inference.analysis.offline_3d import read_pose_consistency_settings
 
     ui = _checks_ui(app_model)
     ui.switches["pose_consistency"].setChecked(True)
@@ -638,7 +638,7 @@ def test_invalid_value_not_saved(app_model, check, key, text):
 
 @pytest.mark.parametrize("check", ["reference_image", "pose_consistency"])
 def test_a_settings_file_that_cannot_be_written_reverts_the_switch_and_the_field(app_model, monkeypatch, check):
-    app_model_module = importlib.import_module("tools.acquisition.model.app_model")
+    app_model_module = importlib.import_module("reachaq.app.model.app_model")
     ui = _checks_ui(app_model)
 
     def refuse(root, **changes):
@@ -666,7 +666,7 @@ def test_a_settings_file_that_cannot_be_written_reverts_the_switch_and_the_field
 
 
 def test_preferences_shows_the_checks_beside_their_switches(app_model):
-    from tools.acquisition.view.preferences_content import PreferencesContent
+    from reachaq.app.view.preferences_content import PreferencesContent
 
     app_model._inference = SimpleNamespace(is_enabled=False, model_location="", pose_parts=[])
     content = PreferencesContent(app_model.preferences, app_model)
