@@ -9,7 +9,7 @@ import time
 from multiprocessing import synchronize
 from multiprocessing.synchronize import Semaphore as SemaphoreType
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple, Any
+from typing import Optional, List, Dict, Tuple, Any, Sequence
 from threading import Thread
 
 from autotrainer.core import FixedArrayMultiQueue, ProjectInfo, EventManager, clear_queue, \
@@ -327,7 +327,12 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         from autotrainer.inference.analysis import intersession_process
         logger.info("imported inference analysis intersession_process: %s", intersession_process)
 
-    def start(self, live_queue: FixedArrayMultiQueue) -> bool:
+    def start(self, live_queue: FixedArrayMultiQueue, *, camera_names: Sequence[str]) -> bool:
+        """Start live inference on `live_queue`, whose cameras are `camera_names` in queue order.
+
+        The same names reach the data monitor, its live workers and the offline replay,
+        so live and replayed poses are attributed by one ordering.
+        """
 
         started = time.perf_counter()
         log_hardware_initialization(
@@ -365,6 +370,15 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         if data_monitor_proc is not None and not data_monitor_proc.is_alive():
             data_monitor_proc.join(3)
             data_monitor_proc = None
+        elif data_monitor_proc is not None and data_monitor_proc.camera_names != tuple(camera_names):
+            # Its camera order is fixed when it is built: reused, it would split this
+            # queue's batches by the previous cameras.
+            logger.info("rebuilding the pose data monitor: live queue cameras %s -> %s",
+                        data_monitor_proc.camera_names, tuple(camera_names))
+            self._stop_data_monitor_proc()
+            # As stop() does: the old monitor's exit sentinel must not reach the new one.
+            clear_queue(self._data_monitor_cmd_queue, name="data_monitor_cmd_queue")
+            data_monitor_proc = None
 
         if data_monitor_proc is None:
             self._data_monitor_watchdog_perf_c.value = time.perf_counter()
@@ -374,6 +388,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
                 msg_queue=self._notif_msg_queue,
                 cmd_queue=self._data_monitor_cmd_queue,
                 cmd_ack_event=self._data_monitor_cmd_ack_event,
+                camera_names=camera_names,
                 frames_per_cam=live_queue.frames_per_camera,
                 monitored_parts_offsets=list(self._pair_offsets_2_handler),
                 watchdog_perf_c=self._data_monitor_watchdog_perf_c,
@@ -388,6 +403,7 @@ class InferenceModel(InferenceProtocol, ProjectDependentProtocol):
         self._live_queue = live_queue
         proc = self._pose_process = PoseProcess(
             live_queue,
+            camera_names=camera_names,
             data_queue=self._output_data_queue,
             cmd_queue=self._cmd_queue,
             cmd_queue_ack=self._cmd_queue_ack,

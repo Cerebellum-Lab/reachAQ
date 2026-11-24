@@ -19,6 +19,7 @@ real rig, where the cameras sit at unequal azimuths and elevations.
 """
 
 import dataclasses
+import importlib
 import pickle
 
 import cv2
@@ -342,10 +343,22 @@ def test_anipose_toml_cameras_triangulate_preset_pixels_to_motor_points(g):
     np.testing.assert_allclose((homogeneous[:3] / homogeneous[3]).T, X, rtol=0, atol=1e-4)
 
 
+def _import_deeplabcut(name):
+    """Import a deeplabcut module, or skip the test when it cannot be imported for any reason.
+
+    importorskip only catches ImportError; DLC 2.3.11 under Keras 3 fails with an AttributeError.
+    """
+    try:
+        return importlib.import_module(name)
+    except Exception as exc:
+        pytest.skip(f"deeplabcut not importable: {exc!r}")
+
+
 @pytest.mark.parametrize("g", PRESETS, ids=preset_id)
 def test_deeplabcut_triangulates_the_export_like_reachaq(g, tmp_path):
-    dlc_tri = pytest.importorskip("deeplabcut.pose_estimation_3d.triangulation")
-    from deeplabcut.utils import auxiliaryfunctions, auxiliaryfunctions_3d
+    dlc_tri = _import_deeplabcut("deeplabcut.pose_estimation_3d.triangulation")
+    auxiliaryfunctions = _import_deeplabcut("deeplabcut.utils.auxiliaryfunctions")
+    auxiliaryfunctions_3d = _import_deeplabcut("deeplabcut.utils.auxiliaryfunctions_3d")
 
     X = working_volume_points()
     stereo = preset_stereo_params(FIT, g)

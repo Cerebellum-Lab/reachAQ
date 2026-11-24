@@ -2487,3 +2487,45 @@ def test_only_a_successful_session_metadata_save_marks_the_live_notes_saved(app_
     with mock.patch.object(app_model, "_save_metadata"):
         app_model._save_project_metadata(project, caller="NA")
     assert app_model._notes_saved_revision == app_model._notes_revision
+
+
+def test_live_inference_is_started_with_the_live_queue_cameras_in_queue_order(app_model, system_config):
+    """Live pose names its cameras by the queue: primary first, no stimulation-mode stimCam.
+
+    Configured left, right, stimCam with right primary and all three recording, so
+    project.camera_names (configuration order, recording cameras) is left, right, stimCam
+    and differs from the queue's right, left.
+    """
+    assert app_model.load_configuration() is True
+    cameras = {camera.name: camera for camera in app_model.reach_cameras}
+    left, right, stim = cameras["left"], cameras["right"], cameras["stimCam"]
+    for camera in (left, right, stim):
+        camera.is_enabled = True
+        camera.is_recording_enabled = True
+    left._configured_is_primary = False
+    right._configured_is_primary = True
+    app_model._ensure_reach_primary_camera()
+    app_model.project = app_model.make_project_info()
+    assert app_model.project.camera_names == ("left", "right", "stimCam")
+
+    started = []
+
+    def start(live_queue, *, camera_names):
+        started.append(tuple(camera_names))
+        return True
+
+    previous_inference = app_model._inference
+    try:
+        with mock.patch.object(
+            type(app_model), "_is_independent_stim_camera", side_effect=lambda camera: camera is stim,
+        ):
+            app_model._inference_cameras = app_model._select_inference_cameras()
+        app_model._inference_queue = object()
+        app_model._inference = SimpleNamespace(is_enabled=True, start=start, stop=lambda: None)
+
+        assert app_model._start_inference_domain(
+            reach_synchronization_ready=True, preflight_error=None)
+    finally:
+        app_model._inference = previous_inference
+
+    assert started == [("right", "left")]

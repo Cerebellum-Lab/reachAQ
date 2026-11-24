@@ -11,7 +11,7 @@ from multiprocessing.sharedctypes import Synchronized
 from multiprocessing.synchronize import Semaphore as SemaphoreType
 from pathlib import Path
 from queue import Empty
-from typing import Optional, Dict
+from typing import Optional, Dict, Sequence
 
 import numpy
 import numpy as np
@@ -183,6 +183,7 @@ class PoseProcess(Process):
         self,
         live_queue: FixedArrayMultiQueue,
         *,
+        camera_names: Sequence[str],
         model_location: str,
         data_queue: Queue,
         cmd_queue: Queue,
@@ -196,6 +197,8 @@ class PoseProcess(Process):
     ):
         """
         :param live_queue: a FixedArrayMultiQueue as the default source of input frames
+        :param camera_names: the live queue's cameras in queue order; the offline replay
+            puts each camera's frames in the same slot
         :param model_location: The model directory to use
         :param data_queue: an output Queue for pose data passed as tuple of pose data and the mode (live or offline)
         :param cmd_queue: an input Queue for starting, terminating, and changing queues
@@ -215,6 +218,11 @@ class PoseProcess(Process):
         self._pose_model: PoseModel
         self._model_location = model_location
         self._live_input_queue = live_queue
+        self._camera_names = tuple(camera_names)
+        if len(self._camera_names) != live_queue.camera_count:
+            raise ValueError(
+                f"{len(self._camera_names)} camera names {self._camera_names}"
+                f" for a live queue of {live_queue.camera_count} cameras")
         self._cmd_queue = cmd_queue
         self._cmd_queue_ack = cmd_queue_ack
         self._msg_queue = msg_queue
@@ -305,7 +313,7 @@ class PoseProcess(Process):
             stop_recorded=self._stop_recorded_event,
             frame_shape=input_q.shape,
             frames_per_cam=self._model_frames_per_camera,
-            nr_cams=input_q.camera_count,
+            camera_names=self._camera_names,
             msg_queue=self._msg_queue,
             event_cb_ack=self._offline_input_event_cb_ack,
             record_stop_sema=self._record_stop_sema,

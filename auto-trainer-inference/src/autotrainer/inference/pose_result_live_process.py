@@ -8,7 +8,7 @@ import queue
 import signal
 import logging.config
 import time
-from typing import Optional, Union, Dict, List, Tuple
+from typing import Optional, Union, Dict, List, Tuple, Sequence
 
 from autotrainer.core import get_perf_now
 from autotrainer.core.logging import (
@@ -38,7 +38,7 @@ class LivePoseResultProcessWorker(multiprocessing.Process):
         monitored_parts_offsets: List[Tuple[str, str]],
         input_q: multiprocessing.Queue,
         output_q: multiprocessing.Queue,
-        camera_count: int = 2,
+        camera_names: Sequence[str],
         generation: int,
         log_config: Optional[Dict] = None,
     ):
@@ -52,7 +52,9 @@ class LivePoseResultProcessWorker(multiprocessing.Process):
         self._pose_algo = pose_algo
         self._monitored_parts_offsets = monitored_parts_offsets
         self._output_q = output_q
-        self._camera_count = camera_count
+        # The live queue's cameras in queue order: slot i of every batch is camera_names[i].
+        self._camera_names = tuple(camera_names)
+        self._camera_count = len(self._camera_names)
         self._generation = generation
 
     @property
