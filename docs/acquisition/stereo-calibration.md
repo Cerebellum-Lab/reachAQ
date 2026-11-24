@@ -209,12 +209,16 @@ only re-aiming the camera helps.
    travel. A low edge below 1 mm is then raised to 1 mm (`SCOUT_HOME_MARGIN_MM`):
    on 2026-11-23 christielab10 was commanded y 0.133 mm from home, stayed at
    0.000, and the scout stopped at its first point. A move onto the home stop
-   itself is made, so an axis whose whole box is below 1 mm is scouted at 0. The
-   upper edges keep no margin. A saved scout list with a point outside today's
-   box is scouted again.
-   A hand-written waypoint outside the travel is refused like any other move:
-   the capture stops with "the move of x to ... was not queued" and the
-   `Axis-X: move to ... refused` line in the log.
+   itself is made, so an axis whose whole box is below 1 mm is scouted at 0,
+   unless `scoutBounds` (or a `min_pos` above 0) excludes 0: the box is then
+   left as configured. The upper edges keep no margin. A saved scout list with
+   a point outside today's box is scouted again.
+   A move list with a waypoint outside the travel is refused before anything is
+   homed or recorded: the hand-written list at the start of a hand-written
+   capture, and the list a scout run ends with (its own, a saved one, or the
+   hand-written fallback) before the capture. The error names up to three
+   waypoints, for example "the hand-written move list leaves the configured
+   travel: waypoint 4 z 52.000 mm (travel 0-35 mm)".
    The points are visited in serpentine order, so every move is one axis.
 2. **Short capture.** The scout records like the capture itself (same camera
    settings, TRIGGER mode, home first), pausing 0.3 s at each point after the

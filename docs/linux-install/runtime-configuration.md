@@ -183,14 +183,25 @@ ReachAQ checks each stage target against the travel before it sends anything:
   coordinates. That covers the animal's base position, protocol presentations,
   the Hardware Control buttons, the intersession shift and every calibration
   and scout waypoint. SET keeps its clamp of a target below 0 to 0, and the
-  check runs after it.
+  check runs after it. On an axis with travel, a relative SET is sent to the
+  board as the absolute target that was checked, so the board cannot add it
+  to a different base. A target within 1e-6 mm of a limit counts as inside.
+- **The animal's base position and a protocol presentation** are checked on
+  all three axes before any is SET. One axis out of range sends none of them,
+  so the stage never mixes the new position with the previous one. The base
+  position logs `Not sending <animal>'s pellet position ...: it lies outside
+  the configured travel`; a protocol presentation stops with an error.
 - **The `move_config.yaml` sequences** (`load_pellet`, `send_pellet`,
   `cover_pellet`, `release_pellet`, `move_retract`, or their built-in
   defaults). Every stepper step is checked before the sequence starts, as
   the steps before it leave the stage. One step out of range refuses the
   whole sequence. As the board command does, a step's target is first held
   to 0 and 15 motor turns (36.5 mm), so a retract that runs into 0 still
-  passes.
+  passes. Steps relative to the send position, and `predefined: send`, are
+  checked from both the requested send position and the one the board
+  reports, when they differ. A sequence with `predefined: send` is refused
+  while the send position of an axis with travel is not known at all (no SET
+  since the connect and none reported).
 - **A motor drift correction** that would put the saved send position outside
   the travel.
 
@@ -205,14 +216,16 @@ An unset side prints as `-inf` or `inf`. A refused sequence also logs
 `Pellet sequence load_pellet refused: a step lies outside the configured
 travel`. Without `min_pos` and `max_pos`, behaviour is as before.
 
+When the board refuses a SET, the host puts that axis's requested send
+position back to the one the board reports, so later checks use the base the
+board really has.
+
 Not checked:
 
 - **Homing** (`send_home`, `send_to_limits` and home steps in a sequence). The
   firmware stops at the switch.
 - **A target the host does not know**: a relative sequence step from a
-  position the board has not reported, or `send_pellet` before any SET since
-  the connect. The host sends nothing for the first; for the second the board
-  goes to the position it saved earlier.
+  position the board has not reported. The host sends nothing for it.
 - **Turning drift correction off**. That re-sends the last SET, which was
   checked when it was made.
 - **The maintenance tools that bypass the acquisition app**: the pellet
