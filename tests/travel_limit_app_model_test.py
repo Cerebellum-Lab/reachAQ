@@ -133,6 +133,23 @@ def test_the_operator_setting_every_axis_clears_the_block_and_a_protocol_target_
     assert hardware.send_pellet() is not None
 
 
+def test_with_a_protocol_the_dialog_says_hardware_control_lasts_this_session_only():
+    hardware = _hardware()
+    app_model = _app_model(hardware)
+    AppModel._set_animal_base_positions(app_model, _animal(5.0, 36.2, 7.0, protocol="plan-1"))
+    (_, message), _ = app_model.on_error.call_args
+    assert "this session only" in message
+    assert "Manual pellet control" in message
+
+
+def test_without_a_protocol_the_dialog_does_not_mention_it():
+    hardware = _hardware()
+    app_model = _app_model(hardware)
+    AppModel._set_animal_base_positions(app_model, _animal(5.0, 36.2, 7.0))
+    (_, message), _ = app_model.on_error.call_args
+    assert "this session only" not in message
+
+
 def test_the_shift_is_refused_whole_when_one_shifted_axis_leaves_the_travel(caplog):
     hardware = _hardware()
     hardware._last_requested_set_coordinates = Offset3DTuple(10.0, 31.0, 10.0)

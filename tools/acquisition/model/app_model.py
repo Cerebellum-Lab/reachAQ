@@ -11079,12 +11079,19 @@ class AppModel(ObservableObject):
             hardware.block_presentation(
                 f"{animal.name}'s pellet position {xyz.humanize(n_digits=3)} lies outside the "
                 "configured travel; set X, Y and Z, or select an animal whose position is inside it")
-            self.on_error(
-                "Pellet position refused",
+            message = (
                 f"{animal.name}'s pellet position {xyz.humanize(n_digits=3)} (motor mm) lies outside "
                 "the configured travel (min_pos / max_pos in motor_config.yaml), so it was not sent. "
                 "No pellet is presented until a position inside the travel is set: set X, Y and Z "
                 "in Hardware Control, or select an animal whose position is inside the travel.")
+            if animal.training.current_protocol is not None:
+                # While a protocol is attached, Hardware Control SETs are not saved to the animal.
+                message += (
+                    f" {animal.name} has a protocol, so X, Y and Z set in Hardware Control apply to "
+                    "this session only and are not saved to the animal. To keep the new position, "
+                    "select Manual pellet control in Protocol, set X, Y and Z in Hardware Control, "
+                    "then select the protocol again.")
+            self.on_error("Pellet position refused", message)
         else:
             hardware.set_x(xyz.x)
             hardware.set_y(xyz.y)
