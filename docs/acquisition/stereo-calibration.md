@@ -32,9 +32,9 @@ used, see
 
 ## Steps
 
-1. **Mount the board on the motor.** It is the 4 mm board with 6 x 8 inner
-   corners: the plain checkerboard, or the ChArUco board if the library's
-   settings name it (see [The calibration board](#the-calibration-board)). Mount it so it moves with the stage and every camera to be
+1. **Mount the board on the motor.** It is the 4 mm ChArUco board with 6 x 8
+   inner corners, or the plain 4 mm checkerboard if the library's settings name it
+   (see [The calibration board](#the-calibration-board)). Mount it so it moves with the stage and every camera to be
    calibrated sees it at the start position. The board is only translated, never tilted, and its
    orientation on the stage does not need to be measured: the fit solves for it.
 2. Choose **Tools → Make 3D calibration**, tick the cameras to calibrate and
@@ -279,12 +279,13 @@ camera, as any scout does; otherwise the old list stays.
 
 ### The calibration board
 
-The calibration uses the 4 mm checkerboard (6 x 8 inner corners) unless the
-library's `calibrations/settings.yaml` has a `board` entry. For the ChArUco board:
+The calibration uses the rig's 4 mm ChArUco board unless the library's
+`calibrations/settings.yaml` has a `board` entry that names another. With no
+`board` key it is exactly this:
 
 ```yaml
 board:
-  kind: charuco          # or checkerboard (the default)
+  kind: charuco          # the default; checkerboard selects the plain board
   square_mm: 4.0
   rows: 6                # inner corners, not squares
   cols: 8
@@ -295,7 +296,18 @@ board:
 That is `cv2.aruco.CharucoBoard((9, 7), 4.0, 3.0, cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50))`:
 9 x 7 squares of 4 mm with a 3 mm marker in each white square, 8 x 6 = 48 inner
 corners, the same corner grid as the checkerboard. A key left out takes the
-checkerboard's value. The entry is checked when **Make 3D calibration** starts,
+ChArUco board's value. To calibrate with the old checkerboard instead:
+
+```yaml
+board:
+  kind: checkerboard
+  square_mm: 4.0
+  rows: 6
+  cols: 8
+```
+
+(`marker_mm` and `dictionary` are refused for a checkerboard.) Calibrations made
+before the ChArUco board record no `kind`, and read as the checkerboard. The entry is checked when **Make 3D calibration** starts,
 before the stage moves: an unknown key, kind or dictionary, a marker not smaller
 than its square, or a dictionary with fewer markers than the board needs (31
 for 9 x 7) stops it with an error naming the key. There is no switch in the

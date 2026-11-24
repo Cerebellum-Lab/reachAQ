@@ -149,6 +149,12 @@ class BoardSpec:
         return board
 
 
+# The rig's board, and the calibration's default (scout.configured_board): cv2.aruco.CharucoBoard
+# ((9, 7), 4.0, 3.0, DICT_4X4_50), 8 x 6 inner corners. BoardSpec() itself stays the
+# checkerboard, so code and stored calibrations that name no kind read as before.
+RIG_CHARUCO_BOARD = BoardSpec(square_mm=4.0, rows=6, cols=8, kind=CHARUCO, marker_mm=3.0, dictionary="DICT_4X4_50")
+
+
 def valid_corners(corners: np.ndarray) -> np.ndarray:
     """The (n,) mask of the rows of an (n, 2) corner array that were detected (finite)."""
     return np.all(np.isfinite(np.asarray(corners, float)), axis=1)

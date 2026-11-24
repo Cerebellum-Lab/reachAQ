@@ -889,6 +889,25 @@ def test_the_library_board_setting_reaches_the_calibration(tmp_path, monkeypatch
     assert boards == [BoardSpec(kind="charuco", marker_mm=3.0, dictionary="DICT_4X4_50")]
 
 
+@pytest.mark.parametrize("library", [False, True], ids=["no_library", "no_board_key"])
+def test_without_a_board_setting_the_calibration_uses_the_rig_charuco_board(tmp_path, monkeypatch, library):
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    if library:
+        app_model.calibration_library_root = tmp_path / "calibrations"
+    boards = []
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: SimpleNamespace(verified=[True]))
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture",
+                        lambda *a, **k: boards.append(k["board"]) or (None, SimpleNamespace(id="cal"),
+                                                                      SimpleNamespace(verdict="pass")))
+    for name in ("left", "right"):
+        (tmp_path / "session" / f"{name}_recording.mp4").write_bytes(b"")
+        (tmp_path / "session" / f"{name}_recording_timestamps.txt").write_text("")
+
+    make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert boards == [BoardSpec(kind="charuco", marker_mm=3.0, dictionary="DICT_4X4_50")]
+
+
 def test_a_bad_board_setting_stops_the_calibration_before_any_motion(tmp_path, monkeypatch):
     from reachaq.inference.multires_calibration import library
 

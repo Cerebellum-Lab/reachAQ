@@ -1108,11 +1108,14 @@ def make_3d_calib(
     src_dir = Path(
         calibration_FLIR.make_new_calibration(square_size, row_ct, col_ct, oversample, sess_path.location))
 
-    # The board from the library settings (default: the 4 mm checkerboard), read before any
+    # The board from the library settings (default: the rig's ChArUco board), read before any
     # motion so a malformed setting stops the calibration before it starts.
     root = getattr(app_model, "calibration_library_root", None)
     board = configured_board({} if root is None else read_settings(root))
-    if board.kind != BoardSpec().kind:
+    if board.kind == BoardSpec().kind:
+        logger.notice("Calibration board: checkerboard, %d x %d inner corners, %g mm squares",
+                      board.rows, board.cols, board.square_mm)
+    else:
         logger.notice("Calibration board: %s, %d x %d inner corners, %g mm squares, %g mm %s markers",
                       board.kind, board.rows, board.cols, board.square_mm, board.marker_mm, board.dictionary)
 

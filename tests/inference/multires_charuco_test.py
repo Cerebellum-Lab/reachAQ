@@ -20,6 +20,7 @@ from reachaq.inference.multires_calibration.extract import detect_board, median_
 from reachaq.inference.multires_calibration.fit import (
     CHARUCO,
     MIN_CHARUCO_CORNERS,
+    RIG_CHARUCO_BOARD,
     BoardSpec,
     CameraModel,
     WaypointObservation,
@@ -284,12 +285,22 @@ def test_store_round_trips_a_charuco_board():
 
 
 def test_board_setting_parses():
-    assert configured_board({}) == BoardSpec()
-    assert configured_board({"scoutBounds": None}) == BoardSpec()
+    # The rig's ChArUco board is the default (Ben, 2026-11-23); BoardSpec() stays the checkerboard.
+    assert configured_board({}) == RIG_CHARUCO_BOARD == CHARUCO_BOARD
+    assert configured_board({"scoutBounds": None}) == RIG_CHARUCO_BOARD
+    assert configured_board({"board": None}) == RIG_CHARUCO_BOARD
     setting = {"kind": "charuco", "square_mm": 4.0, "rows": 6, "cols": 8, "marker_mm": 3.0,
                "dictionary": "DICT_4X4_50"}
     assert configured_board({"board": setting}) == CHARUCO_BOARD
     assert configured_board({"board": {"kind": "checkerboard"}}) == BoardSpec()
+    assert configured_board({"board": {"kind": "checkerboard", "square_mm": 4.0, "rows": 6, "cols": 8}}) == BoardSpec()
+    # A ChArUco key left out takes the rig board's value.
+    assert configured_board({"board": {"kind": "charuco"}}) == RIG_CHARUCO_BOARD
+    assert configured_board({"board": {"marker_mm": 2.5}}) == dataclasses.replace(RIG_CHARUCO_BOARD, marker_mm=2.5)
+
+
+def test_board_spec_default_is_still_the_checkerboard():
+    assert BoardSpec().kind == "checkerboard" and BoardSpec().marker_mm is None
 
 
 @pytest.mark.parametrize("change, key", [
@@ -297,7 +308,8 @@ def test_board_setting_parses():
     ({"dictionary": "DICT_9X9_1"}, "dictionary"),
     ({"dictionary": "getPredefinedDictionary"}, "dictionary"),
     ({"marker_mm": 4.0}, "marker_mm"),
-    ({"marker_mm": None}, "marker_mm"),
+    ({"marker_mm": 0.0}, "marker_mm"),
+    ({"kind": "checkerboard", "marker_mm": 3.0}, "marker_mm"),
     ({"dictionary": "DICT_4X4_50", "rows": 10, "cols": 12}, "dictionary"),  # 143 squares, 71 markers
     ({"rows": "six"}, "rows"),
     ({"rows": 6.5}, "rows"),

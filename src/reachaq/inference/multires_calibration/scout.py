@@ -33,7 +33,12 @@ import yaml
 
 from reachaq.core.logging import get_verbose_logger
 from reachaq.inference.multires_calibration.extract import detect_board, distinct_waypoints, dwell_segments
-from reachaq.inference.multires_calibration.fit import BoardSpec, valid_corners
+from reachaq.inference.multires_calibration.fit import (
+    CHARUCO,
+    RIG_CHARUCO_BOARD,
+    BoardSpec,
+    valid_corners,
+)
 from reachaq.inference.multires_calibration.library import library_root
 
 logger = get_verbose_logger(__name__)
@@ -50,7 +55,7 @@ MAX_PATH = 60
 # The library setting that may narrow the scout's box: {"lo": [x, y, z], "hi": [x, y, z]} in motor mm.
 SCOUT_BOUNDS_SETTING = "scoutBounds"
 # The library setting that names the calibration board (configured_board); unset, it is
-# BoardSpec(), the 4 mm 6 x 8 checkerboard.
+# RIG_CHARUCO_BOARD, the rig's ChArUco board (Ben, 2026-11-23).
 BOARD_SETTING = "board"
 _BOARD_KEYS = ("kind", "square_mm", "rows", "cols", "marker_mm", "dictionary")
 OCCUPANCY_CELLS = 4  # each camera's image is split 4 x 4 to measure how widely its views spread
@@ -576,10 +581,13 @@ def video_sizes(videos: Mapping[str, Path]) -> Dict[str, Tuple[int, int]]:
 
 
 def configured_board(settings: Mapping) -> BoardSpec:
-    """The library settings' board as a BoardSpec; BoardSpec(), the checkerboard, when unset.
+    """The library settings' board as a BoardSpec; RIG_CHARUCO_BOARD, the rig's ChArUco
+    board, when unset (or null).
 
     The setting is {kind, square_mm, rows, cols, marker_mm, dictionary}, rows and cols
-    counting inner corners; a key left out takes BoardSpec's default. Unlike scoutBounds it
+    counting inner corners. `kind` defaults to charuco; a key left out (or null) takes the
+    rig ChArUco board's value, or for `kind: checkerboard` BoardSpec()'s, the 4 mm 6 x 8
+    checkerboard. Unlike scoutBounds it
     is never ignored: a malformed board would calibrate against the wrong geometry, so
     ValueError is raised, naming the key, for an unknown key or kind, an unknown dictionary,
     a marker not smaller than its square, a dictionary too small for the board, or a value
@@ -587,7 +595,7 @@ def configured_board(settings: Mapping) -> BoardSpec:
     """
     value = settings.get(BOARD_SETTING) if settings else None
     if value is None:
-        return BoardSpec()
+        return RIG_CHARUCO_BOARD
     if not isinstance(value, Mapping):
         raise ValueError(f"{BOARD_SETTING}: it must be a mapping of {', '.join(_BOARD_KEYS)}, got {value!r}")
     unknown = sorted(str(k) for k in value if k not in _BOARD_KEYS)
@@ -606,6 +614,10 @@ def configured_board(settings: Mapping) -> BoardSpec:
     for key in ("kind", "dictionary"):
         if value.get(key) is not None:
             fields[key] = str(value[key])
+    if fields.get("kind", CHARUCO) == CHARUCO:
+        defaults = RIG_CHARUCO_BOARD
+        fields = {"kind": CHARUCO, "marker_mm": defaults.marker_mm, "dictionary": defaults.dictionary,
+                  "square_mm": defaults.square_mm, "rows": defaults.rows, "cols": defaults.cols, **fields}
     try:
         return BoardSpec(**fields)
     except ValueError as err:
