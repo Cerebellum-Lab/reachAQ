@@ -285,7 +285,8 @@ class QualityReport:
             # sorted is stable, so metrics of one status keep the order they were graded in.
             for m in sorted(block, key=lambda m: _DISPLAY_ORDER.index(m.status)):
                 value = "-" if m.value is None else f"{_format_value(m.value)} {m.unit}"
-                line = f"{m.status.upper():<5} {m.name:<30}{m.camera or '-':<7}{value}  [{_format_limits(m)}]"
+                # The space after the camera keeps a 7-character name (camera4) or a pair apart from the value.
+                line = f"{m.status.upper():<5} {m.name:<30}{m.camera or '-':<7} {value}  [{_format_limits(m)}]"
                 lines.append(f"{line}  {m.note}" if m.note else line)
         if self.notes:
             lines.append("")

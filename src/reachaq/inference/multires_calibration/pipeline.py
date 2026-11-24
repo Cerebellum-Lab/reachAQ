@@ -455,12 +455,7 @@ def calibrate_capture(
     observations, reversed_order = reconcile_corner_order(kept, board, image_size, calibrated)
     logger.info("calibration capture: %d distinct waypoints; fitting %d of %d cameras",
                 len(observations), len(calibrated), len(cameras))
-    per_view_options = {}
-    if fit_mode != FIT_MOTOR_FRAME:
-        if fix_principal_point:
-            per_view_options["fix_principal_point"] = True
-        if placement != "similarity":
-            per_view_options["placement"] = placement
+    per_view_options = fit_options(fit_mode, fix_principal_point, placement)
     fit = _fit(fit_mode, observations, board, image_size, calibrated, **per_view_options)
 
     notes: List[str] = []
@@ -534,13 +529,7 @@ def calibrate_capture(
         # install copies again and every backup keeps (two 1440x1080 videos a month).
         "capture_folder": str(capture_dir.resolve()),
     }
-    if fit_mode != FIT_MOTOR_FRAME:
-        # Recorded only when it is not the motor-frame fit, so those calibrations read as before.
-        capture["fit"] = fit_mode
-        if per_view_options:
-            capture["fit_principal_point"] = "centre"
-        if "placement" in per_view_options:
-            capture["placement"] = placement
+    capture.update(fit_settings(fit_mode, per_view_options))
     with tempfile.TemporaryDirectory(prefix="calibration_coverage_") as tmp:
         # Every camera's, from extraction: a 2D-only camera's shows what it did see. The
         # hulls do not depend on the corner order.
@@ -589,6 +578,32 @@ def calibrated_preset_sets(live: Mapping[str, PresetGeometry], calibrated: Seque
     if missing:
         raise ValueError(f"no live geometry for {', '.join(missing)}")
     return presets_for_cameras({cam: live[cam] for cam in calibrated})
+
+
+def fit_options(fit_mode: str, fix_principal_point: bool, placement: str) -> Dict[str, object]:
+    """The keyword options calibrate_capture passes to the per-view fit: only those that differ
+    from its defaults, and none for the motor-frame fit."""
+    options: Dict[str, object] = {}
+    if fit_mode != FIT_MOTOR_FRAME:
+        if fix_principal_point:
+            options["fix_principal_point"] = True
+        if placement != "similarity":
+            options["placement"] = placement
+    return options
+
+
+def fit_settings(fit_mode: str, options: Mapping[str, object]) -> Dict[str, str]:
+    """What calibration.yaml records under `capture` about the fit: `fit` for a per-view fit,
+    `fit_principal_point: centre` when it held the principal point, and `placement` when it
+    was not the similarity. Nothing for the motor-frame fit, so those calibrations read as before."""
+    if fit_mode == FIT_MOTOR_FRAME:
+        return {}
+    out = {"fit": fit_mode}
+    if options.get("fix_principal_point"):
+        out["fit_principal_point"] = "centre"
+    if "placement" in options:
+        out["placement"] = str(options["placement"])
+    return out
 
 
 def _fit(mode: str, *args, **kwargs) -> MotorFrameFit:

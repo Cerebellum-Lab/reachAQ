@@ -29,6 +29,7 @@ from reachaq.inference.multires_calibration.report import (
     UNDETERMINED,
     CameraVerdict,
     CaptureSummary,
+    Metric,
     PresetCrossCheck,
     PreviousCalibration,
     QualityReport,
@@ -798,3 +799,13 @@ def test_the_stage_block_reports_slack_and_repeat_visits_and_never_fails(rig, fi
     stage_at = lines.index(STAGE_HEADING)
     stage_names = {line.split()[1] for line in lines[stage_at + 1:] if line.split() and line.split()[0] in STATUS_WORDS}
     assert stage_names >= set(STAGE_METRICS)
+
+
+@pytest.mark.parametrize("camera", ["left", "camera4", "left-camera4"])
+def test_the_text_keeps_the_camera_apart_from_the_value(camera):
+    # A 7-character camera name filled the column, so "camera4" ran into "0.9176".
+    m = Metric("reprojection_rms_px", camera, 0.9176, "sensor px", 0.5, 1.0, "warn")
+    report = QualityReport(created="2026-11-24T00:00:00-07:00", verdict="warn", metrics=[m],
+                           thresholds={m.name: (0.5, 1.0)}, notes=[])
+    (line,) = [line for line in report.to_text().splitlines() if line.startswith("WARN")]
+    assert line.split()[1:4] == ["reprojection_rms_px", camera, "0.9176"]
