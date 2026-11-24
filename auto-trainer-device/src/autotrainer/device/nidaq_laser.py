@@ -639,6 +639,9 @@ class NidaqLaserController:
         #: own reset of the command refused, by id, under the lock; close()
         #: says so when its own reset of one succeeds (_note_reset_after_all).
         self._left_driven: set = set()
+        #: Set when the open fails: its close then drives safe every
+        #: configured laser, those it never opened by transient tasks.
+        self._open_failed = False
         try:
             for channel in configuration.channels:
                 channel_started = time.perf_counter()
@@ -665,6 +668,7 @@ class NidaqLaserController:
                     time.perf_counter() - channel_started,
                 )
         except Exception as error:
+            self._open_failed = True
             still_closing = self._close_after_failed_open()
             if still_closing is not None:
                 # For the caller, which never holds this controller: set when
@@ -1984,7 +1988,7 @@ class NidaqLaserController:
                 with self._operation_lock:
                     self._given_up_operations.append(operation)
         for channel in self._configuration.channels:
-            if channel.channel_id not in self._tasks:
+            if channel.channel_id not in self._tasks and not self._open_failed:
                 continue
             errors.extend(self._drive_channel_safe(channel, "close"))
         for channel_id, tasks in self._tasks.items():
