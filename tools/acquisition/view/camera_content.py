@@ -196,6 +196,7 @@ class CameraContent(ContentWidget):
                 self._capture_view.setShape(value[1], value[0])
         elif name == VideoCaptureModel.CAMERA_LIST_PROP:
             self._capture_view.setCameras(self._model.camera_list)
+            self._capture_view.setCamera(self._model.camera_source)
         elif name == VideoCaptureModel.TEXT_OVERLAY_PROP:
             self._text_overlay = value
             self._capture_view.set_text_overlay(

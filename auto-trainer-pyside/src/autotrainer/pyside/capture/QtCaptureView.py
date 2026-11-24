@@ -211,12 +211,27 @@ class QCaptureView(QWidget):
             self._camera.setCurrentIndex(self._cameras.index(camera))
 
     def setCameras(self, cameras: list):
+        # Repopulating is not a selection. clear() and the first addItem each
+        # moved the index, and each emitted camera_changed, which set the
+        # model's source to None and then to the first camera, under a capture
+        # start running on another thread.
+        current = self._camera.currentData()
         self._cameras = cameras
 
-        self._camera.clear()
+        blocked = self._camera.blockSignals(True)
+        try:
+            self._camera.clear()
 
-        for camera in cameras:
-            self._camera.addItem(camera.name, camera)
+            for camera in cameras:
+                self._camera.addItem(camera.name, camera)
+            if current in cameras:
+                self._camera.setCurrentIndex(cameras.index(current))
+        finally:
+            self._camera.blockSignals(blocked)
+        self._show_camera_name(self._camera.currentData())
+
+    def _show_camera_name(self, camera) -> None:
+        self._camera_name_label.setText(camera.name if camera else "None")
 
     def setTitle(self, title: str):
         self._card_widget.header.setTitle(title)
@@ -370,10 +385,7 @@ class QCaptureView(QWidget):
 
     def _source_changed(self, index):
         camera = self._camera.itemData(index)
-        if camera:
-            self._camera_name_label.setText(camera.name)
-        else:
-            self._camera_name_label.setText("None")
+        self._show_camera_name(camera)
         self.camera_changed.emit(camera)
 
     def _set_recording_enabled_indicator(self, b: bool):

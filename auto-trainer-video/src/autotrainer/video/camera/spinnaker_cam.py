@@ -804,7 +804,7 @@ class SpinCam(CameraBase):
                 logger.warning("%s: GenApi is not readable or writeable", name)
                 set_value = None
         except Exception as err:
-            logger.error("%s: Exception during set: %s", err)
+            logger.error("%s: Exception during set: %s", name, err)
 
         return set_value
 

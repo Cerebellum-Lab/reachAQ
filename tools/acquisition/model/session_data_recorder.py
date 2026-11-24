@@ -314,6 +314,8 @@ class SessionDataRecorder:
         self._laser_rows = []
         self._event_queue = Queue(maxsize=max(1, int(structured_event_capacity)))
         self._structured_event_overruns = 0
+        # Rows a stop() has drained but no snapshot holds yet; see stop().
+        self._stop_event_rows = ()
         self._event_capture_lock = threading.Lock()
         self._event_capture_enabled = False
         self._event_manager = event_manager
@@ -383,6 +385,7 @@ class SessionDataRecorder:
         with self._event_capture_lock:
             self._event_capture_enabled = False
             self._drain_event_queue()
+            self._stop_event_rows = ()
             self._structured_event_overruns = 0
             self._event_capture_enabled = True
         with self._lock:
@@ -528,13 +531,18 @@ class SessionDataRecorder:
     def stop(self, end_perf: float):
         with self._event_capture_lock:
             self._event_capture_enabled = False
-            event_rows = self._drain_event_queue()
+            # A stop that raises below is retried by calling stop() again,
+            # when the queue is already empty, so what this attempt drains is
+            # kept until a snapshot holds it.
+            self._stop_event_rows += self._drain_event_queue()
+            event_rows = self._stop_event_rows
         with self._lock:
             self._pending_stop_end_perf = float(end_perf)
         self._stop_nidaq_thread()
         with self._locked_then_log() as failures:
             if not self._armed or self._project is None or self._start_perf is None:
                 self._pending_stop_end_perf = None
+                self._stop_event_rows = ()
                 self._end_latency_events(
                     failures, "the recorder is cleared without it")
                 self._clear_locked()
@@ -610,6 +618,7 @@ class SessionDataRecorder:
             }
             self._armed = False
             self._pending_stop_end_perf = None
+            self._stop_event_rows = ()
             self._pending_finalization = snapshot
         return self._publish_pending_finalization(max_attempts=2)
 
@@ -682,10 +691,12 @@ class SessionDataRecorder:
             "snapshot were retained for retry"
         ) from first_error
 
-    def abort(self) -> None:
+    def abort(self, *, keep_spool: bool = False) -> None:
+        """Clear the recorder; keep_spool keeps an unfinished recording's spool."""
         with self._event_capture_lock:
             self._event_capture_enabled = False
             self._drain_event_queue()
+            self._stop_event_rows = ()
         self._stop_nidaq_thread()
         with self._locked_then_log() as failures:
             spool_path = self._nidaq_spool_path
@@ -698,7 +709,11 @@ class SessionDataRecorder:
             # its spool, as it keeps its other staged files; v3.0.1 deleted it
             # as the app closed and the session's NI data was lost for good.
             # Only an unfinished recording's spool is removed.
-            retained = pending is not None or self._pending_stop_end_perf is not None
+            retained = (
+                keep_spool
+                or pending is not None
+                or self._pending_stop_end_perf is not None
+            )
             project = (None if pending is None else pending.get("project")) or self._project
             self._pending_finalization = None
             self._pending_stop_end_perf = None
@@ -718,8 +733,8 @@ class SessionDataRecorder:
         """Request recorder shutdown without blocking the operator/UI thread."""
         self._nidaq_stop.set()
 
-    def close(self) -> None:
-        self.abort()
+    def close(self, *, keep_spool: bool = False) -> None:
+        self.abort(keep_spool=keep_spool)
         if self._system_message_handler is not None:
             self._system_message_handler.decoded_message_received -= self._on_device_message
         if self._hardware_model is not None:

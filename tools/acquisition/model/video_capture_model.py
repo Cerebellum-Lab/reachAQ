@@ -382,9 +382,9 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
     def set_runtime_primary(self, is_primary: bool) -> None:
         self._is_primary = is_primary
 
-    def _runtime_camera_url(self) -> str:
+    def _runtime_camera_url(self, source: Optional[CaptureCameraAttrs] = None) -> str:
         """Apply the effective capture role and binning preset without mutating saved configuration."""
-        camera_url = self._camera_source.url
+        camera_url = (self._camera_source if source is None else source).url
         parsed = urllib.parse.urlsplit(camera_url)
         is_spinnaker = parsed.scheme.lower() == "spinnaker"
         # Resolved from the parsed properties, which include the camera
@@ -548,7 +548,10 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
             return True
         # Resolve the capture URL first: an impossible binning preset raises
         # here, before any queue or reader is allocated for this start.
-        camera_url = None if self._camera_source is None else self._runtime_camera_url()
+        # Read the source once: the panel thread can replace it while a start
+        # runs, and a start that read it twice once found None, then a camera.
+        source = self._camera_source
+        camera_url = None if source is None else self._runtime_camera_url(source)
         if self._is_recording_enabled and self.video_encoder == "x264" and not x264_available():
             raise ValueError(
                 f"capture binning {self.capture_binning} records H.264 through ffmpeg's libx264, "
@@ -567,7 +570,7 @@ class VideoCaptureModel(ObservableObject, ProjectDependentProtocol):
 
         self._video_reader_initialize()
 
-        if self._camera_source is not None:
+        if source is not None:
             if "?" in camera_url:
                 url = camera_url + f"&name={self._name}"
             else:

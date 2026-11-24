@@ -54,6 +54,16 @@ The Behavior panel owns the session controls:
 | **Stop** | Recording | Selects the final synchronized camera boundary, closes all writers, retains the session, and drains already-closed pellet-trial analyses |
 | **Abort** | Arming, Recording, Stopping, or Analyzing | Cancels the intertrial-analysis generation, waits for writers to close, deletes the entire session directory, and resets session counts |
 
+Only Abort deletes a session. Closing the window while a session is arming or
+recording asks first: **Stop, save and close** stops the recording normally and
+waits for it to be saved, **Abort (delete session) and close** aborts it, and
+**Cancel** keeps the window open. While a stopped session is still being saved,
+closing asks whether to close once saving finishes. Stopping acquisition, from
+closing or from the headless shutdown, waits up to 120 s for the session to be
+saved; past that it closes with an error and leaves the session's files on disk,
+unfinalized, NI-DAQ spool included. The local API's `STOP_ACQUISITION` is refused
+while a session runs.
+
 The recording state progresses through `Ready`, `Arming`, `Recording`,
 `Stopping`, and `Analyzing`. Record stays disabled until all already-closed
 pellet windows and stopped-session finalization finish. Intertrial analysis uses
@@ -192,9 +202,9 @@ that exact generation and republishes its authoritative metadata; it cannot star
 new session while the previous one remains incomplete. Successful generations remove
 only now-empty staging directories. Failed staged files are never recursively cleaned
 and remain available for diagnosis and retry. Closing the application while a
-finalization is still retained keeps its NI-DAQ spool,
-`.staging/<generation>/streams/nidaq_capture.h5`, and logs its path; only the spool
-of a recording that never stopped is removed.
+finalization is still retained, or before a session was saved within the bound,
+keeps its NI-DAQ spool, `.staging/<generation>/streams/nidaq_capture.h5`, and logs
+its path.
 
 The HDF5 files the application's own process writes (the NI-DAQ spool, `nidaq.h5`,
 `events.h5` and `latency.h5`) are marked close-on-exec as they are opened. HDF5 opens

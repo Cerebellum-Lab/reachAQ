@@ -59,7 +59,7 @@ line, at most 1 MiB. Every connected client receives every event.
 |---|---:|---|
 | `NONE` | 0 | `success`, no data. |
 | `START_ACQUISITION` | 1 | `pending_with_notification`, then a second response with the outcome. |
-| `STOP_ACQUISITION` | 2 | As for start. |
+| `STOP_ACQUISITION` | 2 | As for start, but refused (`failed`, `command_error`) while a session is arming, recording, stopping, analyzing or aborting, as the GUI disables System Mode then. It once aborted the recording and deleted the session. Stop the recording and wait for the session to be saved first. |
 | `GET_STATUS` | 3 | `data` is the reachAQ status (`ReachAQSystemStatus`, the same payload as the `systemStatus` event). |
 | `GET_CONFIGURATION` | 4 | `data` has `application_version`, `device_id`, `configuration_location`, `data_location`, `animal_location`, `log_location`, `inference_model`. |
 | `USER_DEFINED` | 100 | Accepted, not yet acted on. |

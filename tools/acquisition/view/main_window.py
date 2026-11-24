@@ -898,7 +898,7 @@ class MainWindow(QMainWindow):
                 if target_status != AppModelStatus.IDLE:
                     self._on_capture_start_stop(True, target_status=target_status)
             else:
-                logger.verbose("AppModelStatus not idle, not starting acquisition", app_status)
+                logger.verbose("AppModelStatus not idle (%s), not starting acquisition", app_status)
 
     def on_calibrate_diamond_triangle(self, is_toggled):
         refusal = self._app_model.dcs_refusal() if is_toggled and self._diamond_triangle_calib_run is None else None
@@ -1292,15 +1292,92 @@ class MainWindow(QMainWindow):
         self._open_dialogs = []
         for dialog in dialogs:
             dialog.close()
+        self._close_finishing = True
         super().close()
+
+    def _confirm_close_with_session(self) -> bool:
+        """Ask before closing over a session; True to go on closing.
+
+        Closing stops acquisition, which once aborted a recording and deleted
+        the session with no prompt. It now stops and saves; deleting is the
+        operator's explicit choice here, as with Abort.
+        """
+        app_model = self._app_model
+        status = app_model.session_recording_status
+        if status is SessionRecordingStatus.READY:
+            return True
+        project = app_model.project
+        session = "The session" if project is None else project.short_id
+        box = QMessageBox(self)
+        box.setWindowTitle("Session in progress")
+        box.setIcon(QMessageBox.Icon.Warning)
+        abort = None
+        if status in {SessionRecordingStatus.ARMING, SessionRecordingStatus.RECORDING}:
+            box.setText(
+                f"{session} is recording. Closing stops the recording and "
+                "saves it first."
+            )
+            proceed = box.addButton("Stop, save and close", QMessageBox.ButtonRole.AcceptRole)
+            abort = box.addButton(
+                "Abort (delete session) and close", QMessageBox.ButtonRole.DestructiveRole)
+        elif status is SessionRecordingStatus.ABORTING:
+            box.setText(
+                f"{session} is being aborted. Close when that finishes?"
+            )
+            proceed = box.addButton("Close when done", QMessageBox.ButtonRole.AcceptRole)
+        else:
+            box.setText(
+                f"{session} is still being saved. Close when saving finishes?"
+            )
+            proceed = box.addButton("Close when saved", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if abort is not None and clicked == abort:
+            if not app_model.abort_recording():
+                self._show_msg_box(
+                    "Abort refused",
+                    f"{session} could not be aborted; it was not closed.",
+                    QMessageBox.Icon.Warning,
+                )
+                return False
+            return True
+        return clicked == proceed
 
     def close(self):
         logger.debug("received close")
         with self._app_model.app_lock:
+            closing = self._closing
+        if not closing:
+            # The prompt runs a nested event loop, in which a second close
+            # (another window close, Ctrl-C) can arrive: it waits for this one.
+            event = self._close_event
+            self._close_event = None
+            if getattr(self, "_confirming_close", False):
+                if event is not None:
+                    event.ignore()
+                return
+            self._confirming_close = True
+            try:
+                confirmed = self._confirm_close_with_session()
+            finally:
+                self._confirming_close = False
+            if not confirmed:
+                if event is not None:
+                    event.ignore()
+                return
+            self._close_event = event
+        with self._app_model.app_lock:
             event = self._close_event
             if self._closing:
                 if event is not None:
-                    event.accept()
+                    # Only the close _finish_close makes is accepted: one
+                    # made while the close thread still saves a session would
+                    # take the window, and its error dialogs, away early.
+                    if getattr(self, "_close_finishing", False):
+                        event.accept()
+                    else:
+                        event.ignore()
                     self._close_event = None
                 else:
                     logger.warning("already closing")

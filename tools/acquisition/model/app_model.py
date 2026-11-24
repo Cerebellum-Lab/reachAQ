@@ -402,6 +402,10 @@ _LASER_CALIBRATION_RAMP_END_WAIT_S = 2.0
 #: laser; the reset is refused, and the close raises, while the ramp still
 #: holds the output.
 _LASER_CONTROLLER_CLOSE_S = 15.0
+#: How long stopping acquisition, or closing, waits for a session to be
+#: stopped and saved before going on without it (Ben, 2026-11-23). Saving a
+#: 45-minute session took 15.5 s on christielab10.
+SESSION_SAVE_BEFORE_STOP_TIMEOUT_S = 120.0
 #: Why laser work is refused while a controller close given up on is still
 #: inside the driver.
 _LASER_CLOSE_PENDING_REFUSAL = (
@@ -932,6 +936,11 @@ class AppModel(ObservableObject):
         self._animal_name = ""
         self._notes = ""
         self._editable_notes_project: Optional[ProjectInfo] = None
+        # The last session document published for a session; a notes save
+        # republishes it with only its notes changed. See _save_metadata.
+        self._session_metadata_document: Optional[Dict[str, Any]] = None
+        # A stop gave up waiting for a session to be saved; see capture_stop.
+        self._session_left_unsaved = False
         self._last_stopped_session_path: Optional[Path] = None
         # One gate for every write to a stopped session's published files
         # (metadata json/yaml, manifest.json) and for the start of a
@@ -1704,6 +1713,16 @@ class AppModel(ObservableObject):
             if not self._reference_check_pending:
                 self._reference_check = None
             self._reference_check_pending = False
+            if self._session_left_unsaved:
+                # The recorder still holds that session; a new arm would be
+                # refused and its cleanup would clear the old session's data.
+                self.on_error(
+                    "Recording unavailable",
+                    "A stop gave up waiting for the previous session to be "
+                    "saved; its files are kept unfinalized. Restart reachAQ "
+                    "before recording again.",
+                )
+                return False
             return self._start_recording_locked()
 
     def _start_recording_locked(self) -> bool:
@@ -9553,6 +9572,9 @@ class AppModel(ObservableObject):
         if reach_failed:
             if self._retry_reach_camera_domains():
                 retried.append("reach cameras")
+            # Also after a partial retry: each camera it brought back needs
+            # supervising, as at Run.
+            self._register_ready_camera_watchdogs()
         if SubsystemId.CAN_PELLET.value in failed:
             if self._start_can_domain(wait_connected=True):
                 retried.append("CAN/pellet")
@@ -9580,6 +9602,10 @@ class AppModel(ObservableObject):
                 preflight_error=None,
             )
         ):
+            self._analysis.watchdog_monitor.register_watchdog(
+                WatchdogItems.POSE_DATA_MONITOR_PROC,
+                lambda: self._inference.watchdog_monitor_data_proc_perf_c,
+            )
             retried.append("live inference")
         remaining = self._acquisition.subsystems.recording_blockers()
         if remaining:
@@ -9592,6 +9618,21 @@ class AppModel(ObservableObject):
             if retried
             else "All required subsystems are already ready"
         )
+
+    def _register_ready_camera_watchdogs(self) -> None:
+        """Supervise every camera whose domain is READY.
+
+        Run and a subsystem retry both call this. A camera brought back by a
+        retry had no watchdog, so a later stall in it was never detected and
+        the session finalized with its video cut short.
+        """
+        register = self._analysis.watchdog_monitor.register_watchdog
+        for cam in self._cameras:
+            status = self._acquisition.subsystems.get(
+                SubsystemId.camera(cam.name)
+            )
+            if status is not None and status.is_ready:
+                register(f"camera.{cam.name}", lambda cam=cam: cam.watchdog_capture_perf_c)
 
     def _retry_reach_camera_domains(self) -> bool:
         all_cameras = self._ordered_reach_cameras(enabled_only=True)
@@ -9756,6 +9797,36 @@ class AppModel(ObservableObject):
             self._session_invariant_unknown = False
             self._start_count += 1
             is_first_start = self._start_count == 1
+        try:
+            return self._capture_start_begun(
+                target_status=target_status,
+                wait_connected=wait_connected,
+                hardware_init_started=hardware_init_started,
+                previous_internal_error=previous_internal_error,
+            )
+        except BaseException:
+            # The start flag is cleared only by mark_started or a stop; left
+            # set, Run and Stop both refused for the rest of the run and
+            # whatever had opened stayed open. Tear down what started. Once
+            # marked started, Stop works and what failed was a notification
+            # after it: acquisition stays running, as before.
+            if not self._acquisition.started:
+                logger.exception("Acquisition start failed; stopping what it started")
+                try:
+                    self.capture_stop(force=True)
+                except Exception:
+                    logger.exception("Stopping a failed acquisition start also failed")
+            raise
+
+    def _capture_start_begun(
+        self,
+        *,
+        target_status: AppModelStatus,
+        wait_connected: bool,
+        hardware_init_started: float,
+        previous_internal_error,
+    ) -> bool:
+        """The rest of capture_start, once its start flag is set."""
         if previous_internal_error is not None:
             self._on_property_changed(
                 self.Props.INTERNAL_ERROR_DIAGNOSTIC,
@@ -9921,12 +9992,7 @@ class AppModel(ObservableObject):
                 lambda: self._hardware.watchdog_writer_perf_c,
             )
 
-        for cam in self._cameras:
-            status = self._acquisition.subsystems.get(
-                SubsystemId.camera(cam.name)
-            )
-            if status is not None and status.is_ready:
-                watchdog_mon_register(f"camera.{cam.name}", lambda cam=cam: cam.watchdog_capture_perf_c)
+        self._register_ready_camera_watchdogs()
 
         if __debug__ and os.getenv("_AUTOTRAINER_TEST_WATCHDOG") == "1":
             def fake_watchdog(t_end):
@@ -9982,21 +10048,61 @@ class AppModel(ObservableObject):
 
         return True
 
-    def capture_stop(self, force: bool = False):
+    def save_session_before_stop(self, timeout_s: Optional[float] = None) -> bool:
+        """Stop a recording normally and wait, bounded, until it is saved.
+
+        True once the session is READY. An arming session is waited for until
+        it records, then stopped; a stopping, analyzing or aborting one is
+        waited for. False when the bound passed first: the session is left as
+        it is, nothing is deleted or discarded.
+        """
+        if timeout_s is None:
+            timeout_s = SESSION_SAVE_BEFORE_STOP_TIMEOUT_S
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        stop_requested_at = -math.inf
+        announced = False
+        while True:
+            status = self._recording_session.status
+            if status is SessionRecordingStatus.READY:
+                return True
+            if not announced:
+                logger.notice(
+                    "Saving the session (%s) before acquisition stops",
+                    status.value,
+                )
+                announced = True
+            # A refused stop leaves it RECORDING; ask again, once a second.
+            now = time.monotonic()
+            if (
+                status is SessionRecordingStatus.RECORDING
+                and now - stop_requested_at >= 1.0
+            ):
+                stop_requested_at = now
+                self.stop_recording()
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+    def capture_stop(self, force: bool = False, *, save_timeout_s: Optional[float] = None):
         logger.debug("AppModel.capture_stop")
+        # Before begin_stop: while the session finishes, acquisition is still
+        # running, so a subsystem failure meanwhile is still handled as one.
+        # A stop never deletes a session; only an operator Abort does.
+        saved = self.save_session_before_stop(save_timeout_s)
         with self.app_lock:
             if not self._acquisition.begin_stop(force=force):
                 logger.verbose("acquisition not running or already stopping")
                 return
             before_status = self._status
-            recording_status = self._recording_session.status
             session_token = self._recording_session.token()
-        if recording_status in {
-            SessionRecordingStatus.ARMING,
-            SessionRecordingStatus.RECORDING,
-        }:
-            logger.warning("Acquisition stop requested during recording; aborting the session")
-            self.abort_recording(token=session_token)
+        if not saved:
+            message = (
+                "The session was not saved before acquisition stopped "
+                f"(still {self._recording_session.status.value}). Its files "
+                "are kept on disk, unfinalized; nothing was deleted."
+            )
+            logger.error(message)
+            self.on_error("Session not finalized", message)
         # always remove status-file on stop:
         status_file_path = self.status_file_path.expanduser()
         status_file_path.unlink(missing_ok=True)
@@ -10008,9 +10114,12 @@ class AppModel(ObservableObject):
             # must be set before try reload training plans, given checked in it
             self._acquisition.mark_stopped()
             if self._recording_session.status == SessionRecordingStatus.ABORTING:
+                # An operator Abort still finishing: it deletes, as asked.
                 self._finish_abort_recording(token=session_token)
             elif self._recording_session.status != SessionRecordingStatus.READY:
-                self._session_data_recorder.abort()
+                # Given up on above: Idle needs READY, but the recorder keeps
+                # what it holds, and closing keeps the spool with the files.
+                self._session_left_unsaved = True
                 self._set_session_recording_status(
                     SessionRecordingStatus.READY,
                     token=session_token,
@@ -10818,6 +10927,12 @@ class AppModel(ObservableObject):
 
     def on_close(self):
         logger.debug("AppModel.on_close")
+        # Closing saves a running session first, as a stop does, while it can
+        # still finish. The window has already stopped acquisition, asking and
+        # waiting, so this is for a headless close. The stop below does not
+        # wait out the bound a second time.
+        if self._acquisition.started:
+            self.save_session_before_stop()
         # Stop command producers first so none can race with CAN teardown or
         # reschedule themselves after their current timer is cancelled.
         self._prepare_application_shutdown()
@@ -10844,11 +10959,18 @@ class AppModel(ObservableObject):
             pass
         if not self._intertrial_analysis.close():
             logger.warning("Intertrial analysis worker did not stop cleanly")
-        self._session_data_recorder.close()
+        # A session the bound gave up on keeps its NI-DAQ spool with the rest
+        # of its files.
+        self._session_data_recorder.close(
+            keep_spool=(
+                self._session_left_unsaved
+                or self._recording_session.status is not SessionRecordingStatus.READY
+            ),
+        )
         self._analysis.stop()
 
         # ensure go back to IDLE mode + stop cameras & inference & analysis + hardware disconnect :
-        self.capture_stop()
+        self.capture_stop(save_timeout_s=0.0)
 
         self._close_laser_within_bound("reachAQ is closing")
 
@@ -12676,7 +12798,10 @@ class AppModel(ObservableObject):
                         f"Cannot finalize {project_info.short_id}: canonical "
                         "boundary differs from streams/alignment.json"
                     )
-            self._save_metadata(project_info, when, file_name, session)
+            self._save_metadata(
+                project_info, when, file_name, session,
+                notes_only=caller == "session_notes_updated",
+            )
             if session is not None:
                 # Only session metadata carries the live notes.
                 self._notes_saved_revision = notes_revision
@@ -12696,7 +12821,51 @@ class AppModel(ObservableObject):
             "uncalibratedReason": None if camera.name in calibrated else reasons.get(camera.name),
         }
 
-    def _save_metadata(self, project: ProjectInfo, when: datetime, file_name: str, session: Optional[int] = -1):
+    def _save_metadata(
+        self,
+        project: ProjectInfo,
+        when: datetime,
+        file_name: str,
+        session: Optional[int] = -1,
+        *,
+        notes_only: bool = False,
+    ):
+        """Build and publish a metadata document; see notes_only.
+
+        A session document is built from live model state, which is the
+        session's own only until the next one is set up. A notes save comes
+        later (as late as the next Record), so with notes_only it republishes
+        the session's last document with only the notes changed: rebuilt, it
+        carried the next session's protocol, stimulus profiles and laser
+        configuration into this one.
+        """
+        previous = self._session_metadata_document
+        if (
+            notes_only
+            and session is not None
+            and previous is not None
+            and previous.get("sessionId") == project.short_id
+        ):
+            out = {**previous, "notes": self.notes or ""}
+        else:
+            if notes_only and session is not None:
+                logger.warning(
+                    "No published document for %s; its notes save rebuilds it "
+                    "from the current state",
+                    project.short_id,
+                )
+            out = self._metadata_document(project, when, file_name, session)
+        if session is not None:
+            self._session_metadata_document = out
+        self._publish_metadata(out, when, file_name, session)
+
+    def _metadata_document(
+        self,
+        project: ProjectInfo,
+        when: datetime,
+        file_name: str,
+        session: Optional[int],
+    ) -> Dict[str, Any]:
         when_as_utc = when.astimezone(timezone.utc)
         metadata_generation_id = (
             f"acquisition-{when_as_utc.timestamp()}"
@@ -12880,7 +13049,16 @@ class AppModel(ObservableObject):
                         "laser": "simulated", "can": "emulation",
                     },
                 }
-        out = _metadata_without_nonfinite_numbers(out)
+        return _metadata_without_nonfinite_numbers(out)
+
+    def _publish_metadata(
+        self,
+        out: Dict[str, Any],
+        when: datetime,
+        file_name: str,
+        session: Optional[int],
+    ) -> None:
+        when_as_utc = when.astimezone(timezone.utc)
         json_path = Path(file_name + ".json")
         yaml_path = Path(file_name + ".yaml")
         session_dir = None if session is None else Path(file_name).parent
@@ -13032,6 +13210,20 @@ class AppModel(ObservableObject):
             return self._handle_rpc_async_command(request, self.capture_start)
 
         elif cmd == ApiCommand.STOP_ACQUISITION:
+            # As the GUI: System Mode cannot change while a session runs. This
+            # stopped a recording by aborting it, deleting the session.
+            recording_status = self._recording_session.status
+            if recording_status is not SessionRecordingStatus.READY:
+                return ApiCommandRequestResponse(
+                    result=ApiCommandRequestResult.FAILED,
+                    nonce=request.nonce,
+                    command=cmd,
+                    error_code=ApiCommandRequestErrorKind.COMMAND_ERROR,
+                    error_message=(
+                        f"A session is {recording_status.value}; stop it and "
+                        "wait for it to be saved before stopping acquisition"
+                    ),
+                )
             return self._handle_rpc_async_command(request, self.capture_stop)
 
         elif cmd == ApiCommand.USER_DEFINED:

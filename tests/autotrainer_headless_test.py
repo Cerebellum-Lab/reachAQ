@@ -1981,6 +1981,184 @@ def test_hardware_start_failure_performs_can_safety_shutdown(
     assert app_model._acquisition.starting is False
 
 
+def test_a_start_that_raises_tears_down_and_can_run_again(
+    app_model,
+    monkeypatch,
+):
+    # An unwritable output path made the start-up metadata save raise after
+    # the hardware had opened. The start flag stayed set: Run said
+    # "already starting" and Stop did nothing until a restart.
+    assert app_model.load_configuration() is True
+    save = app_model._save_project_metadata
+    failure = FileNotFoundError("output drive unwritable")
+    monkeypatch.setattr(app_model, "_save_project_metadata", mock.Mock(side_effect=failure))
+    capture_stop = mock.Mock(wraps=app_model._capture_stop)
+    monkeypatch.setattr(app_model, "_capture_stop", capture_stop)
+
+    with pytest.raises(FileNotFoundError):
+        app_model.capture_start()
+
+    assert capture_stop.called
+    assert app_model._acquisition.starting is False
+    assert app_model.acquisition_started is False
+    assert app_model.status is AppModelStatus.IDLE
+
+    monkeypatch.setattr(app_model, "_save_project_metadata", save)
+    try:
+        assert app_model.capture_start() is True
+        assert app_model.acquisition_started is True
+    finally:
+        app_model.capture_stop()
+
+
+def test_a_failure_after_the_start_completed_leaves_acquisition_running(
+    app_model,
+    monkeypatch,
+):
+    assert app_model.load_configuration() is True
+    monkeypatch.setattr(
+        app_model, "_log_acquisition_startup_summary",
+        mock.Mock(side_effect=RuntimeError("summary failed")),
+    )
+    capture_stop = mock.Mock(wraps=app_model.capture_stop)
+    monkeypatch.setattr(app_model, "capture_stop", capture_stop)
+    try:
+        with pytest.raises(RuntimeError, match="summary failed"):
+            app_model.capture_start()
+
+        capture_stop.assert_not_called()
+        assert app_model.acquisition_started is True
+    finally:
+        app_model.capture_stop()
+
+
+def test_a_camera_brought_back_by_retry_is_supervised_again(
+    app_model, system_config, trainer_config_dir,
+):
+    # The watchdog that timed out unregistered the camera; Refresh Hardware
+    # brought it back READY with none, so a later stall went undetected.
+    for camera in system_config.cameras:
+        if camera.id in (CameraId.Left, CameraId.Right):
+            camera.is_enabled = True
+            camera.is_record_enabled = True
+    system_config.save_default(trainer_config_dir)
+    assert app_model.load_configuration() is True
+    assert app_model.capture_start() is True
+    try:
+        watchdogs = app_model._analysis.watchdog_monitor
+        camera = next(
+            camera for camera in app_model._ordered_reach_cameras(enabled_only=True)
+            if f"camera.{camera.name}" in watchdogs.registered_watchdogs
+        )
+        key = f"camera.{camera.name}"
+
+        app_model._handle_watchdog_timeout(key)
+        assert key not in watchdogs.registered_watchdogs
+        assert app_model.subsystem_statuses[key].state is SubsystemState.FAILED
+
+        app_model.retry_failed_subsystems()
+
+        assert app_model.subsystem_statuses[key].state is SubsystemState.READY
+        assert key in watchdogs.registered_watchdogs
+    finally:
+        app_model.capture_stop()
+
+
+def _record_left_and_right(app_model, system_config, trainer_config_dir, animal):
+    for camera in system_config.cameras:
+        if camera.id in (CameraId.Left, CameraId.Right):
+            camera.is_enabled = True
+            camera.is_record_enabled = True
+    system_config.save_default(trainer_config_dir)
+    assert app_model.load_configuration() is True
+    app_model.set_runtime_live_inference_override(
+        not system_config.inference.is_enabled)
+    assert app_model.capture_start() is True
+    assert app_model.add_animal(animal, select=True) is not None
+    assert app_model.start_recording() is True
+    _wait_until(lambda: app_model.session_recording_status
+                is SessionRecordingStatus.RECORDING, timeout=30)
+    return Path(app_model.project.get_session_path(skip_ensure=True).location)
+
+
+def test_stopping_acquisition_during_a_recording_saves_the_session(
+    app_model, system_config, trainer_config_dir,
+):
+    # Closing the window stops acquisition, and a stop during a recording
+    # aborted it: the session directory was deleted with no prompt.
+    session_path = _record_left_and_right(
+        app_model, system_config, trainer_config_dir, "stop-saves")
+    abort = mock.Mock(wraps=app_model.abort_recording)
+    with mock.patch.object(app_model, "abort_recording", abort):
+        app_model.capture_stop()
+
+    abort.assert_not_called()
+    assert app_model.session_recording_status is SessionRecordingStatus.READY
+    assert session_path.is_dir()
+    assert (session_path / "manifest.json").is_file()
+    assert app_model.acquisition_started is False
+
+
+def test_a_session_not_saved_within_the_bound_is_left_on_disk(
+    app_model, system_config, trainer_config_dir, monkeypatch,
+):
+    from tools.acquisition.model import app_model as app_model_module
+
+    session_path = _record_left_and_right(
+        app_model, system_config, trainer_config_dir, "stop-bound")
+    monkeypatch.setattr(app_model_module, "SESSION_SAVE_BEFORE_STOP_TIMEOUT_S", 0.2)
+    # The writers never report closure: the session stays STOPPING.
+    monkeypatch.setattr(app_model, "_complete_stopped_recording", lambda *_a, **_k: None)
+    errors = []
+    monkeypatch.setattr(app_model, "on_error", lambda *args: errors.append(args))
+    recorder_abort = mock.Mock(wraps=app_model._session_data_recorder.abort)
+    monkeypatch.setattr(app_model._session_data_recorder, "abort", recorder_abort)
+
+    app_model.capture_stop()
+
+    assert session_path.is_dir()
+    recorder_abort.assert_not_called()
+    assert app_model._session_left_unsaved is True
+    # The recorder still holds that session: a new Record would clear it.
+    assert app_model.start_recording() is False
+    assert errors[-1][0] == "Recording unavailable"
+    assert any(title == "Session not finalized" for title, *_ in errors), errors
+    assert app_model.acquisition_started is False
+
+
+def test_a_refused_stop_is_asked_again(app_model, monkeypatch):
+    statuses = iter([SessionRecordingStatus.RECORDING] * 30 + [SessionRecordingStatus.READY])
+    monkeypatch.setattr(
+        type(app_model._recording_session), "status",
+        property(lambda _self: next(statuses, SessionRecordingStatus.READY)),
+    )
+    stop = mock.Mock(return_value=False)
+    monkeypatch.setattr(app_model, "stop_recording", stop)
+    clock = iter(range(0, 1000))
+    monkeypatch.setattr(time, "monotonic", lambda: float(next(clock)))
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+    assert app_model.save_session_before_stop(timeout_s=500) is True
+    assert stop.call_count > 1
+
+
+def test_the_api_refuses_to_stop_acquisition_while_a_session_runs(app_model):
+    from autotrainer.core.api.commands import (
+        ApiCommand,
+        ApiCommandRequest,
+        ApiCommandRequestResult,
+    )
+
+    app_model._recording_session.begin_record(app_model.project.short_id, {})
+    with mock.patch.object(app_model, "capture_stop") as capture_stop:
+        response = app_model._handle_rpc_service_command(
+            ApiCommandRequest(command=ApiCommand.STOP_ACQUISITION, nonce="n1"))
+
+    capture_stop.assert_not_called()
+    assert response.result is ApiCommandRequestResult.FAILED
+    assert "a session is arming" in response.error_message.lower()
+
+
 def test_periodic_command_producers_stop_without_touching_can():
     events = []
     app_model = object.__new__(AppModel)
