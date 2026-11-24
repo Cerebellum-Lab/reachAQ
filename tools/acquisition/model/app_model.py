@@ -533,6 +533,22 @@ def _serialized_session_configuration(method):
     return wrapped
 
 
+def _preparation_was_cancelled(executor, token) -> bool:
+    """Whether Stop or Abort cancelled this generation's trial preparation.
+
+    Never raises: it decides only how a failed preparation is reported.
+    """
+    try:
+        current = executor.operation
+        return (
+            current is not None
+            and current.state is PreparedState.CANCELLED
+            and current.recipe.session_generation == token.generation
+        )
+    except Exception:
+        return False
+
+
 def _metadata_without_nonfinite_numbers(value):
     """Replace NaN/Infinity recursively so JSON and YAML stay portable."""
     if isinstance(value, float) and not math.isfinite(value):
@@ -6879,12 +6895,7 @@ class AppModel(ObservableObject):
             # before a later motor or laser step failed. Never let those
             # actions leak into the next manual or protocol SEND.
             self._behavior.system_machine.pellet.cancel_prepared_cover_policy()
-            current = self._trial_action_executor.operation
-            if (
-                current is not None
-                and current.recipe.session_generation == token.generation
-                and current.state is PreparedState.CANCELLED
-            ):
+            if _preparation_was_cancelled(self._trial_action_executor, token):
                 # Stop or Abort cancelled it mid-preparation: not a failure.
                 logger.info("Pellet-trial preparation stopped: %s", error)
                 return
