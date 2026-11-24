@@ -2372,6 +2372,41 @@ def test_notes_save_without_a_running_validation_writes_at_once(app_model):
     save.assert_called_once_with(app_model._editable_notes_project, caller="session_notes_updated")
 
 
+def test_a_notes_save_changes_only_the_notes_of_the_finished_session(app_model):
+    # A notes save rebuilt the whole session document from live state: one
+    # made after the operator set up the next session wrote that session's
+    # settings into this one. Here the live stop reason stands in for them.
+    project = app_model.project.to_local_value()
+    _, token = app_model._recording_session.begin_record(project.short_id, {})
+    app_model._recording_session.set_boundary(SessionBoundary(
+        session_id=project.short_id,
+        primary_camera="left",
+        primary_frame_id=42,
+        start_perf_time=10.0,
+        start_wall_time=100.0,
+        camera_when=1_000_000.0,
+    ), token)
+    streams = Path(project.get_session_path().location) / "streams"
+    streams.mkdir(parents=True, exist_ok=True)
+    (streams / "alignment.json").write_text(json.dumps({
+        "canonicalBoundary": {"startPerfTime": 10.0, "startWallTime": 100.0},
+    }))
+    app_model._recording_ending_reason = RecordingEndingReason.MANUAL_STOP
+    app_model._notes = "typed during the session"
+    app_model._save_project_metadata(project, caller="intertrial_analysis_finished")
+    metadata = Path(project.get_metadata_file(project.session, project.when) + ".json")
+    finalized = json.loads(metadata.read_text())
+
+    app_model._recording_ending_reason = RecordingEndingReason.STORAGE_LIMIT
+    app_model._notes = "typed after the session"
+    app_model._save_project_metadata(project, caller="session_notes_updated")
+
+    saved = json.loads(metadata.read_text())
+    assert saved["notes"] == "typed after the session"
+    assert saved["recording"]["stopReason"] == "ManualStop"
+    assert {**saved, "notes": None} == {**finalized, "notes": None}
+
+
 def test_notes_wait_for_a_running_validation_and_are_saved_when_it_ends(app_model):
     app_model._editable_notes_project = app_model.project.to_local_value()
     states = [SessionValidationState(status="running", profile="quick")]

@@ -932,6 +932,9 @@ class AppModel(ObservableObject):
         self._animal_name = ""
         self._notes = ""
         self._editable_notes_project: Optional[ProjectInfo] = None
+        # The last session document published for a session; a notes save
+        # republishes it with only its notes changed. See _save_metadata.
+        self._session_metadata_document: Optional[Dict[str, Any]] = None
         self._last_stopped_session_path: Optional[Path] = None
         # One gate for every write to a stopped session's published files
         # (metadata json/yaml, manifest.json) and for the start of a
@@ -12715,7 +12718,10 @@ class AppModel(ObservableObject):
                         f"Cannot finalize {project_info.short_id}: canonical "
                         "boundary differs from streams/alignment.json"
                     )
-            self._save_metadata(project_info, when, file_name, session)
+            self._save_metadata(
+                project_info, when, file_name, session,
+                notes_only=caller == "session_notes_updated",
+            )
             if session is not None:
                 # Only session metadata carries the live notes.
                 self._notes_saved_revision = notes_revision
@@ -12735,7 +12741,45 @@ class AppModel(ObservableObject):
             "uncalibratedReason": None if camera.name in calibrated else reasons.get(camera.name),
         }
 
-    def _save_metadata(self, project: ProjectInfo, when: datetime, file_name: str, session: Optional[int] = -1):
+    def _save_metadata(
+        self,
+        project: ProjectInfo,
+        when: datetime,
+        file_name: str,
+        session: Optional[int] = -1,
+        *,
+        notes_only: bool = False,
+    ):
+        """Build and publish a metadata document; see notes_only.
+
+        A session document is built from live model state, which is the
+        session's own only until the next one is set up. A notes save comes
+        later (as late as the next Record), so with notes_only it republishes
+        the session's last document with only the notes changed: rebuilt, it
+        carried the next session's protocol, stimulus profiles and laser
+        configuration into this one.
+        """
+        previous = self._session_metadata_document
+        if (
+            notes_only
+            and session is not None
+            and previous is not None
+            and previous.get("sessionId") == project.short_id
+        ):
+            out = {**previous, "notes": self.notes or ""}
+        else:
+            out = self._metadata_document(project, when, file_name, session)
+        if session is not None:
+            self._session_metadata_document = out
+        self._publish_metadata(out, when, file_name, session)
+
+    def _metadata_document(
+        self,
+        project: ProjectInfo,
+        when: datetime,
+        file_name: str,
+        session: Optional[int],
+    ) -> Dict[str, Any]:
         when_as_utc = when.astimezone(timezone.utc)
         metadata_generation_id = (
             f"acquisition-{when_as_utc.timestamp()}"
@@ -12919,7 +12963,16 @@ class AppModel(ObservableObject):
                         "laser": "simulated", "can": "emulation",
                     },
                 }
-        out = _metadata_without_nonfinite_numbers(out)
+        return _metadata_without_nonfinite_numbers(out)
+
+    def _publish_metadata(
+        self,
+        out: Dict[str, Any],
+        when: datetime,
+        file_name: str,
+        session: Optional[int],
+    ) -> None:
+        when_as_utc = when.astimezone(timezone.utc)
         json_path = Path(file_name + ".json")
         yaml_path = Path(file_name + ".yaml")
         session_dir = None if session is None else Path(file_name).parent
