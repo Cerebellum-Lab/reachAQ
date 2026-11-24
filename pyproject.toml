@@ -34,6 +34,7 @@ auto-trainer-headless = "tools.acquisition.headless:main"
 reachaq = "reachAQ.app:main"
 reachaq-validate-session = "tools.session_validation.cli:main"
 reachaq-animal-metadata = "tools.acquisition.model.animal_sources.cli:main"
+reachaq-diagnostics = "tools.acquisition.model.diagnostic_bundle:main"
 # etc... but is same than:
 # python -m tools.acquisition.headless   # for instance.
 #
