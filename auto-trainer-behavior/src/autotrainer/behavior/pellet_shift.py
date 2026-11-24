@@ -24,8 +24,9 @@ logger = get_verbose_logger(__name__)
 
 class ProcessedShiftXYZCallbackHandler(Protocol):
 
-    def __call__(self, project: ProjectInfo, shift: Offset3DTuple) -> None:
-        """Signature of ProcessedShiftXYZCallbackHandler"""
+    def __call__(self, project: ProjectInfo, shift: Offset3DTuple) -> Optional[str]:
+        """Signature of ProcessedShiftXYZCallbackHandler: returns why when the shift was
+        refused (then it is recorded as not applied), None when it was applied."""
 
 
 ProcessedShiftXYZCallbackHandlerT = Optional[ProcessedShiftXYZCallbackHandler]
@@ -241,17 +242,32 @@ class ShiftXYZHandler(ObservableObject):
         #
         if tongue_eaten:
             processed_shift = cfg.tongue_eaten_shift
-        new_y_limit = self._new_shift_y_limit
-        if new_y_limit is not None:
-            logger.notice("Setting new pellet_shift_y_limit: %s", new_y_limit)
-            algo.pellet_shift_y_limit = new_y_limit
-            self._new_shift_y_limit = None
         #
         if trial_shift is not None:
             self.last_shift_xyz = trial_shift
+        # The shift is applied first: a refused one (outside the configured travel) is not
+        # recorded as applied, and its tongue-eaten y-limit is not committed to the animal.
+        refusal = None
         if processed_shift is not None:
-            self.last_processed_shift_xyz = processed_shift
             func = self._processed_shift_handler
+            if func is None:
+                logger.debug("handle_processed_shift_func undefined")
+            else:
+                func: ProcessedShiftXYZCallbackHandler
+                result = func(project, processed_shift)
+                refusal = result if isinstance(result, str) else None
+        new_y_limit = self._new_shift_y_limit
+        self._new_shift_y_limit = None
+        if new_y_limit is not None:
+            if refusal is None:
+                logger.notice("Setting new pellet_shift_y_limit: %s", new_y_limit)
+                algo.pellet_shift_y_limit = new_y_limit
+            else:
+                logger.warning("Not setting pellet_shift_y_limit %s: its shift was refused (%s)",
+                               new_y_limit, refusal)
+        if processed_shift is not None:
+            if refusal is None:
+                self.last_processed_shift_xyz = processed_shift
             post_api_event_content(
                 ApiEventKind.intertrialPelletShift,
                 data=dict(
@@ -259,13 +275,10 @@ class ShiftXYZHandler(ObservableObject):
                            else ApiPelletShiftSource.REACH_FAILURES,
                     shift=dict(x=processed_shift.x, y=processed_shift.y, z=processed_shift.z),
                     deferred=False,
+                    applied=refusal is None,
+                    refusal=refusal,
                 )
             )
-            if func is None:
-                logger.debug("handle_processed_shift_func undefined")
-            else:
-                func: ProcessedShiftXYZCallbackHandler
-                func(project, processed_shift)
 
 
 class ShiftRecommendationController(ShiftXYZHandler):

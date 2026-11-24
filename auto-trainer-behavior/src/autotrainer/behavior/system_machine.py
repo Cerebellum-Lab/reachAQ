@@ -564,9 +564,12 @@ class SystemMachine(StateMachine):
 
     def _handle_processed_shift_xyz(self, project: ProjectInfo, shift: Offset3DTuple):
         logger.success("Received processed shift xyz: %s ; project=%s", shift.round(1), project)
-        self._apply_processed_shift_xyz(shift)
+        return self._apply_processed_shift_xyz(shift)
 
-    def _apply_processed_shift_xyz(self, shift: Offset3DTuple):
+    def _apply_processed_shift_xyz(self, shift: Offset3DTuple) -> Optional[str]:
+        """Shift the send position by `shift`. Returns why when the shift is refused (a
+        shifted axis would leave the configured travel), so the caller records it as not
+        applied; None otherwise."""
         algo = self._algorithm
         dev = self._pellet_device
         if dev is None or not algo.intersession_pellet_shift_enabled:
@@ -582,7 +585,7 @@ class SystemMachine(StateMachine):
         if dev.refuse_shift_outside_travel(delta):
             logger.error("Not applying the pellet send_position shift %s: a shifted axis would leave "
                          "the configured travel, so no axis is shifted", shift.round(1))
-            return
+            return "a shifted axis would leave the configured travel"
         logger.notice("applying pellet send_position shift: %s", shift.round(1))
         # NB: dev.set_x/y/z is in motor coordinate system,
         # but we want the shifts to be in inference system :
