@@ -192,14 +192,23 @@ ReachAQ checks each stage target against the travel before it sends anything:
   position logs `Not sending <animal>'s pellet position ...: it lies outside
   the configured travel` and shows a "Pellet position refused" error. The
   previous animal's position is still SET on the board, so **no pellet is
-  presented** (`Pellet presentation refused: ...` in the log) until X, Y and Z
-  have each been SET again: an animal whose position is inside the travel is
-  selected, or the operator sets all three in Hardware Control. A protocol
-  target or the intersession shift does not lift the block. A protocol
-  presentation stops with an error.
+  presented** (`Pellet presentation refused: ...` in the log) until the board
+  has accepted a SET of each of X, Y and Z: an animal whose position is inside
+  the travel is selected, or the operator sets all three in Hardware Control.
+  A SET the board refuses, or never acknowledges, leaves its axis blocked. A
+  protocol target or the intersession shift does not lift the block. A
+  protocol presentation stops with an error. While the animal has a protocol,
+  X, Y and Z set in Hardware Control apply to this session only and are not
+  saved to the animal; the dialog says so. To keep a new position, select
+  **Manual pellet control** in Protocol, set X, Y and Z, then select the
+  protocol again.
 - **The intersession shift** is checked on every axis it shifts before any is
   SET. One shifted axis out of range shifts none of them and logs `Not
-  applying the pellet send_position shift ...`.
+  applying the pellet send_position shift ...`. A refused shift is not
+  recorded as applied: the last processed shift (the `applied_shift` of later
+  pellet-cycle records) keeps its previous value, the `intertrialPelletShift`
+  event carries `applied: false` and the `refusal` reason, and a tongue-eaten
+  shift's y-limit is not saved to the animal.
 - **The `move_config.yaml` sequences** (`load_pellet`, `send_pellet`,
   `cover_pellet`, `release_pellet`, `move_retract`, or their built-in
   defaults). Every stepper step is checked before the sequence starts, as
