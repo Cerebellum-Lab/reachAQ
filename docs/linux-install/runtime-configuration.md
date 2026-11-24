@@ -167,6 +167,62 @@ electrical homing direction, not this coordinate convention. Existing
 25 still commands X to 25 mm. The LIVE line reports current feedback and its
 freshness, while SET reports the saved send position in the same coordinates.
 
+## Motor travel limits
+
+`pellet.x`, `pellet.y` and `pellet.z` in `~/Autotrainer/motor_config.yaml` can
+each set `min_pos` and `max_pos`, the stage's travel in board millimetres.
+christielab10 uses `min_pos: 0` and `max_pos: 35` on all three axes. Either key
+can be left out: that side is then not limited. A value that is not a finite
+number, or `min_pos` above `max_pos`, stops the connect with an error naming
+the axis (`pellet-x`, `pellet-y` or `pellet-z`). The keys stay on the host;
+nothing new is written to the board.
+
+ReachAQ checks each stage target against the travel before it sends anything:
+
+- **SET and MOVE** of x, y or z, absolute, relative or given in DCS
+  coordinates. That covers the animal's base position, protocol presentations,
+  the Hardware Control buttons, the intersession shift and every calibration
+  and scout waypoint. SET keeps its clamp of a target below 0 to 0, and the
+  check runs after it.
+- **The `move_config.yaml` sequences** (`load_pellet`, `send_pellet`,
+  `cover_pellet`, `release_pellet`, `move_retract`, or their built-in
+  defaults). Every stepper step is checked before the sequence starts, as
+  the steps before it leave the stage. One step out of range refuses the
+  whole sequence. As the board command does, a step's target is first held
+  to 0 and 15 motor turns (36.5 mm), so a retract that runs into 0 still
+  passes.
+- **A motor drift correction** that would put the saved send position outside
+  the travel.
+
+A target outside the travel is **refused, not clamped**: nothing is sent, the
+command is not queued, and the log has an error such as
+
+```
+Axis-X: move to 36.000 refused: outside the configured travel 0-35 mm
+```
+
+An unset side prints as `-inf` or `inf`. A refused sequence also logs
+`Pellet sequence load_pellet refused: a step lies outside the configured
+travel`. Without `min_pos` and `max_pos`, behaviour is as before.
+
+Not checked:
+
+- **Homing** (`send_home`, `send_to_limits` and home steps in a sequence). The
+  firmware stops at the switch.
+- **A target the host does not know**: a relative sequence step from a
+  position the board has not reported, or `send_pellet` before any SET since
+  the connect. The host sends nothing for the first; for the second the board
+  goes to the position it saved earlier.
+- **Turning drift correction off**. That re-sends the last SET, which was
+  checked when it was made.
+- **The maintenance tools that bypass the acquisition app**: the pellet
+  delivery tool (`tools/pellet_delivery`), `scripts/can_console.py` and
+  `tools/hardware/validate_can_hardware.py`. They command the board directly
+  and do not read the travel.
+
+The 3D calibration scout searches the configured travel (see
+[Automatic move list](../acquisition/stereo-calibration.md#automatic-move-list)).
+
 For the current JerryCAN board, expect `can0`, `mtu 72`, CAN FD,
 1 Mbit/s arbitration, and 5 Mbit/s data. See the
 [PEAK/SocketCAN guide](peak-socketcan.md) for installation, termination,

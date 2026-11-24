@@ -194,12 +194,22 @@ only re-aiming the camera helps.
 
 **The scout pass.**
 
-1. **Grid.** 4 x 4 x 3 = 48 points evenly spaced inside the box the hand-written
+1. **Grid.** 4 x 4 x 3 = 48 points evenly spaced inside the stage's configured
+   travel: `min_pos` and `max_pos` under `pellet.x`, `pellet.y` and `pellet.z`
+   in `~/Autotrainer/motor_config.yaml` (0-35 mm on every axis on
+   christielab10; see [Motor travel limits](../linux-install/runtime-configuration.md#motor-travel-limits)).
+   The scout reads that file itself, so it has the travel before any connect.
+   On an axis with no travel configured, the box is the one the hand-written
    list already travels (its commanded motor positions, after the lower-limit
-   clamp; about x 0-17.7, y 0.1-25.1, z 19.8-32.8 mm on christielab10). The box
-   is never widened. An optional `scoutBounds` entry in the library's
-   `settings.yaml`, `{lo: [x, y, z], hi: [x, y, z]}` in motor mm, can narrow it;
-   any other form is ignored with a warning.
+   clamp; about x 0-17.7, y 0.1-25.1, z 19.8-32.8 mm on christielab10); an axis
+   with only one side configured takes that side from the travel and the other
+   from the list. An optional `scoutBounds` entry in the library's
+   `settings.yaml`, `{lo: [x, y, z], hi: [x, y, z]}` in motor mm, can narrow the
+   box; any other form is ignored with a warning. The grid never leaves the
+   travel. A saved scout list with a point outside today's box is scouted again.
+   A hand-written waypoint outside the travel is refused like any other move:
+   the capture stops with "the move of x to ... was not queued" and the
+   `Axis-X: move to ... refused` line in the log.
    The points are visited in serpentine order, so every move is one axis.
 2. **Short capture.** The scout records like the capture itself (same camera
    settings, TRIGGER mode, home first), pausing 0.3 s at each point after the
