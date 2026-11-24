@@ -163,6 +163,7 @@ def fit_per_view(
     tilt: bool = True,
     fix_principal_point: bool = False,
     placement: str = PLACEMENT_SIMILARITY,
+    pixel_scale: float = 1.0,
 ) -> MotorFrameFit:
     """Fit every camera in `camera_names` with a free board pose per view (module docstring).
 
@@ -192,19 +193,28 @@ def fit_per_view(
     Near-parallel views barely separate the principal point from the camera's position; on
     christielab10's session002 the free principal points sat 0.9-1.4 ROI half-sides off centre.
 
+    `pixel_scale` is sensor px per px of these observations (a preset's binning). The slack
+    prior is in mm beside reprojection residuals in px, so the reprojection residuals are
+    weighed in sensor px: a binned preset's fit then solves the same problem as the sensor
+    fit on the same corners, rather than one whose prior is binning^2 times stiffer. The RMS
+    and every reported px stay in the observations' own px.
+
     Raises ValueError as fit_motor_frame does for a camera whose views cannot place it, or
-    when a camera shares no view with the cameras already placed; RuntimeError when no start
-    converges.
+    when a camera shares no view with the cameras already placed, and for a pixel_scale that
+    is not positive; RuntimeError when no start converges.
     """
     if placement not in PLACEMENT_MODES:
         raise ValueError(f"placement must be one of {PLACEMENT_MODES}, got {placement!r}")
+    if not (math.isfinite(pixel_scale) and pixel_scale > 0):
+        raise ValueError(f"pixel_scale must be a positive number, got {pixel_scale!r}")
     obj = board.object_points()
     names = tuple(camera_names)
     data = {cam: _camera_data(observations, cam, len(obj), board) for cam in names}
     ref = max(names, key=lambda cam: len(data[cam].indices))
     if prior_mm is not None and prior_mm < 0:
         prior_mm = MOTOR_PRIOR_MM
-    problem = _Problem(obj, data, names, ref, observations, prior_mm, tilt, affine=placement == PLACEMENT_AFFINE)
+    problem = _Problem(obj, data, names, ref, observations, prior_mm, tilt, affine=placement == PLACEMENT_AFFINE,
+                       pixel_scale=pixel_scale)
     if fix_principal_point:
         width, height = int(image_size[0]), int(image_size[1])
         problem.fixed_pp = {
@@ -265,8 +275,11 @@ class _Problem:
     """
 
     def __init__(self, obj, data: Dict[str, _CameraData], names, ref, observations, prior_mm=None, tilt=True,
-                 affine=False):
+                 affine=False, pixel_scale=1.0):
         self.obj, self.data, self.names, self.ref = obj, data, names, ref
+        # Sensor px per observed px: the reprojection residuals are weighed in sensor px
+        # (fit_per_view's pixel_scale) and divided back for every RMS.
+        self.pixel_scale = float(pixel_scale)
         # The stage model: A m + t, A any 3x3 (12 parameters), or s R m + t (7)
         self.affine = affine
         self.prior_mm = prior_mm
@@ -378,7 +391,8 @@ class _Problem:
         return K, dist, pose[:3], pose[3:]
 
     def residuals(self, x) -> np.ndarray:
-        """Projected minus observed px, every camera's detected corners in block order.
+        """Projected minus observed px, every camera's detected corners in block order, times
+        pixel_scale (sensor px); then the prior's rows.
 
         Vectorised over all corners of a camera (cv2.projectPoints per view was 10 times
         slower); the projection is cv2's pinhole model with k1, k2, p1, p2 (k3 = 0), and
@@ -395,7 +409,7 @@ class _Problem:
                 pose = x[self._pose(cam)]
                 X = X @ _rodrigues(pose[None, :3])[0].T + pose[3:]
             out.append(_project(X, self._intrinsics(x, c, cam)).ravel())
-        reprojection = np.concatenate(out) - self.observed
+        reprojection = (np.concatenate(out) - self.observed) * self.pixel_scale
         if self.prior_mm is None:
             return reprojection
         A, t = self.stage_map(x)
@@ -552,7 +566,8 @@ class _Problem:
         return cost
 
     def _per_camera_squares(self, r) -> Dict[str, List[np.ndarray]]:
-        sq = (r[:len(self.observed)].reshape(-1, 2) ** 2).sum(axis=1)
+        """Per camera, per its view: each corner's squared reprojection distance in observed px."""
+        sq = ((r[:len(self.observed)] / self.pixel_scale).reshape(-1, 2) ** 2).sum(axis=1)
         out, k = {}, 0
         for cam in self.names:
             out[cam] = []

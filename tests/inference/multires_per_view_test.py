@@ -325,6 +325,32 @@ def test_the_principal_point_can_be_held_at_the_image_centre(stage_rig):
         assert fit.rms_px[cam] < 0.25, cam
 
 
+def test_a_binned_fit_with_its_pixel_scale_solves_the_sensor_problem(stage_rig):
+    # The slack prior is in mm beside reprojection residuals in the image's own px, so in a
+    # preset binned b times it weighs b^2 as much. On christielab10's session004 that alone
+    # moved the 256 preset's direct fx 1-3 % from the same corners fitted in sensor px.
+    # pixel_scale (sensor px per image px) restores the sensor fit's weighting.
+    import dataclasses
+
+    from reachaq.inference.multires_calibration.geometry import map_intrinsics, sensor_to_preset_points
+
+    cams = ("left", "right", "top")
+    g = PresetGeometry(2, 720, 540, 0, 0)  # the whole sensor at binning 2: the same corners, half the px
+    sensor = fit_per_view(stage_rig.observations, BOARD, SIZE, cams)
+    binned = [WaypointObservation(o.index, o.motor_mm, {c: sensor_to_preset_points(v, g) for c, v in o.corners.items()})
+              for o in stage_rig.observations]
+    mapped = dataclasses.replace(sensor, cameras={c: dataclasses.replace(m, K=map_intrinsics(m.K, g))
+                                                  for c, m in sensor.cameras.items()}, image_size=(g.width, g.height))
+    scaled = fit_per_view(binned, BOARD, (g.width, g.height), cams, initial=mapped, pixel_scale=g.binning)
+    for cam in cams:
+        np.testing.assert_allclose(scaled.cameras[cam].K, mapped.cameras[cam].K, atol=0.02, err_msg=cam)
+        # The RMS stays in the image's own px.
+        assert scaled.rms_px[cam] == pytest.approx(sensor.rms_px[cam] / g.binning, rel=1e-3), cam
+    assert scaled.placement.outliers == sensor.placement.outliers
+    with pytest.raises(ValueError, match="pixel_scale"):
+        fit_per_view(binned, BOARD, (g.width, g.height), cams, initial=mapped, pixel_scale=0.0)
+
+
 def test_the_principal_point_setting():
     from reachaq.inference.multires_calibration.per_view import configured_principal_point
 

@@ -91,6 +91,8 @@ from reachaq.inference.multires_calibration.fit import (
     WaypointObservation,
     fit_motor_frame,
     reconcile_corner_order,
+    usable_view,
+    valid_corners,
 )
 from reachaq.inference.multires_calibration.geometry import (
     PresetGeometry,
@@ -678,14 +680,28 @@ def _cross_checks(
         ]
         offset = _corner_offset(preset_observations, observations, g)
         try:
-            # Started from the sensor fit mapped to the preset, not from the planar start,
+            reference, extra = fit, {}
+            if fit_mode != FIT_MOTOR_FRAME:
+                # Like with like. The per-view fit's focal length rests on the stage model, so
+                # a subset of the corners moves it: on christielab10's session004 the sensor
+                # fit on only the corners inside the 256 preset's window moved fx 0.9 %. The
+                # reference is therefore the sensor fit on exactly the views and corners the
+                # preset found, and the direct fit weighs its residuals in sensor px
+                # (pixel_scale), so the two solve the same problem and differ only by the
+                # detection in binned frames and the K mapping, which this check is for.
+                reference = _fit(
+                    fit_mode, _same_corners(observations, preset_observations, board), board, fit.image_size,
+                    tuple(videos), initial=fit, **(per_view_options or {}),
+                )
+                extra = {"pixel_scale": float(g.binning)}
+            # Started from the reference mapped to the preset, not from the planar start,
             # which is degenerate in focal length: from it, the 512 preset's fit on the
             # synthetic capture ran out of evaluations. The start does not move the optimum:
             # from the mapped K, from one 1 % and 2 px off, and from the edge-convention
             # mapping, the fit reached the same K to 1e-4 px.
             direct = _fit(
-                fit_mode, preset_observations, board, (g.width, g.height), tuple(videos), initial=_mapped_fit(fit, g),
-                **(per_view_options or {}),
+                fit_mode, preset_observations, board, (g.width, g.height), tuple(videos),
+                initial=_mapped_fit(reference, g), **(per_view_options or {}), **extra,
             )
         except (RuntimeError, ValueError) as error:
             logger.warning("cross-check %s: the direct fit failed: %s", g.name, error)
@@ -693,7 +709,7 @@ def _cross_checks(
             checks.append(PresetCrossCheck(geometry=g, max_intrinsic_delta_px=math.inf, corner_offset_px=offset))
             continue
         delta = max(
-            _intrinsic_delta(direct.cameras[cam].K, map_intrinsics(fit.cameras[cam].K, g)) for cam in videos
+            _intrinsic_delta(direct.cameras[cam].K, map_intrinsics(reference.cameras[cam].K, g)) for cam in videos
         )
         checks.append(PresetCrossCheck(geometry=g, max_intrinsic_delta_px=delta, corner_offset_px=offset))
     return checks
@@ -747,6 +763,24 @@ def _corner_offset(
     if not len(stacked):
         return math.nan
     return float(np.linalg.norm(stacked.mean(axis=0)))
+
+
+def _same_corners(
+    observations: Sequence[WaypointObservation], preset_observations: Sequence[WaypointObservation], board: BoardSpec
+) -> List[WaypointObservation]:
+    """The sensor `observations` cut to what the preset found: per waypoint and camera, only the
+    sensor corners whose ids the preset detection holds, and only where that is still a view."""
+    out = []
+    for o, p in zip(observations, preset_observations):
+        corners = {}
+        for cam, c in o.corners.items():
+            if cam not in p.corners:
+                continue
+            kept = np.where(valid_corners(p.corners[cam])[:, None], np.asarray(c, float), np.nan)
+            if usable_view(kept, board):
+                corners[cam] = kept
+        out.append(WaypointObservation(index=o.index, motor_mm=o.motor_mm, corners=corners))
+    return out
 
 
 def _mapped_fit(fit: MotorFrameFit, g: PresetGeometry) -> MotorFrameFit:
