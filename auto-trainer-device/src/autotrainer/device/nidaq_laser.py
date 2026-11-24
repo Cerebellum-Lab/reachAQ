@@ -945,6 +945,47 @@ class NidaqLaserController:
         except KeyError:
             self._write_transient_analog_sample(channel, channel.minimum_command_volts)
 
+    def _drive_channel_safe(self, channel, context: str) -> list:
+        """The command to its minimum, the shutter closed, the auxiliary off.
+
+        Each write on its own, the command first: a shutter or auxiliary
+        write refused must not leave the output on its held level, which is
+        then the only barrier left. A laser close() never opened (an open
+        that failed before it) is written by transient tasks, so the reset
+        child still drives every configured laser safe. Returns the
+        failures, as close() collects them.
+        """
+        errors = []
+        laser = channel.channel_id.value
+        try:
+            self._reset_command(channel)
+        except Exception as exc:
+            errors.append((f"channel {laser} reset", exc))
+            logger.exception(
+                "Failed to reset the NI-DAQ laser %s command during %s", laser, context)
+        else:
+            self._note_reset_after_all(channel)
+        try:
+            self._close_shutter(channel)
+        except Exception as exc:
+            errors.append((f"channel {laser} shutter close", exc))
+            logger.exception(
+                "Failed to close the NI-DAQ laser %s shutter during %s", laser, context)
+        if channel.auxiliary_output is not None:
+            try:
+                try:
+                    self.set_auxiliary_output(channel.channel_id, False)
+                except KeyError:
+                    self._write_transient_digital_line(
+                        channel.auxiliary_output, False,
+                        f"laser_{laser}_auxiliary_reset")
+            except Exception as exc:
+                errors.append((f"channel {laser} auxiliary off", exc))
+                logger.exception(
+                    "Failed to turn the NI-DAQ laser %s auxiliary off during %s",
+                    laser, context)
+        return errors
+
     def _abort_task(self, task, owner: str, name: str, *, running: bool) -> None:
         """TASK_ABORT on a pulse's or a ramp's task, from any thread.
 
@@ -1945,15 +1986,7 @@ class NidaqLaserController:
         for channel in self._configuration.channels:
             if channel.channel_id not in self._tasks:
                 continue
-            try:
-                self.set_shutter_open(channel.channel_id, False)
-                if channel.auxiliary_output is not None:
-                    self.set_auxiliary_output(channel.channel_id, False)
-                self.set_command_voltage(channel.channel_id, channel.minimum_command_volts)
-                self._note_reset_after_all(channel)
-            except Exception as exc:
-                errors.append((f"channel {channel.channel_id.value} reset", exc))
-                logger.exception("Failed to reset NI-DAQ laser channel %s during close", channel.channel_id.value)
+            errors.extend(self._drive_channel_safe(channel, "close"))
         for channel_id, tasks in self._tasks.items():
             try:
                 tasks.close()
