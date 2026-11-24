@@ -64,6 +64,10 @@ FIT_MOTOR_FRAME = "motor_frame"
 FIT_MODES = (FIT_PER_VIEW, FIT_MOTOR_FRAME)
 # The library setting that picks the fit (configured_fit).
 FIT_SETTING = "fit"
+# The library setting that holds the per-view fit's principal points (configured_principal_point):
+# "free" (the default) or "centre", each camera's at its image centre. UNFINALIZED.
+PRINCIPAL_POINT_SETTING = "fit_principal_point"
+PRINCIPAL_POINT_MODES = ("free", "centre")
 
 _N_INTRINSICS = 8
 # The scale of the soft-L1 residual that holds each view's board origin to the motor
@@ -107,6 +111,18 @@ def configured_fit(settings, board: BoardSpec) -> str:
     return str(value)
 
 
+def configured_principal_point(settings) -> bool:
+    """Whether the library settings hold the per-view fit's principal points at the image
+    centre (`fit_principal_point: centre`); False when unset or "free". Raises ValueError
+    naming the key for any other value."""
+    value = settings.get(PRINCIPAL_POINT_SETTING) if settings else None
+    if value is None:
+        return False
+    if value not in PRINCIPAL_POINT_MODES:
+        raise ValueError(f"{PRINCIPAL_POINT_SETTING}: {value!r} is not one of {', '.join(PRINCIPAL_POINT_MODES)}")
+    return value == "centre"
+
+
 def fit_cameras(
     mode: str,
     observations: Sequence[WaypointObservation],
@@ -133,6 +149,7 @@ def fit_per_view(
     initial: Optional[MotorFrameFit] = None,
     prior_mm: Optional[float] = -1.0,
     tilt: bool = True,
+    fix_principal_point: bool = False,
 ) -> MotorFrameFit:
     """Fit every camera in `camera_names` with a free board pose per view (module docstring).
 
@@ -152,6 +169,11 @@ def fit_per_view(
     `initial`, a fit in this image's pixels, is the only start when given: its intrinsics and
     relative camera poses, with each view's pose from solvePnP.
 
+    `fix_principal_point` holds every camera's (cx, cy): at `initial`'s when given (the
+    cross-check's mapped sensor fit), else at the image centre ((w - 1) / 2, (h - 1) / 2).
+    Near-parallel views barely separate the principal point from the camera's position; on
+    christielab10's session002 the free principal points sat 0.9-1.4 ROI half-sides off centre.
+
     Raises ValueError as fit_motor_frame does for a camera whose views cannot place it, or
     when a camera shares no view with the cameras already placed; RuntimeError when no start
     converges.
@@ -163,6 +185,13 @@ def fit_per_view(
     if prior_mm is not None and prior_mm < 0:
         prior_mm = MOTOR_PRIOR_MM
     problem = _Problem(obj, data, names, ref, observations, prior_mm, tilt)
+    if fix_principal_point:
+        width, height = int(image_size[0]), int(image_size[1])
+        problem.fixed_pp = {
+            cam: (np.asarray(initial.cameras[cam].K, float)[:2, 2] if initial is not None
+                  else np.array([(width - 1) / 2, (height - 1) / 2]))
+            for cam in names
+        }
 
     if initial is not None:
         x0 = problem.start_from(initial)
@@ -227,6 +256,8 @@ class _Problem:
         # Without tilt every view takes view 0's board rotation (the other views' rotation
         # parameters are unused), so only the translations have per-view freedom.
         self.tilt = tilt
+        # camera -> (cx, cy) held there; None fits them
+        self.fixed_pp: Optional[Dict[str, np.ndarray]] = None
         self.views = sorted(set().union(*[d.indices for d in data.values()]))
         self.view_pos = {w: k for k, w in enumerate(self.views)}
         self.prior_off = np.zeros(len(self.views), bool)
@@ -271,8 +302,16 @@ class _Problem:
     def _sim(self):
         return slice(self.n_params - 7, self.n_params)
 
+    def _intrinsics(self, x, c, cam) -> np.ndarray:
+        """Camera c's 8 intrinsics from x, with its principal point held where fixed_pp says."""
+        values = x[self._intr(c)]
+        if self.fixed_pp is not None:
+            values = values.copy()
+            values[2:4] = self.fixed_pp[cam]
+        return values
+
     def _camera(self, x, c, cam):
-        fx, fy, cx, cy, k1, k2, p1, p2 = x[self._intr(c)]
+        fx, fy, cx, cy, k1, k2, p1, p2 = self._intrinsics(x, c, cam)
         K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
         dist = np.array([k1, k2, p1, p2, 0.0])
         if cam == self.ref:
@@ -297,7 +336,7 @@ class _Problem:
             if cam != self.ref:
                 pose = x[self._pose(cam)]
                 X = X @ _rodrigues(pose[None, :3])[0].T + pose[3:]
-            out.append(_project(X, x[self._intr(c)]).ravel())
+            out.append(_project(X, self._intrinsics(x, c, cam)).ravel())
         reprojection = np.concatenate(out) - self.observed
         if self.prior_mm is None:
             return reprojection
@@ -318,7 +357,10 @@ class _Problem:
         for c, cam in enumerate(self.names):
             for p, ids, _ in self.blocks[cam]:
                 rows = slice(row, row + 2 * len(ids))
-                S[rows, self._intr(c)] = 1
+                intrinsics = self._intr(c)
+                S[rows, intrinsics] = 1
+                if self.fixed_pp is not None:  # cx and cy are held: their columns stay empty
+                    S[rows, slice(intrinsics.start + 2, intrinsics.start + 4)] = 0
                 if cam != self.ref:
                     S[rows, self._pose(cam)] = 1
                 view = self._view(p)
@@ -542,6 +584,9 @@ class _Problem:
             per_view[cam] = {self.views[p]: float(np.sqrt(sq.mean())) for (p, _, _), sq in zip(self.blocks[cam], squares[cam])}
             counts[cam] = {self.views[p]: len(ids) for p, ids, _ in self.blocks[cam]}
             fitted = dict(zip(INTRINSIC_NAMES[:_N_INTRINSICS], std[self._intr(c)]))
+            if self.fixed_pp is not None:  # held, not estimated, as k3 is
+                fitted.pop("cx")
+                fitted.pop("cy")
             param_std[cam] = {name: float(fitted.get(name, 0.0)) for name in INTRINSIC_NAMES}
         partial = any(d.valid is not None for d in self.data.values())
         board_motor = _mean_rotation(np.array([R.T @ Rv for Rv in views_R]))

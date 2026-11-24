@@ -253,6 +253,27 @@ def test_the_projection_matches_cv2():
     np.testing.assert_allclose(_project(X, intrinsics), expected, atol=1e-8)
 
 
+def test_the_principal_point_can_be_held_at_the_image_centre(stage_rig):
+    cams = ("left", "right", "top")
+    fit = fit_per_view(stage_rig.observations, BOARD, SIZE, cams, fix_principal_point=True)
+    for cam in cams:
+        np.testing.assert_array_equal(fit.cameras[cam].K[:2, 2], [(SIZE[0] - 1) / 2, (SIZE[1] - 1) / 2])
+        assert fit.param_std[cam]["cx"] == 0.0 and fit.param_std[cam]["cy"] == 0.0
+        # The rig's principal points are 1.5-4 px off centre, so the focal length moves a little.
+        assert fit.cameras[cam].K[0, 0] == pytest.approx(stage_rig.truth.cameras[cam].K[0, 0], rel=0.01), cam
+        assert fit.rms_px[cam] < 0.25, cam
+
+
+def test_the_principal_point_setting():
+    from reachaq.inference.multires_calibration.per_view import configured_principal_point
+
+    assert configured_principal_point({}) is False
+    assert configured_principal_point({"fit_principal_point": "free"}) is False
+    assert configured_principal_point({"fit_principal_point": "centre"}) is True
+    with pytest.raises(ValueError, match="fit_principal_point"):
+        configured_principal_point({"fit_principal_point": "middle"})
+
+
 def test_the_fit_mode_defaults_by_board_and_reads_the_setting():
     assert default_fit_mode(RIG_CHARUCO_BOARD) == FIT_PER_VIEW
     assert default_fit_mode(BoardSpec()) == FIT_MOTOR_FRAME

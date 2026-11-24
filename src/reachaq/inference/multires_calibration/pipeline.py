@@ -364,6 +364,7 @@ def calibrate_capture(
     preset_sets: Optional[Sequence[PresetSet]] = None,
     live_geometries: Optional[Mapping[str, PresetGeometry]] = None,
     fit_mode: Optional[str] = None,
+    fix_principal_point: bool = False,
 ) -> Tuple[CalibrationIndex, QualityReport]:
     """Calibrate every preset in `presets` from the capture in `capture_dir` and write the
     calibration to `output_dir`, which must not exist yet.
@@ -379,6 +380,7 @@ def calibrate_capture(
     `previous_dir` is the calibration this one replaces, if any. `refine` is
     extract.detect_board's corner refinement. `fit_mode` is per_view.FIT_PER_VIEW or
     FIT_MOTOR_FRAME; None is per_view.default_fit_mode(board). The cross-checks use the same.
+    `fix_principal_point` holds the per-view fit's principal points (per_view.fit_per_view).
 
     Only the cameras that meet per_camera_rule are fitted; the report's `cameras` gives
     every camera's verdict. Raises CalibrationRefused, writing nothing, when fewer than 2 do.
@@ -443,12 +445,13 @@ def calibrate_capture(
     observations, reversed_order = reconcile_corner_order(kept, board, image_size, calibrated)
     logger.info("calibration capture: %d distinct waypoints; fitting %d of %d cameras",
                 len(observations), len(calibrated), len(cameras))
-    fit = _fit(fit_mode, observations, board, image_size, calibrated)
+    per_view_options = {"fix_principal_point": True} if fix_principal_point and fit_mode != FIT_MOTOR_FRAME else {}
+    fit = _fit(fit_mode, observations, board, image_size, calibrated, **per_view_options)
 
     notes: List[str] = []
     cross_checks = _cross_checks(
         {cam: videos[cam] for cam in calibrated}, extraction.segments, observations, fit, presets, board, refine, notes,
-        fit_mode,
+        fit_mode, per_view_options,
     )
     for cam, flipped in reversed_order.items():
         if flipped:
@@ -515,6 +518,8 @@ def calibrate_capture(
     if fit_mode != FIT_MOTOR_FRAME:
         # Recorded only when it is not the motor-frame fit, so those calibrations read as before.
         capture["fit"] = fit_mode
+        if per_view_options:
+            capture["fit_principal_point"] = "centre"
     with tempfile.TemporaryDirectory(prefix="calibration_coverage_") as tmp:
         # Every camera's, from extraction: a 2D-only camera's shows what it did see. The
         # hulls do not depend on the corner order.
@@ -570,6 +575,7 @@ def _cross_checks(
     refine: str,
     notes: List[str],
     fit_mode: str = FIT_MOTOR_FRAME,
+    per_view_options: Optional[Mapping] = None,
 ) -> List[PresetCrossCheck]:
     """A PresetCrossCheck per binned preset, in the order of `presets`; a failed fit adds a note.
 
@@ -628,7 +634,8 @@ def _cross_checks(
             # from the mapped K, from one 1 % and 2 px off, and from the edge-convention
             # mapping, the fit reached the same K to 1e-4 px.
             direct = _fit(
-                fit_mode, preset_observations, board, (g.width, g.height), tuple(videos), initial=_mapped_fit(fit, g)
+                fit_mode, preset_observations, board, (g.width, g.height), tuple(videos), initial=_mapped_fit(fit, g),
+                **(per_view_options or {}),
             )
         except (RuntimeError, ValueError) as error:
             logger.warning("cross-check %s: the direct fit failed: %s", g.name, error)
