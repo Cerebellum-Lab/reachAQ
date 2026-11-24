@@ -27,7 +27,7 @@ from .motor_steps import MotorSteps
 from .device import Device
 from .emulation_interface import EmulationInterface
 from .device_api import DeviceApi
-from .can_interface import CanInterface, Target, target_of_motor
+from .can_interface import CanInterface, Target, target_of_motor, _STEPPER_MAX_POS
 from .can_transport import CanTransportConfiguration, CanTransportKind
 from .can_failure import CanFailure, CanFailureKind
 from .board_refusal import CommandRefusal, RefusedCommandClass, is_refusal
@@ -1969,6 +1969,59 @@ class CanDevice(Device):
             logger.error("%s write command failed", step)
 
         return success
+
+
+_STEPPER_AXIS_OF_MOTOR = {Motor.PELLET_X_MOTOR: 0, Motor.PELLET_Y_MOTOR: 1, Motor.PELLET_Z_MOTOR: 2}
+
+
+def sequence_stepper_targets(
+    steps: Iterable[Dict[str, Any]],
+    position: Iterable[float],
+    send_position: Iterable[float],
+) -> Iterable[Tuple[str, float]]:
+    """
+    Yield (axis, target mm) for every stepper move the compound `steps` command, in order,
+    as _perform_next_compound_step runs them, starting from the stepper `position` (x, y, z)
+    and the saved send `position` (x, y, z).
+
+    The target is the one CanInterface sends: an absolute step, or a relative one from the
+    position the steps before it leave, clamped to [0, _STEPPER_MAX_POS] as
+    CanInterface._move_stepper_motor clamps it. x/y/z_rel are relative to the position,
+    send_x/y/z_rel to the send position, and predefined send goes to the send position on
+    each axis. A save_as_fixed step moves the send position instead. A target the host
+    cannot know (relative to an unknown position) is nan; a home step leaves its axis at 0. Servo, delay, tone and stimulus steps yield nothing.
+    """
+    pos = [float(v) for v in position]
+    send = [float(v) for v in send_position]
+
+    def clamp(value: float) -> float:
+        return min(max(value, 0.0), _STEPPER_MAX_POS) if math.isfinite(value) else math.nan
+
+    for step in steps:
+        for idx, axis in enumerate("xyz"):
+            if axis in step:
+                value = _to_tuple(step[axis])
+                target = clamp(float(value[0] if isinstance(value, tuple) else value))
+            elif f"{axis}_rel" in step:
+                target = clamp(pos[idx] + float(step[f"{axis}_rel"]))
+            elif f"send_{axis}_rel" in step:
+                target = clamp(send[idx] + float(step[f"send_{axis}_rel"]))
+            else:
+                continue
+            if step.get("save_as_fixed", False):  # saves the send position, does not move
+                send[idx] = target
+            else:
+                pos[idx] = target
+            yield axis, target
+        if "home" in step and step["home"] in _STEPPER_AXIS_OF_MOTOR:
+            pos[_STEPPER_AXIS_OF_MOTOR[step["home"]]] = 0.0
+        predefined = step.get("predefined")
+        if predefined == "home":
+            pos = [0.0, 0.0, 0.0]
+        elif predefined == "send":
+            for idx, axis in enumerate("xyz"):
+                pos[idx] = send[idx]
+                yield axis, send[idx]
 
 
 def default_load_pellet() -> MotorSteps:

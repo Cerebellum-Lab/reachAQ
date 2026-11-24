@@ -2,6 +2,7 @@
 (min_pos / max_pos in motor_config.yaml), sends nothing and logs an error."""
 import logging
 import math
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -9,8 +10,8 @@ import pytest
 
 from autotrainer.core import Offset3DTuple, SystemCommandKind
 from autotrainer.core.message import SystemDataArgsKwargs
-from autotrainer.device import MotorConfigurationFile
-from tools.acquisition.model.hardware_model import HardwareModel
+from autotrainer.device import CompoundMovements, MotorConfigurationFile, MotorSteps
+from tools.acquisition.model.hardware_model import HardwareModel, _pellet_sequences
 
 TRAVEL = {a: {"min_pos": 0, "max_pos": 35} for a in "xyz"}
 
@@ -22,6 +23,8 @@ def _hardware(pellet=None, *, set_at=(10.0, 10.0, 10.0), motor_at=(10.0, 10.0, 1
     )
     hardware._last_requested_set_coordinates = Offset3DTuple(*set_at)
     hardware._last_motor_coordinates = Offset3DTuple(*motor_at)
+    hardware._last_motor_send_coordinates = Offset3DTuple(math.nan, math.nan, math.nan)
+    hardware._pellet_sequences = _pellet_sequences()
     hardware._device_conn = mock.sentinel.device
     hardware._on_property_changed = mock.Mock()
     hardware._send_with_token = mock.Mock(return_value=mock.sentinel.token)
@@ -150,3 +153,112 @@ def test_a_nan_target_is_refused_when_limits_are_configured(caplog):
     with caplog.at_level(logging.ERROR):
         assert hardware.move_x(math.nan) is None
     hardware._send_with_token.assert_not_called()
+
+
+# The compound sequences (move_config.yaml) are run step by step by CanDevice, so HardwareModel
+# checks every stepper target of one before it triggers it, and refuses the whole sequence.
+
+MOVE_CONFIG = CompoundMovements.from_file(Path(__file__).with_name("move_config.yaml"))
+
+
+def _with_sequence(hardware, name, steps):
+    hardware._pellet_sequences[name] = MotorSteps(name, steps)
+    return hardware
+
+
+@pytest.mark.parametrize("method, name, cmd", [
+    ("load_pellet", "load_pellet", SystemCommandKind.LOAD_PELLET),
+    ("send_pellet", "send_pellet", SystemCommandKind.SEND_PELLET),
+    ("send_retract", "move_retract", SystemCommandKind.SEND_RETRACT),
+    ("cover_pellet", "cover_pellet", SystemCommandKind.COVER_PELLET),
+    ("release_pellet", "release_pellet", SystemCommandKind.RELEASE_PELLET),
+])
+def test_a_sequence_with_a_step_outside_the_travel_is_refused_whole(caplog, method, name, cmd):
+    hardware = _with_sequence(_hardware(TRAVEL), name, [{"y": 0.0}, {"x": 36.0}, {"z": 5.0}])
+    with caplog.at_level(logging.ERROR):
+        assert getattr(hardware, method)() is None
+    hardware._send_with_token.assert_not_called()
+    assert "Axis-X: move to 36.000 refused: outside the configured travel 0-35 mm" in caplog.text
+    assert f"Pellet sequence {name} refused" in caplog.text
+
+    hardware = _with_sequence(_hardware(TRAVEL), name, [{"y": 0.0}, {"x": 35.0}, {"z": 5.0}])
+    assert getattr(hardware, method)() is mock.sentinel.token
+    assert hardware._send_with_token.call_args[0][:2] == (mock.sentinel.device, cmd)
+
+
+def test_every_out_of_range_step_is_logged():
+    hardware = _with_sequence(_hardware(TRAVEL), "load_pellet", [{"x": 36.0}, {"z_rel": 30}])
+    with mock.patch("tools.acquisition.model.hardware_model.logger") as logger:
+        assert hardware.load_pellet() is None
+    messages = [c.args[0] for c in logger.error.call_args_list]
+    # z_rel 30 from z 10 is clamped to CanInterface's 15 turns (36.548 mm): still refused.
+    assert messages == [
+        "Axis-X: move to 36.000 refused: outside the configured travel 0-35 mm",
+        "Axis-Z: move to 36.548 refused: outside the configured travel 0-35 mm",
+        "Pellet sequence %s refused: a step lies outside the configured travel",
+    ]
+
+
+def test_the_christielab10_load_pellet_and_retract_pass():
+    hardware = _hardware(TRAVEL, motor_at=(3.0, 10.0, 4.0))
+    hardware._pellet_sequences = _pellet_sequences(MOVE_CONFIG)
+    assert hardware.load_pellet() is mock.sentinel.token
+    # y_rel -25 from y 10 is clamped to 0 by CanInterface, as before: inside the travel.
+    assert hardware.send_retract() is mock.sentinel.token
+
+
+def test_a_relative_sequence_step_is_checked_from_the_reported_position(caplog):
+    hardware = _with_sequence(_hardware(TRAVEL, motor_at=(3.0, 30.0, 4.0)), "move_retract", [{"y_rel": 6}])
+    with caplog.at_level(logging.ERROR):
+        assert hardware.send_retract() is None
+    assert "Axis-Y: move to 36.000 refused" in caplog.text
+
+
+def test_a_step_relative_to_an_unknown_position_is_not_checked():
+    hardware = _with_sequence(_hardware(TRAVEL, motor_at=(math.nan,) * 3), "move_retract", [{"y_rel": 60}])
+    assert hardware.send_retract() is mock.sentinel.token
+
+
+def test_the_send_position_is_the_requested_one_else_the_reported_one(caplog):
+    steps = [{"send_z_rel": 0}, {"send_x_rel": 0}, {"send_y_rel": 6}]
+    hardware = _with_sequence(_hardware(TRAVEL, set_at=(10.0, 30.0, 10.0)), "move_retract", steps)
+    with caplog.at_level(logging.ERROR):
+        assert hardware.send_retract() is None
+    assert "Axis-Y: move to 36.000 refused" in caplog.text
+
+    hardware = _with_sequence(_hardware(TRAVEL, set_at=(math.nan,) * 3), "send_pellet",
+                              [{"predefined": "send"}])
+    hardware._last_motor_send_coordinates = Offset3DTuple(10.0, 10.0, 35.2)
+    assert hardware.send_pellet() is None
+    hardware._last_motor_send_coordinates = Offset3DTuple(10.0, 10.0, 35.0)
+    assert hardware.send_pellet() is mock.sentinel.token
+
+
+def test_without_travel_limits_sequences_are_sent_as_before():
+    hardware = _with_sequence(_hardware(None), "load_pellet", [{"x": 36.0}])
+    assert hardware.load_pellet() is mock.sentinel.token
+    hardware = _with_sequence(_hardware({"x": {"max_vel": 100}}), "load_pellet", [{"x": 36.0}])
+    assert hardware.load_pellet() is mock.sentinel.token
+
+
+def test_the_sequences_are_move_config_s_else_the_built_in_ones():
+    sequences = _pellet_sequences(MOVE_CONFIG)
+    assert sequences["load_pellet"] is MOVE_CONFIG.load_pellet
+    assert sequences["move_retract"] is MOVE_CONFIG.move_retract
+    assert sequences["cover_pellet"] is MOVE_CONFIG.cover_pellet
+    empty = CompoundMovements.from_yaml_dict({"actions": {"load_pellet": []}})
+    assert _pellet_sequences(empty)["load_pellet"].steps == _pellet_sequences()["load_pellet"].steps
+    assert _pellet_sequences(None)["move_retract"].name == "move_retract"
+
+
+def test_a_drift_moving_the_send_position_out_of_range_is_refused(caplog):
+    hardware = _hardware(TRAVEL, set_at=(34.0, 10.0, 1.0))
+    with caplog.at_level(logging.ERROR):
+        hardware.set_motors_drift(Offset3DTuple(-2.0, 0.0, 0.0))
+        hardware.set_motors_drift(Offset3DTuple(0.0, 0.0, 1.5))
+    hardware._send_with_token.assert_not_called()
+    assert "Axis-X: move to 36.000 refused" in caplog.text
+    assert "Axis-Z: move to -0.500 refused" in caplog.text
+    hardware.set_motors_drift(Offset3DTuple(1.0, 0.0, 0.5))
+    assert [c.args[1] for c in hardware._send_with_token.call_args_list] == [
+        SystemCommandKind.SET_MOTOR_DRIFT, SystemCommandKind.SET_X, SystemCommandKind.SET_Y, SystemCommandKind.SET_Z]

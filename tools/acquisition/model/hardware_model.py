@@ -25,10 +25,33 @@ from autotrainer.device import (CanTransportConfiguration, CanTransportKind, Dev
                                 StepperConfig, ServoConfig, Device, ColorLed, Target, EmulationInterface,
                                 capture_can_diagnostics)
 from autotrainer.device.device_interface import BOARD_STIM_LINE_OUTPUTS, stepper_travel_refusal
+from autotrainer.device.can_device import (default_cover_pellet, default_load_pellet, default_move_retract,
+                                           default_release_pellet, default_send_pellet, sequence_stepper_targets)
+from autotrainer.device.compound_movement_file import CompoundMovements
+from autotrainer.device.motor_steps import MotorSteps
 from autotrainer.behavior import PelletDeviceProtocol
 from tools.acquisition.model.firmware_compatibility import FirmwareCompatibilityPolicy
 
 logger = get_verbose_logger(__name__)
+
+
+def _pellet_sequences(movements=None) -> Dict[str, MotorSteps]:
+    """The compound sequences CanDevice runs for LOAD_PELLET, SEND_PELLET, COVER_PELLET,
+    RELEASE_PELLET and SEND_RETRACT: those of `movements` (move_config.yaml) that are not empty,
+    else CanDevice's built-in defaults, as DeviceConnection.use_compound_movements applies them."""
+    sequences = {
+        "load_pellet": default_load_pellet(),
+        "send_pellet": default_send_pellet(),
+        "cover_pellet": default_cover_pellet(),
+        "release_pellet": default_release_pellet(),
+        "move_retract": default_move_retract(),
+    }
+    if isinstance(movements, CompoundMovements):
+        for name in sequences:
+            steps = getattr(movements, name)
+            if not steps.is_empty:
+                sequences[name] = steps
+    return sequences
 
 _nans_offset3dTuple = Offset3DTuple.get_nan()
 
@@ -96,6 +119,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self._device_conn: Optional[DeviceConnectionProtocol] = None
         # What the last connect wrote to the pellet controller (WRITE_MOTOR_CONFIGURATION).
         self._motor_configurations: Optional[MotorConfigurations] = None
+        # The compound sequences the last connect applied (move_config.yaml, else the built-in ones).
+        self._pellet_sequences: Dict[str, MotorSteps] = _pellet_sequences()
         self._can_device: Optional[CanDevice] = None
         self._can_latency_observer = None
         self._device_uuid_ack_timeout_engaged = False
@@ -462,7 +487,33 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         return self._send_with_token(self._device_conn, SystemCommandKind.SEND_TO_LIMITS,
                                      [Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR, Motor.PELLET_X_MOTOR])
 
+    def _refuse_sequence_outside_travel(self, name: str) -> bool:
+        """True, after logging an error per step, when a stepper target of the compound
+        sequence `name` (move_config.yaml) lies outside the configured travel: the whole
+        sequence is then refused before its first step. Targets are taken from the last
+        reported stepper position and the requested send position (the reported one before
+        any SET); a step relative to a position the host does not know is not checked,
+        CanDevice and CanInterface send nothing for it."""
+        if self._motor_configurations is None:
+            return False
+        send_position = Offset3DTuple(*(
+            requested if math.isfinite(requested) else reported
+            for requested, reported in zip(self._last_requested_set_coordinates,
+                                           self._last_motor_send_coordinates)
+        ))
+        refused = False
+        for axis, target in sequence_stepper_targets(
+            self._pellet_sequences[name].steps, self._last_motor_coordinates, send_position
+        ):
+            if math.isfinite(target) and self._refuse_outside_travel("xyz".index(axis), target):
+                refused = True
+        if refused:
+            logger.error("Pellet sequence %s refused: a step lies outside the configured travel", name)
+        return refused
+
     def send_retract(self) -> Optional[UUID]:
+        if self._refuse_sequence_outside_travel("move_retract"):
+            return None
         return self._send_with_token(self._device_conn, SystemCommandKind.SEND_RETRACT)
 
     def send_home(self) -> Optional[UUID]:
@@ -476,6 +527,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         return token
 
     def load_pellet(self) -> Optional[UUID]:
+        if self._refuse_sequence_outside_travel("load_pellet"):
+            return None
         return self._send_with_token(self._device_conn, SystemCommandKind.LOAD_PELLET)
 
     def send_pellet(
@@ -489,6 +542,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             data["embedded_tone"] = embedded_tone
         if pre_reveal_stimulus is not None:
             data["pre_reveal_stimulus"] = pre_reveal_stimulus
+        if self._refuse_sequence_outside_travel("send_pellet"):
+            return None
         return self._send_with_token(
             self._device_conn,
             SystemCommandKind.SEND_PELLET,
@@ -496,9 +551,13 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         )
 
     def release_pellet(self) -> Optional[UUID]:
+        if self._refuse_sequence_outside_travel("release_pellet"):
+            return None
         return self._send_with_token(self._device_conn, SystemCommandKind.RELEASE_PELLET)
 
     def cover_pellet(self) -> Optional[UUID]:
+        if self._refuse_sequence_outside_travel("cover_pellet"):
+            return None
         return self._send_with_token(self._device_conn, SystemCommandKind.COVER_PELLET)
 
     def attach_servo(self, servo: Motor) -> Optional[UUID]:
@@ -782,7 +841,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         # 2)
         config_started = time.perf_counter()
         log_hardware_initialization(logger, "START | pellet move configuration")
-        device_conn.load_default_move_config()
+        self._pellet_sequences = _pellet_sequences(device_conn.load_default_move_config())
         log_hardware_initialization(
             logger,
             "READY | pellet move configuration | elapsed=%.3fs",
@@ -1486,8 +1545,16 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         )
 
     def set_motors_drift(self, drift: Offset3DTuple):
-        """Apply the pellet motor drift"""
+        """Apply the pellet motor drift. CanInterface moves the saved send position to
+        SET - drift, so that is refused, with nothing sent, when it lies outside the travel."""
         if self._device_conn is None:
+            return
+        refused = False
+        for coord_idx, (requested, axis_drift) in enumerate(zip(self._last_requested_set_coordinates, drift)):
+            target = requested - axis_drift
+            if math.isfinite(target) and self._refuse_outside_travel(coord_idx, target):
+                refused = True
+        if refused:
             return
         self._send_with_token(self._device_conn, SystemCommandKind.SET_MOTOR_DRIFT, drift)
         # this ensure the next send_to_fixed_pos command will get the corrected position:
