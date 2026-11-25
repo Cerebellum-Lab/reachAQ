@@ -1,5 +1,6 @@
 # christielab10's ~/reachAQ/motor_config.yaml as read on 2026-11-20, with the pellet
-# x/y/z travel (min_pos 0 / max_pos 35 mm) added on 2026-11-23.
+# x/y/z travel added on 2026-11-23: min_pos 0, max_pos 35 mm on x and y and 30 mm on z, as
+# the rig's file reads since 2026-11-24 12:14 (pellet 2.4.0's per-axis travel caps).
 tunnel:
   magnet:
     min_pos: 0
@@ -64,4 +65,4 @@ pellet:
     max_acc: 600
     home_vel: 30
     min_pos: 0
-    max_pos: 35
+    max_pos: 30

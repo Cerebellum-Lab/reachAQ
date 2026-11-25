@@ -96,7 +96,8 @@ def test_christielab10_motor_config_loads_with_its_travel():
         (Motor.PELLET_X_MOTOR, Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR),
     ):
         assert motor == expected_motor == config.motor
-        assert (config.minimum_position, config.maximum_position) == (0.0, 35.0)
+        assert (config.minimum_position, config.maximum_position) == (
+            (0.0, 30.0) if expected_motor is Motor.PELLET_Z_MOTOR else (0.0, 35.0))
         assert (config.maximum_velocity, config.maximum_acceleration, config.homing_velocity) == (120, 600, 30)
         assert (config.microsteps, config.steps_per_revolution) == (8, 24.0)
     assert configs.x_config[1].flip_limit_orientation is True

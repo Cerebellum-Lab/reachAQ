@@ -1190,7 +1190,7 @@ def test_run_scout_records_the_grid_as_a_short_capture(tmp_path, monkeypatch):
 def test_motor_travel_is_read_from_the_motor_config_file(_no_motor_config_file):
     assert h3d.motor_travel() == ((None, None),) * 3  # no file: no travel
     _no_motor_config_file.write_bytes(CHRISTIELAB10_MOTOR_CONFIG.read_bytes())
-    assert h3d.motor_travel() == ((0.0, 35.0),) * 3
+    assert h3d.motor_travel() == ((0.0, 35.0), (0.0, 35.0), (0.0, 30.0))
     _no_motor_config_file.write_text(yaml.safe_dump({"pellet": {"y": {"max_pos": 30}}}))
     assert h3d.motor_travel() == ((None, None), (None, 30.0), (None, None))
     _no_motor_config_file.write_text(yaml.safe_dump({"pellet": {"z": {"min_pos": 40, "max_pos": 35}}}))
@@ -1199,7 +1199,7 @@ def test_motor_travel_is_read_from_the_motor_config_file(_no_motor_config_file):
 
 
 def test_run_scout_searches_the_configured_travel_without_a_connect(tmp_path, monkeypatch, _no_motor_config_file):
-    # christielab10's motor_config.yaml: 0-35 mm on every axis. The hardware has not
+    # christielab10's motor_config.yaml: 0-35 mm on x and y, 0-30 mm on z. The hardware has not
     # connected, so it holds no motor configurations: the scout reads the file.
     _no_motor_config_file.write_bytes(CHRISTIELAB10_MOTOR_CONFIG.read_bytes())
     calls, clock = [], _Clock()
@@ -1218,25 +1218,25 @@ def test_run_scout_searches_the_configured_travel_without_a_connect(tmp_path, mo
     h3d.run_scout(app_model, cameras, targets, **_scout_kwargs(app_model, tmp_path, clock, cameras))
 
     # The low edges keep SCOUT_HOME_MARGIN_MM (1 mm) clear of the home stop.
-    assert seen["targets"] == scout_grid(Bounds((1.0, 1.0, 1.0), (35.0, 35.0, 35.0)), counts=(2, 2, 2))
+    assert seen["targets"] == scout_grid(Bounds((1.0, 1.0, 1.0), (35.0, 35.0, 30.0)), counts=(2, 2, 2))
     commanded = app_model.hardware.commands
     assert commanded, "the scout moved the stage"
     for axis, value in commanded:
         assert 0.0 <= value <= 35.0, (axis, value)
         assert not 0.0 < value < 1.0, (axis, value)
     # It reaches the margin and the top of the travel on every axis.
-    for axis in "xyz":
+    for axis, top in (("x", 35.0), ("y", 35.0), ("z", 30.0)):
         values = {value for a, value in commanded if a == axis}
-        assert min(values) == 1.0 and max(values) == 35.0
+        assert min(values) == 1.0 and max(values) == top
 
     # scoutBounds still narrows the travel.
     seen.clear()
     for name in ("left", "right"):  # the first scout moved the recordings away
         (tmp_path / "session" / f"{name}_recording.mp4").write_bytes(b"")
         (tmp_path / "session" / f"{name}_recording_timestamps.txt").write_text("1000.0,0\n")
-    h3d.run_scout(app_model, cameras, targets, configured=Bounds((5.0, 0.0, 31.0), (99, 20.0, 99)),
+    h3d.run_scout(app_model, cameras, targets, configured=Bounds((5.0, 0.0, 21.0), (99, 20.0, 99)),
                   **_scout_kwargs(app_model, tmp_path, clock, cameras))
-    assert seen["targets"] == scout_grid(Bounds((5.0, 1.0, 31.0), (35.0, 20.0, 35.0)), counts=(2, 2, 2))
+    assert seen["targets"] == scout_grid(Bounds((5.0, 1.0, 21.0), (35.0, 20.0, 30.0)), counts=(2, 2, 2))
 
 
 def test_an_aborted_scout_stops_the_cameras_and_moves_no_video(tmp_path, monkeypatch):
