@@ -388,6 +388,10 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             "sent": bool(sent),
         }
         with self._lock:
+            if self._estop_record is not None and self._estop_record.get("kind") == "operator":
+                # Sticky until the stop clears: a later failure stop must not let the
+                # session-end home release a latch the operator set (review I-C).
+                record["kind"] = "operator"
             prev, self._estop_record = self._estop_record, record
             self._estop_home_token = None
             prev_position, self._last_motor_coordinates = self._last_motor_coordinates, _nans_offset3dTuple
@@ -1128,6 +1132,10 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         config_started = time.perf_counter()
         log_hardware_initialization(logger, "START | pellet motor configuration")
         self._motor_configurations = device_conn.load_default_motor_config()
+        # motor_config.yaml pellet.profile_ack_deadlines (missing: true). Off, every stepper
+        # frame waits the fixed ack timeout; a missed ack still stops the stage.
+        can_device.profile_ack_deadlines = bool(
+            getattr(self._motor_configurations, "profile_ack_deadlines", True))
         log_hardware_initialization(
             logger,
             "READY | pellet motor configuration | elapsed=%.3fs",

@@ -326,11 +326,12 @@ def alert_for_pellet_axes(kind: str, axes: Tuple[str, ...]) -> Optional[Operator
 
 
 _HOME_TO_CLEAR = (
-    "Home before continuing (Hardware Control ▸ Home); the session-end home also clears it."
+    "Home before continuing (Hardware Control ▸ Home); the session-end home also clears it "
+    "when the pellet board is Ready at session end."
 )
 _HOME_TO_CLEAR_OPERATOR = (
-    "Home before continuing (Hardware Control ▸ Home) or reconnect (Refresh Hardware); "
-    "the session-end home does not clear it."
+    "Home before continuing (Hardware Control ▸ Home) or reconnect (Refresh Hardware, or a "
+    "calibration capture's connect); the session-end home does not clear it."
 )
 # Hardware Control's Home is enabled only with the board connected and acquisition started
 # (HardwareControlContent._refresh_enabled_state); a reconnect homes as well.
