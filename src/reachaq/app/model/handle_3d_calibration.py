@@ -36,7 +36,7 @@ from reachaq.inference.multires_calibration.pipeline import (
     load_frame_times,
     write_waypoint_log,
 )
-from reachaq.inference.multires_calibration.report import QualityReport, configured_lenses
+from reachaq.inference.multires_calibration.report import DEFERRED_LENS_SETTINGS, QualityReport
 from reachaq.inference.multires_calibration.scout import (
     DEFAULT_COUNTS,
     MAX_PATH,
@@ -626,7 +626,6 @@ def calibrate_waypoint_capture(
     board: Optional[BoardSpec] = None,
     fit_mode: Optional[str] = None,
     fix_principal_point: bool = False,
-    lenses=None,
     placement: Optional[str] = None,
 ) -> Tuple[Path, CalibrationIndex, QualityReport]:
     """Write `log` as the capture's waypoints.yaml beside its source_videos, then calibrate
@@ -650,8 +649,6 @@ def calibrate_waypoint_capture(
         extra["fix_principal_point"] = True
     if placement is not None and placement != PLACEMENT_SIMILARITY:
         extra["placement"] = placement
-    if lenses is not None and lenses.lens_mm:
-        extra["lenses"] = lenses
     index, report = calibrate_capture(
         Path(capture_dir),
         output_dir=output_dir,
@@ -1193,7 +1190,9 @@ def make_3d_calib(
     fit_mode = configured_fit(library_settings, board)
     fix_principal_point = configured_principal_point(library_settings)
     placement = configured_placement(library_settings)
-    lenses = configured_lenses(library_settings)
+    ignored = [key for key in DEFERRED_LENS_SETTINGS if key in library_settings]
+    if ignored:
+        logger.notice("Calibration settings ignored: %s (the nominal-lens checks are deferred)", ", ".join(ignored))
     if board.kind == BoardSpec().kind:
         logger.notice("Calibration board: checkerboard, %d x %d inner corners, %g mm squares",
                       board.rows, board.cols, board.square_mm)
@@ -1258,7 +1257,6 @@ def make_3d_calib(
         board=board,
         fit_mode=fit_mode,
         fix_principal_point=fix_principal_point,
-        lenses=lenses,
         placement=placement,
     )
 

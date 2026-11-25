@@ -152,7 +152,7 @@ def test_clean_synthetic_fit_passes(rig, fitted):
     # The stage block's slack and repeat visits need a per-view fit's placement.
     assert {m.name for m in report.metrics} == (
         set(DEFAULT_THRESHOLDS) - CHANGE_METRICS
-        - {"loo_triangulation_px", "focal_vs_nominal_rel", "stage_slack_rms_mm", "stage_repeat_mm"})
+        - {"loo_triangulation_px", "stage_slack_rms_mm", "stage_repeat_mm"})
     for name in ("views_kept", "covisible_views", "reprojection_rms_px", "joint_reprojection_rms_px",
                  "coverage_roi_fraction", "fx_fy_ratio_dev",
                  "focal_rel_std", "principal_point_offset_frac", "max_distortion_shift_px"):
@@ -776,6 +776,23 @@ def test_stage_error_passes_on_the_planar_rms_and_only_warns_on_the_joint_rms(ti
         assert graded.status == "pass" and graded.value < 0.2, graded
         joint = metric(report, "joint_reprojection_rms_px", cam)
         assert joint.status == "warn" and joint.value > 1.0, joint
+
+
+def test_focal_pair_rel_warns_above_10_percent_between_cameras(exact_rig):
+    # The nominal-lens checks are deferred (until after 2026-12-31): every lens is 8.5 mm, so the
+    # pair check is the plain relative difference, warning above 10 %.
+    assert "focal_vs_nominal_rel" not in DEFAULT_THRESHOLDS
+    truth = exact_rig.truth
+    right = truth.cameras["right"]
+    K = np.array(right.K, float)
+    K[0, 0] *= 1.12
+    fit = with_camera(truth, "right", dataclasses.replace(right, K=K))
+    report = report_for(fit, exact_rig.observations, exact_rig.board, swept_roi(exact_rig.observations))
+    pair = metric(report, "focal_pair_rel", PAIR)
+    fx_a, fx_b = truth.cameras["left"].K[0, 0], K[0, 0]
+    assert pair.value == pytest.approx(abs(fx_a - fx_b) / ((fx_a + fx_b) / 2))
+    assert (pair.warn, pair.fail) == (0.10, None) and pair.status == "warn"
+    assert not any("HFOV" in note for note in report.notes)
 
 
 def test_the_stage_block_reports_slack_and_repeat_visits_and_never_fails(rig, fitted):

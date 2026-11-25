@@ -109,7 +109,6 @@ from reachaq.inference.multires_calibration.per_view import (
     fit_per_view,
 )
 from reachaq.inference.multires_calibration.report import (
-    LensSettings,
     CameraVerdict,
     CaptureSummary,
     PresetCrossCheck,
@@ -370,7 +369,6 @@ def calibrate_capture(
     fit_mode: Optional[str] = None,
     fix_principal_point: bool = False,
     placement: str = "similarity",
-    lenses: Optional[LensSettings] = None,
 ) -> Tuple[CalibrationIndex, QualityReport]:
     """Calibrate every preset in `presets` from the capture in `capture_dir` and write the
     calibration to `output_dir`, which must not exist yet.
@@ -389,8 +387,6 @@ def calibrate_capture(
     `fix_principal_point` holds the per-view fit's principal points, and `placement` picks its
     stage model, "similarity" or "affine" (per_view.fit_per_view).
     `board` defaults to the one the capture's waypoints.yaml records (capture_board).
-    `lenses` (report.configured_lenses) gives the cameras' nominal lenses, which the report
-    compares the fitted focal lengths with.
 
     Only the cameras that meet per_camera_rule are fitted; the report's `cameras` gives
     every camera's verdict. Raises CalibrationRefused, writing nothing, when fewer than 2 do.
@@ -506,12 +502,9 @@ def calibrate_capture(
         rejections=rejections,
     )
     previous = _previous(previous_dir, notes)
-    lens_options = {} if lenses is None else {
-        "lenses": lenses.by_camera(log.cameras), "pixel_um": lenses.pixel_um}
-    # The capture records the full sensor at binning 1, so a fitted px is a sensor px.
     report = build_report(fit, observations, board, base.sensor_roi(), summary, cross_checks, previous,
                           presets=presets, cameras=verdicts,
-                          fix_principal_point="fix_principal_point" in per_view_options, **lens_options)
+                          fix_principal_point="fix_principal_point" in per_view_options)
     report.notes.extend(notes)
 
     capture = {

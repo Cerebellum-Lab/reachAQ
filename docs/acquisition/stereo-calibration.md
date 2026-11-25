@@ -405,24 +405,12 @@ between the axes, which the report gives as `stage axes: scale x ..., y ..., z
 with the principal point free, the z scale trades against the focal length and
 the principal point, and a synthetic fit came out 2 % short in fx.
 
-**Nominal lenses.** The report compares each camera's fitted focal length with
-its lens when `calibrations/settings.yaml` gives one:
-
-```yaml
-lenses:
-  "24152533": {lens_mm: 8.5}    # by camera serial; a camera without one by its name
-  "24152513": {lens_mm: 12}
-  "26040425": {lens_mm: 8.5}
-pixel_um: 3.45                  # the sensor's pixel pitch (BFS-U3-16S2M)
-```
-
-Each camera gets a line such as `right: fitted 12.5 mm, HFOV 22.5° (nominal 12 mm)`
-(the fitted fx × `pixel_um`, at the capture's binning 1), and a warning,
-`focal_vs_nominal_rel`, when the fitted focal length is more than 15 % from the
-nominal one. `focal_pair_rel` then compares two cameras' fitted focal ratio with
-their lenses' ratio; for a pair without both lenses it is reported ungraded.
-`lens_mm` and `pixel_um` must be positive numbers, `lenses` needs `pixel_um`, and
-an unknown key in a lens entry is refused.
+**Deferred until after Dec 31:** a two-stage fit (intrinsics first),
+installed-model grading, and nominal-lens checks. Until then `focal_pair_rel`
+is the plain relative difference between two cameras' focal lengths, which
+warns above 10 % (every christielab10 camera has an 8.5 mm lens). A
+`calibrations/settings.yaml` that still has `lenses` or `pixel_um` keys is
+accepted; the calibration ignores them and logs that it did.
 
 ### The calibration library
 

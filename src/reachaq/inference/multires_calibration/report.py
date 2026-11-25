@@ -96,12 +96,7 @@ DEFAULT_THRESHOLDS: Thresholds = {
     "coverage_roi_fraction": (0.5, 0.25),
     "fx_fy_ratio_dev": (0.01, 0.03),
     "focal_rel_std": (0.005, 0.02),
-    # With a nominal lens for both cameras of a pair: |fitted fx ratio / nominal focal ratio - 1|.
-    # Without, the plain relative difference is reported ungraded (no limits).
     "focal_pair_rel": (0.10, None),
-    # |fitted focal length in mm / the nominal lens's - 1|, for a camera with a nominal lens
-    # (LensSettings). UNFINALIZED: 15 %.
-    "focal_vs_nominal_rel": (0.15, None),
     "principal_point_offset_frac": (0.2, 0.4),
     "max_distortion_shift_px": (60.0, 150.0),
     "epipolar_error_px": (0.5, 1.0),
@@ -338,9 +333,6 @@ def build_report(
     thresholds: Thresholds = DEFAULT_THRESHOLDS,
     presets: Sequence[PresetGeometry] = (),
     cameras: Optional[Mapping[str, CameraVerdict]] = None,
-    lenses: Optional[Mapping[str, float]] = None,
-    pixel_um: Optional[float] = None,
-    binning: int = 1,
     fix_principal_point: bool = False,
 ) -> QualityReport:
     """Grade `fit` and its capture against `thresholds`.
@@ -423,14 +415,6 @@ def build_report(
         add("focal_rel_std", cam, fx_std / fx, "ratio", undetermined)
         add("principal_point_offset_frac", cam, _principal_point_offset(model, roi), "of ROI half-side")
         add("max_distortion_shift_px", cam, _max_distortion_shift(model, roi), "sensor px")
-        nominal = (lenses or {}).get(cam)
-        if pixel_um is not None:
-            focal_mm = fx * pixel_um * binning / 1000.0
-            hfov = math.degrees(2.0 * math.atan(fit.image_size[0] / (2.0 * fx)))
-            notes.append(f"{cam}: fitted {focal_mm:.1f} mm, HFOV {hfov:.1f}\N{DEGREE SIGN}"
-                         + (f" (nominal {nominal:g} mm)" if nominal is not None else " (no nominal lens)"))
-            if nominal is not None:
-                add("focal_vs_nominal_rel", cam, abs(focal_mm / nominal - 1.0), "ratio", f"nominal {nominal:g} mm")
 
     # Every co-visible pair, and each camera against the rest.
     add("stereo_reprojection_rms_px", None, _joint_rms(fit), "sensor px")
@@ -438,15 +422,7 @@ def build_report(
     for first, second in pairs:
         pair = f"{first}-{second}"
         fx_a, fx_b = fit.cameras[first].K[0, 0], fit.cameras[second].K[0, 0]
-        lens_a, lens_b = (lenses or {}).get(first), (lenses or {}).get(second)
-        if lens_a is not None and lens_b is not None:
-            # Cameras with different lenses differ in focal length by design: grade the fitted
-            # ratio against the nominal one.
-            add("focal_pair_rel", pair, abs((fx_a / fx_b) / (lens_a / lens_b) - 1.0), "ratio",
-                f"against the nominal {lens_a:g} / {lens_b:g} mm")
-        else:
-            metrics.append(_grade("focal_pair_rel", pair, abs(fx_a - fx_b) / ((fx_a + fx_b) / 2), "ratio",
-                                  (None, None), "not graded: no nominal lens for both cameras"))
+        add("focal_pair_rel", pair, abs(fx_a - fx_b) / ((fx_a + fx_b) / 2), "ratio")
         add("baseline_mm", pair, float(np.linalg.norm(_centre(fit.cameras[second]) - _centre(fit.cameras[first]))),
             "mm")
         epipolar, square, stereo_note = _stereo_checks(fit, observations, board, first, second)
@@ -596,59 +572,9 @@ def _format_xyz_mm(xyz) -> str:
     return "({:.2f}, {:.2f}, {:.2f}) mm".format(*np.asarray(xyz, float).reshape(3))
 
 
-# The library settings that give each camera's nominal lens (configured_lenses). UNFINALIZED:
-#   lenses: {<camera serial, or name for a camera without one>: {lens_mm: <float>}}
-#   pixel_um: <sensor pixel pitch, um>
-LENSES_SETTING = "lenses"
-PIXEL_UM_SETTING = "pixel_um"
-
-
-@dataclass(frozen=True)
-class LensSettings:
-    """Nominal lens focal lengths (mm) by camera serial or name, and the sensor's pixel pitch (um)."""
-
-    lens_mm: Mapping[str, float]
-    pixel_um: Optional[float]
-
-    def by_camera(self, cameras) -> Dict[str, float]:
-        """camera name -> nominal lens mm for the capture's `cameras` (CaptureCamera): by serial,
-        or by name for a camera without one or whose serial is not listed."""
-        out = {}
-        for camera in cameras:
-            key = camera.serial if camera.serial is not None and str(camera.serial) in self.lens_mm else camera.name
-            if str(key) in self.lens_mm:
-                out[camera.name] = self.lens_mm[str(key)]
-        return out
-
-
-def configured_lenses(settings: Mapping) -> LensSettings:
-    """The library settings' `lenses` and `pixel_um`; empty when unset. Raises ValueError naming
-    the key for a value that is not a mapping, an unknown key in a lens entry, a lens_mm or
-    pixel_um that is not a positive finite number, or lenses without pixel_um."""
-    settings = settings or {}
-    lenses, pixel = settings.get(LENSES_SETTING), settings.get(PIXEL_UM_SETTING)
-    out: Dict[str, float] = {}
-    if lenses is not None:
-        if not isinstance(lenses, Mapping):
-            raise ValueError(f"{LENSES_SETTING}: it must be a mapping of camera -> {{lens_mm: <mm>}}, got {lenses!r}")
-        for key, entry in lenses.items():
-            where = f"{LENSES_SETTING}.{key}"
-            if not isinstance(entry, Mapping):
-                raise ValueError(f"{where}: it must be {{lens_mm: <mm>}}, got {entry!r}")
-            unknown = sorted(str(k) for k in entry if k != "lens_mm")
-            if unknown:
-                raise ValueError(f"{where}.{unknown[0]}: unknown key; expected lens_mm")
-            out[str(key)] = _positive(entry.get("lens_mm"), f"{where}.lens_mm")
-    pixel_um = None if pixel is None else _positive(pixel, PIXEL_UM_SETTING)
-    if out and pixel_um is None:
-        raise ValueError(f"{PIXEL_UM_SETTING}: needed with {LENSES_SETTING}, to turn a focal length in px into mm")
-    return LensSettings(lens_mm=out, pixel_um=pixel_um)
-
-
-def _positive(value, where: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-        raise ValueError(f"{where}: {value!r} must be a positive number")
-    return float(value)
+# Library settings for nominal lenses, which an earlier version graded. The checks are deferred
+# (until after 2026-12-31); make_3d_calib ignores these keys with a log note.
+DEFERRED_LENS_SETTINGS = ("lenses", "pixel_um")
 
 
 def placement_notes(placement) -> List[str]:
