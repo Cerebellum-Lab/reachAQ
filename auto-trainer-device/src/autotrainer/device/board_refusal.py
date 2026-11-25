@@ -20,7 +20,7 @@ import enum
 import math
 from typing import Any, Tuple
 
-from autotrainer.core.message import Motor
+from autotrainer.core.message import Motor, SystemCommandKind
 
 EPERM = -1
 EIO = -5
@@ -37,6 +37,8 @@ _NAMES = {
 }
 
 _STEPPERS = (Motor.PELLET_X_MOTOR, Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR)
+#: SET_X/Y/Z only store the send position: a busy one moves nothing.
+SET_COMMANDS = frozenset({SystemCommandKind.SET_X, SystemCommandKind.SET_Y, SystemCommandKind.SET_Z})
 _AXIS_NAMES = {
     Motor.PELLET_X_MOTOR: "X",
     Motor.PELLET_Y_MOTOR: "Y",
@@ -132,14 +134,20 @@ class CommandRefusal:
 
     @property
     def motion_may_continue(self) -> bool:
-        """-EBUSY on a stepper command: an axis may still be moving.
+        """-EBUSY on a stepper motion command (a move, a home, SEND_TO_FIXED_XYZ, a
+        sequence's stepper step): an axis may still be moving. Not on a SET_X/Y/Z,
+        which moves nothing; CanDevice sends a busy SET again later instead.
 
         The board answers -EBUSY while an axis is in motion, and an axis whose
         step timer free-runs stays in motion for ever (pellet firmware 2.3.1,
         limitation 4). The host cannot tell that from "needs homing", which
         is answered with the same code, so it stops the stage either way.
         """
-        return self.error == EBUSY and self.command_class in _STEPPER_CLASSES
+        return (
+            self.error == EBUSY
+            and self.command_class in _STEPPER_CLASSES
+            and self.command not in SET_COMMANDS
+        )
 
     @property
     def needs_home(self) -> Tuple[Motor, ...]:

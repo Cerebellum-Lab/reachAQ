@@ -299,6 +299,7 @@ def test_ebusy_on_a_resent_stepper_command_is_not_reported_as_needs_home(board):
     re-sent (its lost ack stops the stage), so a SET, which still is, stands in.
     """
     board.device.default_command_ack_timeout_duration = 0.3
+    board.device.busy_set_retry_count = 0  # a busy SET is otherwise sent again (can_device_estop_test)
     board.answer("set_motor_x", _LOST, -16)
 
     refusal = board.refusal_of(board.send(SystemCommandKind.SET_X, 1.0))

@@ -121,18 +121,27 @@ def test_a_lost_send_to_fixed_xyz_ack_in_a_pellet_send_stops_the_stage(board):
     assert refusal.command_class is RefusedCommandClass.FIXED_XYZ
 
 
-def test_a_lost_ack_of_any_frame_of_a_stepper_sequence_stops_the_stage(board):
-    # The load's delay frame: the sequence drives the steppers, so a lost ack in it stops them.
+def test_a_lost_delay_ack_inside_a_load_is_resent_without_an_estop(board):
+    # Only stepper-motion frames stop the stage; a delay frame moves nothing (Ben, 2026-11-24).
     board.device.default_command_ack_timeout_duration = 0.2
-    delays = board.answer("delay", _LOST)
+    delays = board.answer("delay", _LOST, 0, 0, 0)
 
     token = board.send(SystemCommandKind.LOAD_PELLET)
-    refusal = board.refusal_of(token, timeout=5.0)
-    time.sleep(0.4)
 
-    assert len(delays) == 1
-    assert board.interface.estop_frames == [True]
-    assert refusal.stopped_by_estop
+    assert board.wait_for(SystemStatusMessageKind.ACKNOWLEDGE, token, timeout=5.0) is not None
+    assert len(delays) == 4, "the lost delay is re-sent, then the load's other two run"
+    assert board.interface.estop_frames == []
+
+
+def test_a_lost_release_servo_ack_inside_a_send_is_resent_without_an_estop(board):
+    board.device.default_command_ack_timeout_duration = 0.2
+    releases = board.answer("release_pellet", _LOST, 0)
+
+    token = board.send(SystemCommandKind.SEND_PELLET, {"pre_reveal_stimulus": (200, 1000, 2)})
+
+    assert board.wait_for(SystemStatusMessageKind.ACKNOWLEDGE, token, timeout=5.0) is not None
+    assert len(releases) == 2
+    assert board.interface.estop_frames == []
 
 
 def test_a_lost_set_ack_is_still_resent_and_stops_nothing(board):
@@ -177,14 +186,52 @@ def test_ebusy_on_a_stepper_command_stops_the_stage(board, kind, data, sender):
     assert "EBUSY" in board.reported[0][0]
 
 
-def test_ebusy_on_a_resent_set_is_still_moving_and_stops_the_stage(board):
-    board.device.default_command_ack_timeout_duration = 0.2
-    board.answer("set_motor_x", _LOST, -16)
+@pytest.mark.parametrize("kind, data, sender", [
+    (SystemCommandKind.SEND_HOME, None, "stepper_home"),
+    (SystemCommandKind.LOAD_PELLET, None, "move_motor_x"),
+    (SystemCommandKind.SEND_PELLET, None, "fixed_position"),
+], ids=["home", "load-sequence", "send-sequence-fixed-xyz"])
+def test_ebusy_on_a_home_or_a_sequence_stops_the_stage(board, kind, data, sender):
+    board.answer(sender, -16)
+
+    board.refusal_of(board.send(kind, data))
+    deadline = time.monotonic() + 2.0
+    while not board.interface.estop_frames and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert board.interface.estop_frames == [True]
+
+
+def test_a_busy_set_sends_no_estop_and_is_retried_until_the_axis_is_idle(board, caplog):
+    # A SET moves nothing: -EBUSY on it is logged and the SET sent again a little later.
+    board.device.busy_set_retry_delay_s = 0.05
+    sets = board.answer("set_motor_x", -16, -16)
+    y_moves = board.spy("move_motor_y")
+
+    with caplog.at_level(logging.WARNING, logger="autotrainer.device.can_device"):
+        token = board.send(SystemCommandKind.SET_X, 1.0, token="busy-set")
+        after = board.send(SystemCommandKind.MOVE_Y, 2.0, token="after")
+        assert board.wait_for(SystemStatusMessageKind.ACKNOWLEDGE, token) is not None
+
+    assert len(sets) == 3, "two busy answers, then the SET goes through"
+    assert board.interface.estop_frames == []
+    assert not board.wait_for(SystemStatusMessageKind.COMMAND_REFUSED, token, timeout=0.0)
+    assert board.wait_for(SystemStatusMessageKind.ACKNOWLEDGE, after) is not None
+    assert len(y_moves) == 1, "the move queued behind the SET waits for it, then goes"
+    assert any("busy" in r.getMessage() and "SET_X" in r.getMessage() for r in caplog.records)
+
+
+def test_a_set_still_busy_after_its_retries_is_refused_without_an_estop(board):
+    board.device.busy_set_retry_delay_s = 0.05
+    board.device.busy_set_retry_count = 2
+    sets = board.answer("set_motor_x", -16, -16, -16)
 
     refusal = board.refusal_of(board.send(SystemCommandKind.SET_X, 1.0))
+    time.sleep(0.2)
 
-    assert refusal.resent and refusal.outcome_unknown
-    assert board.interface.estop_frames == [True]
+    assert refusal.error == -16
+    assert len(sets) == 3
+    assert board.interface.estop_frames == []
 
 
 @pytest.mark.parametrize("error", [-1, -5, -116])
@@ -355,6 +402,14 @@ def test_only_ebusy_on_a_stepper_command_may_leave_an_axis_moving(command_class,
     assert refusal.motion_may_continue is expected
 
 
+@pytest.mark.parametrize("command", ["SET_X", "SET_Y", "SET_Z"])
+def test_ebusy_on_a_set_is_not_motion(command):
+    refusal = CommandRefusal(token="t", error=-16, command=getattr(SystemCommandKind, command),
+                             step=command, command_class=RefusedCommandClass.STEPPER_MOVE)
+
+    assert refusal.motion_may_continue is False
+
+
 # -- every trigger stops all axes ------------------------------------------------
 # Pellet firmware 2.4.0's STOP can name axes; a stop naming only some leaves the others
 # finishing their moves. Every host failure path sends the board-wide form: the ESTOP
@@ -400,10 +455,9 @@ def _ebusy(board):
     return board.send(SystemCommandKind.MOVE_Z, 15.5)
 
 
-def _resent_ebusy(board):
-    board.device.default_command_ack_timeout_duration = 0.2
-    board.answer("set_motor_x", _LOST, -16)
-    return board.send(SystemCommandKind.SET_X, 1.0)
+def _ebusy_home(board):
+    board.answer("stepper_home", -16)
+    return board.send(SystemCommandKind.SEND_HOME)
 
 
 def _public(board):
@@ -412,9 +466,9 @@ def _public(board):
 
 
 @pytest.mark.parametrize("trigger", [
-    _lost_move, _lost_fixed_xyz, _lost_sequence_frame, _ebusy, _resent_ebusy, _public,
+    _lost_move, _lost_fixed_xyz, _lost_sequence_frame, _ebusy, _ebusy_home, _public,
 ], ids=["move-ack-timeout", "fixed-xyz-ack-timeout", "sequence-ack-timeout", "ebusy",
-        "outcome-unknown-ebusy", "estop-call"])
+        "ebusy-home", "estop-call"])
 def test_every_device_trigger_sends_the_all_axes_estop(board, trigger):
     calls = []
     real = board.interface.estop

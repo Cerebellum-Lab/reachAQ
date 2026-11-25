@@ -30,7 +30,7 @@ from .device_api import DeviceApi
 from .can_interface import CanInterface, Target, target_of_motor, _STEPPER_MAX_POS
 from .can_transport import CanTransportConfiguration, CanTransportKind
 from .can_failure import CanFailure, CanFailureKind
-from .board_refusal import EPERM, CommandRefusal, RefusedCommandClass, is_refusal
+from .board_refusal import EBUSY, EPERM, CommandRefusal, RefusedCommandClass, is_refusal
 from .device_interface import (
     Acknowledge,
     AnalogOutput,
@@ -127,9 +127,7 @@ _XYZ = (Motor.PELLET_X_MOTOR, Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR)
 # SET_X/Y/Z only store the send position on the board; they move nothing.
 _SET_COMMANDS = frozenset({SystemCommandKind.SET_X, SystemCommandKind.SET_Y, SystemCommandKind.SET_Z})
 # Sequences that drive the steppers, directly or through SEND_TO_FIXED_XYZ (which
-# runs the same firmware motion engine). Any of their frames whose ack times out
-# stops the stage: a lost ack can be an axis that never finished (firmware 2.3.1
-# has no motion timeout, and a free-running step timer answers -EBUSY for ever).
+# runs the same firmware motion engine). An ESTOP drops them from the queue.
 _STEPPER_SEQUENCES = frozenset({
     SystemCommandKind.SEND_HOME,
     SystemCommandKind.SEND_TO_LIMITS,
@@ -193,14 +191,15 @@ def _classify_sent_frame(prev_command) -> Tuple[RefusedCommandClass, Tuple[Motor
 def _is_stepper_motion(prev_command, command_kind) -> bool:
     """Whether the frame a board context awaits the ack of may have set a stepper moving.
 
-    True for a stepper move or home, SEND_TO_FIXED_XYZ, and any frame of a
-    sequence that drives the steppers (_STEPPER_SEQUENCES). False for SET_X/Y/Z,
-    which only store a position, and for everything else.
+    True for a stepper move or home and SEND_TO_FIXED_XYZ, standalone or a step of
+    any sequence. False for SET_X/Y/Z, which only store a position, and for a
+    sequence's servo, delay and tone frames: a frame of a sequence is sent after the
+    previous one was acknowledged, which the board does when the move is done, so
+    none of them can leave a stepper moving. They are re-sent on a lost ack, as
+    before (Ben, 2026-11-24). command_kind is kept for the log and callers.
     """
     if prev_command is None:
         return False
-    if command_kind in _STEPPER_SEQUENCES:
-        return True
     if prev_command[0] is _retry_full and prev_command[1][0] in _SET_COMMANDS:
         return False
     command_class, _motors, _step = _classify_sent_frame(prev_command)
@@ -262,6 +261,11 @@ class _BoardPendingContext:
     compound_steps: Optional[List[Dict[str, Any]]] = None
     # The frame awaiting its ack (uuid) may have set a stepper moving (_is_stepper_motion).
     stepper_motion: bool = False
+    # A SET the board answered -EBUSY to, held until busy_set_due (time.perf_counter) and then
+    # sent again; ctx stays set meanwhile, so what is queued for the board waits behind it.
+    busy_set_entry: Optional[Tuple[Any, ...]] = None
+    busy_set_due: float = math.inf
+    busy_set_retries: int = 0
 
     def is_available(self):
         return (
@@ -278,6 +282,11 @@ class CanDevice(Device):
     default_command_ack_timeout_duration: float = 3  # seconds
 
     default_command_ack_timeout_repeat_count: int = 3
+
+    # A SET_X/Y/Z answered -EBUSY moves nothing: it is sent again this often, this many
+    # times (about 3 s), before it is refused. No ESTOP (Ben, 2026-11-24).
+    busy_set_retry_count: int = 12
+    busy_set_retry_delay_s: float = 0.25
 
     same_data_refresh_delay: float = _similar_data_refresh_delay
     """When > 0: if new data value is equal to previous value,
@@ -772,7 +781,11 @@ class CanDevice(Device):
         (SETs, tones, LEDs) stay queued.
         """
         board = self._boards_pending_ctx[Target.PELLET_DEVICE]
-        token = board.ctx
+        held_set = board.busy_set_entry  # a SET moves nothing: it stays queued
+        token = None if held_set is not None else board.ctx
+        board.busy_set_entry = None
+        board.busy_set_due = math.inf
+        board.busy_set_retries = 0
         command_class, motors, step = _classify_sent_frame(board.prev_command)
         kind = board.kind
         dropped = len(board.compound_steps or [])
@@ -812,6 +825,8 @@ class CanDevice(Device):
                     command_class=RefusedCommandClass.OTHER, perf_c=get_perf_now(),
                     estop_reason=str(reason),
                 ))
+        if held_set is not None:
+            kept.insert(0, held_set)
         cur_commands[:] = kept
 
     def _put_to_cmd_queue(self, obj):
@@ -945,6 +960,7 @@ class CanDevice(Device):
                 self._latency("dequeue", token=str(ctx), perf=p_now)
             found_board_with_uuid_ack = None
             refusal = None
+            refused_entry = None
             if kind is _uuid_ack:
                 msg_uuid, msg_perf_c, msg_error = data
                 for target, board_ctx in boards_pending_ctx.items():
@@ -954,8 +970,10 @@ class CanDevice(Device):
                         if is_refusal(msg_error):
                             # Read before the resets below clear what was sent.
                             refusal = self._make_refusal(board_ctx, msg_error, msg_perf_c)
+                            refused_entry = board_ctx.prev_command
                         else:
                             cur_commands.insert(0, (_uuid_ack, data, ctx, -math.inf))
+                            board_ctx.busy_set_retries = 0
                         board_ctx.uuid = None
                         board_ctx.repeated_command_count = 0
                         board_ctx.prev_command = None
@@ -979,6 +997,8 @@ class CanDevice(Device):
                     logger.debug("skipping unknown CAN uuid: %s", data)
                     continue
                 if refusal is not None:
+                    if self._hold_busy_set(found_board_with_uuid_ack, refusal, refused_entry):
+                        continue
                     self._stop_refused_command(found_board_with_uuid_ack, refusal)
                     if refusal.motion_may_continue:
                         self._estop_in_loop(
@@ -1071,6 +1091,19 @@ class CanDevice(Device):
                 board_ctx.uuid = None
                 board_ctx.ctx = None  # it's also included in prev_command
                 break  # only retry 1 board at a time
+            # a busy SET whose wait is over goes out again, ahead of what queued behind it:
+            if retrying_board is None and kind is None:
+                for board_ctx in boards_pending_ctx.values():
+                    entry = board_ctx.busy_set_entry
+                    if entry is None or time.perf_counter() < board_ctx.busy_set_due:
+                        continue
+                    board_ctx.busy_set_entry = None
+                    board_ctx.busy_set_due = math.inf
+                    board_ctx.ctx = None  # it's also included in the entry
+                    board_ctx.kind = None
+                    cur_commands.insert(0, entry)
+                    retrying_board = board_ctx.target
+                    break
             # check for possible _next_compound to process:
             if retrying_board is None and has_compound_left and kind is not _uuid_ack:
                 for board_ctx in boards_pending_ctx.values():
@@ -1347,6 +1380,28 @@ class CanDevice(Device):
             perf_c=perf_c,
         )
 
+    def _hold_busy_set(self, board_ctx: _BoardPendingContext, refusal: CommandRefusal, sent) -> bool:
+        """Hold a SET_X/Y/Z the board answered -EBUSY to, and send it again once its wait is over.
+
+        A SET only stores the send position, so a busy one stops nothing: it waits
+        busy_set_retry_delay_s for the axis to be idle, up to busy_set_retry_count
+        times, and is then refused as any refusal is. Returns whether it was held.
+        """
+        if (refusal.error != EBUSY or sent is None or sent[0] is not _retry_full
+                or sent[1][0] not in _SET_COMMANDS):
+            return False
+        name = getattr(sent[1][0], "name", str(sent[1][0]))
+        if board_ctx.busy_set_retries >= self.busy_set_retry_count:
+            logger.error("Pellet board still busy: %s refused after %s retries", name, board_ctx.busy_set_retries)
+            board_ctx.busy_set_retries = 0
+            return False
+        board_ctx.busy_set_retries += 1
+        board_ctx.busy_set_entry = sent
+        board_ctx.busy_set_due = time.perf_counter() + self.busy_set_retry_delay_s
+        logger.warning("Pellet board busy: %s answered EBUSY; sending it again in %.2f s (%s/%s)",
+                       name, self.busy_set_retry_delay_s, board_ctx.busy_set_retries, self.busy_set_retry_count)
+        return True
+
     def _stop_refused_command(self, board_ctx: _BoardPendingContext, refusal: CommandRefusal) -> None:
         """End a command whose frame the board refused, sending none of its remaining steps.
 
@@ -1465,6 +1520,9 @@ class CanDevice(Device):
             board.repeated_command_count = 0
             board.compound_steps = None
             board.stepper_motion = False
+            board.busy_set_entry = None
+            board.busy_set_due = math.inf
+            board.busy_set_retries = 0
 
     def disconnect(self):
         with self._disconnect_lock:
