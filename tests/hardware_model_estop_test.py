@@ -436,3 +436,31 @@ def test_a_move_never_acknowledged_on_the_emulated_board_stops_the_stage_until_t
         hardware_model._can_device = None
         device.disconnect()
         interface.close()
+
+
+# -- every trigger stops all axes ------------------------------------------------
+
+def test_every_model_trigger_stops_all_axes_through_the_one_estop(hardware_model):
+    """Teardown, waiter timeout and STOP all reach CanDevice.estop(reason): there is no
+    per-axis form to call, and the stop the model records covers X, Y and Z."""
+    import inspect
+
+    assert list(inspect.signature(CanDevice.estop).parameters) == ["self", "reason"]
+    assert list(inspect.signature(HardwareModel.estop).parameters) == ["self", "reason"]
+    log = _wired(hardware_model, moving=True)
+    hardware_model._device_conn = SimpleNamespace(
+        send_message=lambda kind, data=None, context=None: log.append(("send", kind, context)),
+        request_disconnect=lambda: None, join=lambda: True,
+    )
+    token = hardware_model.move_z(15.5)
+    hardware_model.wait_pending_command_acked(token, timeout=0.01, raise_on_timeout=False)
+    hardware_model.estop(OPERATOR_STOP_REASON)
+    hardware_model._can_device.motion_possibly_in_flight = True
+    hardware_model._disconnect_transport_locked(command_outcome="cancelled")
+
+    stops = [entry for entry in log if entry[0] == "estop"]
+    assert [reason for _e, reason in stops] == [
+        "MOVE_Z was not acknowledged within 0.01 s", OPERATOR_STOP_REASON,
+        "the CAN connection was closed during a move",
+    ]
+    assert hardware_model.pellet_estop["axes"] == ["X", "Y", "Z"]
