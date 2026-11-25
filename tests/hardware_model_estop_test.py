@@ -480,3 +480,13 @@ def test_a_teardown_while_a_motion_command_is_pending_between_frames_stops_the_s
     hardware_model._disconnect_transport_locked(command_outcome="cancelled")
 
     assert [entry[0] for entry in log] == ["send", "estop", "request_disconnect"]
+
+
+@pytest.mark.parametrize("reason, kind", [
+    ("MOVE_Z was not acknowledged within 3 s", "failure"),
+    (OPERATOR_STOP_REASON, "operator"),
+])
+def test_the_stop_records_its_kind(hardware_model, reason, kind):
+    _stopped(hardware_model, reason)
+
+    assert hardware_model.pellet_estop["kind"] == kind

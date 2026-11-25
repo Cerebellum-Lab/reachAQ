@@ -328,6 +328,16 @@ def alert_for_pellet_axes(kind: str, axes: Tuple[str, ...]) -> Optional[Operator
 _HOME_TO_CLEAR = (
     "Home before continuing (Hardware Control ▸ Home); the session-end home also clears it."
 )
+_HOME_TO_CLEAR_OPERATOR = (
+    "Home before continuing (Hardware Control ▸ Home) or reconnect (Refresh Hardware); "
+    "the session-end home does not clear it."
+)
+# Hardware Control's Home is enabled only with the board connected and acquisition started
+# (HardwareControlContent._refresh_enabled_state); a reconnect homes as well.
+_ESTOP_REMEDY = (
+    "Check nothing blocks the pellet axes, then Hardware Control ▸ Home (enabled when the pellet "
+    "board is connected and acquisition is started), or Refresh Hardware."
+)
 
 
 def alert_for_pellet_estop(record: Optional[Mapping]) -> Optional[OperatorAlert]:
@@ -339,13 +349,13 @@ def alert_for_pellet_estop(record: Optional[Mapping]) -> Optional[OperatorAlert]
     """
     if not record:
         return None
-    remedy = "Check nothing blocks the pellet axes, then Hardware Control ▸ Home."
-    if record.get("operator"):
+    remedy = _ESTOP_REMEDY
+    if record.get("kind", "operator" if record.get("operator") else "failure") == "operator":
         return OperatorAlert(
             key="pellet:estop",
             severity=AlertSeverity.WARNING,
             title="Pellet stage stopped by the operator",
-            message=f"STOP was pressed in Hardware Control. {_HOME_TO_CLEAR}",
+            message=f"STOP was pressed in Hardware Control. {_HOME_TO_CLEAR_OPERATOR}",
             remedy=remedy,
             is_condition=True,
         )

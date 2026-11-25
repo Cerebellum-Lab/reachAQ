@@ -12073,6 +12073,16 @@ class AppModel(ObservableObject):
             return
         estop = self._hardware.pellet_estop
         home_options = {}
+        if estop is not None and estop.get("kind") == "operator":
+            # Only a failure stop may be cleared by the session end (Ben, 2026-11-24).
+            self._recording_session.finish_end_action(
+                "pellet_home",
+                status="skipped",
+                error="the pellet stage was stopped by the operator (operator STOP); "
+                      "home it with Hardware Control or reconnect",
+            )
+            logger.warning("Session-end pellet home skipped: the operator pressed STOP")
+            return
         if estop is not None:
             # The one automatic home allowed after a stop (Ben, 2026-11-24): it releases
             # the board's latch, and its ack clears needs-home and the stopped state.

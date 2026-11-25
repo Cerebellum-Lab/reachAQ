@@ -382,6 +382,9 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             "reason": str(reason),
             "axes": list(axes),
             "operator": str(reason) == OPERATOR_STOP_REASON,
+            # Which homes may release it: after a failure the session-end home may too;
+            # after the operator's STOP only an operator Home or a reconnect.
+            "kind": "operator" if str(reason) == OPERATOR_STOP_REASON else "failure",
             "sent": bool(sent),
         }
         with self._lock:
@@ -802,6 +805,10 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         it is home_after_estop's home (the latch released first; its ack clears the stop):
         the session-end home is the one automatic home allowed to do that."""
         if release_estop and self.estop_active:
+            if self._estop_record.get("kind") == "operator":
+                raise RuntimeError(
+                    "the pellet stage was stopped by the operator (operator STOP); only Hardware "
+                    "Control ▸ Home or a reconnect releases it")
             token = self.home_after_estop()
         else:
             token = self.send_home()
