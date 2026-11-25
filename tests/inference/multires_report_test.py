@@ -18,20 +18,24 @@ import cv2
 import numpy as np
 import pytest
 
-from reachaq.inference.multires_calibration.fit import WaypointObservation, fit_motor_frame
+from reachaq.inference.multires_calibration.fit import MotorPlacement, WaypointObservation, fit_motor_frame
 from reachaq.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
 from reachaq.inference.multires_calibration.pipeline import per_camera_rule
 from reachaq.inference.multires_calibration.report import (
     DEFAULT_THRESHOLDS,
     LOO_UNDETERMINED_NOTE,
+    STAGE_HEADING,
+    STAGE_METRICS,
     UNDETERMINED,
     CameraVerdict,
     CaptureSummary,
+    Metric,
     PresetCrossCheck,
     PreviousCalibration,
     QualityReport,
     build_report,
     coverage_fraction,
+    planar_rms_px,
     write_coverage_images,
 )
 from multires_synthetic import synthetic_rig
@@ -145,8 +149,12 @@ def test_clean_synthetic_fit_passes(rig, fitted):
     assert report.thresholds == DEFAULT_THRESHOLDS
     # Every metric that applies without a previous calibration is graded, per camera where it
     # is per camera; the leave-one-camera-out check needs a third camera.
-    assert {m.name for m in report.metrics} == set(DEFAULT_THRESHOLDS) - CHANGE_METRICS - {"loo_triangulation_px"}
-    for name in ("views_kept", "covisible_views", "reprojection_rms_px", "coverage_roi_fraction", "fx_fy_ratio_dev",
+    # The stage block's slack and repeat visits need a per-view fit's placement.
+    assert {m.name for m in report.metrics} == (
+        set(DEFAULT_THRESHOLDS) - CHANGE_METRICS
+        - {"loo_triangulation_px", "stage_slack_rms_mm", "stage_repeat_mm"})
+    for name in ("views_kept", "covisible_views", "reprojection_rms_px", "joint_reprojection_rms_px",
+                 "coverage_roi_fraction", "fx_fy_ratio_dev",
                  "focal_rel_std", "principal_point_offset_frac", "max_distortion_shift_px"):
         for cam in CAMERAS:
             metric(report, name, cam)
@@ -343,7 +351,13 @@ def test_text_lists_failures_first(rig, fitted):
     metric_lines = [line for line in lines if line.split() and line.split()[0] in STATUS_WORDS]
     statuses = [line.split()[0] for line in metric_lines]
     assert statuses[0] == "FAIL"
-    assert statuses == sorted(statuses, key=STATUS_WORDS.index)
+    # Failures first within the calibration's metrics and within the stage block after them.
+    stage_at = lines.index(STAGE_HEADING)
+    for block in ([line for line in metric_lines if lines.index(line) < stage_at],
+                  [line for line in metric_lines if lines.index(line) > stage_at]):
+        block_statuses = [line.split()[0] for line in block]
+        assert block and block_statuses == sorted(block_statuses, key=STATUS_WORDS.index)
+    assert all(line.split()[1] in STAGE_METRICS for line in metric_lines if lines.index(line) > stage_at)
     assert len(metric_lines) == len(report.metrics)
     # Each line names the metric and its camera.
     for m in report.metrics:
@@ -711,3 +725,106 @@ def test_undetermined_loo_is_shown_and_not_a_pass():
     (saved,) = [m for m in data["metrics"] if m["name"] == "loo_triangulation_px" and m["camera"] == "camera4"]
     assert saved["value"] is None and saved["status"] == UNDETERMINED
     assert QualityReport.from_json(report.to_json()) == report
+
+
+# The graded RMS (Ben, 2026-11-24): each camera's own planar fit, so stage error cannot fail
+# a calibration; the stage-tied joint RMS only warns, and the stage has its own block.
+
+
+def test_the_graded_rms_is_each_cameras_planar_fit(rig, fitted):
+    report = report_for(fitted, rig.observations, rig.board, swept_roi(rig.observations))
+    obj = rig.board.object_points().astype(np.float32)
+    for cam in CAMERAS:
+        model = fitted.cameras[cam]
+        image = [o.corners[cam].astype(np.float32).reshape(-1, 1, 2) for o in rig.observations if cam in o.corners]
+        dist = np.zeros(5)
+        dist[:4] = np.ravel(model.dist)[:4]
+        rms = cv2.calibrateCamera([obj] * len(image), image, IMAGE_SIZE, np.array(model.K, float), dist,
+                                  flags=cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_K3)[0]
+        graded = metric(report, "reprojection_rms_px", cam)
+        assert graded.value == pytest.approx(rms, rel=1e-3)
+        assert graded.value == pytest.approx(planar_rms_px(rig.observations, rig.board, IMAGE_SIZE, cam, model)[0])
+        # Free poses fit at least as well as poses tied to the stage.
+        assert graded.value <= fitted.rms_px[cam] + 1e-6
+        joint = metric(report, "joint_reprojection_rms_px", cam)
+        assert joint.value == pytest.approx(fitted.rms_px[cam], rel=1e-12)
+        assert (joint.warn, joint.fail) == (1.0, None)
+
+
+def test_holding_the_principal_point_holds_it_in_the_planar_fit(rig, fitted):
+    cam = CAMERAS[0]
+    model = fitted.cameras[cam]
+    off = dataclasses.replace(model, K=np.array(model.K, float) + np.array([[0, 0, 40.0], [0, 0, -30.0], [0, 0, 0]]))
+    free, free_note = planar_rms_px(rig.observations, rig.board, IMAGE_SIZE, cam, off)
+    held, held_note = planar_rms_px(rig.observations, rig.board, IMAGE_SIZE, cam, off, fix_principal_point=True)
+    assert held > free
+    assert "principal point held" in held_note and "principal point held" not in free_note
+
+
+@pytest.fixture(scope="module")
+def tilting_rig():
+    # The board turns up to 3 degrees between waypoints: a stage error the motor-frame model,
+    # a pure translation, cannot take up.
+    return synthetic_rig(noise_px=0.1, tilt_deg=3.0, stage_error_mm=0.05)
+
+
+def test_stage_error_passes_on_the_planar_rms_and_only_warns_on_the_joint_rms(tilting_rig):
+    fit = fit_motor_frame(tilting_rig.observations, tilting_rig.board, IMAGE_SIZE, CAMERAS)
+    report = report_for(fit, tilting_rig.observations, tilting_rig.board, swept_roi(tilting_rig.observations))
+    for cam in CAMERAS:
+        graded = metric(report, "reprojection_rms_px", cam)
+        assert graded.status == "pass" and graded.value < 0.2, graded
+        joint = metric(report, "joint_reprojection_rms_px", cam)
+        assert joint.status == "warn" and joint.value > 1.0, joint
+
+
+def test_focal_pair_rel_warns_above_10_percent_between_cameras(exact_rig):
+    # The nominal-lens checks are deferred (until after 2026-12-31): every lens is 8.5 mm, so the
+    # pair check is the plain relative difference, warning above 10 %.
+    assert "focal_vs_nominal_rel" not in DEFAULT_THRESHOLDS
+    truth = exact_rig.truth
+    right = truth.cameras["right"]
+    K = np.array(right.K, float)
+    K[0, 0] *= 1.12
+    fit = with_camera(truth, "right", dataclasses.replace(right, K=K))
+    report = report_for(fit, exact_rig.observations, exact_rig.board, swept_roi(exact_rig.observations))
+    pair = metric(report, "focal_pair_rel", PAIR)
+    fx_a, fx_b = truth.cameras["left"].K[0, 0], K[0, 0]
+    assert pair.value == pytest.approx(abs(fx_a - fx_b) / ((fx_a + fx_b) / 2))
+    assert (pair.warn, pair.fail) == (0.10, None) and pair.status == "warn"
+    assert not any("HFOV" in note for note in report.notes)
+
+
+def test_the_stage_block_reports_slack_and_repeat_visits_and_never_fails(rig, fitted):
+    # Waypoint 10 is commanded back to waypoint 3's position, where the board stood 2 mm higher in z.
+    first, again = rig.observations[3], rig.observations[10]
+    observations = [dataclasses.replace(o, motor_mm=first.motor_mm) if o is again else o for o in rig.observations]
+    residual = {o.index: (0.0, 0.0, 2.0 if o.index == again.index else 0.0) for o in observations}
+    placement = MotorPlacement(scale=1.0, rms_mm=0.0, residual_mm=residual, tilt_deg={}, outliers=[])
+    report = report_for(dataclasses.replace(fitted, placement=placement), observations, rig.board,
+                        swept_roi(observations))
+
+    repeat = metric(report, "stage_repeat_mm", f"{first.index}-{again.index}")
+    assert repeat.value == pytest.approx(2.0) and repeat.status == "warn"
+    assert "z +2.00" in repeat.note and "board position differs by" in repeat.note
+    # Measured numbers only: the heading names no cause.
+    assert "not the calibration" not in STAGE_HEADING
+    slack = {axis: metric(report, "stage_slack_rms_mm", axis) for axis in "xyz"}
+    assert slack["z"].value == pytest.approx(2.0 / math.sqrt(len(observations)))
+    assert slack["x"].value == 0.0 and slack["y"].value == 0.0
+    assert all(DEFAULT_THRESHOLDS[name][1] is None for name in STAGE_METRICS)
+    assert report.verdict == "warn", not_passing(report)
+    lines = report.to_text().splitlines()
+    stage_at = lines.index(STAGE_HEADING)
+    stage_names = {line.split()[1] for line in lines[stage_at + 1:] if line.split() and line.split()[0] in STATUS_WORDS}
+    assert stage_names >= set(STAGE_METRICS)
+
+
+@pytest.mark.parametrize("camera", ["left", "camera4", "left-camera4"])
+def test_the_text_keeps_the_camera_apart_from_the_value(camera):
+    # A 7-character camera name filled the column, so "camera4" ran into "0.9176".
+    m = Metric("reprojection_rms_px", camera, 0.9176, "sensor px", 0.5, 1.0, "warn")
+    report = QualityReport(created="2026-11-24T00:00:00-07:00", verdict="warn", metrics=[m],
+                           thresholds={m.name: (0.5, 1.0)}, notes=[])
+    (line,) = [line for line in report.to_text().splitlines() if line.startswith("WARN")]
+    assert line.split()[1:4] == ["reprojection_rms_px", camera, "0.9176"]

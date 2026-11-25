@@ -28,7 +28,7 @@ covered area no better.
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -77,22 +77,103 @@ _AMBIGUOUS_FLIP_DEG = (60.0, 120.0)
 _MAX_CONDITION = 1e9
 
 
+# The calibration boards: a plain chessboard, always detected whole, or a ChArUco board
+# (a chessboard with an ArUco marker in every white square), whose corners carry their own
+# ids, so a view of part of it still places every corner it shows.
+CHECKERBOARD = "checkerboard"
+CHARUCO = "charuco"
+BOARD_KINDS = (CHECKERBOARD, CHARUCO)
+# A ChArUco view counts when at least this many corners were found and they span at least
+# two rows and two columns of the board: collinear corners cannot place a planar view.
+MIN_CHARUCO_CORNERS = 12
+
+
 @dataclass(frozen=True)
 class BoardSpec:
-    """A chessboard, counted by its inner corners."""
+    """A calibration board, counted by its inner corners.
+
+    `kind` CHECKERBOARD is a plain chessboard. CHARUCO is a cv2.aruco.CharucoBoard of
+    (cols + 1, rows + 1) squares of `square_mm`, with markers of `marker_mm` from the cv2.aruco
+    dictionary named `dictionary` (such as "DICT_4X4_50"). Raises ValueError, naming the
+    field, for an unknown kind or dictionary, a marker not smaller than its square, or a
+    dictionary with fewer markers than the board needs.
+    """
 
     square_mm: float = 4.0
     rows: int = 6
     cols: int = 8
+    kind: str = CHECKERBOARD
+    marker_mm: Optional[float] = None
+    dictionary: Optional[str] = None
+
+    def __post_init__(self):
+        if self.kind not in BOARD_KINDS:
+            raise ValueError(f"kind: unknown board kind {self.kind!r}; expected one of {', '.join(BOARD_KINDS)}")
+        if self.kind == CHECKERBOARD:
+            if self.marker_mm is not None or self.dictionary is not None:
+                raise ValueError("marker_mm and dictionary are for a charuco board, not a checkerboard")
+            return
+        if self.rows * self.cols < MIN_CHARUCO_CORNERS:
+            raise ValueError(f"rows: a {self.rows} x {self.cols} ChArUco board has fewer than the"
+                             f" {MIN_CHARUCO_CORNERS} inner corners a view needs")
+        if self.marker_mm is None or not 0.0 < float(self.marker_mm) < float(self.square_mm):
+            raise ValueError(f"marker_mm: {self.marker_mm!r} must be above 0 and below square_mm {self.square_mm}")
+        if not isinstance(self.dictionary, str) or not self.dictionary.startswith("DICT_") or not isinstance(
+                getattr(cv2.aruco, self.dictionary, None), int):
+            raise ValueError(f"dictionary: unknown cv2.aruco dictionary {self.dictionary!r}")
+        available = len(cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, self.dictionary)).bytesList)
+        needed = (self.rows + 1) * (self.cols + 1) // 2
+        if available < needed:
+            raise ValueError(f"dictionary: {self.dictionary} has {available} markers; the board needs {needed}")
 
     def object_points(self) -> np.ndarray:
         """(rows*cols, 3) inner-corner positions in mm, row-major with the column fastest, z = 0.
 
         x runs along a row (the columns) and y down the rows, which is the order
-        cv2.findChessboardCorners reports for a pattern size of (cols, rows).
+        cv2.findChessboardCorners reports for a pattern size of (cols, rows). For a ChArUco
+        board row k is corner id k, which cv2 places at ((k % cols) + 1, (k // cols) + 1)
+        squares from the board's outer corner: the same point, one square in.
         """
         row, col = np.mgrid[0:self.rows, 0:self.cols]
         return np.column_stack([col.ravel(), row.ravel(), np.zeros(row.size)]).astype(float) * self.square_mm
+
+    def charuco_board(self):
+        """The cv2.aruco.CharucoBoard this board is (CHARUCO only), with the legacy pattern off.
+
+        The rig's board was generated at OpenCV 4.11's default, legacy pattern off; it is set
+        here so a later default cannot change which squares hold markers.
+        """
+        if self.kind != CHARUCO:
+            raise ValueError(f"a {self.kind} board is not a ChArUco board")
+        dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, self.dictionary))
+        board = cv2.aruco.CharucoBoard(
+            (self.cols + 1, self.rows + 1), float(self.square_mm), float(self.marker_mm), dictionary)
+        board.setLegacyPattern(False)
+        return board
+
+
+# The rig's board, and the calibration's default (scout.configured_board): cv2.aruco.CharucoBoard
+# ((9, 7), 4.0, 3.0, DICT_4X4_50), 8 x 6 inner corners. BoardSpec() itself stays the
+# checkerboard, so code and stored calibrations that name no kind read as before.
+RIG_CHARUCO_BOARD = BoardSpec(square_mm=4.0, rows=6, cols=8, kind=CHARUCO, marker_mm=3.0, dictionary="DICT_4X4_50")
+
+
+def valid_corners(corners: np.ndarray) -> np.ndarray:
+    """The (n,) mask of the rows of an (n, 2) corner array that were detected (finite)."""
+    return np.all(np.isfinite(np.asarray(corners, float)), axis=1)
+
+
+def usable_view(corners: np.ndarray, board: BoardSpec) -> bool:
+    """Whether a camera's corners at a waypoint count as a view of `board`.
+
+    A checkerboard view is always whole. A ChArUco view needs MIN_CHARUCO_CORNERS detected
+    corners spanning two or more rows and two or more columns.
+    """
+    if board.kind == CHECKERBOARD:
+        return True
+    ids = np.flatnonzero(valid_corners(corners))
+    return (len(ids) >= MIN_CHARUCO_CORNERS and len(set(ids // board.cols)) >= 2
+            and len(set(ids % board.cols)) >= 2)
 
 
 @dataclass(frozen=True)
@@ -112,7 +193,9 @@ class WaypointObservation:
 
     index: int
     motor_mm: np.ndarray
-    corners: Dict[str, np.ndarray]  # camera name -> (rows*cols, 2) sensor px, in object_points order
+    # camera name -> (rows*cols, 2) sensor px, in object_points order; a ChArUco corner that
+    # was not detected is a NaN row
+    corners: Dict[str, np.ndarray]
 
 
 @dataclass
@@ -136,6 +219,12 @@ class MotorFrameFit:
     rms_px: Dict[str, float]
     per_view_rms_px: Dict[str, Dict[int, float]]  # camera -> waypoint index -> RMS px
     param_std: Dict[str, Dict[str, float]]  # camera -> INTRINSIC_NAMES -> 1-sigma
+    # camera -> waypoint index -> corners fitted in that view, when the views were partial
+    # (a ChArUco board); None when every view held every corner. Not stored with the fit.
+    corner_counts: Optional[Dict[str, Dict[int, int]]] = None
+    # How the per-view fit (per_view.fit_per_view) placed its views in the motor frame; None
+    # for the motor-frame fit, whose model places them exactly. Not stored with the fit.
+    placement: Optional["MotorPlacement"] = None
 
     def stereo(self, first: str, second: str) -> Tuple[np.ndarray, np.ndarray]:
         """(R, T) with X_second = R @ X_first + T, T in mm, for cameras `first` and `second`."""
@@ -147,10 +236,37 @@ class MotorFrameFit:
 
 
 @dataclass
+class MotorPlacement:
+    """The similarity that places a per-view fit in the motor frame: each view's board origin
+    o_w (in the reference camera's frame, mm) ~ scale * R @ m_w + t for commanded motor
+    position m_w. Stage-accuracy diagnostics, not calibration quality."""
+
+    scale: float
+    rms_mm: float  # RMS of the inlier views' residuals
+    # waypoint index -> where the board was minus where it was commanded, in motor mm (x, y, z)
+    residual_mm: Dict[int, Tuple[float, float, float]]
+    # waypoint index -> the board's rotation from the mean board rotation, degrees
+    tilt_deg: Dict[int, float]
+    outliers: List[int]  # waypoints left out of the similarity (more than 3 MAD off)
+    # waypoint index -> the unit axis of that rotation in the motor frame (zero for none)
+    tilt_axis: Dict[int, Tuple[float, float, float]] = field(default_factory=dict)
+    # The board point the similarity holds (the fitted pivot, or the board centre), in the
+    # board's frame, mm
+    pivot_mm: Optional[Tuple[float, float, float]] = None
+    # The stage model's scale along each motor axis (x, y, z: true mm per commanded mm) and the
+    # angles between the axes (xy, xz, yz), degrees: one scale and 90 degrees for a similarity
+    axis_scale: Optional[Tuple[float, float, float]] = None
+    axis_angle_deg: Optional[Tuple[float, float, float]] = None
+
+
+@dataclass
 class _CameraData:
     indices: List[int]
     motor_mm: np.ndarray  # (n_views, 3)
-    corners: np.ndarray  # (n_views * n_corners, 2)
+    corners: np.ndarray  # (n_views * n_corners, 2), NaN where a corner was not detected
+    # (n_views * n_corners,) the detected rows of `corners`, a fixed index set so the
+    # residual length stays constant; None when every view holds every corner
+    valid: Optional[np.ndarray] = None
 
 
 def fit_motor_frame(
@@ -184,7 +300,7 @@ def fit_motor_frame(
     least-squares optimum of these observations whichever start reaches it.
     """
     obj = board.object_points()
-    data = {cam: _camera_data(observations, cam, len(obj)) for cam in camera_names}
+    data = {cam: _camera_data(observations, cam, len(obj), board) for cam in camera_names}
 
     if initial is not None:
         fit, _, outcome = _solve(_parameters_of(initial, camera_names), obj, data, camera_names, image_size)
@@ -276,15 +392,24 @@ def _solve(
         )
     x = result.x
 
-    cameras, rms_px, per_view, param_std = {}, {}, {}, {}
+    cameras, rms_px, per_view, param_std, corner_counts = {}, {}, {}, {}, {}
     std = _parameter_std(result.jac, result.fun)
     for c, (cam, r) in enumerate(zip(camera_names, _camera_residuals(x, obj, data, camera_names))):
         params = x[c * _CAMERA_PARAMS:(c + 1) * _CAMERA_PARAMS]
         K, dist, rvec, tvec = _unpack_camera(params)
         cameras[cam] = CameraModel(K=K, dist=dist, rvec=rvec, tvec=tvec)
-        sq = (r.reshape(-1, 2) ** 2).sum(axis=1).reshape(len(data[cam].indices), len(obj))
-        rms_px[cam] = float(np.sqrt(sq.mean()))
-        per_view[cam] = {i: float(np.sqrt(v)) for i, v in zip(data[cam].indices, sq.mean(axis=1))}
+        if data[cam].valid is None:
+            sq = (r.reshape(-1, 2) ** 2).sum(axis=1).reshape(len(data[cam].indices), len(obj))
+            rms_px[cam] = float(np.sqrt(sq.mean()))
+            per_view[cam] = {i: float(np.sqrt(v)) for i, v in zip(data[cam].indices, sq.mean(axis=1))}
+            corner_counts[cam] = {i: len(obj) for i in data[cam].indices}
+        else:
+            # Over the detected corners only: each view's own, and all of them for the camera.
+            sq = (r.reshape(-1, 2) ** 2).sum(axis=1)
+            view = np.flatnonzero(data[cam].valid) // len(obj)
+            rms_px[cam] = float(np.sqrt(sq.mean()))
+            per_view[cam] = {i: float(np.sqrt(sq[view == k].mean())) for k, i in enumerate(data[cam].indices)}
+            corner_counts[cam] = {i: int(np.sum(view == k)) for k, i in enumerate(data[cam].indices)}
         block = std[c * _CAMERA_PARAMS:c * _CAMERA_PARAMS + len(_FITTED_INTRINSICS)]
         fitted = dict(zip(_FITTED_INTRINSICS, block))
         # k3 is held, not estimated, so it has no spread of its own.
@@ -299,6 +424,8 @@ def _solve(
         rms_px=rms_px,
         per_view_rms_px=per_view,
         param_std=param_std,
+        # Recorded only when some view was partial, so a checkerboard fit is what it always was.
+        corner_counts=corner_counts if any(d.valid is not None for d in data.values()) else None,
     )
     rms = ", ".join(f"{cam} {rms_px[cam]:.3g}" for cam in camera_names)
     return fit, float(result.cost), f"converged in {result.nfev} evaluations, cost {result.cost:.6g}, rms px {rms}"
@@ -327,9 +454,18 @@ def reconcile_corner_order(
     Returns new observations (the inputs are not changed) and, per camera, whether its
     corners were reversed. Raises ValueError as fit_motor_frame does for a camera whose
     waypoints cannot place it, and RuntimeError when a camera's fit converges from no start.
+
+    A ChArUco board's corners carry their ids, so its order is absolute: the observations
+    come back unchanged (as copies) and no camera is reversed.
     """
-    obj = board.object_points()
-    data = {cam: _camera_data(observations, cam, len(obj)) for cam in camera_names}
+    if board.kind == CHARUCO:
+        copies = [
+            WaypointObservation(index=o.index, motor_mm=np.array(o.motor_mm, dtype=float),
+                                corners={cam: np.array(c, dtype=float) for cam, c in o.corners.items()})
+            for o in observations
+        ]
+        return copies, {cam: False for cam in camera_names}
+    data = {cam: _camera_data(observations, cam, board.rows * board.cols, board) for cam in camera_names}
     board_rotation = {
         cam: cv2.Rodrigues(np.asarray(fit_motor_frame(observations, board, image_size, (cam,)).board_rvec, float))[0]
         for cam in camera_names
@@ -360,13 +496,19 @@ def reconcile_corner_order(
     return reconciled, flipped
 
 
-def _camera_data(observations: Sequence[WaypointObservation], cam: str, n_corners: int) -> _CameraData:
+def _camera_data(
+    observations: Sequence[WaypointObservation], cam: str, n_corners: int, board: Optional[BoardSpec] = None
+) -> _CameraData:
+    """`cam`'s views. With a ChArUco `board`, a view that is not usable_view (too few corners,
+    or collinear ones) is left out."""
     seen = [o for o in observations if cam in o.corners]
     for o in seen:
         if np.shape(o.corners[cam]) != (n_corners, 2):
             raise ValueError(
                 f"{cam}: waypoint {o.index} has corners of shape {np.shape(o.corners[cam])}, expected ({n_corners}, 2)"
             )
+    if board is not None:
+        seen = [o for o in seen if usable_view(o.corners[cam], board)]
     motor = np.array([np.asarray(o.motor_mm, float).reshape(3) for o in seen]).reshape(-1, 3)
     # The motor axes come from how the board moved in this camera; motion along a single
     # line leaves the rotation about that line undetermined.
@@ -376,7 +518,9 @@ def _camera_data(observations: Sequence[WaypointObservation], cam: str, n_corner
             " the camera's pose in the motor frame is undetermined"
         )
     corners = np.concatenate([np.asarray(o.corners[cam], float) for o in seen])
-    return _CameraData(indices=[o.index for o in seen], motor_mm=motor, corners=corners)
+    valid = valid_corners(corners)
+    return _CameraData(indices=[o.index for o in seen], motor_mm=motor, corners=corners,
+                       valid=None if valid.all() else valid)
 
 
 def _initial_camera(
@@ -388,8 +532,15 @@ def _initial_camera(
     if it cannot, the distortion is zero and each view's pose comes from solvePnP.
     """
     n = len(d.indices)
-    image_points = [c.reshape(-1, 1, 2).astype(np.float32) for c in d.corners.reshape(n, -1, 2)]
-    object_points = [obj.astype(np.float32)] * n
+    if d.valid is None:
+        image_points = [c.reshape(-1, 1, 2).astype(np.float32) for c in d.corners.reshape(n, -1, 2)]
+        object_points = [obj.astype(np.float32)] * n
+    else:
+        # cv2.calibrateCamera takes a different number of points per view: each view's detected corners.
+        views = d.corners.reshape(n, -1, 2)
+        masks = d.valid.reshape(n, -1)
+        image_points = [c[m].reshape(-1, 1, 2).astype(np.float32) for c, m in zip(views, masks)]
+        object_points = [obj[m].astype(np.float32) for m in masks]
     size = (int(image_size[0]), int(image_size[1]))
     if K_fixed is None:
         _, K, dist, rvecs, tvecs = cv2.calibrateCamera(
@@ -404,7 +555,7 @@ def _initial_camera(
             )
         except cv2.error:
             K, dist = np.array(K_fixed, float), np.zeros(5)
-            poses = [cv2.solvePnP(object_points[0], p, K, dist)[1:] for p in image_points]
+            poses = [cv2.solvePnP(o, p, K, dist)[1:] for o, p in zip(object_points, image_points)]
             rvecs, tvecs = [r for r, _ in poses], [t for _, t in poses]
     R_views = np.array([cv2.Rodrigues(r)[0] for r in rvecs])  # board -> camera, per view
     t_views = np.array([t.ravel() for t in tvecs])  # board origin in the camera, per view
@@ -466,8 +617,12 @@ def _camera_residuals(x: np.ndarray, obj: np.ndarray, data: Dict[str, _CameraDat
         d = data[cam]
         K, dist, rvec, tvec = _unpack_camera(x[c * _CAMERA_PARAMS:(c + 1) * _CAMERA_PARAMS])
         X = (board_points[None, :, :] + sigma * d.motor_mm[:, None, :]).reshape(-1, 3)
-        projected = cv2.projectPoints(X, rvec, tvec, K, dist)[0].reshape(-1, 2)
-        out.append((projected - d.corners).ravel())
+        if d.valid is None:
+            projected = cv2.projectPoints(X, rvec, tvec, K, dist)[0].reshape(-1, 2)
+            out.append((projected - d.corners).ravel())
+        else:
+            projected = cv2.projectPoints(X[d.valid], rvec, tvec, K, dist)[0].reshape(-1, 2)
+            out.append((projected - d.corners[d.valid]).ravel())
     return out
 
 

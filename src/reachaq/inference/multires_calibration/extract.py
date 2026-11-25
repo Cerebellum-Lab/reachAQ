@@ -32,8 +32,15 @@ turned 180 degrees, so the detector may start from either end. Each camera's det
 are put in the order of its first detection (normalize_corner_order with a reference), so
 the order is consistent across that camera's waypoints. Two cameras can still label the
 board from opposite ends; fit.reconcile_corner_order settles that before the fit.
+
+A ChArUco board (BoardSpec.kind CHARUCO) is detected by its markers, so each corner comes
+with its id and the order needs no settling, and a view may hold only part of the board:
+the corners not found are NaN rows. Its median per corner is over the frames that found
+that corner, and a corner found in fewer than half of the frames that found the board is
+left NaN; a waypoint whose median keeps too few corners (fit.usable_view) is not found.
 """
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
@@ -49,7 +56,13 @@ from reachaq.inference.calibration_FLIR import (
     refine_corners,
     stretchlim_like_matlab,
 )
-from reachaq.inference.multires_calibration.fit import BoardSpec, WaypointObservation
+from reachaq.inference.multires_calibration.fit import (
+    CHARUCO,
+    BoardSpec,
+    WaypointObservation,
+    usable_view,
+    valid_corners,
+)
 
 logger = get_verbose_logger(__name__)
 
@@ -58,6 +71,12 @@ _REFINEMENTS = ("subpix", "legacy")
 _MIN_FRAMES = 8
 _SCALE = 8
 _SUBPIX_WINDOW = (5, 5)
+# A ChArUco corner's cornerSubPix half-window: the checkerboard's 5 px where the squares are
+# large enough, but always inside the gap between the corner and the nearest marker corner,
+# (square - marker) / 2 along each axis, so the marker's edges stay out of the window. At the
+# rig's 4 mm squares and 3 mm markers that gap is an eighth of the square pitch.
+_CHARUCO_SUBPIX_MAX = 5
+_CHARUCO_SUBPIX_MIN = 2
 _SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-3)
 # The board cannot move while the stage is paused, so detections in one segment that
 # disagree by more than this are not trusted.
@@ -90,6 +109,8 @@ _LEGACY_GAMMA = 2.0
 
 _NOT_FOUND = "not found"
 _INCONSISTENT = "inconsistent"
+# A ChArUco waypoint whose median kept fewer corners than fit.usable_view needs.
+_TOO_FEW_CORNERS = "too few corners"
 
 FROM_DWELLS = "logged dwells"
 FROM_MOTION = "motion"
@@ -266,10 +287,19 @@ def detect_board(gray: np.ndarray, board: BoardSpec, *, refine: str = "subpix") 
     "subpix" refines on the original grey, whose values the stretch has not bent.
     "legacy" refines on the image the legacy calibration refines on: the stretched copy after
     adjust_gamma(gamma=2), for which refine_corners' fixed Canny thresholds were tuned.
+
+    A ChArUco board is found by cv2.aruco.CharucoDetector on the raw grey, not the stretched
+    copy, and row k is corner id k. The stretch erases its markers on the rig's dim frames:
+    on christielab10's session010 scout (mean grey 41-75), the frames with 12 or more corners
+    were 119 raw against 30 stretched for the left camera, and 120 against 19 for camera4. Corners it did not find are NaN rows, and None is returned when
+    the found corners are not a usable view (fit.usable_view: fewer than 12, or within one
+    row or one column). Only "subpix" refinement applies to it.
     """
-    _check_refine(refine)
+    _check_refine(refine, board)
     if gray.ndim == 3:
         gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+    if board.kind == CHARUCO:
+        return _detect_charuco(gray, board)
     stretched = _detection_image(gray)
     if stretched is None:
         return None
@@ -291,6 +321,69 @@ def detect_board(gray: np.ndarray, board: BoardSpec, *, refine: str = "subpix") 
         logger.debug("legacy corner refinement failed: %s", err)
         return None
     return normalize_corner_order(np.array(refined), board)
+
+
+def _detect_charuco(gray: np.ndarray, board: BoardSpec) -> Optional[np.ndarray]:
+    """detect_board for a ChArUco board: detected on the raw `gray` and refined with
+    cornerSubPix on it."""
+    if gray.dtype != np.uint8:
+        gray = np.clip(gray, 0, 255).astype(np.uint8)
+    corners, ids, _, _ = _charuco_detector(board).detectBoard(gray)
+    if ids is None or corners is None or len(ids) == 0:
+        return None
+    ids = ids.ravel().astype(int)
+    points = np.full((board.rows * board.cols, 2), np.nan)
+    points[ids] = corners.reshape(-1, 2)
+    if not usable_view(points, board):
+        return None
+    found = points[ids].astype(np.float32).reshape(-1, 1, 2)
+    half = _charuco_subpix_half_window(points, board)
+    refined = cv2.cornerSubPix(gray, found, (half, half), (-1, -1), _SUBPIX_CRITERIA)
+    points[ids] = refined.reshape(-1, 2)
+    return points
+
+
+_CHARUCO_DETECTORS: Dict[BoardSpec, "cv2.aruco.CharucoDetector"] = {}
+
+
+def _charuco_detector(board: BoardSpec):
+    """One cv2.aruco.CharucoDetector per board, built once."""
+    detector = _CHARUCO_DETECTORS.get(board)
+    if detector is None:
+        detector = _CHARUCO_DETECTORS[board] = cv2.aruco.CharucoDetector(board.charuco_board())
+    return detector
+
+
+def _charuco_subpix_half_window(points: np.ndarray, board: BoardSpec) -> int:
+    """The cornerSubPix half-window for a ChArUco detection: the gap between a corner and its
+    nearest marker corner, (square - marker) / 2 of the median square pitch in px, less a
+    pixel, between _CHARUCO_SUBPIX_MIN and _CHARUCO_SUBPIX_MAX."""
+    grid = points.reshape(board.rows, board.cols, 2)
+    steps = np.concatenate([
+        np.linalg.norm(grid[:, 1:] - grid[:, :-1], axis=-1).ravel(),
+        np.linalg.norm(grid[1:, :] - grid[:-1, :], axis=-1).ravel(),
+    ])
+    steps = steps[np.isfinite(steps)]
+    if not len(steps):
+        return _CHARUCO_SUBPIX_MIN
+    gap = float(np.median(steps)) * (board.square_mm - board.marker_mm) / (2.0 * board.square_mm)
+    return int(min(_CHARUCO_SUBPIX_MAX, max(_CHARUCO_SUBPIX_MIN, math.floor(gap) - 1)))
+
+
+def median_corners(stack: np.ndarray, board: BoardSpec) -> np.ndarray:
+    """The per-corner median of (frames, rows*cols, 2) detections of one waypoint.
+
+    A checkerboard's is np.median. A ChArUco corner's is the median over the frames that
+    found it (nanmedian), and NaN when fewer than half the frames found it.
+    """
+    if board.kind != CHARUCO:
+        return np.median(stack, axis=0)
+    seen = np.all(np.isfinite(stack), axis=2)  # (frames, corners)
+    keep = 2 * seen.sum(axis=0) >= len(stack)
+    out = np.full(stack.shape[1:], np.nan)
+    if keep.any():
+        out[keep] = np.nanmedian(stack[:, keep], axis=0)
+    return out
 
 
 def extract_observations(
@@ -319,9 +412,11 @@ def extract_observations(
     frames; and naming the two cameras when a segment starts more than 3 frames apart in
     two of them (more than 75 ms apart, by frame time, with logged dwells). A board found in
     none of the frames, or whose detections disagree by more than 1 px within the segment,
-    only drops that camera from that waypoint and is listed in `rejected`.
+    only drops that camera from that waypoint and is listed in `rejected`. A ChArUco view
+    drops only its corners that disagree by more than 1 px, and is rejected only when the
+    corners left (median_corners, then that rule) are no longer a view (fit.usable_view).
     """
-    _check_refine(refine)
+    _check_refine(refine, board)
     if frames_per_waypoint < 1:
         raise ValueError(f"frames_per_waypoint must be at least 1, got {frames_per_waypoint}")
     if (frame_times is None) != (dwells is None):
@@ -355,6 +450,14 @@ def extract_observations(
             if not found:
                 rejected.append((index, cam, _NOT_FOUND))
                 continue
+            if board.kind == CHARUCO:
+                median, reason, scatter_px = charuco_waypoint(np.stack(found), board)
+                if median is None:
+                    rejected.append((index, cam, reason))
+                    continue
+                corners[i][cam] = median
+                kept_scatter.append(scatter_px)
+                continue
             if reference is None:
                 reference = found[0]
             # (frames, corners, 2), every frame in the order of the camera's first detection
@@ -382,6 +485,39 @@ def extract_observations(
         segmentation_stats=stats,
         segments_from=FROM_MOTION if dwells is None else FROM_DWELLS,
     )
+
+
+def charuco_waypoint(stack: np.ndarray, board: BoardSpec) -> Tuple[Optional[np.ndarray], Optional[str], Optional[float]]:
+    """One camera's ChArUco corners at one waypoint from its (frames, corners, 2) detections:
+    (median, None, median spread in px), or (None, reason, None) when they are not a view.
+
+    The median is median_corners'. A corner whose detections disagree by more than
+    _MAX_CORNER_STD_PX is dropped, not the view: the rest still place it. The reason is
+    "too few corners" when the median is not a usable view, "inconsistent" when it is not
+    once the disagreeing corners are dropped."""
+    median, spread = _charuco_median(stack, board)
+    if median is None:
+        return None, _TOO_FEW_CORNERS, None
+    kept = np.flatnonzero(valid_corners(median))
+    median[kept[spread > _MAX_CORNER_STD_PX]] = np.nan
+    if not usable_view(median, board):
+        return None, _INCONSISTENT, None
+    return median, None, float(np.median(spread[spread <= _MAX_CORNER_STD_PX]))
+
+
+def _charuco_median(stack: np.ndarray, board: BoardSpec) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """(median_corners of the (frames, corners, 2) ChArUco detections, the RMS distance of
+    each kept corner's detections from their mean), or (None, None) when the median is not
+    a usable view."""
+    median = median_corners(stack, board)
+    if not usable_view(median, board):
+        return None, None
+    kept = valid_corners(median)
+    sub = stack[:, kept]
+    seen = np.all(np.isfinite(sub), axis=2)  # (frames, kept corners)
+    deviation = ((sub - np.nanmean(sub, axis=0)) ** 2).sum(axis=2)
+    spread = np.sqrt(np.where(seen, deviation, 0.0).sum(axis=0) / seen.sum(axis=0))
+    return median, spread
 
 
 def _checked_dwell_segments(
@@ -443,9 +579,13 @@ def _check_segments_agree(
                 )
 
 
-def _check_refine(refine: str) -> None:
+def _check_refine(refine: str, board: Optional[BoardSpec] = None) -> None:
     if refine not in _REFINEMENTS:
         raise ValueError(f"refine must be one of {_REFINEMENTS}, got {refine!r}")
+    # refine_corners' line fit needs clean edges across its window, and a ChArUco corner's
+    # window holds marker edges.
+    if board is not None and board.kind == CHARUCO and refine != "subpix":
+        raise ValueError(f"a ChArUco board is refined with \"subpix\" only, got {refine!r}")
 
 
 def _detection_image(gray: np.ndarray) -> Optional[np.ndarray]:

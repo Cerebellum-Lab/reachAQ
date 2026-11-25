@@ -33,7 +33,12 @@ import yaml
 
 from reachaq.core.logging import get_verbose_logger
 from reachaq.inference.multires_calibration.extract import detect_board, distinct_waypoints, dwell_segments
-from reachaq.inference.multires_calibration.fit import BoardSpec
+from reachaq.inference.multires_calibration.fit import (
+    CHARUCO,
+    RIG_CHARUCO_BOARD,
+    BoardSpec,
+    valid_corners,
+)
 from reachaq.inference.multires_calibration.library import library_root
 
 logger = get_verbose_logger(__name__)
@@ -49,6 +54,10 @@ MIN_COVISIBLE = 8
 MAX_PATH = 60
 # The library setting that may narrow the scout's box: {"lo": [x, y, z], "hi": [x, y, z]} in motor mm.
 SCOUT_BOUNDS_SETTING = "scoutBounds"
+# The library setting that names the calibration board (configured_board); unset, it is
+# RIG_CHARUCO_BOARD, the rig's ChArUco board (Ben, 2026-11-23).
+BOARD_SETTING = "board"
+_BOARD_KEYS = ("kind", "square_mm", "rows", "cols", "marker_mm", "dictionary")
 OCCUPANCY_CELLS = 4  # each camera's image is split 4 x 4 to measure how widely its views spread
 
 # The whole board, one square past the inner corners each way, is 9 x 7 squares: seen
@@ -73,6 +82,8 @@ _CORNER_EDGE_MARGIN_PX = 10.0
 ADVICE_EDGE = ("board cut off at the {edge} edge at {n} of {m} points:"
                " aim the camera towards that side or move the board start")
 ADVICE_FOCUS = "board in frame but never detected: check focus at the board distance, then lighting and exposure"
+ADVICE_OTHER_BOARD = ("board type mismatch? a {seen} is in view but {configured} is configured:"
+                      " mount the configured board, or set board in calibrations/settings.yaml")
 ADVICE_GRAZING = ("board seen at a grazing angle (aspect {aspect:.2f} vs 0.78):"
                   " aim the camera more face-on; the stage cannot tilt the board")
 ADVICE_NEVER = "board never in view: the camera points elsewhere or the scout bounds miss its view"
@@ -100,10 +111,12 @@ class Bounds:
 class ScoutView:
     """What one camera saw at one grid point.
 
-    `found` with its (rows*cols, 2) `corners`, and `aspect`, the board's short side over its
-    long side as seen (BOARD_ASPECT face-on); `board_pixels` when the frame holds a
+    `found` with its (rows*cols, 2) `corners` (NaN rows where a ChArUco board's corner was
+    not found), and `aspect`, the board's short side over its long side as seen
+    (BOARD_ASPECT face-on); `board_pixels` when the frame holds a
     board-like patch, found or not, and `touches_edge`, the image edge that patch reaches,
-    or None.
+    or None. `other_board`: not found, but the other kind of board is in view (a
+    checkerboard when ChArUco is configured, ArUco markers when the checkerboard is).
     """
 
     camera: str
@@ -112,14 +125,19 @@ class ScoutView:
     touches_edge: Optional[str]
     aspect: Optional[float]
     board_pixels: bool
+    other_board: bool = False
 
     def __eq__(self, other):
         if not isinstance(other, ScoutView):
             return NotImplemented
         same_corners = (self.corners is None and other.corners is None) or (
-            self.corners is not None and other.corners is not None and np.array_equal(self.corners, other.corners))
-        return same_corners and (self.camera, self.found, self.touches_edge, self.aspect, self.board_pixels) == (
-            other.camera, other.found, other.touches_edge, other.aspect, other.board_pixels)
+            self.corners is not None and other.corners is not None
+            and np.array_equal(self.corners, other.corners, equal_nan=True))
+        same_aspect = self.aspect == other.aspect or (
+            self.aspect is not None and other.aspect is not None and math.isnan(self.aspect) and math.isnan(other.aspect))
+        return same_corners and same_aspect and (
+            self.camera, self.found, self.touches_edge, self.board_pixels, self.other_board) == (
+            other.camera, other.found, other.touches_edge, other.board_pixels, other.other_board)
 
 
 @dataclass(frozen=True)
@@ -233,8 +251,16 @@ def board_aspect(corners: np.ndarray, board: BoardSpec = BoardSpec()) -> float:
 
     The mean square's height over its width, times BOARD_ASPECT: BOARD_ASPECT face-on,
     above it when the view shortens the board's long side, below it when the short side.
+    A partial ChArUco view takes the mean over the neighbouring corner pairs it found.
     """
     c = np.asarray(corners, float).reshape(board.rows, board.cols, 2)
+    if not np.all(np.isfinite(c)):
+        along = np.linalg.norm(c[:, 1:] - c[:, :-1], axis=-1)
+        down = np.linalg.norm(c[1:, :] - c[:-1, :], axis=-1)
+        if not np.isfinite(along).any() or not np.isfinite(down).any():
+            return math.nan  # no neighbouring pair along a row, or down a column: no aspect
+        width, height = np.nanmean(along), np.nanmean(down)
+        return float(height / width * (board.rows + 1) / (board.cols + 1))
     width = (np.linalg.norm(c[0, -1] - c[0, 0]) + np.linalg.norm(c[-1, -1] - c[-1, 0])) / 2 / (board.cols - 1)
     height = (np.linalg.norm(c[-1, 0] - c[0, 0]) + np.linalg.norm(c[-1, -1] - c[0, -1])) / 2 / (board.rows - 1)
     return float(height / width * (board.rows + 1) / (board.cols + 1))
@@ -253,8 +279,23 @@ def scout_view(camera: str, gray: np.ndarray, board: BoardSpec = BoardSpec()) ->
     corners = detect_board(gray, board)
     board_pixels, edge = _board_patch(gray)
     if corners is None:
-        return ScoutView(camera, False, None, edge if board_pixels else None, None, board_pixels)
+        other = board_pixels and _other_board_seen(gray, board)
+        return ScoutView(camera, False, None, edge if board_pixels else None, None, board_pixels, other)
     return ScoutView(camera, True, corners, edge, board_aspect(corners, board), True)
+
+
+def _other_board_seen(gray: np.ndarray, board: BoardSpec) -> bool:
+    """Whether the frame shows the other kind of board than `board`: a whole checkerboard of
+    the same size (a quick check on a half-size frame) when ChArUco is configured, or ArUco
+    markers of DICT_4X4_50 when the checkerboard is. Cheap, and only run on a frame that has a
+    board-like patch but no detection."""
+    if board.kind == CHARUCO:
+        small = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+        found, _ = cv2.findChessboardCorners(small, (board.cols, board.rows), cv2.CALIB_CB_FAST_CHECK)
+        return bool(found)
+    detector = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50))
+    _, ids, _ = detector.detectMarkers(gray)
+    return ids is not None and len(ids) >= 4
 
 
 def _board_patch(gray: np.ndarray) -> Tuple[bool, Optional[str]]:
@@ -398,9 +439,12 @@ def _cells(corners, camera, views, image_sizes) -> set:
     else:
         every = np.concatenate([v[camera].corners for v in views.values()
                                 if camera in v and v[camera].found])
+        every = every[valid_corners(every)]
         lo = every.min(axis=0)
         size = np.maximum(every.max(axis=0) - lo, 1e-9)
-    cell = np.clip(((np.asarray(corners) - lo) / size * OCCUPANCY_CELLS).astype(int), 0, OCCUPANCY_CELLS - 1)
+    corners = np.asarray(corners)
+    corners = corners[valid_corners(corners)]  # a partial ChArUco view's detected corners
+    cell = np.clip(((corners - lo) / size * OCCUPANCY_CELLS).astype(int), 0, OCCUPANCY_CELLS - 1)
     return {(int(u), int(v)) for u, v in cell}
 
 
@@ -561,6 +605,56 @@ def video_sizes(videos: Mapping[str, Path]) -> Dict[str, Tuple[int, int]]:
     return sizes
 
 
+def board_plain(board: BoardSpec) -> dict:
+    """The board as a scout list or a capture's waypoints.yaml records it: BoardSpec's fields,
+    those that are set; BoardSpec(**board_plain(b)) == b."""
+    return {name: getattr(board, name) for name in _BOARD_KEYS if getattr(board, name) is not None}
+
+
+def configured_board(settings: Mapping) -> BoardSpec:
+    """The library settings' board as a BoardSpec; RIG_CHARUCO_BOARD, the rig's ChArUco
+    board, when unset (or null).
+
+    The setting is {kind, square_mm, rows, cols, marker_mm, dictionary}, rows and cols
+    counting inner corners. `kind` defaults to charuco; a key left out (or null) takes the
+    rig ChArUco board's value, or for `kind: checkerboard` BoardSpec()'s, the 4 mm 6 x 8
+    checkerboard. Unlike scoutBounds it
+    is never ignored: a malformed board would calibrate against the wrong geometry, so
+    ValueError is raised, naming the key, for an unknown key or kind, an unknown dictionary,
+    a marker not smaller than its square, a dictionary too small for the board, or a value
+    of the wrong type.
+    """
+    value = settings.get(BOARD_SETTING) if settings else None
+    if value is None:
+        return RIG_CHARUCO_BOARD
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{BOARD_SETTING}: it must be a mapping of {', '.join(_BOARD_KEYS)}, got {value!r}")
+    unknown = sorted(str(k) for k in value if k not in _BOARD_KEYS)
+    if unknown:
+        raise ValueError(f"{BOARD_SETTING}.{unknown[0]}: unknown key; expected {', '.join(_BOARD_KEYS)}")
+    fields = {}
+    for key, kind in (("square_mm", float), ("rows", int), ("cols", int), ("marker_mm", float)):
+        if value.get(key) is None:
+            continue
+        raw = value[key]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or (kind is int and raw != int(raw)):
+            raise ValueError(f"{BOARD_SETTING}.{key}: {raw!r} is not a{'n integer' if kind is int else ' number'}")
+        fields[key] = kind(raw)
+        if not math.isfinite(fields[key]) or fields[key] <= 0 or (kind is int and fields[key] < 2):
+            raise ValueError(f"{BOARD_SETTING}.{key}: {raw!r} is out of range")
+    for key in ("kind", "dictionary"):
+        if value.get(key) is not None:
+            fields[key] = str(value[key])
+    if fields.get("kind", CHARUCO) == CHARUCO:
+        defaults = RIG_CHARUCO_BOARD
+        fields = {"kind": CHARUCO, "marker_mm": defaults.marker_mm, "dictionary": defaults.dictionary,
+                  "square_mm": defaults.square_mm, "rows": defaults.rows, "cols": defaults.cols, **fields}
+    try:
+        return BoardSpec(**fields)
+    except ValueError as err:
+        raise ValueError(f"{BOARD_SETTING}.{err}") from None
+
+
 def configured_bounds(settings: Mapping) -> Optional[Bounds]:
     """The library settings' scoutBounds as Bounds; None when unset or malformed (logged)."""
     value = settings.get(SCOUT_BOUNDS_SETTING) if settings else None
@@ -585,6 +679,7 @@ def diagnose(
     image_sizes: Optional[Mapping[str, Tuple[int, int]]] = None,
     *,
     min_views: int = MIN_VIEWS,
+    board: Optional[BoardSpec] = None,
 ) -> Dict[str, str]:
     """Plain-words advice for each camera that fails the rule, by camera name.
 
@@ -597,6 +692,8 @@ def diagnose(
     - at half or more of the points with the board in view (board pixels, detected or
       not), it reaches one image edge (for a detection, its corners come within 10 px of
       it, given `image_sizes`): cut off at that edge, with how many of the scouted points;
+    - board pixels without a detection, where the other kind of board than `board` was seen
+      (ScoutView.other_board): a board type mismatch;
     - board pixels without a detection: focus, then lighting and exposure;
     - otherwise, detected at too few points: seen at only k of m points.
     """
@@ -605,7 +702,7 @@ def diagnose(
     for camera in cameras:
         seen = [v[camera] for v in views.values() if camera in v]
         detected = [v for v in seen if v.found]
-        aspects = [v.aspect for v in detected if v.aspect is not None]
+        aspects = [v.aspect for v in detected if v.aspect is not None and not math.isnan(v.aspect)]
         median_aspect = float(np.median(aspects)) if aspects else None
         grazing = median_aspect is not None and foreshortening(median_aspect) < GRAZING_FORESHORTENING
         if len(detected) >= min_views and not grazing:
@@ -624,6 +721,11 @@ def diagnose(
             advice[camera] = ADVICE_GRAZING.format(aspect=median_aspect)
         elif tally[edge] > 0 and tally[edge] * 2 >= len(in_view):
             advice[camera] = ADVICE_EDGE.format(edge=edge, n=tally[edge], m=m)
+        elif any(v.other_board for v in undetected):
+            charuco = board is not None and board.kind == CHARUCO
+            advice[camera] = ADVICE_OTHER_BOARD.format(
+                seen="checkerboard" if charuco else "ChArUco board",
+                configured="the ChArUco board" if charuco else "the checkerboard")
         elif undetected:
             advice[camera] = ADVICE_FOCUS
         else:
@@ -637,7 +739,8 @@ def _view_edge(view: ScoutView, size: Optional[Tuple[int, int]]) -> Optional[str
     if size is None:
         return None
     width, height = size
-    u, v = view.corners[:, 0], view.corners[:, 1]
+    found = view.corners[valid_corners(view.corners)]
+    u, v = found[:, 0], found[:, 1]
     gaps = {"left": u.min(), "right": width - 1 - u.max(), "top": v.min(), "bottom": height - 1 - v.max()}
     edge = min(_EDGES, key=lambda e: gaps[e])
     return edge if gaps[edge] <= _CORNER_EDGE_MARGIN_PX else None
@@ -648,13 +751,19 @@ def scout_move_list_path(config_dir: Path) -> Path:
     return library_root(config_dir) / SCOUT_MOVE_LIST_FILE
 
 
-def save_move_list(path: Path, points: Sequence[Point], cameras_serials: Sequence[str], created: datetime) -> None:
-    """Write the move list with its date and the cameras it was scouted for, replacing the file whole."""
+def save_move_list(
+    path: Path, points: Sequence[Point], cameras_serials: Sequence[str], created: datetime,
+    board: Optional[BoardSpec] = None,
+) -> None:
+    """Write the move list with its date, the cameras it was scouted for and, when given, the
+    board it was scouted with, replacing the file whole."""
     data = {
         "created": created.isoformat(),
         "cameras": sorted(str(s) for s in cameras_serials),
         "points": [[float(v) for v in p] for p in points],
     }
+    if board is not None:
+        data["board"] = board_plain(board)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -669,18 +778,26 @@ def save_move_list(path: Path, points: Sequence[Point], cameras_serials: Sequenc
         raise
 
 
-def load_move_list(path: Path, cameras_serials: Sequence[str]) -> Optional[List[Point]]:
+def load_move_list(
+    path: Path, cameras_serials: Sequence[str], board: Optional[BoardSpec] = None,
+) -> Optional[List[Point]]:
     """The saved move list when it was scouted for exactly these cameras (by serial, in any
-    order); None when it was not, or the file is missing or unreadable."""
+    order) and, given `board`, with that board; None when it was not, or the file is missing
+    or unreadable. A list that names no board was scouted with the checkerboard, BoardSpec():
+    a ChArUco board is usable in views the checkerboard is not, and the reverse."""
     try:
         data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
         saved = {str(s) for s in data["cameras"]}
         points = [tuple(float(v) for v in p) for p in data["points"]]
+        saved_board = BoardSpec(**data["board"]) if data.get("board") is not None else BoardSpec()
     except (OSError, yaml.YAMLError, KeyError, TypeError, ValueError) as err:
         logger.info("no saved scout move list at %s: %s", path, err)
         return None
     if saved != {str(s) for s in cameras_serials}:
         logger.info("the saved scout move list is for cameras %s, not %s", sorted(saved), sorted(cameras_serials))
+        return None
+    if board is not None and saved_board != board:
+        logger.info("the saved scout move list was scouted with %s, not %s", saved_board, board)
         return None
     if not points or any(len(p) != 3 or not all(math.isfinite(v) for v in p) for p in points):
         return None

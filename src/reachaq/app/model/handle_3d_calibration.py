@@ -24,6 +24,7 @@ from reachaq.inference.multires_calibration.fit import BoardSpec, CaptureCamera
 from reachaq.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
 from reachaq.inference.multires_calibration.library import add_entry, entry_path, read_settings
 from reachaq.inference.multires_calibration.pipeline import (
+    CAPTURE_BOARD_KEY,
     MAX_CAMERAS,
     MIN_CAMERAS,
     REFERENCE_DIR,
@@ -35,7 +36,7 @@ from reachaq.inference.multires_calibration.pipeline import (
     load_frame_times,
     write_waypoint_log,
 )
-from reachaq.inference.multires_calibration.report import QualityReport
+from reachaq.inference.multires_calibration.report import DEFERRED_LENS_SETTINGS, QualityReport
 from reachaq.inference.multires_calibration.scout import (
     DEFAULT_COUNTS,
     MAX_PATH,
@@ -47,6 +48,8 @@ from reachaq.inference.multires_calibration.scout import (
     Travel,
     bounds_from_plan,
     choose_move_list,
+    board_plain,
+    configured_board,
     configured_bounds,
     diagnose,
     load_move_list,
@@ -56,6 +59,12 @@ from reachaq.inference.multires_calibration.scout import (
     selection_shortfalls,
     scout_views_from_capture,
     video_sizes,
+)
+from reachaq.inference.multires_calibration.per_view import (
+    PLACEMENT_SIMILARITY,
+    configured_fit,
+    configured_placement,
+    configured_principal_point,
 )
 from reachaq.inference.multires_calibration.store import INDEX_FILE, CalibrationIndex, load_index
 
@@ -614,10 +623,16 @@ def calibrate_waypoint_capture(
     presets: Sequence[PresetGeometry],
     previous_dir: Optional[Path],
     live_geometries: Optional[Mapping[str, PresetGeometry]] = None,
+    board: Optional[BoardSpec] = None,
+    fit_mode: Optional[str] = None,
+    fix_principal_point: bool = False,
+    placement: Optional[str] = None,
 ) -> Tuple[Path, CalibrationIndex, QualityReport]:
     """Write `log` as the capture's waypoints.yaml beside its source_videos, then calibrate
     every preset into <session_dir>/<DEFAULT_3D_CALIB_DIR_NAME>.new. With `live_geometries`
-    (capture_live_geometries), the preset sets are each calibrated camera's own.
+    (capture_live_geometries), the preset sets are each calibrated camera's own. `board` is
+    the calibration board (scout.configured_board); None leaves calibrate_capture's default,
+    the checkerboard.
 
     Returns (that folder, the calibration's index, its quality report). The folder is
     named here only, and its installer takes it from the return value.
@@ -626,6 +641,14 @@ def calibrate_waypoint_capture(
     write_waypoint_log(Path(capture_dir, WAYPOINT_LOG), log)
     output_dir = Path(session_dir, f"{DEFAULT_3D_CALIB_DIR_NAME}.new")
     extra = {} if live_geometries is None else {"live_geometries": dict(live_geometries)}
+    if board is not None:
+        extra["board"] = board
+    if fit_mode is not None:
+        extra["fit_mode"] = fit_mode
+    if fix_principal_point:
+        extra["fix_principal_point"] = True
+    if placement is not None and placement != PLACEMENT_SIMILARITY:
+        extra["placement"] = placement
     index, report = calibrate_capture(
         Path(capture_dir),
         output_dir=output_dir,
@@ -866,7 +889,7 @@ def run_scout(
     views = scout_views_from_capture(videos, frame_times, log.motor, log.times, board)
     sizes = video_sizes(videos)
     selection, path = choose_move_list(grid, views, names, image_sizes=sizes, max_path=max_path)
-    diagnosis = diagnose(views, names, sizes)
+    diagnosis = diagnose(views, names, sizes, board=board)
     logger.info("scout chose %d points (a path of %d waypoints); views per camera %s; cameras joined: %s",
                 len(selection.points), len(path), selection.per_camera, selection.connected)
     for camera, advice in diagnosis.items():
@@ -874,14 +897,14 @@ def run_scout(
     return ScoutResult(points=path, selection=selection, diagnosis=diagnosis, views=views)
 
 
-def saved_scout_list(root: Optional[Path], identities: Sequence[str], bounds: Bounds):
+def saved_scout_list(root: Optional[Path], identities: Sequence[str], bounds: Bounds, board: Optional[BoardSpec] = None):
     """The scout list saved in the library `root` for these cameras, or None when there is
     none, it has fewer than MIN_SCOUT_POINTS points, a point lies outside `bounds` (today's
     scout box: the configured travel, or the hand-written box the DCS may have moved) or two
     in a row differ in other than one axis."""
     if root is None:
         return None
-    points = load_move_list(Path(root, SCOUT_MOVE_LIST_FILE), identities)
+    points = load_move_list(Path(root, SCOUT_MOVE_LIST_FILE), identities, board)
     if points is None:
         return None
     if len(points) < MIN_SCOUT_POINTS:
@@ -1159,12 +1182,30 @@ def make_3d_calib(
     src_dir = Path(
         calibration_FLIR.make_new_calibration(square_size, row_ct, col_ct, oversample, sess_path.location))
 
+    # The board from the library settings (default: the rig's ChArUco board), read before any
+    # motion so a malformed setting stops the calibration before it starts.
+    root = getattr(app_model, "calibration_library_root", None)
+    library_settings = {} if root is None else read_settings(root)
+    board = configured_board(library_settings)
+    fit_mode = configured_fit(library_settings, board)
+    fix_principal_point = configured_principal_point(library_settings)
+    placement = configured_placement(library_settings)
+    ignored = [key for key in DEFERRED_LENS_SETTINGS if key in library_settings]
+    if ignored:
+        logger.notice("Calibration settings ignored: %s (the nominal-lens checks are deferred)", ", ".join(ignored))
+    if board.kind == BoardSpec().kind:
+        logger.notice("Calibration board: checkerboard, %d x %d inner corners, %g mm squares",
+                      board.rows, board.cols, board.square_mm)
+    else:
+        logger.notice("Calibration board: %s, %d x %d inner corners, %g mm squares, %g mm %s markers",
+                      board.kind, board.rows, board.cols, board.square_mm, board.marker_mm, board.dictionary)
+    logger.notice("Calibration fit: %s%s", fit_mode, ", principal points at the image centre" if fix_principal_point else "")
+
     if move_list == SCOUT:
-        root = getattr(app_model, "calibration_library_root", None)
         identities = [camera.serial or camera.name for camera in capture_list]
         configured = None if root is None else configured_bounds(read_settings(root))
         targets = [motor for *_, motor in plan]
-        saved = None if rescout else saved_scout_list(root, identities, bounds_from_plan(targets, configured, travel))
+        saved = None if rescout else saved_scout_list(root, identities, bounds_from_plan(targets, configured, travel), board)
         if rescout:
             logger.notice("Scouting again, as asked: any saved scout move list is not used this time")
         if saved is not None:
@@ -1174,7 +1215,7 @@ def make_3d_calib(
         else:
             scout = run_scout(app_model, cameras, targets, project=project, session_dir=Path(sess_path.location),
                               cams_before_cfg=cams_before_cfg, capture_list=capture_list, cam_params=cam_params,
-                              record_mode=record_mode, configured=configured, travel=travel)
+                              record_mode=record_mode, configured=configured, travel=travel, board=board)
             plan, used = choose_plan(SCOUT, diamond_triangle_cfg, scout)
             check_plan_in_travel(plan, travel, used)  # a hand-written fallback is first checked here
             # The rule is checked on the list that will be used, too: the 60-waypoint cap can
@@ -1187,10 +1228,14 @@ def make_3d_calib(
             if advice and confirm_scout is not None and not confirm_scout(advice):
                 raise ScoutCancelled("cancelled at the scout's advice; nothing was captured")
             if used == SCOUT and root is not None and not advice and scout.selection.connected:
-                save_move_list(Path(root, SCOUT_MOVE_LIST_FILE), scout.points, identities, datetime.now())
+                save_move_list(Path(root, SCOUT_MOVE_LIST_FILE), scout.points, identities, datetime.now(), board)
 
     log = _record_plan(app_model, cameras, cams_before_cfg, cam_params, record_mode, project, plan, capture_list,
                        src_dir)
+    # The board goes into waypoints.yaml with the capture, so the capture can be calibrated
+    # again offline without being told it (pipeline.capture_board).
+    if isinstance(log, WaypointLog):
+        log.capture_settings[CAPTURE_BOARD_KEY] = board_plain(board)
 
     if capture_references:
         if confirm_references is None or confirm_references():
@@ -1209,6 +1254,10 @@ def make_3d_calib(
         presets=presets,
         previous_dir=app_model.active_calibration_dir,
         live_geometries=live_geometries,
+        board=board,
+        fit_mode=fit_mode,
+        fix_principal_point=fix_principal_point,
+        placement=placement,
     )
 
     logger.success("Successfully calibrated the capture: %s, verdict %s", index.id, report.verdict)

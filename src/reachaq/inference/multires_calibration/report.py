@@ -24,6 +24,14 @@ status UNDETERMINED and value None: it is neither a pass nor a fail and does not
 verdict. When no camera can be checked (always so with 2 fitted cameras), the report's
 verdict_note says so, so the verdict does not read as a fully checked pass.
 
+Two RMS per camera. reprojection_rms_px, which grades the camera, is its own planar fit's
+(planar_rms_px): its intrinsics against its corners with every view's board pose free, so it
+measures the camera model and the corner detection alone. joint_reprojection_rms_px is the
+same camera's RMS in the stage-tied joint fit, where each view's board is held to its
+commanded position through the stage model; any board placement the model does not describe
+adds to it, so it only warns. The
+stage itself is graded in its own block (STAGE_METRICS), which warns and never fails.
+
 The fit has 2 to 6 cameras. Per-camera metrics are graded for every fitted camera, and the
 pair metrics for every co-visible pair (two cameras that saw the board at a common
 waypoint), with the pair named "a-b" in the fit's camera order. A camera the pipeline's
@@ -60,10 +68,13 @@ import cv2
 import numpy as np
 
 from reachaq.inference.multires_calibration.fit import (
+    CHARUCO,
     BoardSpec,
     CameraModel,
     MotorFrameFit,
     WaypointObservation,
+    usable_view,
+    valid_corners,
 )
 from reachaq.inference.multires_calibration.geometry import PresetGeometry
 
@@ -76,7 +87,12 @@ DEFAULT_THRESHOLDS: Thresholds = {
     # The views a camera shares with another fitted camera; the fit does not need them, but
     # they expose stage geometry the model leaves out (axis skew).
     "covisible_views": (8.0, 4.0),
+    # Each camera's own planar fit (planar_rms_px): its corners against its intrinsics with
+    # every view's board pose free, so stage error cannot enter it.
     "reprojection_rms_px": (0.5, 1.0),
+    # The same camera's RMS in the stage-tied joint fit: the planar residual plus whatever the
+    # stage model leaves (board placement, tilt). A warning about the stage model, never a fail.
+    "joint_reprojection_rms_px": (1.0, None),
     "coverage_roi_fraction": (0.5, 0.25),
     "fx_fy_ratio_dev": (0.01, 0.03),
     "focal_rel_std": (0.005, 0.02),
@@ -89,6 +105,11 @@ DEFAULT_THRESHOLDS: Thresholds = {
     # the other cameras triangulate, projected into it.
     "loo_triangulation_px": (0.5, 1.0),
     "motor_scale_dev": (0.01, None),
+    # Stage accuracy (STAGE_METRICS), per-view fit only: per motor axis, the RMS over every
+    # view of where the board was minus where the stage model put it; and, for a position
+    # visited twice, how far apart the board was on the two visits. UNFINALIZED: 1.0 and 0.5 mm.
+    "stage_slack_rms_mm": (1.0, None),
+    "stage_repeat_mm": (0.5, None),
     "waypoints_unverified": (0.0, None),
     # A waypoint the motor reported elsewhere than commanded puts its view where the board
     # was not: the fit takes the commanded position, so any such waypoint fails.
@@ -112,6 +133,11 @@ DEFAULT_THRESHOLDS: Thresholds = {
     "baseline_mm": (None, None),
     "coverage_frame_fraction": (None, None),
 }
+# The stage-accuracy metrics: how well the stage put the board where it was commanded. They
+# warn and never fail, and the text report lists them in a block of their own after the
+# calibration's metrics.
+STAGE_METRICS = ("motor_scale_dev", "stage_slack_rms_mm", "stage_repeat_mm")
+STAGE_HEADING = "Stage accuracy (measured; warns, never fails):"
 # The metrics where a smaller value is worse; see the module docstring.
 LOWER_IS_WORSE = frozenset({"views_kept", "covisible_views", "coverage_roi_fraction", "coverage_frame_fraction"})
 NO_PREVIOUS_NOTE = "no comparable previous calibration"
@@ -233,7 +259,7 @@ class QualityReport:
 
     def to_text(self) -> str:
         """A summary for the operator: every camera that is not calibrated, then the verdict,
-        then every metric, failures first."""
+        then every calibration metric, failures first, then the stage-accuracy block."""
         counts = {s: sum(m.status == s for m in self.metrics) for s in _DISPLAY_ORDER}
         undetermined = f", {counts[UNDETERMINED]} {UNDETERMINED}" if counts[UNDETERMINED] else ""
         lines = [f"{NOT_CALIBRATED}: {v.name}: {v.reason}" for v in self.cameras.values() if not v.calibrated]
@@ -247,11 +273,16 @@ class QualityReport:
             details = ", ".join(f"{key} {value}" for key, value in self.override.items())
             lines.append(f"Override recorded: {details}")
         lines.append("")
-        # sorted is stable, so metrics of one status keep the order they were graded in.
-        for m in sorted(self.metrics, key=lambda m: _DISPLAY_ORDER.index(m.status)):
-            value = "-" if m.value is None else f"{_format_value(m.value)} {m.unit}"
-            line = f"{m.status.upper():<5} {m.name:<30}{m.camera or '-':<7}{value}  [{_format_limits(m)}]"
-            lines.append(f"{line}  {m.note}" if m.note else line)
+        stage = [m for m in self.metrics if m.name in STAGE_METRICS]
+        for block in ([m for m in self.metrics if m.name not in STAGE_METRICS], stage):
+            if block is stage and stage:
+                lines.extend(["", STAGE_HEADING])
+            # sorted is stable, so metrics of one status keep the order they were graded in.
+            for m in sorted(block, key=lambda m: _DISPLAY_ORDER.index(m.status)):
+                value = "-" if m.value is None else f"{_format_value(m.value)} {m.unit}"
+                # The space after the camera keeps a 7-character name (camera4) or a pair apart from the value.
+                line = f"{m.status.upper():<5} {m.name:<30}{m.camera or '-':<7} {value}  [{_format_limits(m)}]"
+                lines.append(f"{line}  {m.note}" if m.note else line)
         if self.notes:
             lines.append("")
             lines.append("Notes:")
@@ -302,13 +333,19 @@ def build_report(
     thresholds: Thresholds = DEFAULT_THRESHOLDS,
     presets: Sequence[PresetGeometry] = (),
     cameras: Optional[Mapping[str, CameraVerdict]] = None,
+    fix_principal_point: bool = False,
 ) -> QualityReport:
     """Grade `fit` and its capture against `thresholds`.
 
     roi_sensor is the base preset's sensor_roi(), in pixel edges. Only the fit's cameras are
     graded, and only their corners in `observations` are used. The pair checks cover every
-    pair of them that saw the board at a common waypoint. Each camera's RMS is also reported
-    in the pixels of every preset in `presets`.
+    pair of them that saw the board at a common waypoint.
+
+    Each camera's graded reprojection_rms_px is its own planar fit's (planar_rms_px), which
+    holds the principal point at the fit's when `fix_principal_point` (the per-view fit's
+    `fit_principal_point: centre`). Its RMS in the joint fit is joint_reprojection_rms_px,
+    which only warns, and is also reported in the pixels of every preset in `presets`. A
+    per-view fit's placement adds the stage-accuracy metrics (STAGE_METRICS).
 
     `cameras` is every capture camera's verdict, in capture order; a fitted camera it leaves
     out is calibrated, and by default every fitted camera is. The verdict is "fail" if any
@@ -332,12 +369,15 @@ def build_report(
         return graded
 
     fitted = list(fit.cameras)
-    # The fitted cameras that found the board at each waypoint.
-    seen = [{cam for cam in o.corners if cam in fit.cameras} for o in observations]
+    # The fitted cameras that found the board at each waypoint: for a ChArUco board, those
+    # whose corners there are a view (fit.usable_view), so a co-visible view is one where
+    # both cameras pass that minimum.
+    seen = [{cam for cam, c in o.corners.items() if cam in fit.cameras and usable_view(c, board)}
+            for o in observations]
 
     # The capture.
     for cam in fitted:
-        counted = sum(cam in o.corners for o in observations)
+        counted = sum(cam in s for s in seen)
         add("views_kept", cam, capture.views_kept.get(cam, counted), "views")
         add("covisible_views", cam, sum(cam in s and len(s) > 1 for s in seen), "views")
     add("waypoints_unverified", None, capture.waypoints_total - capture.waypoints_verified, "waypoints",
@@ -348,14 +388,22 @@ def build_report(
         if rejected:
             detail = ", ".join(f"{reason} {count}" for reason, count in reasons.items())
             notes.append(f"{cam}: {rejected} views rejected ({detail})")
+    if board.kind == CHARUCO:
+        # A ChArUco view may be partial, so how much of the board each view held is shown.
+        for cam in fitted:
+            notes.append(_views_used_note(cam, fit, observations))
+    if fit.placement is not None:
+        notes.extend(placement_notes(fit.placement))
 
     # Each camera: its residual, its coverage and the sanity of its intrinsics.
     frame = (0.0, 0.0, float(fit.image_size[0]), float(fit.image_size[1]))
     for cam in fitted:
         model = fit.cameras[cam]
         fx, fy = model.K[0, 0], model.K[1, 1]
+        planar, planar_note = planar_rms_px(observations, board, fit.image_size, cam, model, fix_principal_point)
+        add("reprojection_rms_px", cam, planar, "sensor px", planar_note)
         rms = fit.rms_px.get(cam, math.inf)
-        add("reprojection_rms_px", cam, rms, "sensor px")
+        add("joint_reprojection_rms_px", cam, rms, "sensor px", JOINT_RMS_NOTE)
         for g in presets:
             # A binned pixel is b sensor pixels wide, so a distance in sensor px is 1/b of it in preset px.
             add("preset_reprojection_rms_px", cam, rms / g.binning, "preset px", f"preset {g.name}")
@@ -378,8 +426,14 @@ def build_report(
         add("baseline_mm", pair, float(np.linalg.norm(_centre(fit.cameras[second]) - _centre(fit.cameras[first]))),
             "mm")
         epipolar, square, stereo_note = _stereo_checks(fit, observations, board, first, second)
-        add("epipolar_error_px", pair, epipolar, "sensor px", stereo_note)
-        add("square_size_rel_error", pair, square, "ratio", stereo_note)
+        for name, value, unit in (("epipolar_error_px", epipolar, "sensor px"), ("square_size_rel_error", square, "ratio")):
+            if value is None:
+                # Undetermined, as the triangulation check without two other cameras: it
+                # neither passes nor fails.
+                warn, fail = (_as_limit(limit) for limit in thresholds[name])
+                metrics.append(Metric(name, pair, None, unit, warn, fail, UNDETERMINED, stereo_note))
+            else:
+                add(name, pair, value, unit, stereo_note)
     if not pairs:
         # Undetermined, so the pair checks cannot pass.
         stereo_note = (
@@ -401,7 +455,18 @@ def build_report(
             else:
                 loo_checked = True
                 add("loo_triangulation_px", cam, loo, "sensor px", loo_note)
+    # Stage accuracy.
     add("motor_scale_dev", None, abs(fit.motor_scale - 1.0), "ratio")
+    if fit.placement is not None:
+        residual = fit.placement.residual_mm
+        r = np.array(list(residual.values()), float).reshape(-1, 3)
+        for axis, name in enumerate("xyz"):
+            add("stage_slack_rms_mm", name, float(np.sqrt(np.mean(r[:, axis] ** 2))) if len(r) else math.inf, "mm",
+                f"motor {name}, over all {len(r)} views")
+        for a, b, commanded, d in repeat_visits(observations, residual):
+            add("stage_repeat_mm", f"{a}-{b}", float(np.linalg.norm(d)), "mm",
+                f"waypoints {a} and {b} at commanded {_format_xyz_mm(commanded)}:"
+                f" board position differs by x {d[0]:+.2f}, y {d[1]:+.2f}, z {d[2]:+.2f} mm between visits")
     for check in cross_checks:
         add("cross_check_delta_px", None, check.max_intrinsic_delta_px, "preset px", f"preset {check.geometry.name}")
         add("cross_check_corner_offset_px", None, check.corner_offset_px, "preset px", f"preset {check.geometry.name}")
@@ -432,6 +497,138 @@ def build_report(
         cameras=verdicts,
         verdict_note=verdict_note,
     )
+
+
+# A view whose board stood further than this from its commanded position is named in the report.
+PLACEMENT_FLAG_MM = 1.0
+# A planar fit needs views of the board in this many poses to separate the intrinsics.
+_PLANAR_MIN_VIEWS = 3
+_PLANAR_CRITERIA = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 100, 1e-10)
+PLANAR_RMS_NOTE = "the camera's own planar fit, every view's board pose free"
+JOINT_RMS_NOTE = "the stage-tied joint fit: the planar residual plus what the stage model leaves"
+
+
+def planar_rms_px(
+    observations: Sequence[WaypointObservation],
+    board: BoardSpec,
+    image_size: Tuple[int, int],
+    camera: str,
+    model: CameraModel,
+    fix_principal_point: bool = False,
+) -> Tuple[float, str]:
+    """(RMS px, note) of `camera`'s own planar calibration: cv2.calibrateCamera on its valid
+    corners in every view (fit.usable_view), each view's board pose free, with the joint fit's
+    distortion model (k1 k2 p1 p2, k3 held at 0), started from `model`'s intrinsics and, with
+    `fix_principal_point`, holding its principal point there.
+
+    Every view is a near-parallel plane, so the planar fit cannot pin the focal length; its
+    RMS is still the camera model's own residual, since the free poses take up any stage
+    error. +inf, with a note, when the camera has fewer than _PLANAR_MIN_VIEWS views or the
+    fit fails."""
+    obj = board.object_points().astype(np.float32)
+    image_points, object_points = [], []
+    for o in observations:
+        corners = o.corners.get(camera)
+        if corners is None or not usable_view(corners, board):
+            continue
+        ok = valid_corners(corners)
+        image_points.append(np.asarray(corners, float)[ok].astype(np.float32).reshape(-1, 1, 2))
+        object_points.append(obj[ok])
+    if len(image_points) < _PLANAR_MIN_VIEWS:
+        return math.inf, f"planar fit not possible: {len(image_points)} views, {_PLANAR_MIN_VIEWS} needed"
+    K = np.array(model.K, float)
+    dist = np.zeros(5)
+    dist[:4] = np.asarray(model.dist, float).ravel()[:4]
+    flags = cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_K3
+    note = PLANAR_RMS_NOTE
+    if fix_principal_point:
+        flags |= cv2.CALIB_FIX_PRINCIPAL_POINT
+        note += ", principal point held at the fit's"
+    try:
+        rms = cv2.calibrateCamera(object_points, image_points, tuple(int(v) for v in image_size), K, dist,
+                                  flags=flags, criteria=_PLANAR_CRITERIA)[0]
+    except cv2.error as err:
+        return math.inf, f"planar fit failed: {str(err).strip().splitlines()[-1]}"
+    return float(rms), note
+
+
+def repeat_visits(
+    observations: Sequence[WaypointObservation], residual_mm: Mapping[int, Sequence[float]], tol_mm: float = 1e-6
+) -> List[Tuple[int, int, np.ndarray, np.ndarray]]:
+    """(waypoint a, waypoint b, commanded mm, board at b minus board at a in motor mm) for every
+    pair of placed views at the same commanded position, in waypoint order. The commanded
+    position is the same, so the difference of the placement residuals is how far apart the
+    fit placed the board at the two visits."""
+    placed = [(o.index, np.asarray(o.motor_mm, float).reshape(3)) for o in observations if o.index in residual_mm]
+    out = []
+    for i, (a, m_a) in enumerate(placed):
+        for b, m_b in placed[i + 1:]:
+            if np.max(np.abs(m_a - m_b)) <= tol_mm:
+                out.append((a, b, m_a, np.asarray(residual_mm[b], float) - np.asarray(residual_mm[a], float)))
+    return out
+
+
+def _format_xyz_mm(xyz) -> str:
+    return "({:.2f}, {:.2f}, {:.2f}) mm".format(*np.asarray(xyz, float).reshape(3))
+
+
+# Library settings for nominal lenses, which an earlier version graded. The checks are deferred
+# (until after 2026-12-31); make_3d_calib ignores these keys with a log note.
+DEFERRED_LENS_SETTINGS = ("lenses", "pixel_um")
+
+
+def placement_notes(placement) -> List[str]:
+    """The per-view fit's stage diagnostics (fit.MotorPlacement) as report notes: the
+    similarity's scale and RMS, each view placed more than PLACEMENT_FLAG_MM from its commanded
+    position, by name, the board tilt, and every view's residual. They are stage-accuracy
+    warnings; the calibration does not depend on them."""
+    residual = placement.residual_mm
+    inliers = len(residual) - len(placement.outliers)
+    notes = [
+        f"motor placement (per-view fit): similarity scale {placement.scale:.4f}, RMS {placement.rms_mm:.2f} mm"
+        f" over {inliers} of {len(residual)} views"
+        + (f"; left out of it (more than 3 MAD off): waypoints {', '.join(str(w) for w in placement.outliers)}"
+           if placement.outliers else "")
+    ]
+    scales, angles = getattr(placement, "axis_scale", None), getattr(placement, "axis_angle_deg", None)
+    if scales is not None and angles is not None:
+        notes.append(
+            "stage axes: scale x {:.4f}, y {:.4f}, z {:.4f} (true mm per commanded mm);"
+            " angles xy {:.2f}, xz {:.2f}, yz {:.2f} deg".format(*scales, *angles))
+    for w, r in residual.items():
+        if math.hypot(*r) > PLACEMENT_FLAG_MM:
+            axis = int(np.argmax(np.abs(r)))
+            # By sign along the motor axis, not "short" or "past": the move may have run either way.
+            notes.append(
+                f"waypoint {w}: board {abs(r[axis]):.1f} mm off commanded {'xyz'[axis]} ({r[axis]:+.1f} mm)"
+                f" (x {r[0]:+.2f}, y {r[1]:+.2f}, z {r[2]:+.2f} mm; tilt {placement.tilt_deg.get(w, 0.0):.2f} deg)"
+            )
+    if placement.tilt_deg:
+        worst = max(placement.tilt_deg, key=placement.tilt_deg.get)
+        notes.append(
+            f"board tilt from its mean rotation: median {float(np.median(list(placement.tilt_deg.values()))):.2f} deg,"
+            f" max {placement.tilt_deg[worst]:.2f} deg (waypoint {worst}); the stage turned the board between waypoints"
+        )
+    axes = getattr(placement, "tilt_axis", {}) or {}
+    notes.append("board tilt per waypoint, deg (axis in motor x, y, z): " + "; ".join(
+        f"{w} {placement.tilt_deg[w]:.2f}"
+        + (" ({:+.2f}, {:+.2f}, {:+.2f})".format(*axes[w]) if w in axes else "")
+        for w in placement.tilt_deg))
+    notes.append("per-view motor residual, mm (x, y, z): " + "; ".join(
+        f"{w} ({r[0]:+.2f}, {r[1]:+.2f}, {r[2]:+.2f})" for w, r in residual.items()))
+    return notes
+
+
+def _views_used_note(cam: str, fit: MotorFrameFit, observations: Sequence[WaypointObservation]) -> str:
+    """"{cam}: views used N of M waypoints, median K corners per view": N the views the fit
+    used, M the distinct waypoints, K the median of the corners fitted per view."""
+    used = fit.per_view_rms_px.get(cam, {})
+    counts = (fit.corner_counts or {}).get(cam)
+    if counts is None:
+        by_index = {o.index: o.corners[cam] for o in observations if cam in o.corners}
+        counts = {i: int(valid_corners(by_index[i]).sum()) for i in used if i in by_index}
+    median = float(np.median(list(counts.values()))) if counts else 0.0
+    return f"{cam}: views used {len(used)} of {len(observations)} waypoints, median {median:g} corners per view"
 
 
 def coverage_fraction(
@@ -467,7 +664,8 @@ def write_coverage_images(
         cv2.rectangle(image, corner_a, corner_b, (0, 210, 255), 2)
         seen = [o for o in observations if cam in o.corners]
         for o in seen:
-            for u, v in np.asarray(o.corners[cam], float):
+            corners = np.asarray(o.corners[cam], float)
+            for u, v in corners[valid_corners(corners)]:
                 cv2.circle(image, (int(round(u)), int(round(v))), 2, (80, 80, 255), -1)
         label = f"{cam}: {coverage_fraction(observations, cam, roi_sensor):.2f} of ROI covered, {len(seen)} views"
         cv2.putText(image, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
@@ -518,7 +716,11 @@ def _hull_mask(observations, camera, origin, shape, scale) -> np.ndarray:
     for o in observations:
         if camera not in o.corners:
             continue
-        hull = cv2.convexHull(np.asarray(o.corners[camera], np.float32)).reshape(-1, 2).astype(float)
+        corners = np.asarray(o.corners[camera], np.float32)
+        corners = corners[valid_corners(corners)]  # a ChArUco view's detected corners
+        if len(corners) < 3:
+            continue
+        hull = cv2.convexHull(corners).reshape(-1, 2).astype(float)
         vertices = ((hull + 0.5 - offset) / scale - 0.5) * (1 << _FILL_SHIFT)
         cv2.fillPoly(mask, [np.round(vertices).astype(np.int32)], 255, lineType=cv2.LINE_8, shift=_FILL_SHIFT)
     return mask
@@ -561,13 +763,25 @@ def _max_distortion_shift(model: CameraModel, roi) -> float:
 
 def _stereo_checks(fit: MotorFrameFit, observations, board: BoardSpec, first: str, second: str):
     """(mean symmetric epipolar distance in sensor px, |mean triangulated square - square_mm| /
-    square_mm, note) over the waypoints where both cameras found the board."""
-    both = [o for o in observations if first in o.corners and second in o.corners]
+    square_mm, note) over the waypoints where both cameras found the board.
+
+    A ChArUco pair can share waypoints but no corner (each sees its own part of the board):
+    the epipolar and square checks are then None, undetermined, as the triangulation check
+    is with too few cameras. The square check is also None when no two neighbouring corners
+    were both found by both cameras."""
+    both = [o for o in observations if first in o.corners and second in o.corners
+            and usable_view(o.corners[first], board) and usable_view(o.corners[second], board)]
     if not both:
         return math.inf, math.inf, f"no waypoint has the board in both {first} and {second}"
+    # The waypoints where the two found a corner in common: every one, for a checkerboard.
+    both = [o for o in both if (valid_corners(o.corners[first]) & valid_corners(o.corners[second])).any()]
+    if not both:
+        return None, None, f"{first} and {second} found no board corner in common"
     a, b = fit.cameras[first], fit.cameras[second]
-    na = _normalised(np.concatenate([o.corners[first] for o in both]), a)
-    nb = _normalised(np.concatenate([o.corners[second] for o in both]), b)
+    # The corners both cameras detected: every corner of a checkerboard.
+    common = np.concatenate([valid_corners(o.corners[first]) & valid_corners(o.corners[second]) for o in both])
+    na = _normalised(np.concatenate([o.corners[first] for o in both])[common], a)
+    nb = _normalised(np.concatenate([o.corners[second] for o in both])[common], b)
     ha = np.column_stack([na, np.ones(len(na))])
     hb = np.column_stack([nb, np.ones(len(nb))])
 
@@ -583,12 +797,15 @@ def _stereo_checks(fit: MotorFrameFit, observations, board: BoardSpec, first: st
     epipolar = float(np.mean((d_a + d_b) / 2))
 
     X = cv2.triangulatePoints(_projection(a), _projection(b), na.T, nb.T)
-    grid = (X[:3] / X[3]).T.reshape(len(both), board.rows, board.cols, 3)
+    points = np.full((len(common), 3), np.nan)
+    points[common] = (X[:3] / X[3]).T
+    grid = points.reshape(len(both), board.rows, board.cols, 3)
     steps = np.concatenate([
         np.linalg.norm(grid[:, :, 1:] - grid[:, :, :-1], axis=-1).ravel(),  # along each row
         np.linalg.norm(grid[:, 1:, :] - grid[:, :-1, :], axis=-1).ravel(),  # down each column
     ])
-    square = abs(float(steps.mean()) - board.square_mm) / board.square_mm
+    steps = steps[np.isfinite(steps)]  # the neighbours both ends of which both cameras found
+    square = abs(float(steps.mean()) - board.square_mm) / board.square_mm if len(steps) else None
     return epipolar, square, f"{len(both)} waypoints with {first} and {second}"
 
 
@@ -640,10 +857,16 @@ def _leave_one_out(fit: MotorFrameFit, observations, cam: str) -> Tuple[Optional
         seen = [c for c in others if c in o.corners]
         if cam not in o.corners or len(seen) < 2:
             continue
-        X = _triangulate([fit.cameras[c] for c in seen], [o.corners[c] for c in seen])
+        # The corners every one of them detected: every corner of a checkerboard.
+        common = valid_corners(o.corners[cam])
+        for c in seen:
+            common = common & valid_corners(o.corners[c])
+        if not common.any():
+            continue
+        X = _triangulate([fit.cameras[c] for c in seen], [np.asarray(o.corners[c], float)[common] for c in seen])
         projected = cv2.projectPoints(X, np.asarray(model.rvec, float), np.asarray(model.tvec, float),
                                       model.K, model.dist)[0].reshape(-1, 2)
-        distances.append(np.linalg.norm(projected - np.asarray(o.corners[cam], float), axis=1))
+        distances.append(np.linalg.norm(projected - np.asarray(o.corners[cam], float)[common], axis=1))
         waypoints += 1
     if not distances:
         return None, ""
@@ -668,7 +891,13 @@ def _triangulate(models: Sequence[CameraModel], pixels: Sequence[np.ndarray]) ->
 def _joint_rms(fit: MotorFrameFit) -> float:
     """The RMS reprojection distance over every corner of every camera together, in sensor
     px: the residual of the joint fit itself. Every view has the same corners, so the mean
-    of the per-view mean squares is the mean over the corners. Infinite with no views."""
+    of the per-view mean squares is the mean over the corners. Infinite with no views.
+    Partial views (fit.corner_counts) are weighted by the corners each held."""
+    if fit.corner_counts:
+        weighted = [(v * v * fit.corner_counts.get(cam, {}).get(i, 1), fit.corner_counts.get(cam, {}).get(i, 1))
+                    for cam, views in fit.per_view_rms_px.items() for i, v in views.items()]
+        total = sum(n for _, n in weighted)
+        return math.sqrt(sum(s for s, _ in weighted) / total) if total else math.inf
     squares = [v * v for views in fit.per_view_rms_px.values() for v in views.values()]
     return math.sqrt(sum(squares) / len(squares)) if squares else math.inf
 

@@ -4,7 +4,43 @@ All notable changes to reachAQ are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/). Releases before 3.0.0 are not listed.
 
-## [Unreleased] - 4.0.0
+## [Unreleased]
+
+### Added
+
+- Pellet firmware 2.4.0 (capability bit 9, `stepper_motion_safety`): every host
+  stop is an all-axes `STEPPER_STOP` on such a board, ESTOP on 2.3.1; a STOP also
+  goes out at every teardown. `STEPPER_FAULT` frames and the `-ETIME`, `-EFAULT`
+  and `-EIO` ACKs stop every axis and raise the blocking stopped-stage alert; each
+  fault is written to `streams/device.csv` and `recording.stepperFaults`. A
+  FIXED_XYZ refused for `NEEDS_HOME` prompts a home and a resend, without a stop.
+  Status bits `NEEDS_HOME` and `HOMED_SINCE_BOOT` gate automatic motion and
+  Record. `BOOT_CHAIN` bootloader responses decode, and an unknown bootloader
+  subcommand no longer ends the CAN reader. The 2.4.0 allowlist entry requires
+  `stepper_motion_safety`.
+- The pellet capabilities are forgotten when the board reboots mid-session or
+  stops sending timing trailers, and asked for again; stops are ESTOP until it
+  answers. A pyjerrycan host refuses to connect to a board with bit 9, since it
+  cannot send STOP.
+
+### Changed
+
+- Every stepper target is clamped to its axis's `max_pos` from
+  `motor_config.yaml` (at most 15 turns, as before), matching pellet 2.4.0's
+  per-axis travel caps.
+- Decided: the host's acknowledgement deadlines stay shorter than pellet
+  2.4.0's own per-move watchdog, so the host's STOP fires first on a stall and
+  the board's watchdog is the backstop.
+
+## [4.0.1] - 2026-11-25
+
+### Fixed
+
+- The installer's one-CUDA-runtime check reads the environment `conda run` runs in
+  (`CONDA_PREFIX`), so its plugin-installer test no longer fails on a rig that has the
+  DeepLabCut plugin installed.
+
+## [4.0.0] - 2026-11-25
 
 The project is renamed from Autotrainer to reachAQ throughout. There are no
 compatibility aliases: every v3 name below stops working. Upgrade with the
@@ -58,30 +94,34 @@ installer, which migrates the settings; see "Upgrading from v3" in
   uninstalls every `auto-trainer*` distribution, restores the pose plugins v3
   registered, and replaces installed SoftMouse user units that still name a v3
   module.
-- Pellet firmware 2.4.0 (capability bit 9, `stepper_motion_safety`): every host
-  stop is an all-axes `STEPPER_STOP` on such a board, ESTOP on 2.3.1; a STOP also
-  goes out at every teardown. `STEPPER_FAULT` frames and the `-ETIME`, `-EFAULT`
-  and `-EIO` ACKs stop every axis and raise the blocking stopped-stage alert; each
-  fault is written to `streams/device.csv` and `recording.stepperFaults`. A
-  FIXED_XYZ refused for `NEEDS_HOME` prompts a home and a resend, without a stop.
-  Status bits `NEEDS_HOME` and `HOMED_SINCE_BOOT` gate automatic motion and
-  Record. `BOOT_CHAIN` bootloader responses decode, and an unknown bootloader
-  subcommand no longer ends the CAN reader. The 2.4.0 allowlist entry requires
-  `stepper_motion_safety`.
-- The pellet capabilities are forgotten when the board reboots mid-session or
-  stops sending timing trailers, and asked for again; stops are ESTOP until it
-  answers. A pyjerrycan host refuses to connect to a board with bit 9, since it
-  cannot send STOP.
+- The installer stops at the first failed step and names it, checks the platform
+  list (Ubuntu 22.04, NVIDIA driver 570.26 or later), uses the Spinnaker SDK and
+  binding the customer downloads (3.2, no vendored FLIR wheels) and checks that the
+  environment carries one CUDA runtime per engine.
+- ChArUco calibration boards are the default (`board:` in the calibration
+  settings; the plain checkerboard stays available), with partial board views, a
+  board generator (`reachaq.calibration.make_charuco_board`) and a per-view fit in
+  which board poses follow the stage. The per-camera reprojection grade uses each
+  camera's own refit; stage accuracy is reported separately and only warns.
 
-### Changed
+## [3.2.3] - 2026-11-24
 
-- Decided: the host's acknowledgement deadlines stay shorter than pellet
-  2.4.0's own per-move watchdog, so the host's STOP fires first on a stall and
-  the board's watchdog is the backstop.
+### Fixed
 
-- Every stepper target is clamped to its axis's `max_pos` from
-  `motor_config.yaml` (at most 15 turns, as before), matching pellet 2.4.0's
-  per-axis travel caps.
+- The pellet stage is stopped (ESTOP, all axes) when a stepper move or home is not
+  acknowledged within its expected time, when the board reports a motion command
+  busy, when a scout waypoint is not reached, when a capture or calibration fails
+  or ends while the stage moves, and when the application disconnects or closes
+  mid-move. A timed-out move is no longer re-sent. After a stop, the stage must be
+  homed before it moves again; a blocking alert says why, and the stop is recorded
+  in the session metadata.
+
+### Added
+
+- An always-enabled STOP button for the pellet stage.
+- `pellet.profile_ack_deadlines` in `motor_config.yaml` (default on): per-move
+  acknowledgement deadlines from each move's distance, speed and acceleration.
+  Off falls back to a fixed 3 s timeout, which still stops the stage.
 
 ## [3.2.2] - 2026-11-24
 

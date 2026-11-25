@@ -52,7 +52,7 @@ if [ -e "$FAKE_ENVS/$env_name/FAIL_PYTHON" ]; then
     printf 'probe python broke in %s\n' "$env_name" >&2
     exit 3
 fi
-PYTHONPATH="$FAKE_ENVS/$env_name" exec "$FAKE_PYTHON" -S "$@"
+CONDA_PREFIX="$FAKE_ENVS/$env_name" PYTHONPATH="$FAKE_ENVS/$env_name" exec "$FAKE_PYTHON" -S "$@"
 """
 
 

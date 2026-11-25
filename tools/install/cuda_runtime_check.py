@@ -140,7 +140,9 @@ def _environment_facts() -> dict:
     return {
         "nvidia_distributions": names,
         "torch_cuda": torch.version.cuda,
-        "prefix": Path(sys.prefix),
+        # conda run sets CONDA_PREFIX to the environment it runs in; prefer it
+        # over the interpreter's own prefix.
+        "prefix": Path(os.environ.get("CONDA_PREFIX") or sys.prefix),
         "deeplabcut_installed": deeplabcut,
         "library_path": os.environ.get("LD_LIBRARY_PATH", ""),
         "site_nvidia": Path(sysconfig.get_paths()["purelib"]) / "nvidia",
