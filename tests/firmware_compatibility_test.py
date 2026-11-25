@@ -173,34 +173,55 @@ def test_2_3_1_names_stepper_driver_fault_for_a_v1_3_board_reporting_0x44():
     assert "stepper_driver_fault" in result.optional_capabilities
 
 
-def test_2_4_0_accepts_a_v1_2_board_reporting_0x17():
-    """Pellet 2.4.0 on a v1.2 board: timing bits, pulse and clap listener."""
+def test_2_4_0_accepts_a_v1_2_board_reporting_0x217():
+    """Pellet 2.4.0 on a v1.2 board: timing bits, pulse, clap listener and motion safety."""
     result = FirmwareCompatibilityPolicy.load().evaluate(
-        "Pellet: 2.4.0", wire_schema_version=1, capabilities=0x17,
+        "Pellet: 2.4.0", wire_schema_version=1, capabilities=0x217,
     )
 
     assert result.supported
     assert result.commands_allowed
     assert result.reported_capabilities == (
-        "timing_trailer", "time_sync", "finite_stim3_pulse", "sync_listener",
+        "timing_trailer", "time_sync", "finite_stim3_pulse", "sync_listener", "stepper_motion_safety",
     )
     assert set(result.required_capabilities) == {
-        "finite_stim3_pulse", "timing_trailer", "time_sync",
+        "finite_stim3_pulse", "timing_trailer", "time_sync", "stepper_motion_safety",
     }
 
 
-def test_2_4_0_accepts_a_v1_3_board_reporting_0x57():
+def test_2_4_0_accepts_a_v1_3_board_reporting_0x257():
     result = FirmwareCompatibilityPolicy.load().evaluate(
-        "Pellet: 2.4.0", wire_schema_version=1, capabilities=0x57,
+        "Pellet: 2.4.0", wire_schema_version=1, capabilities=0x257,
     )
 
     assert result.commands_allowed
     assert "stepper_driver_fault" in result.reported_capabilities
+    assert "stepper_motion_safety" in result.reported_capabilities
+
+
+def test_2_4_0_refuses_a_board_without_motion_safety():
+    """A 2.4.0 build without bit 9 (the board-time work alone, 0x17) is not the released 2.4.0:
+    the entry requires stepper_motion_safety so that only a host with STOP accepts it (H7)."""
+    result = FirmwareCompatibilityPolicy.load().evaluate(
+        "Pellet: 2.4.0", wire_schema_version=1, capabilities=0x17,
+    )
+
+    assert not result.commands_allowed
+    assert result.missing_capabilities == ("stepper_motion_safety",)
+
+
+def test_2_3_1_is_still_accepted_without_motion_safety():
+    result = FirmwareCompatibilityPolicy.load().evaluate(
+        "Pellet: 2.3.1", wire_schema_version=1, capabilities=0x04,
+    )
+
+    assert result.commands_allowed
+    assert "stepper_motion_safety" not in result.required_capabilities
 
 
 def test_2_4_0_refuses_a_board_without_time_sync():
     result = FirmwareCompatibilityPolicy.load().evaluate(
-        "Pellet: 2.4.0", wire_schema_version=1, capabilities=0x15,
+        "Pellet: 2.4.0", wire_schema_version=1, capabilities=0x215,
     )
 
     assert not result.commands_allowed
@@ -232,4 +253,7 @@ def test_bit_6_does_not_collide_with_the_bits_reserved_for_timing_and_io():
     assert CAPABILITY_BITS["stepper_driver_fault"] == 1 << 6
     assert CAPABILITY_BITS["sync_listener"] == 1 << 4
     assert CAPABILITY_BITS["timekeeper"] == 1 << 5
+    # Bits 7 and 8 are reserved for the stepper home report; 9 is motion safety (2.4.0).
+    assert CAPABILITY_BITS["stepper_motion_safety"] == 1 << 9
+    assert not {1 << 7, 1 << 8} & set(CAPABILITY_BITS.values())
     assert len(set(CAPABILITY_BITS.values())) == len(CAPABILITY_BITS)
