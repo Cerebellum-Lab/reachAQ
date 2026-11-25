@@ -23,7 +23,12 @@ from reachaq.inference.multires_calibration.fit import (
     WaypointObservation,
     fit_motor_frame,
 )
-from reachaq.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
+from reachaq.inference.multires_calibration.geometry import (
+    PresetGeometry,
+    map_intrinsics,
+    presets_from_base,
+    sensor_to_preset_points,
+)
 from reachaq.inference.multires_calibration.per_view import (
     FIT_MOTOR_FRAME,
     FIT_PER_VIEW,
@@ -36,7 +41,12 @@ from reachaq.inference.multires_calibration.products import (
     motor_to_inference_signs,
     preset_stereo_params,
 )
-from reachaq.inference.multires_calibration.report import CaptureSummary, build_report, placement_notes
+from reachaq.inference.multires_calibration.report import (
+    DEFAULT_THRESHOLDS,
+    CaptureSummary,
+    build_report,
+    placement_notes,
+)
 from multires_synthetic import synthetic_rig
 
 SIZE = (1440, 1080)
@@ -349,6 +359,43 @@ def test_a_binned_fit_with_its_pixel_scale_solves_the_sensor_problem(stage_rig):
     assert scaled.placement.outliers == sensor.placement.outliers
     with pytest.raises(ValueError, match="pixel_scale"):
         fit_per_view(binned, BOARD, (g.width, g.height), cams, initial=mapped, pixel_scale=0.0)
+
+
+@pytest.fixture(scope="module")
+def held_sensor_fit(stage_rig):
+    """The recommended per-view fit, principal points held at the image centre."""
+    return fit_per_view(stage_rig.observations, BOARD, SIZE, CAMERAS, fix_principal_point=True)
+
+
+def _cx_plus_5(K, g):
+    out = map_intrinsics(K, g)
+    out[0, 2] += 5.0
+    return out
+
+
+def _fx_plus_1_percent(K, g):
+    out = map_intrinsics(K, g)
+    out[0, 0] *= 1.01
+    return out
+
+
+@pytest.mark.parametrize("mapping, wrong", [(map_intrinsics, False), (_cx_plus_5, True), (_fx_plus_1_percent, True)],
+                         ids=["correct", "cx+5px", "fx+1%"])
+def test_the_preset_cross_check_catches_a_wrong_intrinsics_mapping(stage_rig, held_sensor_fit, monkeypatch, mapping,
+                                                                   wrong):
+    # Review 4b, I-3: with the principal point held, the direct fit kept it at the mapped value
+    # under test, and a 5 px cx error read 0.9 preset px, under the 1.5 warn.
+    g = PresetGeometry(4, 360, 270, 0, 0)  # the whole sensor at binning 4
+    binned = [WaypointObservation(o.index, o.motor_mm, {c: sensor_to_preset_points(v, g) for c, v in o.corners.items()
+                                                        if c in CAMERAS})
+              for o in stage_rig.observations]
+    sensor = [WaypointObservation(o.index, o.motor_mm, {c: v for c, v in o.corners.items() if c in CAMERAS})
+              for o in stage_rig.observations]
+    monkeypatch.setattr(pipeline, "map_intrinsics", mapping)
+    delta = pipeline._preset_delta(sensor, binned, held_sensor_fit, g, BOARD, CAMERAS, FIT_PER_VIEW,
+                                   {"fix_principal_point": True})
+    warn = DEFAULT_THRESHOLDS["cross_check_delta_px"][0]
+    assert (delta > warn) == wrong, delta
 
 
 def test_the_principal_point_setting():
