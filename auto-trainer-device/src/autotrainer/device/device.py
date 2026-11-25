@@ -44,7 +44,7 @@ class Device(ObservableObject):
     def disconnect(self):
         """Request disconnect from the device"""
 
-    def notify_data(self, data: Any) -> None:
+    def notify_data(self, data: Any, *, read_started: Optional[float] = None) -> None:
         """Notification for data received from the device
 
         :param data: one or more bytes received from the device to be handled/interpreted by this Device instance

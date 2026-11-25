@@ -1180,7 +1180,9 @@ class CanDevice(Device):
                             cur_commands.insert(0, (_uuid_ack, data, ctx, -math.inf))
                             board_ctx.busy_set_retries = 0
                             if board_ctx.stepper_motion:
-                                self._log_ack_timing("acked", board_ctx, get_perf_now(), logging.INFO)
+                                # Timed to the reader's receive stamp, not to this loop (recheck M-2).
+                                received = msg_perf_c if msg_perf_c and math.isfinite(msg_perf_c) else get_perf_now()
+                                self._log_ack_timing("acked", board_ctx, received, logging.INFO)
                         board_ctx.uuid = None
                         board_ctx.stepper_motion = False
                         board_ctx.motion_info = None
@@ -1664,7 +1666,6 @@ class CanDevice(Device):
         )
         # The board's error goes with the uuid: a refusal must not look like a success.
         self._put_to_cmd_queue((_uuid_ack, (msg.uuid, perf_c, int(getattr(msg, "error", 0))), None))
-        self._last_rx_perf = get_perf_now()  # after the put: a waiting deadline sees the ack first
 
     @property
     def api(self):
@@ -2033,7 +2034,7 @@ class CanDevice(Device):
         self._put_to_cmd_queue((kind, data, context))
         return
 
-    def notify_data(self, data: Any) -> None:
+    def notify_data(self, data: Any, *, read_started: Optional[float] = None) -> None:
         """
         This method is called when data from the target is received. The data is
         forwarded to a DeviceAPI class.
@@ -2051,9 +2052,12 @@ class CanDevice(Device):
                 handler(message)
             else:
                 logger.warning("Unhandled data type: %s", type(message))
-        # Stamped once the batch is handled, so an ack in it is queued before a deadline
-        # waiting on this proof of life can fire.
-        self._last_rx_perf = get_perf_now()
+        # The proof of life a waiting deadline needs (recheck R-1): a read that *began* after
+        # the deadline has completed, its frames handled and any ack in them queued. Stamped
+        # with when the read began (get_perf_now() before the reader's read, from
+        # DeviceConnection), never with when it was processed: after a stall of the whole
+        # process the first batch holds frames received before the deadline.
+        self._last_rx_perf = get_perf_now() if read_started is None else float(read_started)
 
     def _report_stepper_status(self, message: StepperStatus):
         """

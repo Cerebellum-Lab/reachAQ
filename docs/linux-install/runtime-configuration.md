@@ -336,10 +336,12 @@ time after it is sent:
 - a sequence's stepper steps each get their own; its servo, delay and tone
   frames keep the fixed timeout.
 
-A deadline fires only once the CAN reader has delivered a frame read after it
-(the board sends status every 100 ms), so a stall of the whole app cannot stop a
-move whose acknowledgement is already on its way; if the reader stays silent the
-move is stopped 1 s past its deadline anyway. A `uuid_ack_timeout` set in
+A deadline fires only once the CAN reader has completed a read that began after
+it (the board sends status every 100 ms), so frames received before a stall of
+the whole app are not taken as proof that the acknowledgement is missing; if
+the reader stays silent the move is stopped 1 s past its deadline anyway. The
+stall budget is the 0.3 s in the margin plus this check; a stall that outlasts
+both can still stop a move that had finished. A `uuid_ack_timeout` set in
 `motor_config.yaml` replaces the deadline for that motor: it is a hard ceiling,
 and a value below the real acknowledgement time stops every move. The constants
 (provisional) come from christielab10's acknowledgements: 683 moves and 60 homes
