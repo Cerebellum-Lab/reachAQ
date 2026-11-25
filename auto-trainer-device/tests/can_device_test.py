@@ -1270,47 +1270,58 @@ def test_can_connect_twice(device, caplog):
     assert device.device_interface.is_open is True
 
 
-def test_rel_move_succeed_after_uuid_ack_timeout(
-    expected_tok,
-    expected_tok_event,
+def _record_refusals(device):
+    """Also hand COMMAND_REFUSED to a list: token -> refusal."""
+    refusals = {}
+    acks = device.api.message_callback
+
+    def callback(kind, data):
+        if kind == SystemStatusMessageKind.COMMAND_REFUSED:
+            refusals[data[0]] = data[2]
+        acks(kind, data)
+
+    device.api.message_callback = callback
+    return refusals
+
+
+def _wait_for(predicate, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_a_lost_retract_move_ack_stops_the_stage_and_is_not_resent(
     tokens_acked,
     device,
     device_conn,
-    monkeypatch,
-    caplog,
 ):
-    orig_move_y = device.device_interface.move_motor_y
-    def ret_move(*args, **kwargs):
-        # consume one uuid, but don't insert ack into return messages as with emulation iface
-        device.device_interface.next_uuid()
-        # restore orig move:
-        device.device_interface.move_motor_y = orig_move_y
-        # return True to fake command written to CAN bus ok:
+    # A retract step is a stepper move: its lost ack is stopped with an ESTOP,
+    # never re-sent (the resend is answered -EBUSY while the axis runs on).
+    moves = []
+
+    def lost_move(*args, **kwargs):
+        moves.append(args)
+        device.device_interface.next_uuid()  # the frame went out; its ack is lost
         return True
-    m = mock.MagicMock()
-    m.side_effect = ret_move
-    device.device_interface.move_motor_y = m
+
+    device.device_interface.move_motor_y = lost_move
+    refusals = _record_refusals(device)
     ctx = uuid.uuid4()
-    expected_tok.value = ctx
     device.default_command_ack_timeout_duration = 0.5
-
-    ack_timeout_engaged = False
-    ack_timeout_engaged_count = 0
-    def dev_prop_changed(name, value, old):
-        if name == device.UUID_ACK_TIMEOUT_ENGAGED:
-            nonlocal ack_timeout_engaged, ack_timeout_engaged_count
-            ack_timeout_engaged = value
-            if value:
-                ack_timeout_engaged_count += 1
-
-    device.property_changed += dev_prop_changed
+    engaged = []
+    device.property_changed += (
+        lambda name, value, old: engaged.append(value) if name == device.UUID_ACK_TIMEOUT_ENGAGED else None)
 
     device.notify_message(SystemCommandKind.SEND_RETRACT, None, context=ctx)
 
-    expected_tok_event.wait(3)
-    assert ctx in tokens_acked
-    assert not ack_timeout_engaged
-    assert ack_timeout_engaged_count == 1
+    assert _wait_for(lambda: ctx in refusals)
+    time.sleep(0.6)
+    assert refusals[ctx].stopped_by_estop
+    assert ctx not in tokens_acked
+    assert len(moves) == 1
+    assert device.device_interface.estop_frames == [True]
+    assert engaged == [True, False]
     assert device._commands_handler_thread.is_alive()
 
 
@@ -1392,12 +1403,20 @@ def test_a_lost_ack_for_a_standalone_pulse_finishes_the_command_without_a_resend
 @pytest.mark.parametrize("step, timeout, skips", [
     ({"stim3": 1000}, 0.25, True),
     ({"stim2": 1000}, 0.25, True),
-    ({"x": 1.0}, 3.0, False),
+    ({"x": 1.0}, "profile", False),
 ], ids=["stim3", "stim2", "absolute-move"])
 def test_a_stim_step_arms_the_short_no_retry_timeout(step, timeout, skips):
+    from autotrainer.device import StepperConfig
+    from autotrainer.device.can_interface import _STEPPER_MAX_POS
+    from autotrainer.device.motion_deadline import ack_deadline, profile_time
+
+    if timeout == "profile":  # a move's ack is due after its own profile: from an unknown start
+        config = StepperConfig()
+        timeout = ack_deadline(profile_time(_STEPPER_MAX_POS, config.maximum_velocity,
+                                            config.maximum_acceleration))
     device, interface, board = _open_compound_device()
     assert device._perform_next_compound_step(board, [dict(step)])
-    assert device._prev_command_timeout == timeout
+    assert device._prev_command_timeout == pytest.approx(timeout)
     assert device._prev_command_skips_retry is skips
 
 

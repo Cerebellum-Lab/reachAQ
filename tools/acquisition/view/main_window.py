@@ -1388,6 +1388,12 @@ class MainWindow(QMainWindow):
             self._closing = True
 
         def execute_close():
+            # First: the stop below can wait on a long session save, and a stepper
+            # still moving runs on (AppModel.on_close stops it too, for a headless close).
+            try:
+                self._app_model.hardware.estop_if_moving("reachAQ is closing")
+            except Exception:
+                logger.exception("Pellet ESTOP on close failed")
             self._on_capture_start_stop(False)
             stop_thread = self._stop_capture_thread
             self._timer_calibrate_diamond_triangle.cancel()

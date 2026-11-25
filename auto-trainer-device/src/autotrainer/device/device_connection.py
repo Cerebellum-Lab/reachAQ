@@ -402,11 +402,13 @@ class DeviceConnection(DeviceConnectionProtocol):
 
             # Data from the device for the device listener to process.
             read_started = time.perf_counter()
+            # The device's clock, for a deadline's proof of life: a read begun after it.
+            read_started_perf = get_perf_now()
             messages = []
             if self._interface.can_read():
                 messages = self._interface.read(self._read_limit, collect_ms=self._collect_ms)
                 if len(messages) > 0:
-                    self._device.notify_data(messages)
+                    self._device.notify_data(messages, read_started=read_started_perf)
 
             # Some CAN backends return immediately when no frame is available even
             # when ``collect_ms`` is requested.  Without an explicit idle wait this

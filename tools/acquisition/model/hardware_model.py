@@ -57,6 +57,19 @@ _nans_offset3dTuple = Offset3DTuple.get_nan()
 
 _AXIS_NAMES = {Motor.PELLET_X_MOTOR: "X", Motor.PELLET_Y_MOTOR: "Y", Motor.PELLET_Z_MOTOR: "Z"}
 
+#: The reason the Hardware Control STOP button gives; the alert says the operator pressed it.
+OPERATOR_STOP_REASON = "operator STOP"
+
+# What the stage refuses after an ESTOP until an operator's home succeeds: everything that
+# moves a stepper or a servo. SETs only store a position and are still sent.
+_REFUSED_WHILE_STOPPED = frozenset({
+    SystemCommandKind.MOVE_X, SystemCommandKind.MOVE_Y, SystemCommandKind.MOVE_Z,
+    SystemCommandKind.SEND_FIXED_XYZ, SystemCommandKind.SEND_HOME, SystemCommandKind.SEND_TO_LIMITS,
+    SystemCommandKind.LOAD_PELLET, SystemCommandKind.SEND_PELLET, SystemCommandKind.SEND_RETRACT,
+    SystemCommandKind.RELEASE_PELLET, SystemCommandKind.COVER_PELLET,
+    SystemCommandKind.MOVE_LOAD_SERVO, SystemCommandKind.MOVE_COVER_SERVO,
+})
+
 
 _reg_pellet_version_clean = re.compile("pellet ?:? *")
 class HardwareModel(ObservableObject, PelletDeviceProtocol):
@@ -74,6 +87,9 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     PELLET_NEEDS_HOME_PROPERTY = "pellet_needs_home"
     PELLET_DRIVER_FAULT_PROPERTY = "pellet_driver_fault"
     LAST_COMMAND_REFUSAL_PROPERTY = "last_command_refusal"
+    #: The last ESTOP (a dict: wallTime, perfTime, reason, axes, operator, sent) while the
+    #: stage is stopped; None once a home cleared it.
+    PELLET_ESTOP_PROPERTY = "pellet_estop"
 
     # Per axis x, y, z: the token of the latest SET queued, so a refusal of an older SET does
     # not roll back a newer one (_forget_refused_set).
@@ -89,6 +105,9 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     # SETs that only move the stage for a while, or shift it from where it is: they do not
     # stand in for the refused base position.
     _SENDERS_NOT_CLEARING_THE_BLOCK = frozenset({"ordered_protocol", "processed_shift_xyz"})
+    # Class defaults as well as __init__'s, for models a test builds without __init__.
+    _estop_record: Optional[dict] = None
+    _estop_home_token: Optional[UUID] = None
 
     DEVICE_ACK_TIMEOUT_ENGAGED = "device_ack_timeout_engaged"
     DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED = "device_pellet_status_timeout_engaged"
@@ -154,6 +173,10 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         # the board last said; the board clears it when a home re-proves them.
         self._axes_with_driver_fault: Tuple[str, ...] = ()
         self._last_command_refusal = ""
+        # The last ESTOP while the stage is stopped (PELLET_ESTOP_PROPERTY), and the token of
+        # the operator's home that clears it (home_after_estop).
+        self._estop_record: Optional[dict] = None
+        self._estop_home_token: Optional[UUID] = None
 
         message_handler.property_changed += self._message_handler_property_changed
         message_handler.ack_received += self._ack_received
@@ -226,6 +249,10 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                             age_second,
                         )
                         expired_tokens.add(pending_token)
+                expired_motion = [
+                    self._pending_tokens[token][0] for token in expired_tokens
+                    if self._pending_tokens[token][0] in _REFUSED_WHILE_STOPPED
+                ]
                 for expired in expired_tokens:
                     self._pending_tokens.pop(expired, None)
                     self._remember_command_outcome(
@@ -236,6 +263,9 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 after_commands = list(self._pending_tokens.values())
             if len(expired_tokens) > 0:
                 self._refresh_cmd_in_progress(after_commands)
+                if expired_motion:
+                    self.estop_if_moving(
+                        f"{expired_motion[0].name} was not acknowledged within 30 s", frame_only=True)
 
     @property
     def pending_tokens(self) -> List[str]:
@@ -255,6 +285,139 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     def last_command_refusal(self) -> str:
         """The operator text of the board's last refusal, or ""."""
         return self._last_command_refusal
+
+    # -- ESTOP -------------------------------------------------------------
+
+    @property
+    def pellet_estop(self) -> Optional[dict]:
+        """The last ESTOP while the stage is stopped, or None (PELLET_ESTOP_PROPERTY)."""
+        return self._estop_record
+
+    @property
+    def estop_active(self) -> bool:
+        """The stage was stopped and has not been homed since: motion is refused."""
+        return self._estop_record is not None
+
+    @property
+    def motion_possibly_in_flight(self) -> bool:
+        """A motion command is not finished, here or on the device, since the last stop.
+
+        CanDevice.motion_possibly_in_flight (accepted motion commands and stepper frames
+        awaiting their ack), or a motion token of this model still pending that was sent
+        after the last ESTOP: between a sequence's frames nothing awaits an ack, but the
+        next frame can go out before a teardown stops the device.
+        """
+        if getattr(self._can_device, "motion_possibly_in_flight", False) is True:
+            return True
+        record = self._estop_record
+        stopped_at = -math.inf if record is None else record.get("event", record)["perfTime"]
+        with self._lock:
+            return any(
+                command in _REFUSED_WHILE_STOPPED and started > stopped_at
+                for command, started in self._pending_tokens.values()
+            )
+
+    @property
+    def stepper_frame_in_flight(self) -> bool:
+        """A stepper frame was sent and its ack has not arrived (CanDevice.stepper_frame_in_flight)."""
+        return getattr(self._can_device, "stepper_frame_in_flight", False) is True
+
+    def estop(self, reason: str) -> bool:
+        """Stop every pellet stepper now (CanDevice.estop); False when it could not be sent.
+
+        Fire and forget, written from the calling thread, never queued. The device
+        reports it back (_on_device_estop): the stage is then stopped, every axis
+        needs a home, and motion is refused until an operator's home succeeds.
+        """
+        can_dev = self._can_device
+        if can_dev is None:
+            logger.error("Pellet ESTOP not sent, the pellet board is not connected: %s", reason)
+            return False
+        try:
+            return bool(can_dev.estop(str(reason)))
+        except Exception:
+            logger.exception("Pellet ESTOP failed: %s", reason)
+            return False
+
+    def estop_if_moving(self, reason: str, *, frame_only: bool = False) -> bool:
+        """estop(reason) only while motion is possibly in flight; an idle stage is left alone.
+
+        frame_only narrows it to a stepper frame awaiting its ack: a waiter that gives
+        up must not stop a sequence that is only waiting out a long delay frame.
+        """
+        moving = self.stepper_frame_in_flight if frame_only else self.motion_possibly_in_flight
+        if not moving:
+            return False
+        return self.estop(reason)
+
+    def home_after_estop(self) -> Optional[UUID]:
+        """The operator's home: release the ESTOP latch, then SEND_HOME.
+
+        The board refuses every move and home with -EPERM until the release
+        frame (CanDevice.release_estop, queued before the home). When this home
+        is acknowledged the stop is cleared and motion is allowed again; the
+        automatic homes (pellet machine, session end) are refused while stopped.
+        """
+        can_dev = self._can_device
+        if can_dev is None or self._device_conn is None:
+            logger.error("Pellet home not sent: the pellet board is not connected")
+            return None
+        with self._lock:  # the home's ack cannot be handled before its token is recorded
+            try:
+                can_dev.release_estop()
+            except Exception:
+                logger.exception("Pellet ESTOP release could not be queued; home not sent")
+                return None
+            token = self._send_with_token(self._device_conn, SystemCommandKind.SEND_HOME, _after_estop=True)
+            if self._estop_record is not None:
+                self._estop_home_token = token
+        return token
+
+    def _on_device_estop(self, reason: str, motors, sent: bool) -> None:
+        """CanDevice sent (or tried to send) an ESTOP: the stage is stopped until homed."""
+        axes = tuple(sorted(_AXIS_NAMES[m] for m in motors if m in _AXIS_NAMES))
+        operator = str(reason) == OPERATOR_STOP_REASON
+        # This ESTOP, as session metadata records it (recording.estops).
+        event = {
+            "wallTime": time.time(),
+            "perfTime": get_perf_now(),
+            "reason": str(reason),
+            "axes": list(axes),
+            "operator": operator,
+            # Which homes may release it: after a failure the session-end home may too;
+            # after the operator's STOP only an operator Home or a reconnect.
+            "kind": "operator" if operator else "failure",
+            "sent": bool(sent),
+        }
+        with self._lock:
+            prev = self._estop_record
+            if prev is not None and prev.get("kind") == "operator" and not operator:
+                # Sticky until the stop clears: a later failure stop must not let the
+                # session-end home release a latch the operator set (review I-C). The stop
+                # stays the operator's; the failure is kept, not hidden (recheck M-3).
+                event["kind"] = "operator"
+                record = {**prev, "later_failures": [*prev.get("later_failures", ()), dict(event)],
+                          "event": event}
+                logger.warning("Pellet stage already stopped by the operator; later failure recorded: %s",
+                               reason)
+            else:
+                record = {**event, "later_failures": [], "event": event}
+            self._estop_record = record
+            self._estop_home_token = None
+            prev_position, self._last_motor_coordinates = self._last_motor_coordinates, _nans_offset3dTuple
+        # The reported position is the board's plan, not a measurement: unknown until homed.
+        self._on_property_changed(self.POS_XYZ, _nans_offset3dTuple, prev_position)
+        self._set_axes_needing_home(tuple(sorted(set(axes) | set(self._axes_needing_home))))
+        self.property_changed(self.PELLET_ESTOP_PROPERTY, record, prev)
+        self._emit_device_event("state", "estop", data=dict(event))
+
+    def _clear_estop(self, why: str) -> None:
+        with self._lock:
+            prev, self._estop_record = self._estop_record, None
+            self._estop_home_token = None
+        if prev is not None:
+            logger.warning("Pellet stage %s: the stop (%s) is cleared, motion allowed again", why, prev["reason"])
+            self.property_changed(self.PELLET_ESTOP_PROPERTY, None, prev)
 
     def _check_dcs_cfg(self, *, return_none: bool=False):
         cfg = self._dcs_config
@@ -651,8 +814,18 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     def send_home(self) -> Optional[UUID]:
         return self._send_with_token(self._device_conn, SystemCommandKind.SEND_HOME)
 
-    def send_home_and_wait(self, *, timeout: float = 15.0) -> UUID:
-        token = self.send_home()
+    def send_home_and_wait(self, *, timeout: float = 15.0, release_estop: bool = False) -> UUID:
+        """SEND_HOME and wait for its ack. With release_estop, while the stage is stopped,
+        it is home_after_estop's home (the latch released first; its ack clears the stop):
+        the session-end home is the one automatic home allowed to do that."""
+        if release_estop and self.estop_active:
+            if self._estop_record.get("kind") == "operator":
+                raise RuntimeError(
+                    "the pellet stage was stopped by the operator (operator STOP); only Hardware "
+                    "Control ▸ Home or a reconnect releases it")
+            token = self.home_after_estop()
+        else:
+            token = self.send_home()
         if token is None:
             raise RuntimeError("pellet home command was not queued")
         self.wait_pending_command_acked(token, timeout=timeout)
@@ -866,6 +1039,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             can_transport=transport,
             failure_callback=self._on_can_failure,
             operation_callback=self._on_internal_device_operation,
+            estop_callback=self._on_device_estop,
         )
         log_hardware_initialization(
             logger,
@@ -968,6 +1142,10 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         config_started = time.perf_counter()
         log_hardware_initialization(logger, "START | pellet motor configuration")
         self._motor_configurations = device_conn.load_default_motor_config()
+        # motor_config.yaml pellet.profile_ack_deadlines (missing: true). Off, every stepper
+        # frame waits the fixed ack timeout; a missed ack still stops the stage.
+        can_device.profile_ack_deadlines = bool(
+            getattr(self._motor_configurations, "profile_ack_deadlines", True))
         log_hardware_initialization(
             logger,
             "READY | pellet motor configuration | elapsed=%.3fs",
@@ -985,8 +1163,10 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         # Every initial connection and recovery establishes one deterministic,
         # non-presenting mechanical state. Motor configuration is acknowledged
         # above before homing because its limits and velocities govern HOME.
+        self._release_estop_before_connect_home(can_device, recovery=_recovery)
         self._home_and_detach_pellet(send_dev_ack_cmd)
         self._set_axes_needing_home(())  # the connect home was acknowledged
+        self._clear_estop("homed at connect")
 
         self._device_initialization_complete = True
 
@@ -1007,6 +1187,23 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             self._disconnect_transport_locked(command_outcome="cancelled")
             return False
         return True
+
+    def _release_estop_before_connect_home(self, can_device, *, recovery: bool) -> None:
+        """Queue the ESTOP release ahead of the connect home, which a latched board refuses.
+
+        The latch outlives the app (only a board reset clears it), so an operator's
+        connect (start-up, Refresh Hardware, a calibration capture) always releases
+        it. An automatic recovery does not while this app has the stage stopped: its
+        home is then refused with -EPERM, the recovery stops, and the operator
+        decides, as for any refused connect home.
+        """
+        if recovery and self._estop_record is not None:
+            logger.error("CAN recovery leaves the pellet ESTOP latched (%s): Refresh Hardware to home",
+                         self._estop_record["reason"])
+            return
+        release = getattr(can_device, "release_estop", None)
+        if release is not None:
+            release()
 
     @staticmethod
     def _home_and_detach_pellet(send_acknowledged_command) -> None:
@@ -1037,6 +1234,14 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
     def _disconnect_transport_locked(self, *, command_outcome: str):
         logger.verbose("disconnecting ..")
+        # Every teardown passes here (disconnect, safety shutdown, recovery, a failed
+        # connect). A stepper still running when the host lets go runs on: nothing on a
+        # v1.2 board stops it. So stop it while the bus is still ours, before the device
+        # is told to disconnect, which drops what is pending. An idle stage is left alone.
+        try:
+            self.estop_if_moving("the CAN connection was closed during a move")
+        except Exception:
+            logger.exception("Pellet ESTOP before the CAN teardown failed")
         self._emit_device_event("state", "disconnect_start")
         self._disconnect_event.set()
         with self._lock:
@@ -1192,11 +1397,16 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 self._device_pellet_status_timeout_engaged,
             ))
 
+    def _reported_position(self, status) -> float:
+        """A stepper's reported position, or NaN while the stage is stopped: the board
+        reports where it planned the axis to be, which an ESTOP made unknown until a home."""
+        return math.nan if self._estop_record is not None else status.position
+
     def _message_handler_property_changed(self, name: str, value, old_value):
         props = MessageHandler
         if name == props.STEPPER_X_PROPERTY:
             prev = self._last_motor_coordinates
-            new = prev.replace(x=value.position)
+            new = prev.replace(x=self._reported_position(value))
             self._last_motor_coordinates = new
             self.send_x = value.send_position
             self._note_driver_fault("X", value)
@@ -1204,7 +1414,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
         elif name == props.STEPPER_Y_PROPERTY:
             prev = self._last_motor_coordinates
-            new = prev.replace(y=value.position)
+            new = prev.replace(y=self._reported_position(value))
             self._last_motor_coordinates = new
             self.send_y = value.send_position
             self._note_driver_fault("Y", value)
@@ -1212,7 +1422,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
         elif name == props.STEPPER_Z_PROPERTY:
             prev = self._last_motor_coordinates
-            new = prev.replace(z=value.position)
+            new = prev.replace(z=self._reported_position(value))
             self._last_motor_coordinates = new
             self.send_z = value.send_position
             self._note_driver_fault("Z", value)
@@ -1296,7 +1506,14 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         if device is not None:
             device.latency_observer = observer
 
-    def _send_with_token(self, device: Optional[DeviceConnectionProtocol], cmd: SystemCommandKind, data=None) -> Optional[UUID]:
+    def _send_with_token(self, device: Optional[DeviceConnectionProtocol], cmd: SystemCommandKind, data=None,
+                         *, _after_estop: bool = False) -> Optional[UUID]:
+        record = self._estop_record
+        if record is not None and cmd in _REFUSED_WHILE_STOPPED and not _after_estop:
+            logger.error(
+                "Pellet %s refused: the stage was stopped (%s). Home it with Hardware Control ▸ Home first",
+                cmd.name, record["reason"])
+            return None
         with self._lock:
             # ensure only 1 command can be sent at the same time
             # NB: there are multiple threads which can act on this instance,
@@ -1742,14 +1959,29 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             self._lift_presentation_block(token)
             if popped[0] in {SystemCommandKind.SEND_HOME, SystemCommandKind.SEND_TO_LIMITS}:
                 # Both home all three axes, and only the whole sequence is acknowledged.
-                self._set_axes_needing_home(())
+                with self._lock:
+                    stopped = self._estop_record is not None
+                    clears_stop = stopped and token == self._estop_home_token
+                if stopped and not clears_stop:
+                    # A home sent before the stop: it does not vouch for the stage now.
+                    logger.warning("Pellet home %s acknowledged, but the stage was stopped since; "
+                                   "it still needs a home", token)
+                else:
+                    self._set_axes_needing_home(())
+                    if clears_stop:
+                        self._clear_estop("homed after the stop")
 
     def _command_refused(self, token, *, perf_c: Optional[float] = None, refusal=None):
-        """The board refused the command of this token: it ended and will never be acknowledged."""
+        """The board refused the command of this token: it ended and will never be acknowledged.
+
+        A command an ESTOP ended (refusal.stopped_by_estop) ends as "stopped"; its
+        physical outcome is unknown, and the ESTOP raises its own alert.
+        """
+        stopped = bool(getattr(refusal, "stopped_by_estop", False))
         with self._lock:
             popped = self._pending_tokens.pop(token, None)
             if popped is not None:
-                self._remember_command_outcome(token, "refused", refusal.message)
+                self._remember_command_outcome(token, "stopped" if stopped else "refused", refusal.message)
             commands_in_prog = list(self._pending_tokens.values())
         if popped is not None:
             self._refresh_cmd_in_progress(commands_in_prog)
@@ -1780,11 +2012,11 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         )
         # A refusal is not a CAN fault: COMMAND and OPERATION_UNKNOWN start no recovery.
         self.command_failed(CanFailure(
-            CanFailureKind.OPERATION_UNKNOWN if refusal.outcome_unknown else CanFailureKind.COMMAND,
+            CanFailureKind.OPERATION_UNKNOWN if refusal.outcome_unknown or stopped else CanFailureKind.COMMAND,
             refusal.message,
             command=command,
             context=None if token is None else str(token),
-            category="board_refusal",
+            category="estop" if stopped else "board_refusal",
             error_code=int(refusal.error),
         ))
 
@@ -1878,6 +2110,9 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             commands_in_progress = list(self._pending_tokens.values())
         if pending is not None:
             self._refresh_cmd_in_progress(commands_in_progress)
+            if pending[0] in _REFUSED_WHILE_STOPPED:
+                self.estop_if_moving(f"{pending[0].name} was not acknowledged within {timeout:g} s",
+                                     frame_only=True)
         if raise_on_timeout:
             raise RuntimeError(f"timeout waiting ack of pending token={token}")
         logger.warning("timeout waiting ack token %s, but continuing", token)

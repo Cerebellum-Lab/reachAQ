@@ -7,6 +7,10 @@ The YAML base key is "pellet", with five subgroups:
 * "x" - for x stepper configuration
 * "y" - for y stepper configuration
 * "z" - for z stepper configuration
+
+and one switch, "profile_ack_deadlines" (default true): whether a stepper move's
+ack is due after its own motion profile (motion_deadline), or after the fixed
+ack timeout. Either way a missed ack stops the stage (ESTOP).
 """
 from functools import partial
 
@@ -40,6 +44,8 @@ class MotorConfigurationFile(MotorConfigurations):
     _x_config: StepperConfig
     _y_config: StepperConfig
     _z_config: StepperConfig
+    #: pellet.profile_ack_deadlines; False falls back to the fixed ack timeout.
+    profile_ack_deadlines: bool = True
 
     def __init__(self):
         """
@@ -111,6 +117,13 @@ class MotorConfigurationFile(MotorConfigurations):
         items_loaded = []
 
         pellet_dct: Dict = yaml_dict.get("pellet", {})
+        switch = pellet_dct.get("profile_ack_deadlines", True)
+        if not isinstance(switch, bool):
+            raise ValueError(f"pellet.profile_ack_deadlines must be true or false, got {switch!r}")
+        self.profile_ack_deadlines = switch
+        if not switch and source is not None:
+            logger.warning("pellet.profile_ack_deadlines is false: stepper moves wait the fixed ack "
+                           "timeout; a missed ack still stops the stage")
 
         def do_load(parent_dct: Dict, section: str, item: str, motor: Motor, config_cls: Type[T_MotorConfig]) -> T_MotorConfig:
             dct: Optional[Dict] = parent_dct.get(section)
