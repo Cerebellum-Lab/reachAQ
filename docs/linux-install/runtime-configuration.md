@@ -170,7 +170,11 @@ freshness, while SET reports the saved send position in the same coordinates.
 
 `pellet.x`, `pellet.y` and `pellet.z` in `~/reachAQ/motor_config.yaml` can
 each set `min_pos` and `max_pos`, the stage's travel in board millimetres.
-christielab10 uses `min_pos: 0` and `max_pos: 35` on all three axes. Either key
+christielab10 uses `min_pos: 0` with `max_pos: 35` on x and y and `max_pos: 30`
+on z. Pellet firmware 2.4.0 has its own per-axis travel cap, a per-rig build
+setting (`CONFIG_LIB_MOTOR_MOTION_STEPPER<n>_TRAVEL_UM`, x 35, y 35, z 30 mm by
+default, christielab10's values): each rig's `max_pos` must match its board's
+build, or targets between the two are refused by the board with `-ERANGE`. Either key
 can be left out: that side is then not limited. A value that is not a finite
 number, or `min_pos` above `max_pos`, stops the connect with an error naming
 the axis (`pellet-x`, `pellet-y` or `pellet-z`). The keys stay on the host;
@@ -410,6 +414,23 @@ harmless on a board that is not latched.
 On a bit 9 board reachAQ also sends a STOP when it disconnects with nothing
 moving (a routine teardown): it leaves idle axes homed, so it is not reported as
 a stop.
+
+The capability bits are forgotten when the pellet board reboots mid-session (a
+new boot id in the timing trailer), or when its stepper status frames stop
+carrying a timing trailer (2.4.0 reverted to 2.3.1 by MCUboot): 2.3.1 drops a
+STOP without a word. Until the board answers the capabilities request reachAQ
+then sends, every stop is ESTOP, which every firmware honours. A host on the
+pyjerrycan backend, which cannot send STOP, refuses to connect to a board with
+bit 9.
+
+**Deadlines (decided, 2026-11-25).** reachAQ's acknowledgement deadlines (above,
+`1.1 × t + 0.4 s`, the home `1.1 × 36.55 mm / home_vel + 0.4 s`) stay shorter
+than the 2.4.0 board's own watchdog (`1.5 × t + 0.5 s`, the home
+`1.5 × 16 turns / home_vel + 0.5 s`). On a stall the host's STOP therefore
+fires first and the board ACKs the move `-ECANCELED`; the board's `WATCHDOG`
+fault is the backstop when the host is gone or stalled. Stopping first is the
+safe direction. The cost: a home slower than the host's deadline is stopped, as
+on 2.3.1, and the board's watchdog is rarely seen on the rig.
 
 The board's own faults:
 

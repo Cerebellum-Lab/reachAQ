@@ -68,8 +68,16 @@ installer, which migrates the settings; see "Upgrading from v3" in
   Record. `BOOT_CHAIN` bootloader responses decode, and an unknown bootloader
   subcommand no longer ends the CAN reader. The 2.4.0 allowlist entry requires
   `stepper_motion_safety`.
+- The pellet capabilities are forgotten when the board reboots mid-session or
+  stops sending timing trailers, and asked for again; stops are ESTOP until it
+  answers. A pyjerrycan host refuses to connect to a board with bit 9, since it
+  cannot send STOP.
 
 ### Changed
+
+- Decided: the host's acknowledgement deadlines stay shorter than pellet
+  2.4.0's own per-move watchdog, so the host's STOP fires first on a stall and
+  the board's watchdog is the backstop.
 
 - Every stepper target is clamped to its axis's `max_pos` from
   `motor_config.yaml` (at most 15 turns, as before), matching pellet 2.4.0's
