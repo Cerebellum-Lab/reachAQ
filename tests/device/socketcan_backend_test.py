@@ -546,3 +546,180 @@ def test_ack_error_decodes_as_a_signed_int32(payload, error):
     message = socketcan_jerrycan.decode_frame(can_id, payload + bytes([42]))
     assert message.ack.error == error
     assert message.uuid == 42
+
+
+# -- pellet 2.4.0: STEPPER_STOP, STEPPER_FAULT, BOOT_CHAIN (jerrycan_types.h) -----------
+
+def _socketcan_interface():
+    return CanInterface(
+        required_targets=(Target.PELLET_DEVICE,),
+        can_transport=CanTransportConfiguration(kind=CanTransportKind.SOCKETCAN, fd=True),
+    )
+
+
+def test_stepper_stop_encodes_its_type_mask_and_uuid():
+    message = JerryCANMsg()
+    message.type = JerryCANCmdType.STEPPER_STOP
+    message.uuid = 0
+    message.stepper_stop.motor_mask = 0x05
+
+    can_id, payload = socketcan_jerrycan.encode_frame(message, 0)
+
+    assert JerryCANCmdType.STEPPER_STOP == 0x2C
+    assert can_id == 0x2C << 5
+    assert payload == b"\x05\x00"  # 1-byte motor_mask, then the uuid
+    decoded = socketcan_jerrycan.decode_frame(can_id, payload)
+    assert decoded.type == JerryCANCmdType.STEPPER_STOP
+    assert decoded.stepper_stop.motor_mask == 0x05
+    assert decoded.uuid == 0
+
+
+def test_stepper_fault_decodes_its_20_bytes_and_the_faulted_uuid():
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.STEPPER_FAULT, 0)
+    payload = struct.pack("<BBBBiiff", 2, 2, 0x02, 0, 571, 1142, 6.25, 192.0)
+    assert len(payload) == 20
+
+    message = socketcan_jerrycan.decode_frame(can_id, payload + bytes([77]))
+
+    assert JerryCANCmdType.STEPPER_FAULT == 0x2D
+    assert message.uuid == 77
+    fault = message.stepper_fault
+    assert (fault.motor_id, fault.reason, fault.flags) == (2, 2, 0x02)
+    assert (fault.pulses_issued, fault.pulses_planned) == (571, 1142)
+    assert fault.believed_position == 6.25
+    assert fault.pulses_per_turn == 192.0
+
+
+def test_the_receive_filter_admits_stepper_fault_frames():
+    filters = socketcan_jerrycan._jerrycan_filters()
+    assert {"can_id": 0x2D << 5, "can_mask": 0x7E0, "extended": False} in filters
+
+
+def test_boot_chain_response_decodes_its_10_bytes_with_the_uuid_at_offset_11():
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.BOOTLOADER_RESPONSE, 0)
+    flags = (socketcan_jerrycan.BOOT_CHAIN_STAGE0 | socketcan_jerrycan.BOOT_CHAIN_MCUBOOT_VALID
+             | socketcan_jerrycan.BOOT_CHAIN_HEADER_OK)
+    payload = struct.pack("<BBI4sB", 7, flags, 12, b"\xde\xad\xbe\xef", 0x2A)
+    assert len(payload) == 11
+
+    message = socketcan_jerrycan.decode_frame(can_id, payload + bytes([9]))
+
+    response = message.bootloader_response
+    assert response.type == socketcan_jerrycan.JerryCANBootloaderCmd.SubCommand.BOOT_CHAIN
+    assert response.boot_chain.flags == flags
+    assert response.boot_chain.desc_sequence == 12
+    assert response.boot_chain.mcuboot_sha256_prefix == b"\xde\xad\xbe\xef"
+    assert response.boot_chain.running_build_num == 0x2A
+    assert message.uuid == 9
+
+
+def test_boot_chain_read_error_flag_decodes():
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.BOOTLOADER_RESPONSE, 0)
+    payload = struct.pack("<BBI4sB", 7, socketcan_jerrycan.BOOT_CHAIN_READ_ERROR, 0, bytes(4), 0)
+
+    message = socketcan_jerrycan.decode_frame(can_id, payload + b"\x00")
+
+    assert message.bootloader_response.boot_chain.flags == 0x80
+
+
+def test_a_legacy_version_response_still_reads_its_uuid_at_offset_7():
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.BOOTLOADER_RESPONSE, 0)
+    payload = struct.pack("<BBBBBBB", 0, 2, 4, 0, 2, 3, 1)
+
+    message = socketcan_jerrycan.decode_frame(can_id, payload + bytes([5]))
+
+    assert message.bootloader_response.version.running_version_minor == 4
+    assert message.uuid == 5
+
+
+def test_a_boot_chain_response_from_the_pellet_does_not_end_the_reader(caplog):
+    # Before 2.4.0 hosts raised "Malformed JerryCAN frame" on subcommand 7, which ended
+    # the reader and with it the pellet connection.
+    backend = SocketCanJerryCAN(CanTransportConfiguration(kind="socketcan", fd=True))
+    boot_chain = struct.pack("<BBI4sB", 7, 0x07, 3, b"\x01\x02\x03\x04", 1) + b"\x00"
+    backend._bus = FakeBus([
+        _raw_message(JerryCANCmdType.BOOTLOADER_RESPONSE << 5, boot_chain),
+        _pellet_heartbeat(),
+    ])
+
+    messages = backend.ReceiveMessages(max_count=2, collect_ms=5000)
+
+    assert [m.type for m in messages] == [JerryCANCmdType.BOOTLOADER_RESPONSE, JerryCANCmdType.HEARTBEAT]
+    interface = _socketcan_interface()
+    with caplog.at_level(logging.INFO, logger="reachaq.device.can_interface"):
+        assert interface._translate(messages[0]) is None
+    assert "pellet boot chain: flags=0x07 desc_sequence=3 mcuboot_sha256_prefix=01020304" in caplog.text
+
+
+def test_an_unknown_bootloader_subcommand_is_kept_as_a_number_and_dropped(caplog):
+    backend = SocketCanJerryCAN(CanTransportConfiguration(kind="socketcan", fd=True))
+    backend._bus = FakeBus([
+        _raw_message(JerryCANCmdType.BOOTLOADER_RESPONSE << 5, bytes([0x42, 1, 2, 3, 4, 5, 6, 0])),
+        _pellet_heartbeat(),
+    ])
+
+    messages = backend.ReceiveMessages(max_count=2, collect_ms=5000)
+
+    assert messages[0].bootloader_response.type == 0x42
+    with caplog.at_level(logging.INFO, logger="reachaq.device.can_interface"):
+        assert _socketcan_interface()._translate(messages[0]) is None
+    assert "unknown subcommand 66" in caplog.text
+    assert messages[1].type == JerryCANCmdType.HEARTBEAT
+
+
+def test_can_interface_translates_a_stepper_fault():
+    from reachaq.device import StepperFault
+    from reachaq.device.stepper_motor import turns_to_mm
+
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.STEPPER_FAULT, 0)
+    payload = struct.pack("<BBBBiiff", 2, 2, 0x02, 0, 571, 1142, 2.5, 192.0) + bytes([31])
+    message = socketcan_jerrycan.decode_frame(can_id, payload)
+
+    fault = _socketcan_interface()._translate(message)
+
+    assert isinstance(fault, StepperFault)
+    assert fault.target == Target.PELLET_DEVICE
+    assert fault.motor == Motor.PELLET_Z_MOTOR
+    assert fault.reason_name == "LIMIT" and fault.toward_switch and not fault.is_homing
+    assert (fault.pulses_issued, fault.pulses_planned, fault.uuid) == (571, 1142, 31)
+    assert fault.believed_position_mm == pytest.approx(turns_to_mm(2.5))
+    assert not fault.needs_home_only
+    # Raw counts only, never "lost steps" (design I8: bench step 1b has not run).
+    assert "571 pulses issued of 1142 planned" in fault.describe()
+    assert "lost" not in fault.describe()
+
+
+def test_can_interface_records_the_pellet_capabilities_and_bit_9():
+    interface = _socketcan_interface()
+    assert interface.board_capabilities is None
+    assert not interface.has_stepper_motion_safety
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.CAPABILITIES_RESPONSE, 0)
+
+    for caps, motion_safety in ((0x17, False), (0x217, True)):
+        message = socketcan_jerrycan.decode_frame(can_id, struct.pack("<BII", 1, caps, 5) + b"\x00")
+        interface._translate(message)
+        assert interface.board_capabilities == caps
+        assert interface.has_stepper_motion_safety is motion_safety
+
+
+def test_stepper_stop_goes_out_with_uuid_0_and_leaves_the_command_uuids_alone():
+    interface = _socketcan_interface()
+    interface._pellet_addr = 0
+    sent = []
+    interface._jc = types.SimpleNamespace(StepperStop=lambda dst, mask, uuid: sent.append((dst, mask, uuid)) or 0)
+    before = CanInterface.uuid()
+
+    assert interface.stepper_stop(0) is True
+
+    assert sent == [(0, 0, 0)]
+    assert CanInterface.uuid() == before
+
+
+def test_a_backend_without_stepper_stop_reports_no_motion_safety():
+    # pyjerrycan has no StepperStop: the host stays on ESTOP even with bit 9.
+    interface = _socketcan_interface()
+    interface._jc = types.SimpleNamespace()
+    interface._board_capabilities = 0x217
+
+    assert not interface.has_stepper_motion_safety
+    assert interface.stepper_stop(0) is False

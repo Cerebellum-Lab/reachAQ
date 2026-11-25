@@ -11,6 +11,15 @@ a line that cannot carry a pulse for GPIO_PULSE, and -EBUSY is "needs homing"
 for a stepper move but "still moving" for a servo. So each refusal carries
 the class of the command that was refused, and the rules below key on both.
 Pellet firmware 2.3.1, docs/releases/v2.3.1.md, "ACK errors".
+
+Pellet 2.4.0 (capability bit 9, "stepper motion safety", docs/releases/v2.4.0.md)
+adds -ECANCELED (stopped by STEPPER_STOP), -ETIME (the board's per-move watchdog),
+-EFAULT (a limit fault, or a pressed switch at the start) and -ERANGE (a target past
+the axis's travel), and widens -EIO (a DMA failure, a driver not idle) and -EBUSY
+(needs-home, a single move during a sequence, FIXED_XYZ or CFG_WRITE while moving).
+A FIXED_XYZ refused whole because an axis needs a home is -EBUSY with a STEPPER_FAULT
+NEEDS_HOME frame naming each such axis: the refusal then carries those axes
+(needs_home_axes) and nothing moved.
 """
 
 from __future__ import annotations
@@ -25,16 +34,28 @@ from reachaq.core.message import Motor, SystemCommandKind
 EPERM = -1
 EIO = -5
 EAGAIN = -11
+EFAULT = -14
 EBUSY = -16
+ERANGE = -34
+ETIME = -62
 ETIMEDOUT = -116
+ECANCELED = -140
 
 _NAMES = {
     EPERM: "EPERM",
     EIO: "EIO",
     EAGAIN: "EAGAIN",
+    EFAULT: "EFAULT",
     EBUSY: "EBUSY",
+    ERANGE: "ERANGE",
+    ETIME: "ETIME",
     ETIMEDOUT: "ETIMEDOUT",
+    ECANCELED: "ECANCELED",
 }
+#: Pellet 2.4.0: the board stopped a move itself (watchdog, limit fault, DMA or driver
+#: not idle). Design H4: blocking, and the host stops every axis, because a FIXED_XYZ
+#: goes on with its other axes after one faults.
+_BLOCKING_FAULT_ERRORS = frozenset({ETIME, EFAULT, EIO})
 
 _STEPPERS = (Motor.PELLET_X_MOTOR, Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR)
 #: SET_X/Y/Z only store the send position: a busy one moves nothing.
@@ -108,6 +129,12 @@ class CommandRefusal:
     #: an error: why the stage was stopped. The error is then -EPERM, the
     #: code the latched board answers every move with until it is released.
     estop_reason: str = ""
+    #: The board advertised capability bit 9 (pellet 2.4.0): its codes mean what
+    #: the 2.4.0 rules say, and its own faults stop the stage (blocking_fault).
+    motion_safety: bool = False
+    #: The axes STEPPER_FAULT NEEDS_HOME frames named for this command's uuid: a
+    #: FIXED_XYZ the board refused whole, with -EBUSY, moving nothing.
+    needs_home_axes: Tuple[Motor, ...] = ()
 
     @property
     def stopped_by_estop(self) -> bool:
@@ -147,6 +174,21 @@ class CommandRefusal:
             self.error == EBUSY
             and self.command_class in _STEPPER_CLASSES
             and self.command not in SET_COMMANDS
+            and not self.needs_home_axes  # a FIXED_XYZ refused whole: nothing moved
+        )
+
+    @property
+    def blocking_fault(self) -> bool:
+        """Pellet 2.4.0: the board stopped this stepper command itself (-ETIME watchdog,
+        -EFAULT limit fault or pressed switch, -EIO DMA or driver). Design H4: the host
+        stops every axis (a FIXED_XYZ finishes its other axes otherwise), raises a
+        blocking alert and blocks Record until a home. Never on a board without bit 9,
+        where -EIO is a driver fault that stopped nothing else (2.3.1 behaviour)."""
+        return (
+            self.motion_safety
+            and self.error in _BLOCKING_FAULT_ERRORS
+            and self.command_class in _STEPPER_CLASSES
+            and self.command not in SET_COMMANDS
         )
 
     @property
@@ -163,6 +205,15 @@ class CommandRefusal:
             # A fault or a silence stop: the host cannot tell which axes the
             # board marked, so all of them.
             return _STEPPERS
+        if error == ERANGE:
+            return ()  # refused before anything changed (pellet 2.4.0)
+        if error == EBUSY and self.needs_home_axes:
+            return tuple(m for m in _STEPPERS if m in self.needs_home_axes)
+        if error in (ETIME, EFAULT, ECANCELED):
+            # Pellet 2.4.0: the board stopped the move and set needs-home on its axis.
+            if cls is RefusedCommandClass.FIXED_XYZ:
+                return _STEPPERS  # one error for three axes
+            return tuple(m for m in self.motors if m in _AXIS_NAMES)
         if error == EBUSY and not self.outcome_unknown:
             if cls is RefusedCommandClass.FIXED_XYZ:
                 return _STEPPERS  # one error for three axes
@@ -192,6 +243,38 @@ class CommandRefusal:
                     f"Pellet axis {_axes(self.motors)} was still moving when its command "
                     "was re-sent after an acknowledgement timeout; its final position is "
                     "unknown. Let it stop before the next command."
+                )
+            if error == EBUSY and self.needs_home_axes:
+                return (
+                    f"Pellet axis {_axes(self.needs_home)} needs a home, so the board refused the "
+                    "whole move and nothing moved. Home the pellet axes, then send it again."
+                )
+            if error == ECANCELED:
+                return (
+                    f"Pellet axis {_axes(self.needs_home)} was stopped mid-move by a STOP; where it "
+                    "stopped is not known. Home the pellet axes."
+                )
+            if error == ETIME:
+                return (
+                    f"Pellet axis {_axes(self.needs_home)} did not finish in time and the board "
+                    "stopped it (watchdog). Check nothing blocks the axis, then home the pellet axes."
+                )
+            if error == EFAULT:
+                return (
+                    f"Pellet axis {_axes(self.needs_home)} hit its limit switch where the move did not "
+                    "expect it, or started toward a switch already pressed: its position was wrong. "
+                    "Check nothing blocks the axis, then home the pellet axes."
+                )
+            if error == ERANGE:
+                return (
+                    f"The pellet board refused a target past axis {_axes(self.motors)}'s travel; "
+                    "nothing moved. Re-save the position inside the travel."
+                )
+            if error == EIO and self.motion_safety:
+                return (
+                    "The pellet board stopped a move: its step output failed (DMA) or was still "
+                    "running, or a driver faulted. Home the pellet axes; if the home is refused "
+                    "too, reboot the pellet board."
                 )
             if error == EIO and cls is RefusedCommandClass.STEPPER_HOME:
                 return (
