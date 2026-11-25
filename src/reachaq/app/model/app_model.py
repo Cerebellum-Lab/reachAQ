@@ -12062,15 +12062,6 @@ class AppModel(ObservableObject):
             },
         ):
             return
-        estop = self._hardware.pellet_estop
-        if estop is not None:
-            self._recording_session.finish_end_action(
-                "pellet_home",
-                status="skipped",
-                error=f"the pellet stage was stopped ({estop['reason']}); home it with Hardware Control",
-            )
-            logger.warning("Session-end pellet home skipped: the stage was stopped (%s)", estop["reason"])
-            return
         status = self._acquisition.subsystems.get(SubsystemId.CAN_PELLET)
         if status is None or not status.is_ready or not self._hardware.connected:
             self._recording_session.finish_end_action(
@@ -12080,8 +12071,16 @@ class AppModel(ObservableObject):
             )
             logger.warning("Session-end pellet home skipped: pellet board not Ready")
             return
+        estop = self._hardware.pellet_estop
+        home_options = {}
+        if estop is not None:
+            # The one automatic home allowed after a stop (Ben, 2026-11-24): it releases
+            # the board's latch, and its ack clears needs-home and the stopped state.
+            logger.warning("Session-end pellet home after a stop (%s): releasing the ESTOP latch and homing",
+                           estop["reason"])
+            home_options["release_estop"] = True
         try:
-            token = self._hardware.send_home_and_wait(timeout=15.0)
+            token = self._hardware.send_home_and_wait(timeout=15.0, **home_options)
         except Exception as error:
             message = str(error) or error.__class__.__name__
             logger.exception("Session-end pellet home failed")
