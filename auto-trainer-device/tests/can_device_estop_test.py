@@ -61,6 +61,17 @@ class _EstopBoard(_Board):
 def board():
     b = _EstopBoard()
     b.start()
+    # Per-move ack deadlines (motion_deadline): christielab10's limits, every axis homed and
+    # the send position known, so a move's deadline is well inside the 3 s these tests wait.
+    from autotrainer.core import Offset3DTuple
+    from autotrainer.device import StepperConfig
+
+    for motor in _XYZ:
+        config = StepperConfig()
+        config.maximum_velocity, config.maximum_acceleration, config.homing_velocity = 120.0, 600.0, 30.0
+        b.device._motor_configs[motor] = config
+        b.device._commanded_pos[motor] = 0.0
+    b.device._last_send_pos = Offset3DTuple(1.0, 1.0, 1.0)
     try:
         yield b
     finally:
@@ -85,7 +96,8 @@ def test_a_lost_stepper_ack_stops_the_stage_and_is_never_resent(board, kind, dat
     assert len(calls) == 1, "a stepper frame whose ack is lost must never be re-sent"
     assert board.interface.estop_frames == [True]
     assert refusal.stopped_by_estop
-    assert "not acknowledged within 0.2 s" in refusal.estop_reason
+    assert "not acknowledged within" in refusal.estop_reason
+    assert board.device._boards_pending_ctx[Target.PELLET_DEVICE].ack_timeout_used is not None
     assert refusal.needs_home == _XYZ
     assert refusal.message.startswith("Pellet stage stopped: ")
     assert "Home before continuing" in refusal.message
@@ -257,6 +269,7 @@ def test_ebusy_on_a_servo_move_sends_no_estop(board):
 
 def test_estop_is_written_at_once_and_never_queued_behind_the_pending_move(board):
     board.device.default_command_ack_timeout_duration = 30.0  # the move would wait its ack for 30 s
+    board.device._motor_configs[Motor.PELLET_Z_MOTOR].uuid_ack_timeout = 30.0  # explicit: stays pending
     moves = board.answer("move_motor_z", _LOST)
     token = board.send(SystemCommandKind.MOVE_Z, 15.5, token="moving")
     deadline = time.monotonic() + 2.0
@@ -285,6 +298,7 @@ def test_estop_is_written_at_once_and_never_queued_behind_the_pending_move(board
 
 def test_estop_drops_the_queued_motion_commands_and_keeps_the_rest(board):
     board.device.default_command_ack_timeout_duration = 30.0
+    board.device._motor_configs[Motor.PELLET_Z_MOTOR].uuid_ack_timeout = 30.0  # explicit: stays pending
     board.answer("move_motor_z", _LOST)
     y_moves = board.spy("move_motor_y")
     pending = board.send(SystemCommandKind.MOVE_Z, 15.5, token="pending")
@@ -364,6 +378,7 @@ def test_motion_in_flight_is_set_by_a_move_and_cleared_by_its_ack(board):
 
 def test_a_set_awaiting_its_ack_is_not_motion_in_flight(board):
     board.device.default_command_ack_timeout_duration = 30.0
+    board.device._motor_configs[Motor.PELLET_Z_MOTOR].uuid_ack_timeout = 30.0  # explicit: stays pending
     sets = board.answer("set_motor_x", _LOST)
     board.send(SystemCommandKind.SET_X, 1.0)
     deadline = time.monotonic() + 2.0
@@ -504,6 +519,7 @@ def _wait(predicate, timeout=3.0):
 
 def _pending_move(board):
     board.device.default_command_ack_timeout_duration = 30.0
+    board.device._motor_configs[Motor.PELLET_Z_MOTOR].uuid_ack_timeout = 30.0  # explicit: stays pending
     moves = board.answer("move_motor_z", _LOST)
     board.send(SystemCommandKind.MOVE_Z, 15.5, token="moving")
     assert _wait(lambda: moves)
@@ -566,6 +582,7 @@ def test_a_command_loop_crash_during_a_move_sends_an_estop(board):
 def test_a_disconnect_between_the_frames_of_a_send_sends_an_estop(board):
     # I-3: during the pre-reveal delay no stepper frame awaits its ack, but the send is not done.
     board.device.default_command_ack_timeout_duration = 30.0
+    board.device._motor_configs[Motor.PELLET_Z_MOTOR].uuid_ack_timeout = 30.0  # explicit: stays pending
     delays = board.answer("delay", _LOST)
     board.send(SystemCommandKind.SEND_PELLET, {"pre_reveal_stimulus": (200, 1000, 2)}, token="send")
     assert _wait(lambda: delays)
@@ -581,6 +598,7 @@ def test_a_disconnect_between_the_frames_of_a_send_sends_an_estop(board):
 def test_a_queued_motion_command_is_motion_possibly_in_flight(board):
     # I-3: queued behind a pending SET, the move has not been sent yet.
     board.device.default_command_ack_timeout_duration = 30.0
+    board.device._motor_configs[Motor.PELLET_Z_MOTOR].uuid_ack_timeout = 30.0  # explicit: stays pending
     sets = board.answer("set_motor_x", _LOST)
     board.send(SystemCommandKind.SET_X, 1.0, token="set")
     assert _wait(lambda: sets)

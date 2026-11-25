@@ -290,10 +290,11 @@ with `-EBUSY`. The one command that stops it is ESTOP, a single broadcast
 frame with no acknowledgement. ReachAQ sends it (since v3.2.3):
 
 - when a stepper-motion frame is not acknowledged in time: a MOVE, a home or
-  `SEND_TO_FIXED_XYZ`, standalone or a step of a sequence. That frame is **not
-  re-sent** any more (a re-sent move is what the running axis answers with
-  `-EBUSY`). A sequence's servo, delay and tone frames and a lost SET are still
-  re-sent, and a lost stimulus-pulse acknowledgement is still skipped;
+  `SEND_TO_FIXED_XYZ`, standalone or a step of a sequence. "In time" is the
+  move's own deadline (below), not the fixed 3 s. That frame is **not re-sent**
+  any more (a re-sent move is what the running axis answers with `-EBUSY`). A
+  sequence's servo, delay and tone frames and a lost SET are still re-sent with
+  the fixed timeout, and a lost stimulus-pulse acknowledgement is still skipped;
 - when the board answers `-EBUSY` to a move, a home, a sequence or
   `SEND_TO_FIXED_XYZ`. A busy SET (which moves nothing) is logged and sent again
   every 0.25 s, up to 12 times, before it is refused;
@@ -302,29 +303,51 @@ frame with no acknowledgement. ReachAQ sends it (since v3.2.3):
 - when a calibration capture or scout fails, before its cameras stop, and at
   its teardown if a move is still in flight; when a scout waypoint is not
   reached;
-- when the CAN connection is closed while a move is in flight: a disconnect,
-  a CAN safety shutdown or recovery, a failed connect, closing the app. An
+- when the CAN connection is closed while motion is possibly in flight: a
+  disconnect, a CAN safety shutdown or recovery, a failed connect, closing the
+  app, a crash of the CAN reader or of the command loop. Motion is possibly in
+  flight from the moment a move, home or sequence is accepted until it is
+  acknowledged or refused, also while it is queued or between its frames. An
   idle stage is never stopped by a disconnect;
 - when the operator presses **STOP** in Hardware Control. STOP is enabled
   whenever the board is connected, also while a command runs.
 
 Each ESTOP is logged at ERROR with its reason (`Pellet ESTOP sent: ...`) and
 written to the session's metadata as `recording.estops` (`wallTime`,
-`perfTime`, `reason`, `axes`, `operator`, `sent`). The command it stopped ends
-as `stopped`, never acknowledged.
+`perfTime`, `reason`, `axes`, `operator`, `kind` (`failure` or `operator`),
+`sent`). A failed write is tried once more at once. The command it stopped
+ends as `stopped`, never acknowledged.
+
+**Per-move deadline.** The board acknowledges a move when it is done, so a
+stepper frame's acknowledgement is due
+`max(0.6 s, profile_time × 1.25 + 0.4 s)` after it is sent. `profile_time` is
+the move's trapezoid (or triangle) at the axis's `max_vel` and `max_acc` from
+`motor_config.yaml`, over the distance from the axis's last commanded position
+(the full travel, 36.5 mm, when that is unknown, as after a connect or a stop).
+A home uses the distance to the switch at `home_vel`; `SEND_TO_FIXED_XYZ` the
+sum of the three axes, which the board moves one after another. A
+`uuid_ack_timeout` set in `motor_config.yaml` still replaces it. The constants
+come from christielab10's acknowledgements of 2026-11-24 (683 moves, 60 homes):
+the board acknowledged at most 0.24 s after the profile time. The 15:55 z
+runaway (1.0 → 15.5 mm) is stopped 0.79 s after it was sent. A 3D-calibration
+waypoint's arrival wait uses the same deadline.
 
 After an ESTOP every axis needs a home, the LIVE position shows `—`, and every
 move, send, load, retract, cover, release and automatic home is refused; SETs
 still go out. The alert "Pellet stage stopped: <reason>. Home before continuing
 (Hardware Control ▸ Home); the session-end home also clears it." stays until the
-stage is homed (a STOP the operator pressed says so instead). The board stays latched in E-stop and refuses every move and
-home with `-EPERM` until it is released. **Hardware Control ▸ Home** releases
-it and then homes; Refresh Hardware (a connect) does the same, since the latch
-outlives the app. The session-end home is the one automatic home that may run
-after a stop: it releases the latch, homes, and on its acknowledgement clears the
-stop (logged). The pellet machine's re-homes and an automatic CAN recovery do not
-release a stop this app made: they are refused until an operator Home or a
-reconnect.
+stage is homed. After the operator's STOP it reads "STOP was pressed in
+Hardware Control. Home before continuing (Hardware Control ▸ Home) or reconnect
+(Refresh Hardware); the session-end home does not clear it." The board stays
+latched in E-stop and refuses every move and home with `-EPERM` until it is
+released. **Hardware Control ▸ Home** releases it and then homes; it is enabled
+only while the pellet board is connected and acquisition is started. Refresh
+Hardware (a connect) releases and homes as well, since the latch outlives the
+app. After a failure stop the session-end home may run too: it releases the
+latch, homes, and on its acknowledgement clears the stop (logged). After the
+operator's STOP it is skipped. The pellet machine's re-homes and an automatic
+CAN recovery never release a stop this app made: they are refused until an
+operator Home or a reconnect.
 
 The maintenance tools (`tools/pellet_delivery`, `scripts/can_console.py`,
 `tools/hardware/validate_can_hardware.py`) do not send ESTOP.

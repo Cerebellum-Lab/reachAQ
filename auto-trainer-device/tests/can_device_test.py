@@ -1403,12 +1403,20 @@ def test_a_lost_ack_for_a_standalone_pulse_finishes_the_command_without_a_resend
 @pytest.mark.parametrize("step, timeout, skips", [
     ({"stim3": 1000}, 0.25, True),
     ({"stim2": 1000}, 0.25, True),
-    ({"x": 1.0}, 3.0, False),
+    ({"x": 1.0}, "profile", False),
 ], ids=["stim3", "stim2", "absolute-move"])
 def test_a_stim_step_arms_the_short_no_retry_timeout(step, timeout, skips):
+    from autotrainer.device import StepperConfig
+    from autotrainer.device.can_interface import _STEPPER_MAX_POS
+    from autotrainer.device.motion_deadline import ack_deadline, profile_time
+
+    if timeout == "profile":  # a move's ack is due after its own profile: from an unknown start
+        config = StepperConfig()
+        timeout = ack_deadline(profile_time(_STEPPER_MAX_POS, config.maximum_velocity,
+                                            config.maximum_acceleration))
     device, interface, board = _open_compound_device()
     assert device._perform_next_compound_step(board, [dict(step)])
-    assert device._prev_command_timeout == timeout
+    assert device._prev_command_timeout == pytest.approx(timeout)
     assert device._prev_command_skips_retry is skips
 
 

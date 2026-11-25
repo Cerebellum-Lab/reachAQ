@@ -19,6 +19,7 @@ from autotrainer.core.capture import CaptureProcessStatus
 from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from autotrainer.device import MotorConfigurationFile, stepper_travel_refusal
+from autotrainer.device.motion_deadline import ack_deadline, profile_time
 from autotrainer.inference.multires_calibration.fit import BoardSpec, CaptureCamera
 from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
 from autotrainer.inference.multires_calibration.library import add_entry, entry_path, read_settings
@@ -385,6 +386,33 @@ def _why(err: BaseException) -> str:
     return text.splitlines()[0][:160] if text else type(err).__name__
 
 
+ARRIVAL_FALLBACK_S = 2.0
+
+
+def _arrival_timeout(
+    limits: Mapping[str, Optional[Tuple[float, float]]],
+    axes: Sequence[str],
+    target: Sequence[float],
+    origin: Optional[Sequence[float]],
+) -> float:
+    """How long a waypoint's arrival is waited for: the per-move ack deadline of its slowest
+    axis (motion_deadline, as CanDevice bounds the move's ack), or ARRIVAL_FALLBACK_S when
+    the start or the axis's speed is not known."""
+    if origin is None:
+        return ARRIVAL_FALLBACK_S
+    deadlines = []
+    for axis in axes:
+        k = AXES.index(axis)
+        axis_limits_ = limits.get(axis)
+        if axis_limits_ is None:
+            return ARRIVAL_FALLBACK_S
+        deadline = ack_deadline(profile_time(target[k] - origin[k], *axis_limits_))
+        if deadline is None:
+            return ARRIVAL_FALLBACK_S
+        deadlines.append(deadline)
+    return max(deadlines) if deadlines else ARRIVAL_FALLBACK_S
+
+
 def _command(hard, axis: str, motor_value: float) -> None:
     move = {"x": hard.move_x, "y": hard.move_y, "z": hard.move_z}[axis]
     token = move(motor_value)
@@ -403,7 +431,7 @@ def run_waypoints(
     now=time.time,
     clock=time.monotonic,
     tolerance: float = 0.05,
-    arrival_timeout: float = 2.0,
+    arrival_timeout: Optional[float] = None,
     capture_settings: Optional[Mapping[str, Any]] = None,
     cameras: Optional[Sequence[CaptureCamera]] = None,
     strict: bool = False,
@@ -459,13 +487,14 @@ def run_waypoints(
         wait = _move_settle(limits, moved, motor, origin) if settle is None else settle
         logger.debug("waypoint %d: %s to %s, settle %.3f s", i, "".join(moved), motor, wait)
         sleep(wait)
+        timeout = _arrival_timeout(limits, moved, motor, origin) if arrival_timeout is None else arrival_timeout
         origin = motor  # the next move starts where this one was commanded to
         arrived, reported = wait_until_arrived(
-            hard, motor, tolerance=tolerance, timeout=arrival_timeout, sleep=sleep, now=clock)
+            hard, motor, tolerance=tolerance, timeout=timeout, sleep=sleep, now=clock)
         arrive = now()
         if strict:
             if not arrived:
-                _stop_stage(hard, f"calibration waypoint {i} was not reached within {arrival_timeout:g} s")
+                _stop_stage(hard, f"calibration waypoint {i} was not reached within {timeout:.2f} s")
                 raise ScoutAborted(f"waypoint {i}: the motor reported {reported}, not the commanded {motor}")
             _abort_on_fault(hard, f"waypoint {i}")
         if not arrived:
