@@ -31,6 +31,7 @@ from .can_interface import CanInterface, Target, target_of_motor, _STEPPER_MAX_P
 from .can_transport import CanTransportConfiguration, CanTransportKind
 from .can_failure import CanFailure, CanFailureKind
 from .board_refusal import EBUSY, EPERM, CommandRefusal, RefusedCommandClass, is_refusal
+from .motion_deadline import ack_deadline, profile_time
 from .device_interface import (
     Acknowledge,
     AnalogOutput,
@@ -363,6 +364,8 @@ class CanDevice(Device):
         }
         self._last_pellet_pos = Offset3DTuple(math.nan, math.nan, math.nan)
         self._last_send_pos = Offset3DTuple(math.nan, math.nan, math.nan)
+        # Where each stepper was last commanded to (NaN: unknown), for per-move ack deadlines.
+        self._forget_commanded_positions()
 
         if isinstance(self._interface, EmulationInterface):
             logger.warning(
@@ -444,6 +447,7 @@ class CanDevice(Device):
         self._move_retract = default_move_retract()
 
     def _clear_caches(self):
+        self._forget_commanded_positions()
         for cache in (
             self._previous_stepper_status_pos_perf_c,
             self._previous_servo_status_pos_perf_c,
@@ -501,12 +505,31 @@ class CanDevice(Device):
         def apply_set_or_move(func, motor, *args, **kwargs):
             has_relative = "relative" in kwargs
             is_relative = has_relative and kwargs["relative"]
+            end = None
             if motor is not None:
                 cfg = self._motor_configs[motor]
+                # A move's ack is due after its own profile (motion_deadline); an
+                # explicit uuid_ack_timeout in motor_config.yaml still wins.
+                deadline, end = self._move_deadline(motor, args[0] if args else math.nan,
+                                                    relative=is_relative)
                 if cfg.uuid_ack_timeout is not None:
                     self._prev_command_timeout = cfg.uuid_ack_timeout
+                elif deadline is not None:
+                    self._prev_command_timeout = deadline
             self._prev_command_is_relative = is_relative
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
+            if motor is not None and result:
+                self._commanded_pos[motor] = end
+            return result
+
+        def send_fixed_xyz(_):
+            deadline, ends = self._fixed_xyz_deadline()
+            if deadline is not None:
+                self._prev_command_timeout = deadline
+            result = self._interface.fixed_position()
+            if result:
+                self._commanded_pos.update(ends)
+            return result
 
         # Initialize command handlers lookup table
         self._command_handlers = {
@@ -550,7 +573,7 @@ class CanDevice(Device):
                 )),
 
             # NB: only used by test and can_console, we should always use SEND_PELLET instead.
-            SystemCommandKind.SEND_FIXED_XYZ: lambda _: self._interface.fixed_position(),
+            SystemCommandKind.SEND_FIXED_XYZ: send_fixed_xyz,
 
             # NB: the following sequences are using "predefined" move,
             # that are below automatically handled for possible servo attach/detach
@@ -765,6 +788,77 @@ class CanDevice(Device):
         """
         self._put_to_cmd_queue((_estop_release, None, None))
 
+    # -- per-move ack deadlines (motion_deadline) ------------------------------------
+
+    def _forget_commanded_positions(self) -> None:
+        self._commanded_pos = {motor: math.nan for motor in _XYZ}
+
+    def _profile(self, motor: Motor, distance: float, *, home: bool = False, rate=None) -> Optional[float]:
+        config = self._motor_configs.get(motor)
+        if config is None:
+            return None
+        velocity = config.homing_velocity if home else config.maximum_velocity
+        if rate is not None:
+            velocity = float(rate) / 100.0 * velocity
+        return profile_time(distance, velocity, config.maximum_acceleration)
+
+    def _move_deadline(self, motor: Motor, target, *, relative: bool = False,
+                       home: bool = False) -> Tuple[Optional[float], float]:
+        """(ack deadline in s or None, where the axis ends) of a move of `motor` to `target`.
+
+        The move starts where the axis was last commanded; from an unknown start
+        it is given the full travel (_STEPPER_MAX_POS). A home ends at 0 and runs
+        at the homing speed. `target` may be a (position, rate %) pair.
+        """
+        rate = None
+        if isinstance(target, tuple) and len(target) == 2:
+            target, rate = target
+        start = self._commanded_pos.get(motor, math.nan)
+        try:
+            target = float(target)
+        except (TypeError, ValueError):
+            target = math.nan
+        end = 0.0 if home else (start + target if relative else target)
+        distance = abs(end - start) if math.isfinite(start) and math.isfinite(end) else _STEPPER_MAX_POS
+        return ack_deadline(self._profile(motor, distance, home=home, rate=rate)), end
+
+    def _fixed_xyz_deadline(self) -> Tuple[Optional[float], Dict[Motor, float]]:
+        """SEND_TO_FIXED_XYZ moves the axes one after another: the sum of their profiles."""
+        total, ends = 0.0, {}
+        for motor, end in zip(_XYZ, self._last_send_pos):
+            start = self._commanded_pos.get(motor, math.nan)
+            known = math.isfinite(start) and math.isfinite(end)
+            profile = self._profile(motor, abs(end - start) if known else _STEPPER_MAX_POS)
+            if profile is None:
+                return None, {}
+            total += profile
+            ends[motor] = end if math.isfinite(end) else math.nan
+        return ack_deadline(total), ends
+
+    def _compound_step_deadline(self, step: Dict[str, Any]) -> Tuple[Optional[float], Dict[Motor, float]]:
+        """The ack deadline of a sequence's stepper step, and where its axes end; (None, {}) otherwise."""
+        for key, motor in (('x', Motor.PELLET_X_MOTOR), ('y', Motor.PELLET_Y_MOTOR), ('z', Motor.PELLET_Z_MOTOR)):
+            if key in step:
+                deadline, end = self._move_deadline(motor, _to_tuple(step[key]))
+                return deadline, {motor: end}
+            if f'{key}_rel' in step:
+                deadline, end = self._move_deadline(motor, step[f'{key}_rel'], relative=True)
+                return deadline, {motor: end}
+            if f'send_{key}_rel' in step:
+                base = self._last_send_pos["xyz".index(key)]
+                deadline, end = self._move_deadline(motor, base + step[f'send_{key}_rel'])
+                return deadline, {motor: end}
+        if 'home' in step:
+            deadline, end = self._move_deadline(step['home'], 0.0, home=True)
+            return deadline, {step['home']: end}
+        predefined = step.get('predefined')
+        if predefined == 'send':
+            return self._fixed_xyz_deadline()
+        if predefined == 'home':  # replaced by one home per axis, Y first
+            deadline, end = self._move_deadline(Motor.PELLET_Y_MOTOR, 0.0, home=True)
+            return deadline, {Motor.PELLET_Y_MOTOR: end}
+        return None, {}
+
     def _write_estop(self, asserted: bool, reason: str) -> bool:
         estop = getattr(self._interface, "estop", None)
         sent = False
@@ -782,6 +876,7 @@ class CanDevice(Device):
                 break
         if asserted and sent:
             self._stopped_since_motion = True
+            self._forget_commanded_positions()  # where a stop left the axes is not known
         if asserted:
             logger.error("Pellet ESTOP %s: %s", "sent" if sent else "NOT SENT (bus write failed)", reason)
         elif sent:
@@ -1119,7 +1214,7 @@ class CanDevice(Device):
                     # Pellet firmware 2.3.1 has no motion timeout of its own.
                     kind_name = getattr(board_ctx.kind, "name", str(board_ctx.kind))
                     self._estop_in_loop(
-                        f"{kind_name} was not acknowledged within {board_ctx.ack_timeout_used:g} s",
+                        f"{kind_name} was not acknowledged within {board_ctx.ack_timeout_used:.2f} s",
                         cur_commands,
                     )
                     break
@@ -2115,6 +2210,7 @@ class CanDevice(Device):
         self._compound_step_host_only = False
         motor = None
         before_uuid = self._interface.uuid()
+        step_deadline, step_ends = self._compound_step_deadline(step)
 
         if 'x' in step:
             motor = Motor.PELLET_X_MOTOR
@@ -2295,8 +2391,11 @@ class CanDevice(Device):
                         motor_cfg = self._motor_configs.get(motor)
                         if motor_cfg is not None:
                             cmd_ack_timeout = motor_cfg.uuid_ack_timeout
+                if cmd_ack_timeout is None:
+                    cmd_ack_timeout = step_deadline  # a stepper step: its own profile
                 if cmd_ack_timeout is not None:
                     self._prev_command_timeout = cmd_ack_timeout
+            self._commanded_pos.update(step_ends)
         else:
             logger.error("%s write command failed", step)
 

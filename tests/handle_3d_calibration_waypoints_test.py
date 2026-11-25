@@ -1572,7 +1572,7 @@ def test_an_unreached_scout_waypoint_stops_the_stage_before_the_scout_aborts(mon
         run_waypoints(motor, _scout_grid_plan(), strict=True, arrival_timeout=2.0,
                       sleep=clock.sleep, now=clock.now, clock=clock.now)
 
-    assert motor.stops == ["calibration waypoint 0 was not reached within 2 s"]
+    assert motor.stops == ["calibration waypoint 0 was not reached within 2.00 s"]
 
 
 class _StoppableCaptureMotor(_StoppableMotor, _CaptureMotor):
@@ -1639,3 +1639,28 @@ def test_the_capture_teardown_stops_a_stage_still_moving_before_the_cameras(tmp_
         assert stops[0] < min(i for i, call in enumerate(calls) if call[1:] == ("on_capture_stop",))
     else:
         assert stops == []
+
+
+def test_each_arrival_wait_is_bounded_by_its_own_moves_profile(monkeypatch):
+    # Review I-5: the arrival wait gets the per-move ack deadline, not a fixed 2 s.
+    from reachaq.device.motion_deadline import ack_deadline, profile_time
+
+    clock = _Clock()
+    motor = _scout_motor(clock)
+    timeouts = []
+    real_wait = h3d.wait_until_arrived
+
+    def wait(hard, target, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        return real_wait(hard, target, **kwargs)
+
+    monkeypatch.setattr(h3d, "wait_until_arrived", wait)
+    plan = _scout_grid_plan()
+    run_waypoints(motor, plan, strict=True, sleep=clock.sleep, now=clock.now, clock=clock.now)
+
+    for k in range(1, len(plan)):
+        axis = plan[k][0]
+        i = "xyz".index(axis)
+        v, a = SPEEDS[axis]
+        distance = abs(plan[k][2][i] - plan[k - 1][2][i])
+        assert timeouts[k] == pytest.approx(ack_deadline(profile_time(distance, v, a)))
