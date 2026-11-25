@@ -55,6 +55,7 @@ class SystemMessageHandler(MessageHandler):
             SystemStatusMessageKind.PRESSURE_READING,
             SystemStatusMessageKind.SYNC_CLAP_OBSERVATION,
             SystemStatusMessageKind.SYNC_BARCODE_REPORT,
+            SystemStatusMessageKind.PELLET_STEPPER_FAULT,
         }:
             # The decoded-message event carries this timestamp-sensitive state to
             # acquisition consumers.  It has no legacy UI property of its own.
