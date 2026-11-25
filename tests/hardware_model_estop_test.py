@@ -533,3 +533,196 @@ def test_a_later_failure_under_an_operator_stop_is_kept_and_logged(hardware_mode
     assert record["event"]["reason"] == later["reason"]
     assert any("calibration waypoint 3" in r.getMessage() and "operator" in r.getMessage()
                for r in caplog.records)
+
+
+# -- pellet 2.4.0 (capability bit 9): faults, status bits, the STOP frame ---------------
+
+from reachaq.core import MessageHandler  # noqa: E402
+from reachaq.device import StepperFault, StepperStatus  # noqa: E402
+
+_STATUS_PROPERTY = {"X": MessageHandler.STEPPER_X_PROPERTY, "Y": MessageHandler.STEPPER_Y_PROPERTY,
+                    "Z": MessageHandler.STEPPER_Z_PROPERTY}
+_MOTOR = {"X": Motor.PELLET_X_MOTOR, "Y": Motor.PELLET_Y_MOTOR, "Z": Motor.PELLET_Z_MOTOR}
+_HOMED = 0x08  # HOMED_SINCE_BOOT
+_NEEDS_HOME = 0x04
+
+
+def _status(hardware_model, axis, bits, position=4.0):
+    hardware_model._message_handler_property_changed(_STATUS_PROPERTY[axis], StepperStatus(
+        Target.PELLET_DEVICE, _MOTOR[axis], position, 5.0, False, status=bits), None)
+
+
+def _fault_message(hardware_model, reason, axis="Z"):
+    fault = StepperFault(target=Target.PELLET_DEVICE, motor=_MOTOR[axis], reason=reason, flags=0x02,
+                         pulses_issued=571, pulses_planned=1142, believed_position_turns=2.5,
+                         believed_position_mm=6.09, pulses_per_turn=192.0, uuid=12)
+    hardware_model._decoded_device_message(SystemStatusMessageKind.PELLET_STEPPER_FAULT, fault, 1.0, 2.0)
+    return fault
+
+
+def _published(hardware_model, name):
+    values = []
+    hardware_model.property_changed += (
+        lambda changed, value, old: values.append(value) if changed == name else None)
+    return values
+
+
+def test_a_board_fault_marks_its_axis_needing_home_and_is_published_for_the_session(hardware_model):
+    faults = _published(hardware_model, HardwareModel.PELLET_STEPPER_FAULT_PROPERTY)
+    events = []
+    hardware_model.device_event += lambda direction, kind, data, *rest: events.append((direction, kind, data))
+
+    _fault_message(hardware_model, 2)
+
+    assert hardware_model.pellet_axes_needing_home == ("Z",)
+    (record,) = faults
+    assert record["axis"] == "Z" and record["reasonName"] == "LIMIT" and record["blocking"] is True
+    assert (record["pulsesIssued"], record["pulsesPlanned"]) == (571, 1142)
+    assert isinstance(record["wallTime"], float) and isinstance(record["perfTime"], float)
+    assert "lost" not in record["description"], "raw counts until bench step 1b"
+    assert [(d, k) for d, k, _ in events] == [("state", "stepper_fault")]
+
+
+def test_a_needs_home_fault_is_not_blocking_but_still_needs_the_home(hardware_model):
+    faults = _published(hardware_model, HardwareModel.PELLET_STEPPER_FAULT_PROPERTY)
+
+    _fault_message(hardware_model, 6, axis="X")
+
+    assert faults[0]["blocking"] is False and faults[0]["reasonName"] == "NEEDS_HOME"
+    assert hardware_model.pellet_axes_needing_home == ("X",)
+    assert not hardware_model.estop_active
+
+
+def test_on_2_4_0_status_needs_home_and_not_homed_since_boot_gate_motion(hardware_model):
+    hardware_model._board_capabilities = 0x217
+    published = _published(hardware_model, HardwareModel.PELLET_NEEDS_HOME_PROPERTY)
+
+    _status(hardware_model, "X", _HOMED)
+    _status(hardware_model, "Y", 0)  # never homed since boot
+    _status(hardware_model, "Z", _HOMED | _NEEDS_HOME)
+
+    assert hardware_model.pellet_axes_needing_home == ("Y", "Z")
+    assert published[-1] == ("Y", "Z")
+
+    _status(hardware_model, "Y", _HOMED)
+    _status(hardware_model, "Z", _HOMED)  # the board's home cleared it
+
+    assert hardware_model.pellet_axes_needing_home == ()
+    assert published[-1] == ()
+
+
+def test_a_stale_needs_home_status_is_corrected_by_the_next_frame(hardware_model):
+    hardware_model._board_capabilities = 0x217
+    _status(hardware_model, "Z", _HOMED)
+    hardware_model._set_axes_needing_home(())  # an acknowledged home
+
+    _status(hardware_model, "Z", _HOMED | _NEEDS_HOME)  # sent just before the home ended
+    assert hardware_model.pellet_axes_needing_home == ("Z",)
+    _status(hardware_model, "Z", _HOMED)
+
+    assert hardware_model.pellet_axes_needing_home == ()
+
+
+def test_a_refusal_needs_home_outlives_the_status_bits(hardware_model):
+    hardware_model._board_capabilities = 0x217
+    hardware_model._set_axes_needing_home(("X",))
+
+    _status(hardware_model, "X", _HOMED)
+
+    assert hardware_model.pellet_axes_needing_home == ("X",), "only an acknowledged home clears it"
+
+
+def test_on_2_3_1_status_bits_2_and_3_mean_nothing(hardware_model):
+    hardware_model._board_capabilities = 0x04
+
+    _status(hardware_model, "X", 0)
+    _status(hardware_model, "Z", _NEEDS_HOME)
+
+    assert hardware_model.pellet_axes_needing_home == ()
+    assert hardware_model.last_position.z == 4.0
+
+
+def test_on_2_4_0_a_needs_home_axis_position_is_not_taken_as_proof(hardware_model):
+    hardware_model._board_capabilities = 0x217
+
+    _status(hardware_model, "Z", _HOMED | _NEEDS_HOME, position=6.0)
+    assert math.isnan(hardware_model.last_position.z)
+
+    _status(hardware_model, "Z", _HOMED, position=0.0)
+    assert hardware_model.last_position.z == 0.0
+
+
+def test_a_connect_forgets_the_previous_boards_status_bits(hardware_model):
+    hardware_model._board_capabilities = 0x217
+    _status(hardware_model, "Y", 0)
+    assert hardware_model.pellet_axes_needing_home == ("Y",)
+
+    hardware_model._set_board_axes_needing_home(())
+
+    assert hardware_model.pellet_axes_needing_home == ()
+
+
+@pytest.mark.parametrize("frame", ["STOP", "ESTOP"])
+def test_the_stop_records_which_frame_stopped_the_stage(hardware_model, frame):
+    _wired(hardware_model)
+    hardware_model._can_device.last_stop_frame = frame
+
+    hardware_model.estop("MOVE_Z was not acknowledged within 3 s")
+
+    assert hardware_model.pellet_estop["frame"] == frame
+
+
+def test_a_board_fault_reaches_the_model_through_the_device_and_stops_the_stage(hardware_model):
+    # End to end on the emulated 2.4.0 board: the fault frame stops every axis with STOP, the
+    # stop raises the blocking stopped-stage record naming the axis and the reason, and the
+    # fault is published for the session metadata.
+    def route(kind, data):
+        hardware_model._decoded_device_message(kind, data, 1.0, 2.0)
+
+    device = CanDevice(api=DeviceApi(message_callback=route), force_emulation=True,
+                       required_targets=(Target.PELLET_DEVICE,),
+                       estop_callback=hardware_model._on_device_estop)
+    interface = device.device_interface
+    interface.board_capabilities = 0x217
+    interface.open()
+    device.connect()
+    hardware_model._can_device = device
+    hardware_model._board_capabilities = 0x217
+    faults = _published(hardware_model, HardwareModel.PELLET_STEPPER_FAULT_PROPERTY)
+    try:
+        fault = StepperFault(target=Target.PELLET_DEVICE, motor=Motor.PELLET_Z_MOTOR, reason=1,
+                             pulses_issued=300, pulses_planned=1142, believed_position_mm=3.0, uuid=99)
+        device.notify_data([fault])
+
+        assert interface.stop_frames == [0]
+        assert interface.estop_frames == []
+        record = hardware_model.pellet_estop
+        assert record["frame"] == "STOP" and record["kind"] == "failure"
+        assert "axis Z WATCHDOG" in record["reason"]
+        assert hardware_model.pellet_axes_needing_home == ("X", "Y", "Z")
+        assert faults[0]["reasonName"] == "WATCHDOG" and faults[0]["blocking"] is True
+    finally:
+        hardware_model._can_device = None
+        device.disconnect()
+        interface.close()
+
+
+
+def test_a_board_that_lost_bit_9_keeps_its_unhomed_axes_needing_a_home(hardware_model):
+    # Review I1: a reboot into 2.3.1. Its status bits 2/3 read 0 (unhomed) until its
+    # capabilities answer says 0x04; those axes then stay needing a home until a home.
+    from reachaq.device import BoardCapabilities
+
+    hardware_model._board_capabilities = 0x217
+    _status(hardware_model, "X", 0)
+    _status(hardware_model, "Y", 0)
+    assert hardware_model.pellet_axes_needing_home == ("X", "Y")
+
+    hardware_model._decoded_device_message(SystemStatusMessageKind.BOARD_CAPABILITIES, BoardCapabilities(
+        target=Target.PELLET_DEVICE, wire_schema_version=1, capabilities=0x04, boot_id=2), 1.0, 2.0)
+
+    assert not hardware_model.pellet_motion_safety
+    assert hardware_model.pellet_axes_needing_home == ("X", "Y")
+    _status(hardware_model, "X", 0)  # 2.3.1's zeros mean nothing now
+    hardware_model._set_axes_needing_home(())  # an acknowledged home
+    assert hardware_model.pellet_axes_needing_home == ()

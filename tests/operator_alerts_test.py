@@ -354,3 +354,24 @@ def test_the_operator_alert_shows_a_later_failure_too(wired):
     assert alert.title == "Pellet stage stopped by the operator"
     assert "(a later failure was also recorded: MOVE_Z was not acknowledged within 0.88 s)" in alert.message
     assert "could not be written to the CAN bus" in alert.message
+
+
+def test_a_board_fault_stop_names_the_axis_and_the_reason_and_is_blocking(wired):
+    # Pellet 2.4.0: a STEPPER_FAULT stops every axis with STOP through the same path (H4).
+    model, center, dialogs = wired
+    record = dict(_estop("the pellet board reported a fault: axis Z LIMIT during a move: the limit "
+                         "switch tripped before the end of the move (position fault)"), frame="STOP")
+    model.hardware.property_changed("pellet_estop", record, None)
+
+    (alert,) = center.active_alerts()
+    assert alert.severity is AlertSeverity.ERROR and alert.needs_dialog and alert.is_condition
+    assert "axis Z LIMIT" in alert.message
+    assert dialogs == [alert]
+
+
+def test_an_unwritten_stop_names_the_frame_it_tried(wired):
+    model, center, _dialogs = wired
+    model.hardware.property_changed("pellet_estop", dict(_estop(sent=False), frame="STOP"), None)
+
+    (alert,) = center.active_alerts()
+    assert "The STOP could not be written to the CAN bus." in alert.message

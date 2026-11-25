@@ -197,7 +197,7 @@ only re-aiming the camera helps.
 
 1. **Grid.** 4 x 4 x 3 = 48 points evenly spaced inside the stage's configured
    travel: `min_pos` and `max_pos` under `pellet.x`, `pellet.y` and `pellet.z`
-   in `~/reachAQ/motor_config.yaml` (0-35 mm on every axis on
+   in `~/reachAQ/motor_config.yaml` (0-35 mm on x and y and 0-30 mm on z on
    christielab10; see [Motor travel limits](../linux-install/runtime-configuration.md#motor-travel-limits)).
    The scout reads that file itself, so it has the travel before any connect.
    On an axis with no travel configured, the box is the one the hand-written

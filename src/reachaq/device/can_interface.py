@@ -65,6 +65,7 @@ from .device_interface import (
     StepperConfig,
     ServoStatus,
     StepperStatus,
+    StepperFault,
     Version,
     BoardTimeSync,
     BoardCapabilities,
@@ -72,6 +73,7 @@ from .device_interface import (
     SyncBarcodeReport,
     DigitalPulseStatus,
     PressureReading,
+    CAPABILITY_STEPPER_MOTION_SAFETY,
 )
 from .board_clock import BoardClockModel, BoardSequenceTracker
 from .stepper_motor import mm_to_turns, turns_to_mm
@@ -111,8 +113,30 @@ class MissingDeviceAddressError(RuntimeError):
     """Dedicated for when device address could not be read"""
 
 
+class PelletBackendUnsupportedError(RuntimeError):
+    """The pellet board's firmware needs a CAN backend feature this one lacks (STEPPER_STOP)."""
+
+
 _STEPPER_MAX_TURNS = 15  # absolute max nbr of turns for each stepper, hardcoded for now.
 _STEPPER_MAX_POS = turns_to_mm(_STEPPER_MAX_TURNS)
+
+#: CAPABILITIES_RESPONSE bit 0: every frame that has room carries a timing trailer.
+_CAPABILITY_TIMING_TRAILER = 1 << 0
+
+#: STEPPER_STOP's uuid. The host never gives a command uuid 0 (next_uuid skips it), so the
+#: board's ACK of a STOP can never be matched to the command it stopped.
+STEPPER_STOP_UUID = 0
+
+
+def stepper_travel_cap_mm(config) -> float:
+    """The highest target (mm) a stepper is sent to: its max_pos (motor_config.yaml), held to
+    the absolute 15 turns. Pellet 2.4.0 refuses a target past its own per-axis travel with
+    -ERANGE (x 35, y 35, z 30 mm by default, christielab10's max_pos values); clamping here
+    keeps the host's targets inside it (design H8)."""
+    maximum = getattr(config, "maximum_position", None)
+    if maximum is None or not math.isfinite(maximum):
+        return _STEPPER_MAX_POS
+    return min(_STEPPER_MAX_POS, max(0.0, float(maximum)))
 
 
 def _is_pellet_by_addr(addr: int) -> bool:
@@ -421,6 +445,9 @@ class CanInterface(DeviceInterface):
         }
 
         self._pellet_addr: Optional[int] = None
+        # The pellet board's CAPABILITIES_RESPONSE bits, from open() or any later answer;
+        # None until the board has answered (firmware 2.2.0 and older never does).
+        self._board_capabilities: Optional[int] = None
         self._foreign_board_addresses = set()
         # One clock and one sequence per board address: a second board's
         # trailer is not a reboot of the first.
@@ -507,6 +534,9 @@ class CanInterface(DeviceInterface):
             "SYNC_BARCODE": self._translate_sync_barcode,
             "ANALOG_BLOCK": no_op,
             "PWM_SET": no_op,
+            # Pellet 2.4.0 (capability bit 9). STOP is host to board only.
+            "STEPPER_FAULT": self._translate_stepper_fault,
+            "STEPPER_STOP": no_op,
         }
         for name, handler in optional_handlers.items():
             kind = getattr(cmd_type, name, None)
@@ -748,6 +778,19 @@ class CanInterface(DeviceInterface):
     def motors_position(self) -> Offset3DTuple:
         return self._last_positions
 
+    @property
+    def board_capabilities(self) -> Optional[int]:
+        """The pellet board's capability bits as it last reported them, None before it has."""
+        return self._board_capabilities
+
+    @property
+    def has_stepper_motion_safety(self) -> bool:
+        """The board advertises bit 9 (pellet 2.4.0: STEPPER_STOP, STEPPER_FAULT, needs-home bits)
+        and this backend can send STEPPER_STOP. pyjerrycan has no StepperStop: it stays on ESTOP."""
+        caps = self._board_capabilities
+        return (caps is not None and bool(caps & CAPABILITY_STEPPER_MOTION_SAFETY)
+                and hasattr(self._jc, "StepperStop"))
+
     def open(self) -> bool:
         """
         Open the interface (CANbus) connection
@@ -758,6 +801,7 @@ class CanInterface(DeviceInterface):
         if self._jc is None:
             return False
 
+        self._board_capabilities = None  # a reconnect may find other firmware
         try:
             self._channel_ownership.acquire()
         except CanChannelInUseError as exc:
@@ -819,6 +863,8 @@ class CanInterface(DeviceInterface):
                         motor=None,
                         timeout=0.25,
                     )
+                    if capabilities is not None:
+                        self._refuse_backend_without_stop(int(capabilities.capabilities))
                     if capabilities is not None and capabilities.capabilities & 0x2:
                         for _ in range(4):
                             if self.request_clock_sync():
@@ -1211,6 +1257,9 @@ class CanInterface(DeviceInterface):
 
         turns_position = mm_to_turns(corrected_position)
         turns_velocity = mm_to_turns(velocity)
+        # Per axis: max_pos from motor_config.yaml, at most 15 turns (H8).
+        cap_mm = stepper_travel_cap_mm(config)
+        cap_turns = mm_to_turns(cap_mm)
         turns_acceleration = mm_to_turns(config.maximum_acceleration)
 
         if relative:
@@ -1227,18 +1276,20 @@ class CanInterface(DeviceInterface):
                     position -= tentative
                     turns_position = mm_to_turns(position)
                     logger.verbose("Limiting relative move to %s", position)
-                elif tentative > _STEPPER_MAX_POS:
-                    position = _STEPPER_MAX_POS - last_pos
+                elif tentative > cap_mm:
+                    position = cap_mm - last_pos
                     turns_position = mm_to_turns(position)
-                    logger.verbose("Limiting relative move to %s", position)
+                    logger.warning("%s: limiting relative move to %.3f mm: %.3f mm is past the axis's "
+                                   "travel cap %.3f mm", motor, position, tentative, cap_mm)
         else:
             # absolute move
             if turns_position < 0:
                 logger.debug("limited turns_position to 0 ; was %.1f", turns_position)
                 turns_position = 0
-            elif turns_position > _STEPPER_MAX_TURNS:
-                logger.debug("limited turns_position to max ; was %.1f", turns_position)
-                turns_position = _STEPPER_MAX_TURNS
+            elif turns_position > cap_turns:
+                logger.warning("%s: limiting target to %.3f mm: %.3f mm is past the axis's travel cap",
+                               motor, cap_mm, turns_to_mm(turns_position))
+                turns_position = cap_turns
 
         uuid = CanInterface.next_uuid()
         res = self._jc.StepperMove(
@@ -1501,6 +1552,29 @@ class CanInterface(DeviceInterface):
         logger.debug("motor=%s: tentative request addr=%s tgt=%s => res=%s", motor, addr, target, res)
         return res == 0
 
+    def stepper_stop(self, motor_mask: int = 0) -> bool:
+        """
+        STEPPER_STOP (pellet 2.4.0, capability bit 9): stop the steppers of `motor_mask`
+        now; bit n is stepper n and 0 is every stepper.
+
+        The board never refuses it and needs no release. A stopped move is ACKed
+        -ECANCELED with its own uuid and its axis then needs a home; an idle axis keeps
+        its position and stays homed. STOP's own ACK (0) carries STEPPER_STOP_UUID, 0,
+        which the host never gives a command, so it cannot be taken for the ack of the
+        move it stopped, and sending it from any thread leaves the command loop's uuid
+        accounting alone (next_uuid is not called).
+
+        Returns:
+            bool: True if the frame was written to the bus; False without StepperStop
+        """
+        send = getattr(self._jc, "StepperStop", None)
+        if send is None:
+            return False
+        addr = self._tgt2addr(Target.PELLET_DEVICE)
+        res = send(addr, int(motor_mask) & 0xFF, STEPPER_STOP_UUID)
+        logger.debug("StepperStop(mask=%#x) res=%s", int(motor_mask) & 0xFF, res)
+        return res == 0
+
     def estop(self, asserted: bool = True) -> bool:
         """
         Assert or release the E-stop on every board: one broadcast frame, no uuid, no ack.
@@ -1695,6 +1769,8 @@ class CanInterface(DeviceInterface):
             Populated class type (see device_interface.py) or None
         """
         sequence_status = self._observe_board_sequence(message)
+        if _is_pellet_by_addr(message.dst_id):
+            self._check_pellet_identity(message, sequence_status)
         if not _is_pellet_by_addr(message.dst_id) and message.type not in self._any_board_types:
             self._ignore_foreign_board(message.dst_id)
             return None
@@ -1710,6 +1786,47 @@ class CanInterface(DeviceInterface):
             res.index = self._get_index(message)
             self._apply_board_timing(res, message, sequence_status)
         return res
+
+    def _refuse_backend_without_stop(self, capabilities: int) -> None:
+        """Raise when the board has bit 9 (pellet 2.4.0) and this backend cannot send
+        STEPPER_STOP (pyjerrycan): a host that cannot stop the board's way must not drive
+        it, and it would not decode STEPPER_FAULT either (design H7)."""
+        if capabilities & CAPABILITY_STEPPER_MOTION_SAFETY and not hasattr(self._jc, "StepperStop"):
+            raise PelletBackendUnsupportedError(
+                f"The pellet board reports stepper motion safety (capabilities {capabilities:#x}, pellet "
+                f"firmware 2.4.0 or later), but the {type(self._jc).__name__} CAN backend cannot send "
+                "STEPPER_STOP. Use the SocketCAN backend (REACHAQ_CAN_TRANSPORT=socketcan) with this firmware.")
+
+    def _check_pellet_identity(self, message, sequence_status: dict) -> None:
+        """Forget the pellet's capabilities when the board may now run other firmware.
+
+        A reboot mid-session (a new boot_id in the timing trailer), or a STEPPER_STATUS
+        without a trailer from a board whose capabilities said it sends one (2.4.0
+        reverted by MCUboot to 2.3.1, which has no trailer), can mean the board no longer
+        has bit 9. 2.3.1 drops STEPPER_STOP silently and the write still succeeds, so the
+        host must not trust the old bits: until the board answers again every stop is
+        ESTOP, which every firmware honours. The capabilities and the version are asked
+        for again; the answers restore the bits and the compatibility check.
+        """
+        caps = self._board_capabilities
+        if caps is None:
+            return
+        if sequence_status.get("reboot"):
+            why = "the pellet board rebooted (new boot id)"
+        elif (caps & _CAPABILITY_TIMING_TRAILER
+              and message.type == self._jerrycan_cmd_type.STEPPER_STATUS
+              and not bool(getattr(message, "board_timing_valid", False))):
+            why = "the pellet board stopped sending timing trailers (other firmware?)"
+        else:
+            return
+        self._board_capabilities = None
+        logger.warning("%s: its capabilities are forgotten until it answers again; stops are ESTOP meanwhile",
+                       why)
+        for request in (self.request_capabilities, self.request_version):
+            try:
+                request()
+            except Exception as error:
+                logger.warning("Could not ask the pellet board again (%s): %s", request.__name__, error)
 
     def _ignore_foreign_board(self, address: int) -> None:
         """Skip traffic from a board this host has no driver for.
@@ -1812,9 +1929,10 @@ class CanInterface(DeviceInterface):
             clock_model=model,
         )
 
-    @staticmethod
-    def _translate_capabilities(message) -> BoardCapabilities:
+    def _translate_capabilities(self, message) -> BoardCapabilities:
         response = message.capabilities_response
+        if _is_pellet_by_addr(message.dst_id):
+            self._board_capabilities = int(response.capabilities)
         return BoardCapabilities(
             target=_addr2tgt(message.dst_id),
             wire_schema_version=int(response.wire_schema_version),
@@ -1869,9 +1987,23 @@ class CanInterface(DeviceInterface):
             message: JerryCANMsg with bootloader response data
 
         Returns:
-            Version object if the bootloader response is a version request, None otherwise
+            Version object if the bootloader response is a version request, None otherwise.
+            BOOT_CHAIN (pellet 2.4.0) is logged; a subcommand this host does not know is
+            logged and dropped, never fatal.
         """
-        if message.bootloader_response.type == self._bootloader_cmd_cls.SubCommand.VERSION:
+        response_type = message.bootloader_response.type
+        boot_chain = getattr(self._bootloader_cmd_cls.SubCommand, "BOOT_CHAIN", None)
+        if boot_chain is not None and response_type == boot_chain:
+            chain = message.bootloader_response.boot_chain
+            logger.info(
+                "pellet boot chain: flags=%#04x desc_sequence=%s mcuboot_sha256_prefix=%s running_build_num=%s",
+                int(chain.flags), int(chain.desc_sequence), bytes(chain.mcuboot_sha256_prefix).hex(),
+                int(chain.running_build_num))
+            return None
+        if isinstance(response_type, int) and not isinstance(response_type, self._bootloader_cmd_cls.SubCommand):
+            logger.info("Ignoring a bootloader response with unknown subcommand %s", response_type)
+            return None
+        if response_type == self._bootloader_cmd_cls.SubCommand.VERSION:
             target = _addr2tgt(message.dst_id)
             if hasattr(message.bootloader_response.version, "running_major"):
                 # pyjerrycan < 1.2.0
@@ -2022,6 +2154,26 @@ class CanInterface(DeviceInterface):
             return None
         self._handle_motor_status_age(motor)
         return ServoStatus(target, motor, self.round_float(message.servo_status.position))
+
+    def _translate_stepper_fault(self, message) -> Optional[StepperFault]:
+        """STEPPER_FAULT (pellet 2.4.0): the axis, the reason and the raw counts, with the
+        faulted command's uuid. believed_position is in turns on the wire."""
+        target = _addr2tgt(message.dst_id)
+        report = message.stepper_fault
+        motor = _id_to_motor(target, False, report.motor_id)
+        turns = float(report.believed_position)
+        return StepperFault(
+            target=target,
+            motor=motor,
+            reason=int(report.reason),
+            flags=int(report.flags),
+            pulses_issued=int(report.pulses_issued),
+            pulses_planned=int(report.pulses_planned),
+            believed_position_turns=turns,
+            believed_position_mm=turns_to_mm(turns) if math.isfinite(turns) else math.nan,
+            pulses_per_turn=float(report.pulses_per_turn),
+            uuid=int(message.uuid),
+        )
 
     def _handle_stepper_status(self, message):
         status = self._translate_stepper_status(message)

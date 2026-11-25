@@ -26,6 +26,11 @@ CAPABILITY_BITS = {
     # at boot and reports driver faults in STEPPER_STATUS.status. A v1.2
     # board never sets it, so it is optional in the policy.
     "stepper_driver_fault": 1 << 6,
+    # Bits 7 and 8 are reserved on the board for the stepper home report (z-homing).
+    # Pellet 2.4.0: STEPPER_STOP, STEPPER_FAULT, the per-move watchdog, the limit-fault
+    # rules and STEPPER_STATUS bits NEEDS_HOME / HOMED_SINCE_BOOT. Required by 2.4.0, so
+    # only a host that stops with STEPPER_STOP accepts that firmware (design H7).
+    "stepper_motion_safety": 1 << 9,
 }
 
 

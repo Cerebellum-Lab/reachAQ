@@ -546,3 +546,354 @@ def test_ack_error_decodes_as_a_signed_int32(payload, error):
     message = socketcan_jerrycan.decode_frame(can_id, payload + bytes([42]))
     assert message.ack.error == error
     assert message.uuid == 42
+
+
+# -- pellet 2.4.0: STEPPER_STOP, STEPPER_FAULT, BOOT_CHAIN (jerrycan_types.h) -----------
+
+def _socketcan_interface():
+    return CanInterface(
+        required_targets=(Target.PELLET_DEVICE,),
+        can_transport=CanTransportConfiguration(kind=CanTransportKind.SOCKETCAN, fd=True),
+    )
+
+
+def test_stepper_stop_encodes_its_type_mask_and_uuid():
+    message = JerryCANMsg()
+    message.type = JerryCANCmdType.STEPPER_STOP
+    message.uuid = 0
+    message.stepper_stop.motor_mask = 0x05
+
+    can_id, payload = socketcan_jerrycan.encode_frame(message, 0)
+
+    assert JerryCANCmdType.STEPPER_STOP == 0x2C
+    assert can_id == 0x2C << 5
+    assert payload == b"\x05\x00"  # 1-byte motor_mask, then the uuid
+    decoded = socketcan_jerrycan.decode_frame(can_id, payload)
+    assert decoded.type == JerryCANCmdType.STEPPER_STOP
+    assert decoded.stepper_stop.motor_mask == 0x05
+    assert decoded.uuid == 0
+
+
+def test_stepper_fault_decodes_its_20_bytes_and_the_faulted_uuid():
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.STEPPER_FAULT, 0)
+    payload = struct.pack("<BBBBiiff", 2, 2, 0x02, 0, 571, 1142, 6.25, 192.0)
+    assert len(payload) == 20
+
+    message = socketcan_jerrycan.decode_frame(can_id, payload + bytes([77]))
+
+    assert JerryCANCmdType.STEPPER_FAULT == 0x2D
+    assert message.uuid == 77
+    fault = message.stepper_fault
+    assert (fault.motor_id, fault.reason, fault.flags) == (2, 2, 0x02)
+    assert (fault.pulses_issued, fault.pulses_planned) == (571, 1142)
+    assert fault.believed_position == 6.25
+    assert fault.pulses_per_turn == 192.0
+
+
+def test_the_receive_filter_admits_stepper_fault_frames():
+    filters = socketcan_jerrycan._jerrycan_filters()
+    assert {"can_id": 0x2D << 5, "can_mask": 0x7E0, "extended": False} in filters
+
+
+def test_boot_chain_response_decodes_its_10_bytes_with_the_uuid_at_offset_11():
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.BOOTLOADER_RESPONSE, 0)
+    flags = (socketcan_jerrycan.BOOT_CHAIN_STAGE0 | socketcan_jerrycan.BOOT_CHAIN_MCUBOOT_VALID
+             | socketcan_jerrycan.BOOT_CHAIN_HEADER_OK)
+    payload = struct.pack("<BBI4sB", 7, flags, 12, b"\xde\xad\xbe\xef", 0x2A)
+    assert len(payload) == 11
+
+    message = socketcan_jerrycan.decode_frame(can_id, payload + bytes([9]))
+
+    response = message.bootloader_response
+    assert response.type == socketcan_jerrycan.JerryCANBootloaderCmd.SubCommand.BOOT_CHAIN
+    assert response.boot_chain.flags == flags
+    assert response.boot_chain.desc_sequence == 12
+    assert response.boot_chain.mcuboot_sha256_prefix == b"\xde\xad\xbe\xef"
+    assert response.boot_chain.running_build_num == 0x2A
+    assert message.uuid == 9
+
+
+def test_boot_chain_read_error_flag_decodes():
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.BOOTLOADER_RESPONSE, 0)
+    payload = struct.pack("<BBI4sB", 7, socketcan_jerrycan.BOOT_CHAIN_READ_ERROR, 0, bytes(4), 0)
+
+    message = socketcan_jerrycan.decode_frame(can_id, payload + b"\x00")
+
+    assert message.bootloader_response.boot_chain.flags == 0x80
+
+
+def test_a_legacy_version_response_still_reads_its_uuid_at_offset_7():
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.BOOTLOADER_RESPONSE, 0)
+    payload = struct.pack("<BBBBBBB", 0, 2, 4, 0, 2, 3, 1)
+
+    message = socketcan_jerrycan.decode_frame(can_id, payload + bytes([5]))
+
+    assert message.bootloader_response.version.running_version_minor == 4
+    assert message.uuid == 5
+
+
+def test_a_boot_chain_response_from_the_pellet_does_not_end_the_reader(caplog):
+    # Before 2.4.0 hosts raised "Malformed JerryCAN frame" on subcommand 7, which ended
+    # the reader and with it the pellet connection.
+    backend = SocketCanJerryCAN(CanTransportConfiguration(kind="socketcan", fd=True))
+    boot_chain = struct.pack("<BBI4sB", 7, 0x07, 3, b"\x01\x02\x03\x04", 1) + b"\x00"
+    backend._bus = FakeBus([
+        _raw_message(JerryCANCmdType.BOOTLOADER_RESPONSE << 5, boot_chain),
+        _pellet_heartbeat(),
+    ])
+
+    messages = backend.ReceiveMessages(max_count=2, collect_ms=5000)
+
+    assert [m.type for m in messages] == [JerryCANCmdType.BOOTLOADER_RESPONSE, JerryCANCmdType.HEARTBEAT]
+    interface = _socketcan_interface()
+    with caplog.at_level(logging.INFO, logger="reachaq.device.can_interface"):
+        assert interface._translate(messages[0]) is None
+    assert "pellet boot chain: flags=0x07 desc_sequence=3 mcuboot_sha256_prefix=01020304" in caplog.text
+
+
+def test_an_unknown_bootloader_subcommand_is_kept_as_a_number_and_dropped(caplog):
+    backend = SocketCanJerryCAN(CanTransportConfiguration(kind="socketcan", fd=True))
+    backend._bus = FakeBus([
+        _raw_message(JerryCANCmdType.BOOTLOADER_RESPONSE << 5, bytes([0x42, 1, 2, 3, 4, 5, 6, 0])),
+        _pellet_heartbeat(),
+    ])
+
+    messages = backend.ReceiveMessages(max_count=2, collect_ms=5000)
+
+    assert messages[0].bootloader_response.type == 0x42
+    with caplog.at_level(logging.INFO, logger="reachaq.device.can_interface"):
+        assert _socketcan_interface()._translate(messages[0]) is None
+    assert "unknown subcommand 66" in caplog.text
+    assert messages[1].type == JerryCANCmdType.HEARTBEAT
+
+
+def test_can_interface_translates_a_stepper_fault():
+    from reachaq.device import StepperFault
+    from reachaq.device.stepper_motor import turns_to_mm
+
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.STEPPER_FAULT, 0)
+    payload = struct.pack("<BBBBiiff", 2, 2, 0x02, 0, 571, 1142, 2.5, 192.0) + bytes([31])
+    message = socketcan_jerrycan.decode_frame(can_id, payload)
+
+    fault = _socketcan_interface()._translate(message)
+
+    assert isinstance(fault, StepperFault)
+    assert fault.target == Target.PELLET_DEVICE
+    assert fault.motor == Motor.PELLET_Z_MOTOR
+    assert fault.reason_name == "LIMIT" and fault.toward_switch and not fault.is_homing
+    assert (fault.pulses_issued, fault.pulses_planned, fault.uuid) == (571, 1142, 31)
+    assert fault.believed_position_mm == pytest.approx(turns_to_mm(2.5))
+    assert not fault.needs_home_only
+    # Raw counts only, never "lost steps" (design I8: bench step 1b has not run).
+    assert "571 pulses issued of 1142 planned" in fault.describe()
+    assert "lost" not in fault.describe()
+
+
+def test_can_interface_records_the_pellet_capabilities_and_bit_9():
+    interface = _socketcan_interface()
+    assert interface.board_capabilities is None
+    assert not interface.has_stepper_motion_safety
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.CAPABILITIES_RESPONSE, 0)
+
+    for caps, motion_safety in ((0x17, False), (0x217, True)):
+        message = socketcan_jerrycan.decode_frame(can_id, struct.pack("<BII", 1, caps, 5) + b"\x00")
+        interface._translate(message)
+        assert interface.board_capabilities == caps
+        assert interface.has_stepper_motion_safety is motion_safety
+
+
+def test_stepper_stop_goes_out_with_uuid_0_and_leaves_the_command_uuids_alone():
+    interface = _socketcan_interface()
+    interface._pellet_addr = 0
+    sent = []
+    interface._jc = types.SimpleNamespace(StepperStop=lambda dst, mask, uuid: sent.append((dst, mask, uuid)) or 0)
+    before = CanInterface.uuid()
+
+    assert interface.stepper_stop(0) is True
+
+    assert sent == [(0, 0, 0)]
+    assert CanInterface.uuid() == before
+
+
+def test_a_backend_without_stepper_stop_reports_no_motion_safety():
+    # pyjerrycan has no StepperStop: the host stays on ESTOP even with bit 9.
+    interface = _socketcan_interface()
+    interface._jc = types.SimpleNamespace()
+    interface._board_capabilities = 0x217
+
+    assert not interface.has_stepper_motion_safety
+    assert interface.stepper_stop(0) is False
+
+
+# -- per-axis travel clamp (design H8) -----------------------------------------------
+
+def _clamp_interface(max_pos):
+    from reachaq.device import StepperConfig
+
+    interface = _socketcan_interface()
+    interface._pellet_addr = 0
+    moves = []
+
+    def stepper_move(addr, motor_id, position, velocity, acceleration, abs_or_rel, save, uuid):
+        moves.append((motor_id, position, int(abs_or_rel), save))
+        return 0
+
+    interface._jc = types.SimpleNamespace(StepperMove=stepper_move)
+    config = StepperConfig.from_dict({} if max_pos is None else {"min_pos": 0, "max_pos": max_pos})
+    interface.z_config = config
+    interface.x_config = StepperConfig.from_dict({"min_pos": 0, "max_pos": 35.0})
+    return interface, moves
+
+
+def test_an_absolute_target_past_max_pos_is_clamped_to_it():
+    from reachaq.device.stepper_motor import mm_to_turns
+
+    interface, moves = _clamp_interface(30.0)
+
+    assert interface.move_motor_z(33.0)
+    assert interface.move_motor_x(36.0)
+    assert interface.move_motor_z(12.0)
+
+    assert moves[0][1] == pytest.approx(mm_to_turns(30.0))  # z: 30 mm, as the 2.4.0 cap
+    assert moves[1][1] == pytest.approx(mm_to_turns(35.0))  # x: its own 35 mm
+    assert moves[2][1] == pytest.approx(mm_to_turns(12.0))  # inside the travel: unchanged
+
+
+def test_a_saved_send_position_past_max_pos_is_clamped_too():
+    from reachaq.device.stepper_motor import mm_to_turns
+
+    interface, moves = _clamp_interface(30.0)
+
+    assert interface.set_motor_z(31.0)
+
+    assert moves == [(2, pytest.approx(mm_to_turns(30.0)), 0, True)]
+
+
+def test_a_relative_move_is_held_to_max_pos():
+    from reachaq.core import Offset3DTuple
+    from reachaq.device.stepper_motor import mm_to_turns
+
+    interface, moves = _clamp_interface(30.0)
+    interface._last_positions = Offset3DTuple(0.0, 0.0, 25.0)
+
+    assert interface.move_motor_z(10.0, relative=True)
+
+    assert moves[0][1] == pytest.approx(mm_to_turns(5.0))  # 25 + 10 held to 30
+
+
+def test_without_max_pos_the_absolute_15_turn_cap_stays():
+    interface, moves = _clamp_interface(None)
+
+    assert interface.move_motor_z(100.0)
+
+    assert moves[0][1] == pytest.approx(15.0)
+
+
+# -- review I1: a mid-session reboot or firmware change forgets bit 9 ------------------
+
+def _status_frame(*, boot_id=None, sequence=1):
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.STEPPER_STATUS, 0)
+    payload = struct.pack("<BBBBff", 2, 0x08, 0, 0, 1.0, 1.0) + b"\x00"
+    if boot_id is not None:
+        payload += struct.pack("<BBBBIIQ", 0xA7, 1, 0, 0, boot_id, sequence, 1000 * sequence)
+    return socketcan_jerrycan.decode_frame(can_id, payload)
+
+
+def _bit_9_interface():
+    interface = _socketcan_interface()
+    interface._pellet_addr = 0
+    asked = []
+    interface._jc = types.SimpleNamespace(
+        StepperStop=lambda *args: 0,
+        RequestCapabilities=lambda dst: asked.append("capabilities") or 0,
+        BootloaderCommand=lambda dst, subcmd: asked.append("version") or 0,
+    )
+    interface._board_capabilities = 0x217
+    return interface, asked
+
+
+def test_a_pellet_reboot_forgets_bit_9_and_asks_again(caplog):
+    interface, asked = _bit_9_interface()
+    interface._translate(_status_frame(boot_id=0x1111, sequence=1))
+    interface._translate(_status_frame(boot_id=0x1111, sequence=2))
+    assert interface.has_stepper_motion_safety and asked == []
+
+    with caplog.at_level(logging.WARNING, logger="reachaq.device.can_interface"):
+        interface._translate(_status_frame(boot_id=0x2222, sequence=0))
+
+    assert interface.board_capabilities is None
+    assert not interface.has_stepper_motion_safety, "stops are ESTOP until the board answers"
+    assert asked == ["capabilities", "version"]
+    assert "rebooted" in caplog.text
+
+
+def test_a_board_reverted_to_2_3_1_is_seen_by_its_missing_timing_trailer():
+    # 2.3.1 sends no timing trailer, so its boot id is never seen: the missing trailer is.
+    interface, asked = _bit_9_interface()
+    interface._translate(_status_frame(boot_id=0x1111))
+
+    interface._translate(_status_frame(boot_id=None))
+
+    assert interface.board_capabilities is None and not interface.has_stepper_motion_safety
+    assert asked == ["capabilities", "version"]
+    # The board's answer decides again: 2.3.1 reports 0x04, so it stays on ESTOP.
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.CAPABILITIES_RESPONSE, 0)
+    interface._translate(socketcan_jerrycan.decode_frame(can_id, struct.pack("<BII", 1, 0x04, 9) + b"\x00"))
+    assert interface.board_capabilities == 0x04 and not interface.has_stepper_motion_safety
+
+
+def test_a_board_without_timing_trailers_is_not_mistaken_for_a_reboot():
+    interface, asked = _bit_9_interface()
+    interface._board_capabilities = 0x204  # bit 9 without the trailer bit
+
+    interface._translate(_status_frame(boot_id=None))
+
+    assert interface.board_capabilities == 0x204 and asked == []
+
+
+# -- review m8: a backend that cannot send STOP refuses a bit 9 board -----------------
+
+def test_a_backend_without_stop_refuses_to_open_a_bit_9_board(monkeypatch):
+    from reachaq.device import BoardCapabilities
+    from reachaq.device.can_interface import PelletBackendUnsupportedError
+
+    class NoStopBus:  # pyjerrycan's JerryCAN has no StepperStop
+        close_called = False
+
+        def Open(self):
+            return 0
+
+        def Close(self):
+            self.close_called = True
+            return 0
+
+        def ReceiveMessages(self, max_count, collect_ms):
+            return [_status_frame(boot_id=None)]
+
+        def RequestCapabilities(self, dst):
+            return 0
+
+    interface = _socketcan_interface()
+    interface._channel_ownership = mock.Mock()
+    interface._jc = NoStopBus()
+    monkeypatch.setattr(interface, "_query_configuration", lambda: None)
+    monkeypatch.setattr(interface, "_translate", lambda message: None)
+    monkeypatch.setattr(interface, "_assign_address", lambda message: setattr(interface, "_pellet_addr", 0))
+    monkeypatch.setattr(interface, "get_response", lambda *args, **kwargs: BoardCapabilities(
+        target=Target.PELLET_DEVICE, wire_schema_version=1, capabilities=0x217, boot_id=1))
+
+    with pytest.raises(PelletBackendUnsupportedError, match="cannot send STEPPER_STOP"):
+        interface.open()
+
+    assert interface._jc.close_called and not interface.is_open
+
+
+def test_a_backend_without_stop_still_opens_a_2_3_1_board(monkeypatch):
+    from reachaq.device import BoardCapabilities
+
+    interface = _socketcan_interface()
+    interface._jc = types.SimpleNamespace()
+
+    interface._refuse_backend_without_stop(0x04)  # no raise
+    interface._jc = types.SimpleNamespace(StepperStop=lambda *a: 0)
+    interface._refuse_backend_without_stop(0x217)  # SocketCAN: no raise

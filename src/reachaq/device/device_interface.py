@@ -165,6 +165,101 @@ class BoardCapabilities(Source):
     boot_id: int = 0
 
 
+#: Capability bit 9 (pellet 2.4.0): STEPPER_STOP, STEPPER_FAULT, the per-move watchdog, the
+#: limit-fault rules and STEPPER_STATUS bits NEEDS_HOME / HOMED_SINCE_BOOT. The same bit is
+#: "stepper_motion_safety" in firmware_compatibility.CAPABILITY_BITS.
+CAPABILITY_STEPPER_MOTION_SAFETY = 1 << 9
+
+#: STEPPER_FAULT reasons (pellet 2.4.0, jerrycan_cmd_stepper_fault_t.reason).
+STEPPER_FAULT_REASONS = {
+    1: "WATCHDOG",
+    2: "LIMIT",
+    3: "SWITCH_AT_START",
+    4: "DMA",
+    5: "DRIVER_NOT_IDLE",
+    6: "NEEDS_HOME",
+}
+STEPPER_FAULT_NEEDS_HOME = 6
+_STEPPER_FAULT_TEXT = {
+    1: "the move outran its deadline (watchdog)",
+    2: "the limit switch tripped before the end of the move (position fault)",
+    3: "the move started toward a limit switch that was already pressed",
+    4: "the step DMA failed",
+    5: "the step DMA or timer was still running at the start of a move",
+    6: "a FIXED_XYZ was refused whole because this axis needs a home; nothing moved",
+}
+
+
+@dataclass
+class StepperFault(Source):
+    """A pellet 2.4.0 STEPPER_FAULT: why the board stopped (or refused) a stepper command.
+
+    Sent unacknowledged with the faulted command's uuid, before that command's error
+    ACK (the host accepts either order). The pulse counts are raw counts from the DMA:
+    "one transfer is one pulse" is not yet checked on a board (design I8, bench step
+    1b), so they are never shown as lost steps.
+    """
+    motor: Motor = Motor.NONE
+    reason: int = 0
+    flags: int = 0
+    pulses_issued: int = 0
+    pulses_planned: int = 0  # 0 for a home
+    believed_position_turns: float = 0.0  # where the board believed the axis was, before any re-zero
+    believed_position_mm: float = 0.0
+    pulses_per_turn: float = 0.0
+    uuid: int = 0
+
+    @property
+    def reason_name(self) -> str:
+        return STEPPER_FAULT_REASONS.get(int(self.reason), f"reason {int(self.reason)}")
+
+    @property
+    def is_homing(self) -> bool:
+        return bool(self.flags & 0x01)
+
+    @property
+    def toward_switch(self) -> bool:
+        return bool(self.flags & 0x02)
+
+    @property
+    def needs_home_only(self) -> bool:
+        """Reason 6: a FIXED_XYZ refused whole; nothing moved, the axis needs a home."""
+        return int(self.reason) == STEPPER_FAULT_NEEDS_HOME
+
+    @property
+    def axis(self) -> str:
+        return {Motor.PELLET_X_MOTOR: "X", Motor.PELLET_Y_MOTOR: "Y", Motor.PELLET_Z_MOTOR: "Z"}.get(
+            self.motor, str(self.motor))
+
+    def describe(self) -> str:
+        """One line for the operator and the log: axis, reason and the raw counts."""
+        text = _STEPPER_FAULT_TEXT.get(int(self.reason), "an unknown fault")
+        if self.needs_home_only:
+            return f"axis {self.axis} {self.reason_name}: {text}"
+        what = "home" if self.is_homing else "move"
+        planned = "" if self.is_homing else f" of {int(self.pulses_planned)} planned"
+        return (f"axis {self.axis} {self.reason_name} during a {what}: {text} "
+                f"({int(self.pulses_issued)} pulses issued{planned}; the board believed it was at "
+                f"{self.believed_position_mm:.2f} mm)")
+
+    def to_record(self) -> Dict[str, Any]:
+        """The fault as session metadata records it (recording.stepperFaults)."""
+        return {
+            "axis": self.axis,
+            "reason": int(self.reason),
+            "reasonName": self.reason_name,
+            "homing": self.is_homing,
+            "towardSwitch": self.toward_switch,
+            "pulsesIssued": int(self.pulses_issued),
+            "pulsesPlanned": int(self.pulses_planned),
+            "believedPositionTurns": float(self.believed_position_turns),
+            "believedPositionMm": float(self.believed_position_mm),
+            "pulsesPerTurn": float(self.pulses_per_turn),
+            "canUuid": int(self.uuid),
+            "description": self.describe(),
+        }
+
+
 @dataclass
 class SyncClapObservation(Source):
     """A board heard the timekeeper's CAN clap; its board timing (OBSERVED) says when."""
@@ -448,6 +543,9 @@ def stepper_travel_refusal(axis: str, target: float, config) -> Optional[str]:
 #: STEPPER_STATUS.status bits (pellet firmware 2.3.1). A v1.2 board always sends 0.
 STEPPER_STATUS_DRIVER_FAULT = 0x01  # this motor's driver raised DIAG; latched until a re-home
 STEPPER_STATUS_ENABLE_OFF = 0x02  # the shared enable is off, for any reason
+#: Pellet 2.4.0, only with CAPABILITY_STEPPER_MOTION_SAFETY; 0 on older firmware.
+STEPPER_STATUS_NEEDS_HOME = 0x04  # the board refuses motion on this axis until it is homed
+STEPPER_STATUS_HOMED_SINCE_BOOT = 0x08  # a home has reached this axis's switch since boot
 
 
 @dataclass
@@ -506,6 +604,16 @@ class StepperStatus(Source, StepperStatusMessage):
     def enable_off(self) -> bool:
         """True if the shared enable is off, for any reason."""
         return bool(self.status & STEPPER_STATUS_ENABLE_OFF)
+
+    @property
+    def needs_home(self) -> bool:
+        """Pellet 2.4.0 (bit 9 boards only): the board refuses motion until this axis is homed."""
+        return bool(self.status & STEPPER_STATUS_NEEDS_HOME)
+
+    @property
+    def homed_since_boot(self) -> bool:
+        """Pellet 2.4.0 (bit 9 boards only): a home has reached the switch since the board booted."""
+        return bool(self.status & STEPPER_STATUS_HOMED_SINCE_BOOT)
 
 
 @dataclass

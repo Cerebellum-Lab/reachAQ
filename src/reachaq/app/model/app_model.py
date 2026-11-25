@@ -4140,7 +4140,8 @@ class AppModel(ObservableObject):
         axes = self._pellet_axes_needing_home()
         if pellet_source_required and axes:
             blockers.append(
-                f"Pellet axis {', '.join(axes)} needs homing after a refused command: "
+                f"Pellet axis {', '.join(axes)} needs homing (after a refusal, a stop or a board fault, "
+                "or not homed since the board booted): "
                 "home the pellet axes"
             )
         faults = self._pellet_axes_with_driver_fault()
@@ -12250,6 +12251,10 @@ class AppModel(ObservableObject):
             if value is not None:
                 # Kept with the session the stop happened in; Record resets them.
                 self._recording_session.add_estop(value.get("event", value))
+        elif name == getattr(hard, "PELLET_STEPPER_FAULT_PROPERTY", None):
+            if value is not None:
+                # Pellet 2.4.0 STEPPER_FAULTs, with the session they happened in.
+                self._recording_session.add_stepper_fault(value)
         elif name in {
             hard.FIRMWARE_COMPATIBILITY_PROPERTY,
             hard.PELLET_NEEDS_HOME_PROPERTY,
@@ -13104,6 +13109,10 @@ class AppModel(ObservableObject):
                     "estops": [
                         dict(estop)
                         for estop in self._recording_session.estops
+                    ],
+                    "stepperFaults": [
+                        dict(fault)
+                        for fault in self._recording_session.stepper_faults
                     ],
                     "storage": dict(
                         self._recording_session.storage_telemetry

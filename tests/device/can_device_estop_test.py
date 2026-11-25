@@ -684,3 +684,380 @@ def test_a_failed_estop_write_is_tried_once_more(board):
     assert board.device.estop("test stop") is True
     assert calls == [True, True]
     assert board.reported == [("test stop", _XYZ, True)]
+
+
+# -- pellet 2.4.0 (capability bit 9): STEPPER_STOP instead of ESTOP ------------------
+# The same entry point (CanDevice.estop / _estop_in_loop) sends an all-axes STEPPER_STOP
+# when the board advertises bit 9, and ESTOP on a 2.3.1 board, which the tests above use.
+
+from reachaq.device import StepperFault  # noqa: E402
+
+_BIT_9 = 1 << 9
+
+
+class _SafetyBoard(_EstopBoard):
+    """_EstopBoard with capability bit 9 whose reader also hands on STEPPER_FAULT frames,
+    in the order the board sent them, before the acks that follow."""
+
+    def __init__(self, capabilities=0x217):
+        super().__init__()
+        self.interface.board_capabilities = capabilities
+        real_stop = self.interface.stepper_stop
+
+        def stepper_stop(motor_mask=0):
+            self.frames.append(("stop", int(motor_mask)))
+            return real_stop(motor_mask)
+
+        self.interface.stepper_stop = stepper_stop
+
+    def _deliver(self):
+        while not self._stop.is_set():
+            for message in self.interface.read(64):
+                if isinstance(message, Acknowledge):
+                    self.device._handle_ack(message)
+                elif isinstance(message, StepperFault):
+                    self.device.notify_data([message])
+            time.sleep(0.001)
+
+    def answer_with_faults(self, name, error, *faults):
+        """interface.<name> answers once: these STEPPER_FAULT frames (reason, motor), with
+        its uuid, then its ack with `error`, in that order as the board sends them."""
+        calls = []
+
+        def call(*args, **kwargs):
+            calls.append(args)
+            uuid = self.interface.next_uuid()
+            for reason, motor in faults:
+                self.interface._messages.append(_fault(reason, motor, uuid))
+            if error is not None:
+                self.interface._messages.append(Acknowledge(uuid=uuid, error=error))
+            return True
+
+        self._replace(name, call)
+        return calls
+
+
+def _fault(reason, motor, uuid, *, flags=0x02, issued=571, planned=1142):
+    return StepperFault(target=Target.PELLET_DEVICE, motor=motor, reason=reason, flags=flags,
+                        pulses_issued=issued, pulses_planned=planned, believed_position_turns=2.5,
+                        believed_position_mm=6.09, pulses_per_turn=192.0, uuid=uuid)
+
+
+@pytest.fixture
+def safety_board():
+    b = _SafetyBoard()
+    b.start()
+    from reachaq.core import Offset3DTuple
+    from reachaq.device import StepperConfig
+
+    for motor in _XYZ:
+        config = StepperConfig()
+        config.maximum_velocity, config.maximum_acceleration, config.homing_velocity = 120.0, 600.0, 30.0
+        b.device._motor_configs[motor] = config
+        b.device._commanded_pos[motor] = 0.0
+    b.device._last_send_pos = Offset3DTuple(1.0, 1.0, 1.0)
+    try:
+        yield b
+    finally:
+        b.close()
+
+
+def _stops(board):
+    return [frame for frame in board.frames if frame[0] in ("stop", "estop")]
+
+
+@pytest.mark.parametrize("trigger", [
+    _lost_move, _lost_fixed_xyz, _lost_sequence_frame, _ebusy, _ebusy_home, _public,
+], ids=["move-ack-timeout", "fixed-xyz-ack-timeout", "sequence-ack-timeout", "ebusy",
+        "ebusy-home", "estop-call"])
+def test_on_a_2_4_0_board_every_trigger_sends_one_all_axes_stop_and_no_estop(safety_board, trigger):
+    board = safety_board
+    token = trigger(board)
+    if token is not None:
+        refusal = board.refusal_of(token)
+        assert refusal.motion_safety
+    assert _wait(lambda: board.interface.stop_frames)
+    time.sleep(0.3)  # no second stop, no re-send
+
+    assert board.interface.stop_frames == [0], "one STOP, motor_mask 0: every stepper"
+    assert board.interface.estop_frames == []
+    assert board.device.last_stop_frame == "STOP"
+    assert [axes for _reason, axes, _sent in board.reported] == [_XYZ]
+    # The STOP's own ACK (uuid 0) was taken as such, not left for a command.
+    assert _wait(lambda: board.device._stop_acks_outstanding == 0)
+
+
+def test_a_2_3_1_board_still_gets_estop_and_never_stop(board):
+    _lost_move(board)
+    assert _wait(lambda: board.interface.estop_frames)
+
+    assert board.interface.estop_frames == [True]
+    assert board.interface.stop_frames == []
+    assert board.device.last_stop_frame == "ESTOP"
+    assert not board.device.stepper_motion_safety
+
+
+def test_a_stop_that_cannot_be_written_falls_back_to_estop(safety_board):
+    def dead(motor_mask=0):
+        raise OSError(100, "Network is down")
+
+    safety_board.interface.stepper_stop = dead
+
+    assert safety_board.device.estop("test stop") is True
+
+    assert safety_board.interface.estop_frames == [True]
+    assert safety_board.device.last_stop_frame == "ESTOP"
+
+
+def test_the_release_before_a_home_is_still_estop_release_on_2_4_0(safety_board):
+    # Harmless on a board that is not latched, needed on one a fallback ESTOP latched.
+    safety_board.device.estop("test stop")
+    safety_board.device.release_estop()
+
+    assert _wait(lambda: safety_board.interface.estop_frames == [False])
+    assert safety_board.interface.stop_frames == [0]
+
+
+def test_the_late_ecanceled_of_the_stopped_move_is_recognised(safety_board, caplog):
+    board = safety_board
+    board.device.default_command_ack_timeout_duration = 30.0
+    board.device._motor_configs[Motor.PELLET_Z_MOTOR].uuid_ack_timeout = 30.0
+    moves = board.answer("move_motor_z", _LOST)
+    token = board.send(SystemCommandKind.MOVE_Z, 15.5, token="moving")
+    assert _wait(lambda: moves)
+    uuid = board.interface.uuid()
+
+    with caplog.at_level(logging.INFO, logger="reachaq.device.can_device"):
+        board.device.estop("operator STOP")
+        refusal = board.refusal_of(token)
+        board.interface._messages.append(Acknowledge(uuid=uuid, error=-140))
+        assert _wait(lambda: "ended a stopped command" in caplog.text)
+
+    assert refusal.stopped_by_estop
+    assert f"uuid={uuid}) with ECANCELED" in caplog.text
+
+
+# -- the board's own faults (STEPPER_FAULT and the new ACK codes) ----------------------
+
+@pytest.mark.parametrize("error, name", [(-62, "ETIME"), (-14, "EFAULT"), (-5, "EIO")])
+def test_on_2_4_0_a_board_fault_ack_stops_every_axis_and_is_blocking(safety_board, error, name):
+    board = safety_board
+    board.answer("move_motor_z", error)
+
+    refusal = board.refusal_of(board.send(SystemCommandKind.MOVE_Z, 15.5))
+    assert _wait(lambda: board.interface.stop_frames)
+
+    assert refusal.error == error and refusal.error_name == name
+    assert refusal.blocking_fault and not refusal.stopped_by_estop
+    assert board.interface.stop_frames == [0]
+    assert name in board.reported[0][0]
+    assert Motor.PELLET_Z_MOTOR in refusal.needs_home
+
+
+@pytest.mark.parametrize("error", [-62, -14, -5])
+def test_on_2_3_1_the_same_codes_stop_nothing(board, error):
+    board.answer("move_motor_z", error)
+
+    refusal = board.refusal_of(board.send(SystemCommandKind.MOVE_Z, 15.5))
+    time.sleep(0.2)
+
+    assert not refusal.blocking_fault
+    assert board.interface.estop_frames == []
+
+
+def test_erange_is_refused_without_a_stop_and_without_needs_home(safety_board):
+    board = safety_board
+    board.answer("move_motor_z", -34)
+
+    refusal = board.refusal_of(board.send(SystemCommandKind.MOVE_Z, 15.5))
+    time.sleep(0.2)
+
+    assert refusal.error_name == "ERANGE"
+    assert refusal.needs_home == ()
+    assert "past axis Z's travel" in refusal.message
+    assert board.interface.stop_frames == [] and board.interface.estop_frames == []
+
+
+@pytest.mark.parametrize("reason", [1, 2, 3, 4, 5])
+def test_a_fault_frame_before_its_ack_stops_the_stage_once(safety_board, reason):
+    board = safety_board
+    board.answer_with_faults("move_motor_z", -14, (reason, Motor.PELLET_Z_MOTOR))
+
+    token = board.send(SystemCommandKind.MOVE_Z, 15.5)
+    refusal = board.refusal_of(token)
+    time.sleep(0.3)
+
+    assert board.interface.stop_frames == [0], "the fault stops; its -EFAULT ack does not stop again"
+    assert refusal.stopped_by_estop, "the STOP the fault sent ended the move"
+    assert "the pellet board reported a fault: axis Z" in refusal.estop_reason
+    faults = [d for k, d in board.messages if k == SystemStatusMessageKind.PELLET_STEPPER_FAULT]
+    assert [f.reason for f in faults] == [reason]
+    assert len(board.reported) == 1
+
+
+def test_a_fault_frame_after_its_ack_does_not_stop_the_stage_again(safety_board):
+    # H6: either order. The -EFAULT ack stops; the late fault frame is only reported.
+    board = safety_board
+    calls = []
+
+    def call(*args, **kwargs):
+        calls.append(args)
+        uuid = board.interface.next_uuid()
+        board.interface._messages.append(Acknowledge(uuid=uuid, error=-14))
+
+        def late():
+            time.sleep(0.1)
+            board.interface._messages.append(_fault(2, Motor.PELLET_Z_MOTOR, uuid))
+
+        threading.Thread(target=late, daemon=True).start()
+        return True
+
+    board._replace("move_motor_z", call)
+    refusal = board.refusal_of(board.send(SystemCommandKind.MOVE_Z, 15.5))
+    assert _wait(lambda: any(k == SystemStatusMessageKind.PELLET_STEPPER_FAULT for k, _ in board.messages))
+    time.sleep(0.1)
+
+    assert refusal.error_name == "EFAULT"
+    assert board.interface.stop_frames == [0]
+    assert len(board.reported) == 1
+
+
+def test_a_fixed_xyz_refused_whole_for_needs_home_prompts_a_home_and_stops_nothing(safety_board):
+    board = safety_board
+    board.answer_with_faults("fixed_position", -16, (6, Motor.PELLET_X_MOTOR), (6, Motor.PELLET_Z_MOTOR))
+
+    refusal = board.refusal_of(board.send(SystemCommandKind.SEND_FIXED_XYZ))
+    time.sleep(0.3)
+
+    assert refusal.needs_home_axes == (Motor.PELLET_X_MOTOR, Motor.PELLET_Z_MOTOR)
+    assert refusal.needs_home == (Motor.PELLET_X_MOTOR, Motor.PELLET_Z_MOTOR)
+    assert not refusal.motion_may_continue
+    assert "Pellet axis X/Z needs a home" in refusal.message and "send it again" in refusal.message
+    assert board.interface.stop_frames == [] and board.interface.estop_frames == []
+    assert board.reported == []
+
+
+def test_a_bare_ebusy_on_fixed_xyz_without_a_needs_home_frame_still_stops(safety_board):
+    # The prompt is keyed on the NEEDS_HOME frame, not on -EBUSY: a bare one may be a move.
+    board = safety_board
+    board.answer("fixed_position", -16)
+
+    refusal = board.refusal_of(board.send(SystemCommandKind.SEND_FIXED_XYZ))
+    assert _wait(lambda: board.interface.stop_frames)
+
+    assert refusal.needs_home_axes == ()
+    assert refusal.motion_may_continue
+    assert refusal.needs_home == _XYZ
+
+
+def test_an_idle_2_4_0_teardown_sends_a_quiet_stop(safety_board):
+    token = safety_board.send(SystemCommandKind.MOVE_Y, 2.0)
+    assert safety_board.wait_for(SystemStatusMessageKind.ACKNOWLEDGE, token) is not None
+    assert _wait(lambda: not safety_board.device.motion_possibly_in_flight)
+
+    safety_board.device.disconnect()
+
+    assert safety_board.interface.stop_frames == [0], "H1: a STOP before CAN closes"
+    assert safety_board.interface.estop_frames == []
+    assert safety_board.reported == [], "nothing was moving: no stop is reported"
+
+
+def test_a_2_4_0_disconnect_during_a_move_sends_a_reported_stop(safety_board):
+    _pending_move(safety_board)
+
+    safety_board.device.disconnect()
+
+    assert safety_board.interface.stop_frames == [0]
+    assert "disconnected during a move" in safety_board.reported[0][0]
+
+
+# -- CommandRefusal: the 2.4.0 codes ----------------------------------------------------
+
+@pytest.mark.parametrize("error, name", [
+    (-140, "ECANCELED"), (-62, "ETIME"), (-14, "EFAULT"), (-34, "ERANGE"), (-5, "EIO"), (-16, "EBUSY"),
+])
+def test_the_2_4_0_ack_codes_have_their_names(error, name):
+    from reachaq.device import board_error_name
+
+    assert board_error_name(error) == name
+
+
+@pytest.mark.parametrize("error, motion_safety, expected", [
+    (-62, True, True), (-14, True, True), (-5, True, True),
+    (-62, False, False), (-14, False, False), (-5, False, False),
+    (-140, True, False), (-34, True, False), (-16, True, False), (-1, True, False),
+])
+def test_only_the_board_fault_codes_on_a_2_4_0_board_are_blocking(error, motion_safety, expected):
+    refusal = CommandRefusal(token="t", error=error, command=SystemCommandKind.MOVE_Z, step="MOVE_Z",
+                             command_class=RefusedCommandClass.STEPPER_MOVE, motors=(Motor.PELLET_Z_MOTOR,),
+                             motion_safety=motion_safety)
+
+    assert refusal.blocking_fault is expected
+
+
+def test_a_blocking_code_on_a_servo_or_a_set_is_not_a_board_stepper_fault():
+    servo = CommandRefusal(token="t", error=-5, command=None, step="s",
+                           command_class=RefusedCommandClass.SERVO_MOVE, motion_safety=True)
+    a_set = CommandRefusal(token="t", error=-62, command=SystemCommandKind.SET_X, step="SET_X",
+                           command_class=RefusedCommandClass.STEPPER_MOVE, motion_safety=True)
+
+    assert not servo.blocking_fault and not a_set.blocking_fault
+
+
+@pytest.mark.parametrize("error, command_class, expected", [
+    (-140, RefusedCommandClass.STEPPER_MOVE, (Motor.PELLET_Z_MOTOR,)),
+    (-62, RefusedCommandClass.STEPPER_MOVE, (Motor.PELLET_Z_MOTOR,)),
+    (-14, RefusedCommandClass.STEPPER_HOME, (Motor.PELLET_Z_MOTOR,)),
+    (-14, RefusedCommandClass.FIXED_XYZ, _XYZ),
+    (-34, RefusedCommandClass.STEPPER_MOVE, ()),
+])
+def test_what_the_2_4_0_codes_leave_needing_a_home(error, command_class, expected):
+    refusal = CommandRefusal(token="t", error=error, command=SystemCommandKind.MOVE_Z, step="s",
+                             command_class=command_class, motors=(Motor.PELLET_Z_MOTOR,), motion_safety=True)
+
+    assert refusal.needs_home == expected
+
+
+# -- review I1, m1, m4 -------------------------------------------------------------------
+
+def test_a_2_4_0_board_rebooted_into_2_3_1_is_stopped_with_estop(safety_board):
+    # The interface forgets bit 9 on the reboot (socketcan_backend_test); the next stop is
+    # ESTOP, both while the board has not answered and once it says 0x04.
+    board = safety_board
+    board.interface.board_capabilities = None  # the reboot was seen
+    board.device.estop("MOVE_Z was not acknowledged within 0.9 s")
+    board.interface.board_capabilities = 0x04  # it answered: 2.3.1
+    _lost_move(board)
+    assert _wait(lambda: len(board.interface.estop_frames) == 2)
+
+    assert board.interface.stop_frames == []
+    assert board.interface.estop_frames == [True, True]
+    assert board.device.last_stop_frame == "ESTOP"
+
+
+def test_a_failed_teardown_stop_says_no_estop_follows(safety_board, caplog):
+    safety_board.interface.stepper_stop = lambda motor_mask=0: False
+
+    with caplog.at_level(logging.WARNING, logger="reachaq.device.can_device"):
+        safety_board.device.disconnect()
+
+    assert safety_board.interface.estop_frames == []
+    assert "STOP NOT SENT" in caplog.text and "trying ESTOP" not in caplog.text
+
+
+def test_a_reissued_uuid_forgets_its_last_stop(safety_board):
+    # m4: the 8-bit uuid wraps; a new command on an old uuid is not "already stopped".
+    board = safety_board
+    calls = board.answer("move_motor_z", _LOST)
+    board.device.default_command_ack_timeout_duration = 30.0
+    board.device._motor_configs[Motor.PELLET_Z_MOTOR].uuid_ack_timeout = 30.0
+    uuid = board.interface.uuid() % 255 + 1  # the uuid the move will get
+    board.device._remember_stopped_uuid(uuid)
+    board.device._needs_home_faults[uuid] = (0.0, (Motor.PELLET_X_MOTOR,))
+
+    board.send(SystemCommandKind.MOVE_Z, 15.5, token="moving")
+    assert _wait(lambda: calls)
+    assert _wait(lambda: board.device._boards_pending_ctx[Target.PELLET_DEVICE].uuid == uuid)
+
+    assert not board.device._was_stopped(uuid)
+    assert uuid not in board.device._needs_home_faults

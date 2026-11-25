@@ -7,6 +7,7 @@ versions:
       - finite_stim3_pulse
       - timing_trailer
       - time_sync
+      - stepper_motion_safety
     optional_capabilities:
       - sync_listener
       - stepper_driver_fault
@@ -17,11 +18,20 @@ versions:
     limitations:
       - >-
         Rollout pending: not yet qualified on a rig. 2.4.0 is v2.3.1 plus the
-        board-time work (timing trailer, TIME_SYNC, clap listener, DWT clock)
-        and the v2.3.2 fixes. A pellet v1.2 board reports capabilities
-        0x00000017 and a v1.3 board 0x00000057. stepper_driver_fault is
+        board-time work (timing trailer, TIME_SYNC, clap listener, DWT clock),
+        the v2.3.2 fixes and motion safety (STEPPER_STOP, STEPPER_FAULT, a
+        per-move watchdog, limit-fault rules, needs-home status bits and
+        per-axis travel caps). A pellet v1.2 board reports capabilities
+        0x00000217 and a v1.3 board 0x00000257. stepper_driver_fault is
         optional for the same reason as on 2.3.1, and sync_listener because
         claps are consumed only by hosts with the board-clock fix.
+      - >-
+        Requires stepper_motion_safety (bit 9), so only a reachAQ that stops
+        with STEPPER_STOP and handles STEPPER_FAULT accepts it (release notes,
+        Motion safety, H7). After flashing, re-save every FIXED_XYZ position
+        inside its axis's travel (35 mm on x and y, 30 mm on z by default)
+        and home each axis: a saved position past the travel is refused with
+        -ERANGE.
       - >-
         Needs reachAQ v3.0.1 or later. The board advertises time_sync, so
         open() runs four back-to-back time syncs, and v3.0.0's board-clock

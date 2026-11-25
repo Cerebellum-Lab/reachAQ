@@ -8,7 +8,7 @@ import socket
 import struct
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 from .can_transport import CanTransportConfiguration, CanTransportKind
 
@@ -157,6 +157,9 @@ class JerryCANCmdType(enum.IntEnum):
     SYNC_BARCODE = 0x27
     ANALOG_BLOCK = 0x28
     PWM_SET = 0x29
+    # 0x2A and 0x2B are reserved for the stepper home report (pellet z-homing).
+    STEPPER_STOP = 0x2C  # pellet 2.4.0, capability bit 9
+    STEPPER_FAULT = 0x2D  # pellet 2.4.0, capability bit 9
     ACKNOWLEDGE = 0x30
 
 
@@ -174,6 +177,8 @@ class JerryCANBootloaderCmd:
         FINALIZE = 4
         ACK = 5
         NACK = 6
+        # Pellet 2.4.0's boot chain report; older firmware NACKs the request.
+        BOOT_CHAIN = 7
 
 
 @dataclasses.dataclass
@@ -347,11 +352,30 @@ class BootloaderStatus:
     bytes_written: int = 0
 
 
+#: jerrycan_cmd_bootloader_boot_chain_t.flags (reachAQ-hardware jerrycan_types.h)
+BOOT_CHAIN_STAGE0 = 1 << 0  # page 0 holds a reachAQ stage 0
+BOOT_CHAIN_MCUBOOT_VALID = 1 << 1  # the boot descriptor is valid for the MCUboot bytes
+BOOT_CHAIN_HEADER_OK = 1 << 2  # the running (slot 0) image header was read
+BOOT_CHAIN_READ_ERROR = 1 << 7  # a boot-region read failed: the other flags are incomplete
+
+
+@dataclasses.dataclass
+class BootloaderBootChain:
+    """BOOT_CHAIN's 10 bytes. desc_sequence and the prefix are 0 without MCUBOOT_VALID,
+    running_build_num is valid only with HEADER_OK."""
+    flags: int = 0
+    desc_sequence: int = 0
+    mcuboot_sha256_prefix: bytes = bytes(4)
+    running_build_num: int = 0
+
+
 @dataclasses.dataclass
 class BootloaderResponse:
-    type: JerryCANBootloaderCmd.SubCommand = JerryCANBootloaderCmd.SubCommand.VERSION
+    #: A SubCommand, or the bare number of a subcommand this host does not know.
+    type: Union[JerryCANBootloaderCmd.SubCommand, int] = JerryCANBootloaderCmd.SubCommand.VERSION
     version: BootloaderVersion = dataclasses.field(default_factory=BootloaderVersion)
     status: BootloaderStatus = dataclasses.field(default_factory=BootloaderStatus)
+    boot_chain: BootloaderBootChain = dataclasses.field(default_factory=BootloaderBootChain)
 
 
 @dataclasses.dataclass
@@ -367,6 +391,36 @@ class DelayCommand:
 @dataclasses.dataclass
 class FixedXyzCommand:
     rsvd: int = 0
+
+
+@dataclasses.dataclass
+class StepperStopCommand:
+    motor_mask: int = 0  # bit n is stepper n; 0 is every stepper
+
+
+#: jerrycan_cmd_stepper_fault_t.reason
+STEPPER_FAULT_WATCHDOG = 1
+STEPPER_FAULT_LIMIT = 2
+STEPPER_FAULT_SWITCH_AT_START = 3
+STEPPER_FAULT_DMA = 4
+STEPPER_FAULT_DRIVER_NOT_IDLE = 5
+STEPPER_FAULT_NEEDS_HOME = 6
+#: jerrycan_cmd_stepper_fault_t.flags
+STEPPER_FAULT_FLAG_HOMING = 1 << 0
+STEPPER_FAULT_FLAG_TOWARD_SWITCH = 1 << 1
+
+
+@dataclasses.dataclass
+class StepperFaultReport:
+    """STEPPER_FAULT's 20 bytes, sent by the board with the faulted command's uuid."""
+    motor_id: int = 0
+    reason: int = 0
+    flags: int = 0
+    rsvd: int = 0
+    pulses_issued: int = 0
+    pulses_planned: int = 0
+    believed_position: float = 0.0  # turns, before any re-zero
+    pulses_per_turn: float = 0.0
 
 
 @dataclasses.dataclass
@@ -503,6 +557,8 @@ class JerryCANMsg:
         self.bootloader_data = BootloaderData()
         self.delay = DelayCommand()
         self.fixed_xyz = FixedXyzCommand()
+        self.stepper_stop = StepperStopCommand()
+        self.stepper_fault = StepperFaultReport()
         self.ack = Acknowledge()
         self.time_sync_request = TimeSyncRequest()
         self.time_sync_response = TimeSyncResponse()
@@ -559,12 +615,27 @@ _PAYLOAD_SIZES = {
     JerryCANCmdType.SYNC_BARCODE: 4,
     JerryCANCmdType.ANALOG_BLOCK: 38,
     JerryCANCmdType.PWM_SET: 7,
+    JerryCANCmdType.STEPPER_STOP: 1,
+    JerryCANCmdType.STEPPER_FAULT: 20,
     JerryCANCmdType.ACKNOWLEDGE: 4,
 }
+
+#: BOOT_CHAIN's BOOTLOADER_RESPONSE fills the whole 11-byte struct, so its uuid sits at
+#: offset 11; every other subcommand keeps the legacy 7 bytes (jerrycan_types.h,
+#: jerrycan_bootloader_response_wire_size).
+_BOOTLOADER_RESPONSE_BOOT_CHAIN_SIZE = 11
 
 
 def _payload_size(message_type: JerryCANCmdType) -> int:
     return _PAYLOAD_SIZES.get(JerryCANCmdType(message_type), 0)
+
+
+def _frame_payload_size(message_type: JerryCANCmdType, data: bytes) -> int:
+    """The payload length of a received frame: per subcommand for BOOTLOADER_RESPONSE."""
+    if (JerryCANCmdType(message_type) == JerryCANCmdType.BOOTLOADER_RESPONSE and data
+            and data[0] == JerryCANBootloaderCmd.SubCommand.BOOT_CHAIN):
+        return _BOOTLOADER_RESPONSE_BOOT_CHAIN_SIZE
+    return _payload_size(message_type)
 
 
 def encode_can_id(message_type: JerryCANCmdType, dst_id: int) -> int:
@@ -686,6 +757,8 @@ def _pack_payload(message: JerryCANMsg) -> bytes:
         return struct.pack("<H", int(message.delay.delay))
     if message_type == JerryCANCmdType.FIXED_XYZ:
         return struct.pack("<B", int(message.fixed_xyz.rsvd))
+    if message_type == JerryCANCmdType.STEPPER_STOP:
+        return struct.pack("<B", int(message.stepper_stop.motor_mask) & 0xFF)
     if message_type == JerryCANCmdType.TIME_SYNC_REQUEST:
         return struct.pack(
             "<IQ", message.time_sync_request.request_id,
@@ -750,7 +823,7 @@ def decode_frame(arbitration_id: int, data: bytes, *, timestamp_ns: Optional[int
     message.timestamp_ns = time.time_ns() if timestamp_ns is None else timestamp_ns
     message.index = time.perf_counter_ns() if index is None else index
     message.wire_length = len(data)
-    payload_size = _payload_size(message.type)
+    payload_size = _frame_payload_size(message.type, data)
     payload = bytes(data[:payload_size])
     if payload_size < JERRYCAN_ACTUAL_PAYLOAD_SIZE and len(data) > payload_size:
         message.uuid = data[payload_size]
@@ -776,12 +849,22 @@ def decode_frame(arbitration_id: int, data: bytes, *, timestamp_ns: Optional[int
 def _unpack_payload(message: JerryCANMsg, payload: bytes) -> None:
     message_type = JerryCANCmdType(message.type)
     if message_type == JerryCANCmdType.BOOTLOADER_RESPONSE:
-        response_type = JerryCANBootloaderCmd.SubCommand(payload[0])
+        try:
+            response_type = JerryCANBootloaderCmd.SubCommand(payload[0])
+        except ValueError:
+            # A subcommand newer than this host: kept as its number and not parsed.
+            # Raising here ended the reader, and with it the pellet connection.
+            message.bootloader_response.type = int(payload[0])
+            return
         message.bootloader_response.type = response_type
         if response_type == JerryCANBootloaderCmd.SubCommand.VERSION:
             fields = payload[1:7].ljust(6, b"\0")
             version = BootloaderVersion(*struct.unpack("<BBBBBB", fields))
             message.bootloader_response.version = version
+        elif response_type == JerryCANBootloaderCmd.SubCommand.BOOT_CHAIN:
+            fields = payload[1:_BOOTLOADER_RESPONSE_BOOT_CHAIN_SIZE].ljust(10, b"\0")
+            flags, sequence, prefix, build = struct.unpack("<BI4sB", fields)
+            message.bootloader_response.boot_chain = BootloaderBootChain(flags, sequence, prefix, build)
         else:
             fields = payload[1:6].ljust(5, b"\0")
             active, bytes_written = struct.unpack("<BI", fields)
@@ -821,6 +904,10 @@ def _unpack_payload(message: JerryCANMsg, payload: bytes) -> None:
         message.temp_hum_read = TempHumRead(*fields)
     elif message_type == JerryCANCmdType.ACKNOWLEDGE:
         message.ack.error = struct.unpack("<i", payload)[0]
+    elif message_type == JerryCANCmdType.STEPPER_FAULT:
+        message.stepper_fault = StepperFaultReport(*struct.unpack("<BBBBiiff", payload))
+    elif message_type == JerryCANCmdType.STEPPER_STOP:
+        message.stepper_stop = StepperStopCommand(payload[0])
     elif message_type == JerryCANCmdType.TIME_SYNC_RESPONSE:
         message.time_sync_response = TimeSyncResponse(*struct.unpack("<IQQ", payload))
     elif message_type == JerryCANCmdType.CAPABILITIES_RESPONSE:
@@ -1255,6 +1342,13 @@ class SocketCanJerryCAN:
         msg.type = JerryCANCmdType.DELAY
         msg.uuid = uuid
         msg.delay.delay = delay
+        return self.SendMessage(msg, dst_id)
+
+    def StepperStop(self, dst_id: int, motor_mask: int, uuid: int) -> int:
+        msg = JerryCANMsg()
+        msg.type = JerryCANCmdType.STEPPER_STOP
+        msg.uuid = uuid
+        msg.stepper_stop = StepperStopCommand(motor_mask)
         return self.SendMessage(msg, dst_id)
 
     def SendToFixedXYZ(self, dst_id: int, uuid: int) -> int:

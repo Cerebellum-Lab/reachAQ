@@ -27,10 +27,10 @@ from .motor_steps import MotorSteps
 from .device import Device
 from .emulation_interface import EmulationInterface
 from .device_api import DeviceApi
-from .can_interface import CanInterface, Target, target_of_motor, _STEPPER_MAX_POS
+from .can_interface import CanInterface, Target, target_of_motor, _STEPPER_MAX_POS, STEPPER_STOP_UUID
 from .can_transport import CanTransportConfiguration, CanTransportKind
 from .can_failure import CanFailure, CanFailureKind
-from .board_refusal import EBUSY, EPERM, CommandRefusal, RefusedCommandClass, is_refusal
+from .board_refusal import EBUSY, EPERM, CommandRefusal, RefusedCommandClass, board_error_name, is_refusal
 from .motion_deadline import (READER_SILENT_BACKSTOP_S, ack_deadline, fixed_xyz_deadline, home_deadline,
                               home_time, profile_time)
 from .device_interface import (
@@ -48,6 +48,7 @@ from .device_interface import (
     StepperConfig,
     ServoStatus,
     StepperStatus,
+    StepperFault,
     Version,
     BoardTimeSync,
     BoardCapabilities,
@@ -103,6 +104,13 @@ _shutdown_requested = _Sentinel(role="shutdown_requested")
 # put the release on the bus in order, before the home queued after it.
 _estop_abort = _Sentinel(role="estop_abort")
 _estop_release = _Sentinel(role="estop_release")
+
+# STEPPER_STOP's motor_mask for every stepper (pellet 2.4.0).
+_STOP_ALL_AXES = 0
+# How long a stopped command's uuid, or a NEEDS_HOME fault's, is remembered: the board's
+# late ACK or fault for it is then recognised. uuids are 8 bits and wrap after 255
+# commands, so this stays well below the time that takes.
+_UUID_MEMORY_S = 5.0
 
 # A stimulus pulse is never re-sent after a lost ack (the board has most likely
 # pulsed: a second GPIO_PULSE is a second STIM edge), so there is no reason to
@@ -362,6 +370,19 @@ class CanDevice(Device):
         # Set by a written ESTOP, cleared by the next motion command or stepper frame:
         # nothing is in flight that the stop did not already stop.
         self._stopped_since_motion = False
+        # The frame the last stop used: "STOP" (pellet 2.4.0, bit 9) or "ESTOP"; None before any.
+        self.last_stop_frame: Optional[str] = None
+        # STEPPER_STOPs written whose ACK (uuid STEPPER_STOP_UUID) has not arrived.
+        self._stop_acks_outstanding = 0
+        # uuid -> perf of the commands a stop or a board fault ended: their late ACK, or a
+        # fault frame after the ACK, is recognised (fault and ACK may come in either order).
+        self._stopped_uuids: Dict[int, float] = {}
+        # uuid -> (perf, motors) of STEPPER_FAULT NEEDS_HOME frames, read when that uuid's
+        # -EBUSY arrives: the board refused a FIXED_XYZ whole, and these axes need a home.
+        self._needs_home_faults: Dict[int, Tuple[float, Tuple[Motor, ...]]] = {}
+        # The reader (a fault) and the command loop (an error ACK) both check-and-remember a
+        # uuid before stopping: one stop per event.
+        self._stopped_uuids_lock = threading.Lock()
 
         self._init_default_move_configs()
         self._compound_movement: Optional[List[Dict[str, Any]]] = None
@@ -733,6 +754,8 @@ class CanDevice(Device):
                 SystemStatusMessageKind.SYNC_BARCODE_REPORT, message,
             ),
 
+            StepperFault: self._handle_stepper_fault,
+
             Acknowledge: self._handle_ack,
         }
 
@@ -772,15 +795,25 @@ class CanDevice(Device):
         self._motion_tokens.discard(refusal.token)
         super()._refuse_command(refusal)
 
-    def estop(self, reason: str) -> bool:
-        """Stop every pellet stepper now: one ESTOP frame, written from the calling thread.
+    @property
+    def stepper_motion_safety(self) -> bool:
+        """The board advertises capability bit 9 (pellet 2.4.0) and the interface can send
+        STEPPER_STOP: every stop is then an all-axes STOP, not an ESTOP."""
+        return getattr(self._interface, "has_stepper_motion_safety", False) is True
 
-        Fire and forget: the frame has no uuid, is never acknowledged and is
-        never re-sent, and it does not wait behind the command awaiting its ack
-        (it is not queued at all). A dead bus is logged and swallowed. Then the
-        command loop ends what was stopped: the command in flight and every
-        queued motion command are refused with the ESTOP's reason, so their
-        waiters and tokens end. Returns whether the frame reached the bus.
+    def estop(self, reason: str) -> bool:
+        """Stop every pellet stepper now: one stop frame, written from the calling thread.
+
+        The frame is an all-axes STEPPER_STOP on a board with capability bit 9 (pellet
+        2.4.0), and ESTOP otherwise (_write_estop picks it). STOP needs no release and is
+        ACKed (uuid STEPPER_STOP_UUID); ESTOP latches until release_estop.
+
+        Fire and forget: nothing waits for an ack (ESTOP has none; STOP's is only
+        logged), it is never re-sent, and it does not wait behind the command
+        awaiting its ack (it is not queued at all). A dead bus is logged and
+        swallowed. Then the command loop ends what was stopped: the command in
+        flight and every queued motion command are refused with the stop's
+        reason, so their waiters and tokens end. Returns whether the frame reached the bus.
         """
         sent = self._write_estop(True, reason)
         try:
@@ -923,7 +956,37 @@ class CanDevice(Device):
             number(board_ctx.ack_timeout_used), number(p_now - board_ctx.sent_perf),
         )
 
+    def _write_stepper_stop(self, reason: str, *, quiet: bool = False) -> bool:
+        """An all-axes STEPPER_STOP; one immediate retry of a failed write, as for ESTOP.
+        quiet: a routine stop (teardown with nothing moving), logged below ERROR."""
+        sent = False
+        for attempt in (1, 2):
+            try:
+                sent = bool(self._interface.stepper_stop(_STOP_ALL_AXES))
+            except Exception as err:
+                logger.error("Could not write the pellet STOP frame (attempt %s/2): %s", attempt, err)
+            if sent:
+                break
+        if sent:
+            self._stop_acks_outstanding += 1
+            self.last_stop_frame = "STOP"
+            self._stopped_since_motion = True
+            self._forget_commanded_positions()  # where a stop left the axes is not known
+            (logger.info if quiet else logger.error)("Pellet STOP (all axes) sent: %s", reason)
+        elif quiet:
+            # The teardown stop: nothing was moving, and an ESTOP would latch, so none follows.
+            logger.warning("Pellet STOP NOT SENT (bus write failed): %s", reason)
+        else:
+            logger.error("Pellet STOP NOT SENT (bus write failed), trying ESTOP: %s", reason)
+        return sent
+
     def _write_estop(self, asserted: bool, reason: str) -> bool:
+        """Write a stop (asserted) or the ESTOP release. The one place that picks the frame:
+        an all-axes STEPPER_STOP when the board has bit 9 (falling back to ESTOP if it cannot
+        be written), ESTOP otherwise. The release is always ESTOP(0): harmless on a board
+        that is not latched, and needed by one that is."""
+        if asserted and self.stepper_motion_safety and self._write_stepper_stop(reason):
+            return True
         estop = getattr(self._interface, "estop", None)
         sent = False
         # One immediate retry of a failed write: the frame latches and is idempotent.
@@ -939,6 +1002,7 @@ class CanDevice(Device):
             if sent or estop is None:
                 break
         if asserted and sent:
+            self.last_stop_frame = "ESTOP"
             self._stopped_since_motion = True
             self._forget_commanded_positions()  # where a stop left the axes is not known
         if asserted:
@@ -979,6 +1043,8 @@ class CanDevice(Device):
         (SETs, tones, LEDs) stay queued.
         """
         board = self._boards_pending_ctx[Target.PELLET_DEVICE]
+        if board.uuid is not None:
+            self._remember_stopped_uuid(board.uuid)  # the board's late ACK for it is expected
         held_set = board.busy_set_entry  # a SET moves nothing: it stays queued
         token = None if held_set is not None else board.ctx
         board.busy_set_entry = None
@@ -1006,7 +1072,7 @@ class CanDevice(Device):
             self._refuse_command(CommandRefusal(
                 token=token, error=EPERM, command=kind, step=step,
                 command_class=command_class, motors=motors, perf_c=get_perf_now(),
-                estop_reason=str(reason),
+                estop_reason=str(reason), motion_safety=self.stepper_motion_safety,
             ))
         kept = []
         for entry in cur_commands:
@@ -1021,7 +1087,7 @@ class CanDevice(Device):
                 self._refuse_command(CommandRefusal(
                     token=ctx, error=EPERM, command=inner, step=getattr(inner, "name", str(inner)),
                     command_class=RefusedCommandClass.OTHER, perf_c=get_perf_now(),
-                    estop_reason=str(reason),
+                    estop_reason=str(reason), motion_safety=self.stepper_motion_safety,
                 ))
         if held_set is not None:
             kept.insert(0, held_set)
@@ -1205,12 +1271,27 @@ class CanDevice(Device):
                                 )
                         break
                 if found_board_with_uuid_ack is None:
-                    logger.debug("skipping unknown CAN uuid: %s", data)
+                    if self._was_stopped(msg_uuid):
+                        logger.info("The board ended a stopped command (uuid=%s) with %s",
+                                    msg_uuid, board_error_name(msg_error) if msg_error else "0")
+                    else:
+                        logger.debug("skipping unknown CAN uuid: %s", data)
                     continue
                 if refusal is not None:
                     if self._hold_busy_set(found_board_with_uuid_ack, refusal, refused_entry):
                         continue
-                    if refusal.motion_may_continue:
+                    if refusal.blocking_fault and not self._claim_stop(msg_uuid):
+                        # Its fault frame already stopped the stage.
+                        self._stop_refused_command(found_board_with_uuid_ack, refusal)
+                    elif refusal.blocking_fault:
+                        # Pellet 2.4.0 stopped the move itself; stop every axis (H1, H4).
+                        self._estop_in_loop(
+                            f"the board stopped {refusal.step} with {refusal.error_name}",
+                            cur_commands,
+                            before_clean_up=partial(
+                                self._stop_refused_command, found_board_with_uuid_ack, refusal),
+                        )
+                    elif refusal.motion_may_continue:
                         self._estop_in_loop(
                             f"the board answered {refusal.error_name} to {refusal.step}"
                             " (an axis may still be moving)",
@@ -1511,6 +1592,9 @@ class CanDevice(Device):
                     prev_command[2] = ctx  # ensure it keeps the context/token as well
                     prev_command[3] = perf_c  # and the perf_c as well.
                 target_board.uuid = after_uuid
+                with self._stopped_uuids_lock:  # the 8-bit uuid was reissued: forget its last use
+                    self._stopped_uuids.pop(after_uuid, None)
+                self._needs_home_faults.pop(after_uuid, None)
                 command_timeout_delay = self._prev_command_timeout or self.default_command_ack_timeout_duration
                 target_board.ack_perf_timeout = t_perf_last_command_with_uuid + command_timeout_delay
                 target_board.ack_timeout_used = command_timeout_delay
@@ -1608,7 +1692,85 @@ class CanDevice(Device):
             motors=motors,
             resent=board_ctx.repeated_command_count > 0,
             perf_c=perf_c,
+            motion_safety=self.stepper_motion_safety,
+            needs_home_axes=self._take_needs_home_faults(board_ctx.uuid),
         )
+
+    # -- pellet 2.4.0 STOP acks and STEPPER_FAULT (capability bit 9) -------------------
+
+    def _remember_stopped_uuid(self, uuid) -> None:
+        with self._stopped_uuids_lock:
+            now = get_perf_now()
+            self._stopped_uuids = {
+                u: t for u, t in self._stopped_uuids.items() if now - t < _UUID_MEMORY_S
+            }
+            self._stopped_uuids[int(uuid)] = now
+
+    def _claim_stop(self, uuid) -> bool:
+        """True, and the uuid remembered, unless a stop for it was already made."""
+        with self._stopped_uuids_lock:
+            if self._was_stopped(uuid):
+                return False
+            now = get_perf_now()
+            self._stopped_uuids = {
+                u: t for u, t in self._stopped_uuids.items() if now - t < _UUID_MEMORY_S
+            }
+            self._stopped_uuids[int(uuid)] = now
+            return True
+
+    def _was_stopped(self, uuid) -> bool:
+        stamp = self._stopped_uuids.get(int(uuid))
+        return stamp is not None and get_perf_now() - stamp < _UUID_MEMORY_S
+
+    def _take_needs_home_faults(self, uuid) -> Tuple[Motor, ...]:
+        """The axes NEEDS_HOME fault frames named for `uuid`, forgotten once read."""
+        if uuid is None:
+            return ()
+        entry = self._needs_home_faults.pop(int(uuid), None)
+        if entry is None or get_perf_now() - entry[0] >= _UUID_MEMORY_S:
+            return ()
+        return entry[1]
+
+    def _handle_stepper_fault(self, fault: StepperFault) -> None:
+        """A STEPPER_FAULT, on the reader thread, before the ACK it precedes is queued.
+
+        NEEDS_HOME (reason 6) moved nothing: it is kept for the -EBUSY ACK of the same
+        uuid, whose refusal then names the axes to home before resending. Every other
+        reason is the board stopping a move or home it found wrong: the host stops every
+        axis at once (H1: a FIXED_XYZ finishes its other axes otherwise) and the stop's
+        listener raises the blocking alert (H4). Not twice for one command: a fault that
+        follows its own error ACK (either order, H6), which already stopped the stage,
+        is only reported. Every fault goes on to the api, for the session data and
+        metadata.
+        """
+        description = fault.describe()
+        uuid = int(fault.uuid)
+        if fault.needs_home_only:
+            logger.warning("Pellet board: %s (uuid=%s)", description, uuid)
+            now = get_perf_now()
+            previous = self._needs_home_faults.get(uuid)
+            motors = () if previous is None or now - previous[0] >= _UUID_MEMORY_S else previous[1]
+            self._needs_home_faults[uuid] = (now, tuple(dict.fromkeys((*motors, fault.motor))))
+        else:
+            logger.error("Pellet board fault: %s (uuid=%s)", description, uuid)
+            if not self._claim_stop(uuid):
+                logger.info("Stage already stopped for uuid=%s; not stopping it again", uuid)
+            else:
+                try:
+                    self.estop(f"the pellet board reported a fault: {description}")
+                except Exception:
+                    logger.exception("Pellet STOP after a board fault failed")
+        api = self._api
+        if api is not None:
+            api.send_message(SystemStatusMessageKind.PELLET_STEPPER_FAULT, fault)
+
+    def _on_stop_ack(self, error: int) -> None:
+        self._stop_acks_outstanding = max(0, self._stop_acks_outstanding - 1)
+        if error == 0:
+            logger.info("Pellet STOP acknowledged by the board")
+        else:
+            # The board never refuses STOP (pellet 2.4.0): an error here is unexpected.
+            logger.error("Pellet STOP answered %s (%s)", board_error_name(error), error)
 
     def _hold_busy_set(self, board_ctx: _BoardPendingContext, refusal: CommandRefusal, sent) -> bool:
         """Hold a SET_X/Y/Z the board answered -EBUSY to, and send it again once its wait is over.
@@ -1664,8 +1826,13 @@ class CanDevice(Device):
             kernel_wall=(kernel_ns / 1e9
                          if isinstance(kernel_ns, int) and kernel_ns > 0 else None),
         )
+        error = int(getattr(msg, "error", 0))
+        if int(msg.uuid) == STEPPER_STOP_UUID and self._stop_acks_outstanding > 0:
+            # A STOP's own ACK (pellet 2.4.0): no command waits on uuid 0.
+            self._on_stop_ack(error)
+            return
         # The board's error goes with the uuid: a refusal must not look like a success.
-        self._put_to_cmd_queue((_uuid_ack, (msg.uuid, perf_c, int(getattr(msg, "error", 0))), None))
+        self._put_to_cmd_queue((_uuid_ack, (msg.uuid, perf_c, error), None))
 
     @property
     def api(self):
@@ -1760,10 +1927,17 @@ class CanDevice(Device):
         # finally (a reader crash) and connect() all pass here. Stop a stage that may be
         # moving before what is pending is dropped and the loop is told to exit.
         try:
-            if self.motion_possibly_in_flight and getattr(self._interface, "is_open", False):
-                self.estop("the CAN device disconnected during a move")
+            if getattr(self._interface, "is_open", False):
+                if self.motion_possibly_in_flight:
+                    self.estop("the CAN device disconnected during a move")
+                elif self.stepper_motion_safety:
+                    # H1: a STOP on every teardown, before CAN closes. On a 2.4.0 board it
+                    # needs no release and leaves an idle axis homed, so it costs nothing;
+                    # nothing was moving, so no stop is reported. A 2.3.1 board is left
+                    # alone: its ESTOP latches and every axis would need a home.
+                    self._write_stepper_stop("teardown: the CAN device is disconnecting", quiet=True)
         except Exception:
-            logger.exception("Pellet ESTOP before the device disconnect failed")
+            logger.exception("Pellet stop before the device disconnect failed")
         with self._disconnect_lock:
             self._want_exit.set()
             with self._command_execution_lock:
