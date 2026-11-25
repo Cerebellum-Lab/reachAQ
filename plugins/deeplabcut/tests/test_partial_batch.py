@@ -8,12 +8,12 @@ side of this is tested in core (tests/live_partial_batch_test.py).
 
 
 def test_a_backend_can_declare_that_it_batches_internally():
-    from autotrainer.pose_plugins.deeplabcut import DlcTorchPoseModel
+    from reachaq.pose_plugins.deeplabcut import DlcTorchPoseModel
 
     assert DlcTorchPoseModel("/unused").supports_partial_batch is True
 
 
 def test_the_tensorflow_backend_still_requires_a_full_batch():
-    from autotrainer.pose_plugins.deeplabcut import DlcPoseModel
+    from reachaq.pose_plugins.deeplabcut import DlcPoseModel
 
     assert DlcPoseModel("/unused").supports_partial_batch is False

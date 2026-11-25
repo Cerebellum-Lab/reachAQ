@@ -7,7 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QRect  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from tools.acquisition.model.user_preferences import UserPreferences  # noqa: E402
+from reachaq.app.model.user_preferences import UserPreferences  # noqa: E402
 
 
 @pytest.fixture

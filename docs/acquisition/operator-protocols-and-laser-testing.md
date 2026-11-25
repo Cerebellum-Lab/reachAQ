@@ -499,7 +499,7 @@ shutter** holds the PMT shutter open for the ramp. Press **Run Ramp**.
   is rebuilt: on every Run and Stop, on a DAQ Ports save or a configuration
   load that changes the lasers, and when a laser close that ended late
   disconnects the laser.
-  `tools/hardware/validate_laser_hardware.py --action ramp` takes the same
+  `src/reachaq/hardware/validate_laser_hardware.py --action ramp` takes the same
   settle as `--settle-us` (default 600) and the step as `--samples-per-step`
   (default 500).
 - The laser controller's own inputs, the diode and the command copy for the

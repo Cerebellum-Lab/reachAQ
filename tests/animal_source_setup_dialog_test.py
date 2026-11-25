@@ -7,10 +7,10 @@ from PySide6.QtWidgets import QApplication, QComboBox, QLineEdit
 
 from softmouse_https_source_test import COLONY, Session  # noqa: E402
 
-from tools.acquisition.model.animal_sources.config import load_source_configuration
-from tools.acquisition.model.animal_sources.credentials import KEYRING_SERVICE, CredentialStore
-from tools.acquisition.model.animal_sources.softmouse import SoftMouseSource
-from tools.acquisition.view.animal_source_setup_dialog import AnimalSourceSetupDialog
+from reachaq.app.model.animal_sources.config import load_source_configuration
+from reachaq.app.model.animal_sources.credentials import KEYRING_SERVICE, CredentialStore
+from reachaq.app.model.animal_sources.softmouse import SoftMouseSource
+from reachaq.app.view.animal_source_setup_dialog import AnimalSourceSetupDialog
 
 
 TAG = "360002353933099"

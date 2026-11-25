@@ -1,0 +1,212 @@
+
+import copy
+import ctypes
+import multiprocessing
+import os
+import queue
+import time
+import logging
+
+import pytest
+
+import reachaq.core.logging
+
+import numpy as np
+
+from reachaq.core import ProjectInfo
+from reachaq.core.pose_elements import AllHandsParts, SceneElement
+from reachaq.inference import (
+    InferenceMode,
+    InferenceMonitorDataMsg,
+    PoseResponse,
+    pose_result_process,
+)
+from reachaq.inference.pose_result_process import InferenceMonitorDataProc, live_source_frames
+from top_fixtures import collect_log_queue_to_caplog
+
+frames_idc_online_no_recording = np.asarray([(-1, -1, -1), (-1, -1, -1)])
+
+zero_pose_data = np.zeros((2, 42, 3), dtype=float)
+
+
+@pytest.fixture()
+def inference_data_proc(pose_algo, capture_multiprocess_logs, monkeypatch, caplog) -> InferenceMonitorDataProc:  # noqa
+    pairs_offset = [
+        (SceneElement.Diamond, SceneElement.Triangle),
+        (SceneElement.Star, SceneElement.Triangle),
+        (SceneElement.Triangle, SceneElement.Pellet),
+        *(
+            (SceneElement.Pellet, hand_part)
+            for hand_part in AllHandsParts
+        ),
+    ]
+
+    # pose_result_process.make_log_dict_config
+    monkeypatch.setattr(pose_result_process, "make_log_dict_config", lambda: {
+        'version': 1,
+        'disable_existing_loggers': False,
+        'handlers': {
+            'queue': {
+                'class': 'reachaq.core.logging.WithThreadIdQueueHandler',
+                'queue': capture_multiprocess_logs,
+                'level': logging.NOTSET,  # pass everything to the listener
+            }
+        },
+        # root logger is here:
+        'root': {
+            'handlers': ['queue'],
+            # with its own level here:
+            'level': logging.NOTSET,  # root_log_level,
+            # FORCE NOTSET to relay everything so that file handler can properly get DEBUG as well
+        },
+        # but eventual level of other loggers have to be defined here:
+        'loggers': copy.deepcopy(reachaq.core.logging._limit_loggers_level),  # noqa
+    })
+
+    proc = InferenceMonitorDataProc(
+        project=ProjectInfo(camera_names=("left", "right")),
+        camera_names=("left", "right"),
+        pose_data_queue=multiprocessing.Queue(),
+        cmd_queue=multiprocessing.Queue(),
+        msg_queue=multiprocessing.Queue(),
+        cmd_ack_event=multiprocessing.Event(),
+        frames_per_cam=3,
+        watchdog_perf_c=multiprocessing.Value(ctypes.c_double),
+        monitored_parts_offsets=pairs_offset,
+    )
+    proc._cmd_queue.put(
+        (proc.Msg.SET_POSE_ALGO, (pose_algo,), None)
+    )
+    yield proc  # noqa
+    # Let the monitor process stop its live workers before falling back to a
+    # hard termination. Terminating the parent first leaves its workers
+    # orphaned and can make subsequent inference tests appear to hang.
+    proc._cmd_queue.put(None)
+    proc.join(3)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(3)
+
+
+def test_live_no_recording(inference_data_proc):
+    proc = inference_data_proc
+    proc.start()
+    # Do not race pose-data submission against the independent command thread
+    # installing the pose algorithm. Under full-suite process load, early data
+    # can otherwise be correctly ignored before SET_POSE_ALGO is acknowledged.
+    assert proc._cmd_ack_event.wait(3)
+    proc._cmd_ack_event.clear()
+    for _ in range(5):
+        # NB: the 3 first are discarded by the pose result process
+        proc._data_queue.put((
+            zero_pose_data,
+            InferenceMode.Live,
+            frames_idc_online_no_recording,
+        ))
+        time.sleep(0.1)
+    msg, (args, kwargs) = proc._msg_queue.get(timeout=3)
+    print(msg, args, kwargs)
+    assert msg is InferenceMonitorDataMsg.POSE_RESULT_READY
+    pose_rsp = args[0]
+    assert isinstance(pose_rsp, PoseResponse)
+    assert pose_rsp.sequence == 0
+    assert pose_rsp.source_frame_ids == ((), ())
+    #
+    msg, (args, kwargs) = proc._msg_queue.get(timeout=3)
+    pose_rsp = args[0]
+    # print(msg, args, kwargs)
+    assert pose_rsp.sequence == 1
+
+
+def test_live_response_preserves_actual_source_frame_ids(
+    inference_data_proc, monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ProjectInfo().get_session_path()[0]).mkdir(parents=True)
+    proc = inference_data_proc
+    proc.start()
+    assert proc._cmd_ack_event.wait(3)
+    proc._cmd_ack_event.clear()
+    frame_ids = np.asarray(((101, 102, 103), (201, 202, 203)))
+    # Initial monitor samples can be discarded while live workers warm up.
+    for _ in range(8):
+        proc._data_queue.put((zero_pose_data, InferenceMode.Live, frame_ids))
+        time.sleep(0.1)
+    _, (args, _) = proc._msg_queue.get(timeout=3)
+    pose_rsp = args[0]
+    assert pose_rsp.source_frame_ids == ((101, 102, 103), (201, 202, 203))
+
+
+def test_live_response_carries_each_source_frames_exposure_time(
+    inference_data_proc, monkeypatch, tmp_path
+):
+    """Consumers time live pose from these, not from a nominal frame rate."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ProjectInfo().get_session_path()[0]).mkdir(parents=True)
+    proc = inference_data_proc
+    proc.start()
+    assert proc._cmd_ack_event.wait(3)
+    proc._cmd_ack_event.clear()
+    frame_ids = np.asarray(((101, 102, 103), (101, 102, 103)))
+    frames_perf = np.asarray(((10.0, 10.5, 11.0), (10.25, 10.75, 11.25)))
+    for _ in range(8):
+        proc._data_queue.put((zero_pose_data, InferenceMode.Live, frame_ids, None, frames_perf))
+        time.sleep(0.1)
+    _, (args, _) = proc._msg_queue.get(timeout=3)
+    pose_rsp = args[0]
+    assert pose_rsp.source_frame_ids == ((101, 102, 103), (101, 102, 103))
+    assert pose_rsp.source_frame_perf_times == ((10.0, 10.5, 11.0), (10.25, 10.75, 11.25))
+
+
+def test_live_source_frames_drops_a_padded_frames_time_with_its_id():
+    ids = np.asarray(((101, 102, -1), (201, -1, 203)))
+    perf = np.asarray(((1.0, 2.0, 3.0), (4.0, 5.0, 6.0)))
+    assert live_source_frames(ids, perf) == (((101, 102), (201, 203)), ((1.0, 2.0), (4.0, 6.0)))
+
+
+def test_live_source_frames_without_times_reports_none_rather_than_inventing_them():
+    ids = np.asarray(((101, 102), (201, 202)))
+    assert live_source_frames(ids, None) == (((101, 102), (201, 202)), ())
+
+
+def test_renew_workers(request, monkeypatch, caplog, capture_multiprocess_logs):
+    # os.environ["REACHAQ_LIVE_WORKERS_RENEW_TIMER_DELAY"] = "3"
+    proc = request.getfixturevalue("inference_data_proc")
+    proc._live_generation_renew_age = 3
+    proc.start()
+    # proc = inference_data_proc
+    # monkeypatch.setattr(pose_result_process, "LIVE_WORKERS_RENEW_TIMER_DELAY", 3)
+    for _ in range(3):
+        # NB: the 3 first are discarded by the pose result process
+        proc._data_queue.put(
+            (
+                zero_pose_data,
+                InferenceMode.Live,
+                frames_idc_online_no_recording,
+            )
+        )
+    tot_put = 8
+    for _ in range(tot_put):
+        proc._data_queue.put(
+            (
+                zero_pose_data,
+                InferenceMode.Live,
+                frames_idc_online_no_recording,
+            )
+        )
+        time.sleep(1)
+        # increase_simulate_perf_now(1)
+
+    collect_log_queue_to_caplog(capture_multiprocess_logs)
+    assert "making new workers generation-1.." in caplog.text
+    assert "making new workers generation-2.." in caplog.text
+
+    seq_nr = None
+
+    for _ in range(5):
+        msg, (args, kwargs) = proc._msg_queue.get(timeout=3)
+        pose_rsp = args[0]
+        if seq_nr is None:
+            seq_nr = pose_rsp.sequence
+        assert pose_rsp.sequence == seq_nr
+        seq_nr += 1

@@ -11,7 +11,7 @@ import h5py
 import numpy as np
 import pytest
 
-from autotrainer.core.latency.schema import (
+from reachaq.core.latency.schema import (
     CAMERA_FRAME_DTYPE,
     CLOCK_LATCH_DTYPE,
     CLOCK_PAIR_DTYPE,
@@ -23,10 +23,10 @@ from autotrainer.core.latency.schema import (
     STIM_DISPATCH_DTYPE,
     pose_batch_dtype,
 )
-from tools.acquisition.model.latency_event_log import LatencyEventLog
-from tools.autotrainer_version import __version__ as app_version
-from tools.latency import finalize
-from tools.latency import rebuild
+from reachaq.app.model.latency_event_log import LatencyEventLog
+from reachaq.version import __version__ as app_version
+from reachaq.latency import finalize
+from reachaq.latency import rebuild
 
 RATE = 10_000.0
 PERIOD = 1 / 150
@@ -1165,8 +1165,8 @@ def test_unreadable_streams_share_one_open_retry_budget(tmp_path, monkeypatch):
 
 
 def test_a_rebuild_can_take_the_calibration_from_a_configuration(tmp_path, capsys):
-    from autotrainer.core import SystemConfiguration
-    from autotrainer.core.configuration import (NidaqDeliveryCalibration,
+    from reachaq.core import SystemConfiguration
+    from reachaq.core.configuration import (NidaqDeliveryCalibration,
                                                 NidaqSignalStreamConfiguration)
     session = _session(tmp_path / "session")
     (session / "streams" / "alignment.json").write_text(json.dumps(_alignment(calibration=False)))

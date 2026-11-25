@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools.acquisition.model import nidaq_monitor_session as module
-from tools.acquisition.model.nidaq_monitor_session import NidaqMonitorSession
+from reachaq.app.model import nidaq_monitor_session as module
+from reachaq.app.model.nidaq_monitor_session import NidaqMonitorSession
 
 
 class _Stream:

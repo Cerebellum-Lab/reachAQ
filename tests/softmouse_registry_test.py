@@ -4,8 +4,8 @@ import sqlite3
 import openpyxl
 import pytest
 
-from tools.acquisition.model.animal_registry import AnimalRegistry, RegistrySchemaError
-from tools.acquisition.model.animal_sources.mapping import (
+from reachaq.app.model.animal_registry import AnimalRegistry, RegistrySchemaError
+from reachaq.app.model.animal_sources.mapping import (
     AnimalTableMapper,
     ColumnMapping,
     ImportGuardrails,

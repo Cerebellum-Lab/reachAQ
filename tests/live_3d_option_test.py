@@ -16,15 +16,15 @@ import yaml
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
-from autotrainer.core import Offset3DTuple
-from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
-from autotrainer.inference.multires_calibration import library
+from reachaq.core import Offset3DTuple
+from reachaq.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from reachaq.inference.multires_calibration import library
 from calibration_metadata_test import _saved_calibration3d  # noqa: E402
-from tools.acquisition.model.app_model_status import AppModelStatus  # noqa: E402
-from tools.acquisition.view import preferences_content as preferences_module  # noqa: E402
-from tools.acquisition.view.preferences_content import PreferencesContent  # noqa: E402
+from reachaq.app.model.app_model_status import AppModelStatus  # noqa: E402
+from reachaq.app.view import preferences_content as preferences_module  # noqa: E402
+from reachaq.app.view.preferences_content import PreferencesContent  # noqa: E402
 
-app_model_module = importlib.import_module("tools.acquisition.model.app_model")
+app_model_module = importlib.import_module("reachaq.app.model.app_model")
 
 LIVE_3D_OFF = "live 3D is off"
 

@@ -16,13 +16,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
-from autotrainer.core import Motor, SystemCommandKind
-from autotrainer.core.interfaces import RecordingEndingReason
-from tools.acquisition.model.recording_session_controller import RecordingSessionController
-from tools.acquisition.model.session_boundary import SessionBoundary
-from tools.acquisition.model.subsystem_status import SubsystemId, SubsystemState
-from tools.acquisition.view import main_window as main_window_module
-from tools.acquisition.view.main_window import MainWindow
+from reachaq.core import Motor, SystemCommandKind
+from reachaq.core.interfaces import RecordingEndingReason
+from reachaq.app.model.recording_session_controller import RecordingSessionController
+from reachaq.app.model.session_boundary import SessionBoundary
+from reachaq.app.model.subsystem_status import SubsystemId, SubsystemState
+from reachaq.app.view import main_window as main_window_module
+from reachaq.app.view.main_window import MainWindow
 
 _XYZ = (Motor.PELLET_X_MOTOR, Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR)
 
@@ -181,7 +181,7 @@ def test_closing_the_window_stops_a_moving_stage_before_the_capture_stop(monkeyp
 
 def test_the_session_end_home_after_an_operator_stop_does_not_release_it(app_model):
     # Ben, 2026-11-24: after an operator STOP only an operator Home or a reconnect releases.
-    from tools.acquisition.model.hardware_model import OPERATOR_STOP_REASON
+    from reachaq.app.model.hardware_model import OPERATOR_STOP_REASON
 
     app_model._set_subsystem_status(SubsystemId.CAN_PELLET, SubsystemState.READY)
     hardware = app_model.hardware
@@ -205,7 +205,7 @@ def test_the_session_end_home_after_an_operator_stop_does_not_release_it(app_mod
 
 def test_the_session_end_home_after_an_operator_stop_and_a_failure_stop_does_not_release(app_model):
     # Review I-C, end to end: STOP pressed, then a failure stop; the session end is skipped.
-    from tools.acquisition.model.hardware_model import OPERATOR_STOP_REASON
+    from reachaq.app.model.hardware_model import OPERATOR_STOP_REASON
 
     app_model._set_subsystem_status(SubsystemId.CAN_PELLET, SubsystemState.READY)
     hardware = app_model.hardware
@@ -225,7 +225,7 @@ def test_the_session_end_home_after_an_operator_stop_and_a_failure_stop_does_not
 
 
 def test_each_estop_is_its_own_entry_in_the_session_metadata(app_model):
-    from tools.acquisition.model.hardware_model import OPERATOR_STOP_REASON
+    from reachaq.app.model.hardware_model import OPERATOR_STOP_REASON
 
     hardware = app_model.hardware
     hardware._on_device_estop(OPERATOR_STOP_REASON, _XYZ, True)

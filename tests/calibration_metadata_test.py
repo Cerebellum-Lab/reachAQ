@@ -21,14 +21,14 @@ import pytest
 import yaml
 
 import top_fixtures
-from autotrainer.behavior import BehaviorAlgorithm
-from autotrainer.core import ProjectInfo
-from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
-from autotrainer.core.logging import unregister_fatal_exception_callback
-from autotrainer.inference.analysis.intersession_process import resolve_session_calibration
-from autotrainer.inference.multires_calibration import library, store
-from autotrainer.inference.multires_calibration.fit import BoardSpec
-from autotrainer.inference.multires_calibration.geometry import presets_from_base
+from reachaq.behavior import BehaviorAlgorithm
+from reachaq.core import ProjectInfo
+from reachaq.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
+from reachaq.core.logging import unregister_fatal_exception_callback
+from reachaq.inference.analysis.intersession_process import resolve_session_calibration
+from reachaq.inference.multires_calibration import library, store
+from reachaq.inference.multires_calibration.fit import BoardSpec
+from reachaq.inference.multires_calibration.geometry import presets_from_base
 from multires_calibration_fakes import FIT
 from reload_calib_multires_test import (  # noqa: F401 (start_app is a fixture)
     BASE,
@@ -43,9 +43,9 @@ from reload_calib_multires_test import (  # noqa: F401 (start_app is a fixture)
     _write_multires,
     start_app,
 )
-from tools.acquisition.model import app_model as app_model_module
-from tools.acquisition.model.app_model import AppModel, _camera_configured_metadata
-from tools.acquisition.model.inference_model import InferenceModel
+from reachaq.app.model import app_model as app_model_module
+from reachaq.app.model.app_model import AppModel, _camera_configured_metadata
+from reachaq.app.model.inference_model import InferenceModel
 
 
 # The hardware.configured keys before calibration3d was added beside them.
@@ -92,7 +92,7 @@ def _saved_calibration3d(app_model, tmp_path, *, session_scope=True, with_docume
 
 
 def test_metadata_names_the_active_calibration(app_model, tmp_path):
-    folder = _write_multires(tmp_path / "Autotrainer-calib" / DEFAULT_3D_CALIB_DIR_NAME)
+    folder = _write_multires(tmp_path / "reachAQ-calib" / DEFAULT_3D_CALIB_DIR_NAME)
     _configure_live_pair(app_model, **BASE_PARAMS)
     app_model.reload_calib(folder)
     index = app_model.active_calibration_index
@@ -111,7 +111,7 @@ def test_metadata_names_the_active_calibration(app_model, tmp_path):
 
 def test_metadata_names_an_overridden_calibration_with_its_override(app_model, tmp_path):
     override = {"by": "operator", "reason": "baseline warning expected after the remount"}
-    folder = tmp_path / "Autotrainer-calib" / DEFAULT_3D_CALIB_DIR_NAME
+    folder = tmp_path / "reachAQ-calib" / DEFAULT_3D_CALIB_DIR_NAME
     folder.parent.mkdir(parents=True)
     store.write_calibration(folder, fit=FIT, presets=presets_from_base(BASE, (4, 2, 1)), board=BoardSpec(),
                             report=dataclasses.replace(_REPORT, override=override), capture={})
@@ -134,7 +134,7 @@ def test_metadata_names_a_legacy_calibration(app_model, calib_dir, tmp_path):
 
 
 def test_metadata_says_why_live_3d_was_off(app_model, tmp_path):
-    folder = _write_multires(tmp_path / "Autotrainer-calib" / DEFAULT_3D_CALIB_DIR_NAME)
+    folder = _write_multires(tmp_path / "reachAQ-calib" / DEFAULT_3D_CALIB_DIR_NAME)
     # The operator moved the ROI: no preset of this calibration has these pixels.
     _configure_live_pair(app_model, **{**BASE_PARAMS, "offsetx": 0, "offsety": 0})
     with mock.patch.object(app_model, "on_error") as on_error:
@@ -165,7 +165,7 @@ def test_metadata_says_when_there_was_no_calibration(app_model, tmp_path):
 
 def test_metadata_says_why_a_broken_calibration_was_not_used(
         app_model, tmp_path, system_config, trainer_config_dir):
-    folder = _write_multires(tmp_path / "Autotrainer-calib" / DEFAULT_3D_CALIB_DIR_NAME)
+    folder = _write_multires(tmp_path / "reachAQ-calib" / DEFAULT_3D_CALIB_DIR_NAME)
     _save_live_pair_params(system_config, trainer_config_dir, **BASE_PARAMS)
     app_model.reload_calib(folder)
     (folder / "presets" / BASE.name / "camera_matrix" / "stereo_params.pickle").unlink()
@@ -213,7 +213,7 @@ def test_the_app_resolves_each_session_s_own_calibration(
 def test_intersession_analysis_is_given_the_root_not_a_folder(tmp_path):
     model = InferenceModel.__new__(InferenceModel)
     model._calib_dir = None
-    model._calib_root = tmp_path / "Autotrainer"
+    model._calib_root = tmp_path / "reachAQ"
     model._event_manager = mock.Mock()
     model._intersession_detection = None
     pool = model._process_pool = mock.Mock()
@@ -227,9 +227,9 @@ def test_intersession_analysis_is_given_the_root_not_a_folder(tmp_path):
 
     (args, kwds), (args_3d, kwds_3d) = [(c.kwargs["args"], c.kwargs["kwds"]) for c in pool.apply_async.call_args_list]
     assert args == args_3d == (detection.configuration.project,)
-    assert kwds == {"calib_dir": None, "calib_root": tmp_path / "Autotrainer", "frame_rate": 150,
+    assert kwds == {"calib_dir": None, "calib_root": tmp_path / "reachAQ", "frame_rate": 150,
                     "offline_3d": False}
-    assert kwds_3d["calib_dir"] is None and kwds_3d["calib_root"] == tmp_path / "Autotrainer"
+    assert kwds_3d["calib_dir"] is None and kwds_3d["calib_root"] == tmp_path / "reachAQ"
     detection.configuration.complete.assert_called_once()
 
 
@@ -237,7 +237,7 @@ def test_the_detection_response_is_handed_on_before_offline_3d(tmp_path):
     order = []
     model = InferenceModel.__new__(InferenceModel)
     model._calib_dir = None
-    model._calib_root = tmp_path / "Autotrainer"
+    model._calib_root = tmp_path / "reachAQ"
     model._event_manager = mock.Mock()
     model._intersession_detection = None
     model.detection_result_ready = lambda project, result: order.append(("response", result))
@@ -275,7 +275,7 @@ def test_offline_3d_after_the_detection_is_abandoned_when_inference_stops(tmp_pa
 
 
 def test_the_pool_worker_yields_to_live_acquisition(monkeypatch):
-    from tools.acquisition.model import inference_model as inference_model_module
+    from reachaq.app.model import inference_model as inference_model_module
 
     niced, initialised = [], []
     for name in inference_model_module._SINGLE_THREAD_ENV:

@@ -13,9 +13,9 @@ actually carry risk.
 import numpy
 import pytest
 
-from autotrainer.core import FixedArrayMultiQueue
-from autotrainer.core.multiproc import get_mp_ctx
-from autotrainer.inference.pose_process import DEFAULT_MODEL_FRAMES_PER_CAMERA
+from reachaq.core import FixedArrayMultiQueue
+from reachaq.core.multiproc import get_mp_ctx
+from reachaq.inference.pose_process import DEFAULT_MODEL_FRAMES_PER_CAMERA
 
 
 SHAPE = (4, 6)  # rows, cols -- small enough to assert on directly

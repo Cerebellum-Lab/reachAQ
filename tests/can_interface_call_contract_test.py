@@ -18,7 +18,7 @@ import pathlib
 import pytest
 
 CAN_INTERFACE = (pathlib.Path(__file__).resolve().parents[1]
-                 / "auto-trainer-device" / "src" / "autotrainer" / "device"
+                 / "src" / "reachaq" / "device"
                  / "can_interface.py")
 
 

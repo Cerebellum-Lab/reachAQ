@@ -1,9 +1,9 @@
 import numpy as np
 import pytest
 
-from autotrainer.core import ObservableObject, SystemStatusMessageKind
-from autotrainer.device import PressureReading, Target
-from tools.acquisition.model.pressure_stream_model import (
+from reachaq.core import ObservableObject, SystemStatusMessageKind
+from reachaq.device import PressureReading, Target
+from reachaq.app.model.pressure_stream_model import (
     PressureStreamModel,
     counts_to_volts,
 )

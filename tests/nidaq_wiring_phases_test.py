@@ -17,9 +17,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools.acquisition.model.nidaq_wiring_verification import WiringPoint
+from reachaq.app.model.nidaq_wiring_verification import WiringPoint
 
-_TOOL = Path(__file__).resolve().parents[1] / "tools" / "hardware" / "verify_nidaq_wiring.py"
+_TOOL = Path(__file__).resolve().parents[1] / "src" / "reachaq" / "hardware" / "verify_nidaq_wiring.py"
 _spec = importlib.util.spec_from_file_location("verify_nidaq_wiring", _TOOL)
 verify = importlib.util.module_from_spec(_spec)
 sys.modules.setdefault("verify_nidaq_wiring", verify)
@@ -238,7 +238,7 @@ def test_the_frequency_mapping_answers_by_line_name():
     tone2 by frequency. Copies of a devicetree fact stop being true without
     anything failing.
     """
-    from autotrainer.device.device_interface import (
+    from reachaq.device.device_interface import (
         TONE_CONFIRMATION_FREQUENCIES_HZ,
         tone_confirmation_frequency,
     )

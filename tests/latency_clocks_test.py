@@ -6,7 +6,7 @@ import tracemalloc
 import numpy as np
 import pytest
 
-from tools.latency import clocks
+from reachaq.latency import clocks
 
 
 def test_fit_line_recovers_offset_and_drift_and_rejects_an_outlier():

@@ -13,7 +13,7 @@ with runner.inference() to 1.5e-5 px and 0.0 likelihood at batch 1, 2 and 6.
 
 import pytest
 
-from autotrainer.pose_plugins.deeplabcut import DlcTorchPoseModel
+from reachaq.pose_plugins.deeplabcut import DlcTorchPoseModel
 
 
 GOOD_CONFIG = {

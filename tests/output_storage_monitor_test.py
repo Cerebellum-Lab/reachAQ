@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from tools.acquisition.model import output_storage_monitor as storage_module
-from tools.acquisition.model.output_storage_monitor import (
+from reachaq.app.model import output_storage_monitor as storage_module
+from reachaq.app.model.output_storage_monitor import (
     RecordingStorageMonitor,
     preflight_storage,
 )

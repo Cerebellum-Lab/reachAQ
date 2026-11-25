@@ -2,10 +2,10 @@ import json
 
 import pytest
 
-from tools.acquisition.model.trial_protocol_repository import (
+from reachaq.app.model.trial_protocol_repository import (
     TrialProtocolRepository,
 )
-from tools.acquisition.model.trial_protocol_schedule import (
+from reachaq.app.model.trial_protocol_schedule import (
     ProtocolPatch,
     TrialProtocolDocument,
 )

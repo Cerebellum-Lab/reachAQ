@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools.acquisition.model.app_model import AppModel, _camera_configured_metadata
+from reachaq.app.model.app_model import AppModel, _camera_configured_metadata
 
 
 class _Camera:

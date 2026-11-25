@@ -20,8 +20,8 @@ reimplements the loop only proves the reimplementation works.
 
 import numpy as np
 
-from autotrainer.core.frame_index import FrameIndexCategory
-from autotrainer.inference.pose_process import (
+from reachaq.core.frame_index import FrameIndexCategory
+from reachaq.inference.pose_process import (
     _is_end_of_recording,
     take_newest_live_batch,
 )

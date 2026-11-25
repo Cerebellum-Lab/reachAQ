@@ -1,6 +1,6 @@
 import math
 
-from autotrainer.inference.pose_algorithm import PoseResponse
+from reachaq.inference.pose_algorithm import PoseResponse
 
 
 def test_a_response_keeps_its_live_stamps_through_round():

@@ -15,10 +15,10 @@ import h5py
 import numpy as np
 import pytest
 
-from autotrainer.core import ProjectInfo
-from autotrainer.core.latency.schema import CLOCK_LATCH_DTYPE
-from tools.acquisition.model.session_data_recorder import SessionDataRecorder
-from tools.latency import clocks
+from reachaq.core import ProjectInfo
+from reachaq.core.latency.schema import CLOCK_LATCH_DTYPE
+from reachaq.app.model.session_data_recorder import SessionDataRecorder
+from reachaq.latency import clocks
 from frame_alignment_synthetic import (
     ARRIVAL, CAMERA_OFFSET, DRIFT, EPOCH_EARLY, EXPOSURE, FIRST_ID, HOST0, PERIOD, RATE, READ,
     SyntheticRig,

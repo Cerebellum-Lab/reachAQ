@@ -2,9 +2,9 @@ import threading
 
 import numpy as np
 
-from autotrainer.core.fixed_array_multiqueue import FixedArrayMultiQueue
-from autotrainer.inference.pose_process import take_newest_live_batch
-from autotrainer.inference.pose_result_process import (
+from reachaq.core.fixed_array_multiqueue import FixedArrayMultiQueue
+from reachaq.inference.pose_process import take_newest_live_batch
+from reachaq.inference.pose_result_process import (
     close_in_background,
     split_pose_item,
     wait_for_latency_closers,

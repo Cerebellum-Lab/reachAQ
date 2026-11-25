@@ -17,12 +17,12 @@ the values that used to be built in.
 ## Settings directory
 
 There is nothing to do. `REACHAQ_CONFIG_DIR` is unset on the rig, so it keeps
-`~/Autotrainer`.
+`~/reachAQ`.
 
 ## SoftMouse publication
 
 The publication on the lab's Isilon share used to be built in. It is now the
-`[softmouse]` preferences, in `~/.config/Colorado/Auto Trainer.conf`:
+`[softmouse]` preferences, in `~/.config/reachAQ/reachAQ.conf`:
 
 ```ini
 [softmouse]
@@ -59,14 +59,14 @@ that with a drop-in:
 mkdir -p ~/.config/systemd/user/reachaq-softmouse-publisher.service.d
 printf '[Unit]\nRequiresMountsFor=/mnt/isilon\n' \
   > ~/.config/systemd/user/reachaq-softmouse-publisher.service.d/isilon.conf
-cp tools/softmouse_sync/systemd/reachaq-softmouse-publisher.service ~/.config/systemd/user/
+cp src/reachaq/softmouse_sync/systemd/reachaq-softmouse-publisher.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user cat reachaq-softmouse-publisher.service | grep RequiresMountsFor
 ```
 
 ## Real-time priority
 
-`sudo bash tools/hardware/reachaq-latency-setup.sh rtprio-enable` used to fall
+`sudo bash src/reachaq/hardware/reachaq-latency-setup.sh rtprio-enable` used to fall
 back to the user `christielab10` when `SUDO_USER` was unset. It now refuses to
 run without `SUDO_USER`, so run it with `sudo` from the operator account.
 
@@ -75,3 +75,30 @@ run without `SUDO_USER`, so run it with `sudo` from the operator account.
 The rig boots with `intel_iommu=off`. The
 [NI-DAQ guide](../linux-install/ni-daq-pxi.md#iommu-and-dma-boot-with-intel_iommuoff)
 explains why and how to check it.
+
+## Pellet z: offsets measured in calibration captures (disputed, under review)
+
+In two z moves, the board's position measured in the 3D calibration cameras
+differed from the commanded position. The offsets were measured model-free, from
+the board's position in the cameras, and a second analysis of the raw captures
+gave the same offsets. They have not been confirmed by watching the stage. The
+matter stays open until the z tuning tests or a direct measurement of the stage
+settle it.
+
+- **session004.** A 30 to 1 mm descent measured about 7 mm short of the
+  commanded travel. Mid-descent, at about 85 mm/s, the board measured about 1 mm
+  back up before it continued. The offset persisted until the top stop.
+- **session006.** A 5 to 2 mm move measured -0.08 mm against -3 mm commanded,
+  and the motor buzzed during the command. The +3 mm offset persisted.
+
+The same moves measured correctly most of the time.
+
+The host cannot see such an offset. The board reports its commanded position,
+so `waypoints_unreached` stays 0. christielab10 has a v1.2 board, which has no
+DIAG line.
+
+The calibration report's stage-accuracy block (`stage_slack_rms_mm`,
+`stage_repeat_mm`) shows the measured offsets.
+
+The z speed and acceleration are being retuned. The chosen values will be
+recorded here.

@@ -1,4 +1,4 @@
-from autotrainer.video import VideoManager
+from reachaq.video import VideoManager
 
 print("Random Image Generator")
 print("\tCamera 0: random://0")

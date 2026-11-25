@@ -9,14 +9,14 @@ Neither changes the kernel, the GPU driver, or NI-DAQmx.
 
 ## Applying them without the full installer
 
-`tools/hardware/reachaq-latency-setup.sh` applies, inspects and reverts the same
+`src/reachaq/hardware/reachaq-latency-setup.sh` applies, inspects and reverts the same
 two settings on their own, which is what you want on a rig that is already
 installed:
 
 ```bash
-bash tools/hardware/reachaq-latency-setup.sh status          # no root needed
-sudo bash tools/hardware/reachaq-latency-setup.sh governor performance
-sudo bash tools/hardware/reachaq-latency-setup.sh rtprio-enable
+bash src/reachaq/hardware/reachaq-latency-setup.sh status          # no root needed
+sudo bash src/reachaq/hardware/reachaq-latency-setup.sh governor performance
+sudo bash src/reachaq/hardware/reachaq-latency-setup.sh rtprio-enable
 ```
 
 Each has a matching revert: `governor powersave` and `rtprio-disable`.
@@ -25,7 +25,7 @@ The governor is a **runtime** setting and does not survive a reboot. To make it
 persistent, install the unit rather than repeating the command:
 
 ```bash
-sudo install -m 0644 tools/hardware/reachaq-cpu-governor.service /etc/systemd/system/
+sudo install -m 0644 src/reachaq/hardware/reachaq-cpu-governor.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now reachaq-cpu-governor.service
 ```

@@ -19,7 +19,7 @@ Work happens on a *dataset*, chosen at the top of the window.
   single-animal DeepLabCut project. The project itself is only read, never
   changed. Frames with no labelled part are skipped.
 
-Datasets are stored under `~/Autotrainer/pose_training/datasets/<name>/`:
+Datasets are stored under `~/reachAQ/pose_training/datasets/<name>/`:
 frames as 256 × 256 grey images and the labels in `labels.csv`. Every change is
 saved at once.
 
@@ -83,7 +83,7 @@ no longer match what it says it was trained on; start a new run instead.
 **Pause** and **Resume** also work by hand. **Cancel** stops the run and
 discards it. Closing the window does not stop training.
 
-Models are written under `~/Autotrainer/pose_training/models/<dataset>/<date-time>/`.
+Models are written under `~/reachAQ/pose_training/models/<dataset>/<date-time>/`.
 Each one records which dataset, which labels (as a fingerprint) and which
 held-out sessions it was trained on.
 

@@ -6,7 +6,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_DEFAULT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)
 INSTALL_REPO=${REACHAQ_INSTALL_REPO:-$REPO_DEFAULT}
 INSTALL_ENV=${REACHAQ_INSTALL_ENV:-reachaq}
-INSTALL_CONFIG_DIR=${REACHAQ_INSTALL_CONFIG_DIR:-${REACHAQ_CONFIG_DIR:-$HOME/Autotrainer}}
+INSTALL_CONFIG_DIR=${REACHAQ_INSTALL_CONFIG_DIR:-${REACHAQ_CONFIG_DIR:-$HOME/reachAQ}}
 SYSTEM_CONFIG=${REACHAQ_SYSTEM_CONFIG:-$INSTALL_CONFIG_DIR/system_configuration.yaml}
 USER_CONFIG_DIR=${REACHAQ_USER_CONFIG_DIR:-$HOME/.config/reachaq}
 USER_DATA_DIR=${REACHAQ_USER_DATA_DIR:-$HOME/.local/share}
@@ -74,7 +74,7 @@ install -m 0755 "$SCRIPT_DIR/bin/reachaq" "$USER_BIN_DIR/reachaq"
 install -m 0755 "$SCRIPT_DIR/bin/reachaq-sync" "$USER_BIN_DIR/reachaq-sync"
 # The icon as a scalable SVG, plus PNGs rendered from it so small sizes get
 # exact pixels.
-icon_dir="$INSTALL_REPO/tools/acquisition/view/icons"
+icon_dir="$INSTALL_REPO/src/reachaq/app/view/icons"
 install -m 0644 "$icon_dir/reachaq.svg" \
     "$USER_DATA_DIR/icons/hicolor/scalable/apps/reachaq.svg"
 for icon_size in 16 22 24 32 48 64 96 128 192 256 512; do

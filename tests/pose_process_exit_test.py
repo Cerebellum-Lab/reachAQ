@@ -18,15 +18,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from autotrainer.inference import (
+from reachaq.inference import (
     InferenceCommandMessageKind, InferenceStatus, InferenceStatusMessageKind,
 )
-from autotrainer.inference import pose_process
-from autotrainer.inference.pose_process import PoseProcess
-from tools.acquisition.model import inference_model as inference_model_module
-from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.inference_model import InferenceModel
-from tools.acquisition.model.subsystem_status import SubsystemId, SubsystemState
+from reachaq.inference import pose_process
+from reachaq.inference.pose_process import PoseProcess
+from reachaq.app.model import inference_model as inference_model_module
+from reachaq.app.model.app_model import AppModel
+from reachaq.app.model.inference_model import InferenceModel
+from reachaq.app.model.subsystem_status import SubsystemId, SubsystemState
 
 
 def _exited(code=0):

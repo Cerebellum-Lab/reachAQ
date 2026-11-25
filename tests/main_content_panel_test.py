@@ -5,10 +5,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication
 
-from autotrainer.pyside.content_widget import ContentWidget
-from tools.acquisition.view import main_content as main_content_module
-from tools.acquisition.view.detachable_panel import PanelState
-from tools.acquisition.view.main_content import MainContent
+from reachaq.pyside.content_widget import ContentWidget
+from reachaq.app.view import main_content as main_content_module
+from reachaq.app.view.detachable_panel import PanelState
+from reachaq.app.view.main_content import MainContent
 
 
 @pytest.fixture

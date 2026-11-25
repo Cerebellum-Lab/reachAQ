@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (  # noqa: E402
     QSplitter,
 )
 
-from tools.acquisition.view.detachable_panel import (  # noqa: E402
+from reachaq.app.view.detachable_panel import (  # noqa: E402
     EXPANDED_WIDTH_FRACTION,
     DetachablePanelHost,
     PanelState,

@@ -11,9 +11,9 @@ every simulated session says so in its metadata and in validation.
 ## Starting it
 
 ```bash
-python -m reachAQ.app --simulate                          # GUI, starts idle as usual
-python -m reachAQ.app --simulate --start-mode running     # GUI, System Mode running at once
-python -m tools.acquisition.headless --simulate           # headless, starts running
+python -m reachaq.app --simulate                          # GUI, starts idle as usual
+python -m reachaq.app --simulate --start-mode running     # GUI, System Mode running at once
+python -m reachaq.app.headless --simulate           # headless, starts running
 ```
 
 The 3D calibration is copied from files stored in Git LFS. In a checkout without
@@ -26,7 +26,7 @@ them, run `git lfs checkout` first; the simulation refuses to start from pointer
 | `--sim-reset` | Regenerate the home's configuration, preferences, motor files and calibration. Without it they are generated on first run only, so edits made in the app persist. |
 
 `-c` and `--preferences-file` still work; given, they replace the home's files.
-A simulation never reads or writes `~/Autotrainer`, the operator's preferences
+A simulation never reads or writes `~/reachAQ`, the operator's preferences
 or the rig's instance lock. It takes its own lock, `<home>/app.lock`, so it can
 run beside the rig's instance, and a second simulation on the same home exits
 with status 3.
@@ -53,8 +53,8 @@ Everything is set up in `main()` before `AppModel` exists, because the NI-DAQ
 worker runs in a forkserver child that keeps the environment it started with.
 The variables are `REACHAQ_SIMULATION=1`, `REACHAQ_SIM_BUS`, `REACHAQ_SIM_EPOCH`,
 `REACHAQ_SIM_CAMERA_FPS`, `REACHAQ_SIM_CAMERA_EXPOSURE_S`,
-`REACHAQ_SIM_LINE_ALIASES`, `AUTOTRAINER_DIAMOND_TRIANGLE_CONFIG` and
-`AUTOTRAINER_CAN_TRANSPORT=emulation`. Use the
+`REACHAQ_SIM_LINE_ALIASES`, `REACHAQ_DIAMOND_TRIANGLE_CONFIG` and
+`REACHAQ_CAN_TRANSPORT=emulation`. Use the
 flag rather than setting them by hand: by hand, the configuration, preferences,
 data and lock are not moved into a sim home.
 

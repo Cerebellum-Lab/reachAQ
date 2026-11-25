@@ -18,7 +18,7 @@ import ast
 
 import source_contract
 
-from autotrainer.inference import pose_process
+from reachaq.inference import pose_process
 
 
 def _pose_batch_puts():

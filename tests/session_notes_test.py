@@ -1,8 +1,8 @@
 import threading
 from types import SimpleNamespace
 
-from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.session_validation_controller import SessionValidationState
+from reachaq.app.model.app_model import AppModel
+from reachaq.app.model.session_validation_controller import SessionValidationState
 
 
 def test_stopped_session_notes_use_the_snapshotted_project(monkeypatch):

@@ -20,8 +20,8 @@ import numpy
 import pytest
 from PySide6.QtWidgets import QApplication
 
-from autotrainer.core.fixed_array_queue import BufferResult, FixedArrayQueue
-from autotrainer.pyside.capture.QtCaptureView import (
+from reachaq.core.fixed_array_queue import BufferResult, FixedArrayQueue
+from reachaq.pyside.capture.QtCaptureView import (
     POSE_FRAME_TOLERANCE,
     POSE_HISTORY,
     ImageData,

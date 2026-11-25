@@ -15,18 +15,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from autotrainer.core import (
+from reachaq.core import (
     LaserChannelConfiguration,
     LaserChannelId,
     LaserSystemConfiguration,
     NidaqPortConfiguration,
     NidaqTimingConfiguration,
 )
-from tools.acquisition.model import nidaq_monitor_session, nidaq_signal_monitor_model
-from tools.acquisition.model.app_model_status import SessionRecordingStatus
-from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts
-from tools.acquisition.model.nidaq_monitor_session import NidaqMonitorSession
-from tools.acquisition.model.subsystem_status import SubsystemId, SubsystemState
+from reachaq.app.model import nidaq_monitor_session, nidaq_signal_monitor_model
+from reachaq.app.model.app_model_status import SessionRecordingStatus
+from reachaq.app.model.nidaq_discovery import NidaqDevicePorts
+from reachaq.app.model.nidaq_monitor_session import NidaqMonitorSession
+from reachaq.app.model.subsystem_status import SubsystemId, SubsystemState
 
 import nidaq_stream_fakes
 from nidaq_monitor_session_test import _Stream
@@ -429,7 +429,7 @@ class _HeldExitContext:
     def __reduce_ex__(self, _protocol):
         # The sample ring keeps the context it was made with and goes to the
         # worker with it; the worker gets the stream's real one.
-        from autotrainer.core.multiproc import get_nidaq_mp_ctx
+        from reachaq.core.multiproc import get_nidaq_mp_ctx
         return get_nidaq_mp_ctx, ()
 
     def Process(self, *args, **kwargs):  # noqa: N802 - multiprocessing's name
@@ -569,7 +569,7 @@ def test_a_relayed_worker_log_is_capped_at_warning_once_the_worker_is_replaced(
     # status bar over a healthy newer one.
     messages = queue.Queue()
     messages.put(("log", (
-        logging.ERROR, "tools.acquisition.model.nidaq_signal_monitor_model",
+        logging.ERROR, "reachaq.app.model.nidaq_signal_monitor_model",
         "Failed to close the NI-DAQ signal stream", False)))
     messages.put(("stopped", None))
 
@@ -660,7 +660,7 @@ def test_an_idle_start_refuses_a_line_its_board_cannot_clock_as_run_does(
     # existed, reached the preflight, and failed there at -200452, naming
     # neither the line nor the board.
     from hardware_status_content_test import _patch_hardware_scans
-    from tools.acquisition.model import app_model as app_model_module
+    from reachaq.app.model import app_model as app_model_module
 
     discover = _discover_dev1_lines(None)
     monitor = nidaq_app.nidaq_signal_monitor
@@ -711,7 +711,7 @@ def test_an_idle_start_refuses_a_line_its_board_cannot_clock_as_run_does(
 def _refused_idle_start(nidaq_app, monkeypatch):
     """Load a plan whose Dev1 line cannot be clocked; the Idle start refuses it."""
     from hardware_status_content_test import _patch_hardware_scans
-    from tools.acquisition.model import app_model as app_model_module
+    from reachaq.app.model import app_model as app_model_module
 
     discover = _discover_dev1_lines(None)
     monitor = nidaq_app.nidaq_signal_monitor
@@ -775,9 +775,9 @@ def test_run_still_lists_a_laser_route_problem_after_an_idle_refusal(
     # the plan's own master: here cam_frames' board, Dev2, which the plan
     # prefers to Dev1, the first analog input's. Guessed "first analog", the
     # laser on Dev1 looked clocked from its own board, and went unlisted.
-    from autotrainer.core import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
-    from tools.acquisition.model import app_model as app_model_module
-    from tools.acquisition.model.nidaq_routing import UNIDENTIFIED
+    from reachaq.core import NidaqSignalChannelConfiguration, NidaqSignalStreamConfiguration
+    from reachaq.app.model import app_model as app_model_module
+    from reachaq.app.model.nidaq_routing import UNIDENTIFIED
 
     def board(name, **values):
         return NidaqDevicePorts(
@@ -843,7 +843,7 @@ def test_an_idle_start_refuses_an_export_line_the_laser_takes_as_run_does(
     # stream's own start in Idle never asked, and drove the line the laser
     # drives its clock onto. The check needs no board, so a start that finds
     # none refuses it too, where Run's check of the boards is skipped.
-    from tools.acquisition.model import app_model as app_model_module
+    from reachaq.app.model import app_model as app_model_module
 
     system_config.nidaq_ports = NidaqPortConfiguration(
         cam_frames="Dev1/port0/line0",
@@ -1024,7 +1024,7 @@ def test_a_laser_on_independent_boards_does_not_fail_run_over_a_route_it_never_u
     # NI-DAQ over a route this mode never uses; it read "blocked", as a
     # diagnostic preview, before that, and does again. Here the validation
     # is the real one: the fixture above stubs it out.
-    from tools.acquisition.model import app_model as app_model_module
+    from reachaq.app.model import app_model as app_model_module
 
     system_config.hardware.nidaq_enabled = True
     system_config.nidaq_ports = NidaqPortConfiguration(
@@ -1462,7 +1462,7 @@ def _null_laser_configuration():
 
 
 def _with_bad_nidaq_line(system_config, trainer_config_dir, **ports):
-    from autotrainer.core import (
+    from reachaq.core import (
         NidaqSignalChannelConfiguration,
         NidaqSignalStreamConfiguration,
     )
@@ -1717,7 +1717,7 @@ def test_the_fix_derives_the_stream_state_and_requirement_from_the_new_plan(
 ):
     # The fix wrote STOPPED "configured; not started" and kept the refused
     # plan's requirement, whatever the fixed plan held.
-    from autotrainer.core import NidaqSignalStreamConfiguration
+    from reachaq.core import NidaqSignalStreamConfiguration
 
     # A bad line, and no laser or input of the operator's own.
     system_config.hardware.nidaq_enabled = True
@@ -1753,11 +1753,11 @@ def test_headless_exits_1_naming_a_bad_ni_line(
     # on it, as every load did before the GUI learned to load and block.
     from types import SimpleNamespace
 
-    import autotrainer.core.event as core_event
-    import autotrainer.core.logging as core_logging
-    from tools.acquisition import headless
-    from tools.acquisition.model import app_model as app_model_module
-    from tools.acquisition.model.app_model_status import AppModelStatus
+    import reachaq.core.event as core_event
+    import reachaq.core.logging as core_logging
+    from reachaq.app import headless
+    from reachaq.app.model import app_model as app_model_module
+    from reachaq.app.model.app_model_status import AppModelStatus
 
     _with_bad_nidaq_line(system_config, trainer_config_dir, tone1="Dev1/port1/line0")
     monitor = _with_fake_worker(app_model)
@@ -1784,7 +1784,7 @@ def test_headless_exits_1_naming_a_bad_ni_line(
         assert starts == [] and closes == [True]
         assert any(
             "nidaqPorts.tone1 'Dev1/port1/line0'" in record.getMessage()
-            and record.name == "autotrainer.headless"
+            and record.name == "reachaq.headless"
             for record in caplog.records
         )
         # Headless has no Edit DAQ Ports: its load's own ERROR line said to

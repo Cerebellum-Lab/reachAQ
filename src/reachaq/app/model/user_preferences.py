@@ -1,0 +1,388 @@
+import logging
+import platform
+import sys
+from pathlib import Path
+from typing import Optional, Union
+
+from PySide6.QtCore import QByteArray, QCoreApplication, QRect, QSettings
+
+from reachaq.core import ObservableObject
+from reachaq.core.logging import get_verbose_logger
+from reachaq.core.configuration import SystemConfiguration
+
+
+logger = get_verbose_logger(__name__)
+
+
+def _laser_section_key(name: str) -> str:
+    """Where a Laser Control section's fold is saved, beside ui/splitters/."""
+    return f"ui/laser_control/sections/{name}"
+
+
+def _laser_command_output_key(channel_id: int) -> str:
+    """Where a laser's Command output choice is saved."""
+    return f"ui/laser_control/command_output/laser{int(channel_id)}"
+
+
+def get_default_configuration_location() -> Path:
+    return SystemConfiguration.DEFAULT_CONFIG_DIR.expanduser()
+
+
+def get_default_animals_location(default_config_location: Path) -> Path:
+    return default_config_location.joinpath("animals")
+
+
+class UserPreferences(ObservableObject):
+
+    CONFIGURATION_LOCATION = "configuration_location"
+    SERIAL_NUMBER = "serial_number"
+    LIVE_FEED_REFRESH_RATE = "live_feed_refresh_rate"
+    CALIBRATION_REMINDER_DAYS = "calibration_reminder_days"
+    LOG_LOCATION = "log_location"
+    LOG_LEVEL = "log_level"
+    SELECTED_ANIMAL = "selected_animal"
+    ANIMAL_LOCATION = "animal_location"
+    PELLET_PORT = "pellet_port"
+    MEASUREMENT_GRAPH = "measurement_graph"
+    ANIMAL_METADATA_SOURCE = "animal_metadata_source"
+    SOFTMOUSE_MANIFEST_PATH = "softmouse_manifest_path"
+    SOFTMOUSE_PUBLICATION_MOUNT = "softmouse_publication_mount"
+    SOFTMOUSE_NAME_COLUMN = "softmouse_name_column"
+    SOFTMOUSE_NIGHTLY_REFRESH = "softmouse_nightly_refresh"
+    WINDOW_NORMAL_GEOMETRY = "window_normal_geometry"
+
+    def __init__(self, *, settings_file_path: Optional[Path] = None):
+        super().__init__()
+        if settings_file_path is None:
+            settings_args = ()
+        else:
+            settings_args = (settings_file_path.as_posix(), QSettings.Format.IniFormat)
+
+        if sys.platform.startswith("win"):
+            if settings_file_path is None:
+                settings = self._settings = QSettings(QSettings.Format.IniFormat, QSettings.Scope.UserScope, "reachAQ", "reachAQ")
+            else:
+                settings = self._settings = QSettings(*settings_args)
+        else:
+            QCoreApplication.setOrganizationName("reachAQ")
+            QCoreApplication.setOrganizationDomain("colorado.edu")
+            QCoreApplication.setApplicationName("reachAQ")
+            # IniFormat is required for the settings_file_path to be effective,
+            # otherwise it's prepended with XDG_CONFIG_DIR :
+            settings = self._settings = QSettings(*settings_args)
+
+        logger.verbose("Using setting ini file: %r", settings.fileName())
+
+        self._serial_number: str = settings.value("system/serial_number", platform.node(), str)  # noqa
+        self._last_configuration: str = settings.value("system/last_configuration", "", str)  # noqa
+
+        self._configuration_location: str = settings.value(  # noqa
+            "system/configuration_location",
+            get_default_configuration_location().as_posix(),
+            str,
+        )
+
+        self._animal_location: str = settings.value(
+            "system/animal_location",
+            get_default_animals_location(Path(self._configuration_location)).as_posix())  # noqa
+
+        # Subject selection is session state. Never restore it when reachAQ starts,
+        # and remove the legacy persisted value so older installations also start
+        # with an empty subject.
+        self._selected_animal: str = ""
+        settings.remove("system/selected_animal")
+
+        self._log_location: str = settings.value("system/log_location", "")  # noqa
+        self._log_level: int = settings.value("system/log_level", logging.WARNING, int)  # noqa
+
+        self._live_feed_refresh_rate: int = settings.value("display/refresh_rate", 15, int)  # noqa
+        self._calibration_reminder_days: int = settings.value("calibration/reminder_days", 30, int)  # noqa
+        self._measurement_graph: str = settings.value("ui/measurement_graph", "")  # noqa
+
+        # The animal metadata source this user set up, as JSON (see
+        # animal_sources.config); its secrets are kept outside this file.
+        self._animal_metadata_source: str = settings.value(
+            "animal_metadata/source", "", str
+        ).strip()
+        # Before sources existed: a shared publication to read, and the
+        # options that went with it. Read when no source is set up.
+        self._softmouse_manifest_path: str = settings.value(
+            "softmouse/manifest_path", "", str
+        ).strip()
+        # The mount the publication must be on; empty checks none.
+        self._softmouse_publication_mount: str = settings.value(
+            "softmouse/publication_mount", "", str
+        ).strip()
+        self._softmouse_name_column: str = settings.value(
+            "softmouse/new_animal_name_column", "Physical Tag", str
+        )
+        self._softmouse_nightly_refresh: bool = settings.value(
+            "softmouse/nightly_refresh", True, bool
+        )
+        self._window_normal_geometry = QRect(
+            settings.value("ui/window_normal_geometry", QRect(), QRect)
+        )
+        # Transient values that may come from individual configuration files, but are conveniently accessed from
+        # the user preferences.
+
+        self._pellet_port = None
+
+    @property
+    def settings_file_name(self) -> str:
+        """The file these preferences are read from and saved to."""
+        return self._settings.fileName()
+
+    def save(self):
+        logger.verbose("Saving ini config to %s", self._settings.fileName())
+        self._settings.sync()
+
+    def splitter_state(self, name: str) -> QByteArray:
+        value = self._settings.value(f"ui/splitters/{name}", QByteArray())
+        if isinstance(value, QByteArray):
+            return value
+        return QByteArray(value) if value else QByteArray()
+
+    def set_splitter_state(self, name: str, state: QByteArray) -> None:
+        self._settings.setValue(f"ui/splitters/{name}", state)
+
+    def laser_section_expanded(self, name: str) -> Optional[bool]:
+        """Whether Laser Control's section `name` was left open; None if not saved."""
+        return self._saved_flag(_laser_section_key(name))
+
+    def set_laser_section_expanded(self, name: str, expanded: bool) -> None:
+        self._settings.setValue(_laser_section_key(name), bool(expanded))
+
+    def laser_command_output_shown(self, channel_id: int) -> Optional[bool]:
+        """Whether a laser's Command output trace was left shown; None if not saved."""
+        return self._saved_flag(_laser_command_output_key(channel_id))
+
+    def set_laser_command_output_shown(self, channel_id: int, shown: bool) -> None:
+        self._settings.setValue(_laser_command_output_key(channel_id), bool(shown))
+
+    def _saved_flag(self, key: str) -> Optional[bool]:
+        """A saved true or false, or None: nothing saved, or anything else.
+
+        Read untyped and judged here. Parsed from the file, true and false
+        come back as the str they are written as; only a value this process
+        set comes back a bool. A typed read would turn whatever else a
+        damaged or hand-edited file holds into a bool by rules of its own.
+        Never raises, so a bad file cannot stop a panel opening; it opens as
+        it would with nothing saved.
+        """
+        try:
+            value = self._settings.value(key)
+        except Exception as exc:
+            logger.warning("Could not read %s from the preferences: %s", key, exc)
+            return None
+        if isinstance(value, bool):
+            return value
+        text = value.strip().lower() if isinstance(value, str) else None
+        if text in ("true", "false"):
+            return text == "true"
+        if value is not None:
+            logger.warning("Ignoring %s = %r in the preferences: not true or false", key, value)
+        return None
+
+    @property
+    def window_normal_geometry(self) -> QRect:
+        return QRect(self._window_normal_geometry)
+
+    @window_normal_geometry.setter
+    def window_normal_geometry(self, value: QRect) -> None:
+        value = QRect(value)
+        if not value.isValid() or value.width() < 1 or value.height() < 1:
+            return
+        previous = self._window_normal_geometry
+        self._window_normal_geometry = value
+        self._settings.setValue("ui/window_normal_geometry", value)
+        self._on_property_changed(self.WINDOW_NORMAL_GEOMETRY, value, previous)
+
+    @property
+    def right_panel_state(self) -> str:
+        """Where the laser and protocol panel was left: docked, expanded or detached."""
+        value = self._settings.value("ui/panels/right_side_state", "docked")
+        return str(value) if value else "docked"
+
+    @right_panel_state.setter
+    def right_panel_state(self, value: str) -> None:
+        self._settings.setValue("ui/panels/right_side_state", str(value))
+
+    @property
+    def right_panel_detached_geometry(self) -> QRect:
+        value = self._settings.value(
+            "ui/panels/right_side_detached_geometry", QRect()
+        )
+        return QRect(value) if isinstance(value, QRect) else QRect()
+
+    @right_panel_detached_geometry.setter
+    def right_panel_detached_geometry(self, value: QRect) -> None:
+        value = QRect(value)
+        # A zero-size or invalid rectangle would restore an unusable window.
+        if not value.isValid() or value.width() < 1 or value.height() < 1:
+            return
+        self._settings.setValue("ui/panels/right_side_detached_geometry", value)
+
+    @property
+    def last_configuration(self) -> str:
+        return self._last_configuration
+
+    @property
+    def configuration_location(self) -> str:
+        return self._configuration_location
+
+    @configuration_location.setter
+    def configuration_location(self, value: Union[str, Path]) -> None:
+        value = Path(value).as_posix()
+        prev, self._configuration_location = self._configuration_location, value
+        self._on_property_changed(self.CONFIGURATION_LOCATION, value, prev)
+        self._settings.setValue("system/configuration_location", value)
+
+    @property
+    def serial_number(self) -> str:
+        return self._serial_number
+
+    @serial_number.setter
+    def serial_number(self, value: str):
+        prev, self._serial_number = self._serial_number, value
+        self._settings.setValue("system/serial_number", value)
+        self._on_property_changed(self.SERIAL_NUMBER, value, prev)
+
+    @property
+    def live_feed_refresh_rate(self) -> int:
+        return self._live_feed_refresh_rate
+
+    @live_feed_refresh_rate.setter
+    def live_feed_refresh_rate(self, value: int):
+        prev, self._live_feed_refresh_rate = self._live_feed_refresh_rate, value
+        self._settings.setValue("display/refresh_rate", value)
+        self._on_property_changed(self.LIVE_FEED_REFRESH_RATE, value, prev)
+
+    @property
+    def calibration_reminder_days(self) -> int:
+        """How many days old the active 3D calibration may be before the app suggests a new one."""
+        return self._calibration_reminder_days
+
+    @calibration_reminder_days.setter
+    def calibration_reminder_days(self, value: int):
+        prev, self._calibration_reminder_days = self._calibration_reminder_days, value
+        self._settings.setValue("calibration/reminder_days", value)
+        self._on_property_changed(self.CALIBRATION_REMINDER_DAYS, value, prev)
+
+    @property
+    def log_location(self) -> str:
+        return self._log_location
+
+    @log_location.setter
+    def log_location(self, value: Union[str, Path]):
+        value = Path(value).as_posix()
+        prev, self._log_location = self._log_location, value
+        self._settings.setValue("system/log_location", value)
+        self._on_property_changed(self.LOG_LOCATION, value, prev)
+
+    @property
+    def selected_animal(self) -> str:
+        return self._selected_animal
+
+    @selected_animal.setter
+    def selected_animal(self, value: str):
+        # set new value first,
+        prev, self._selected_animal = self._selected_animal, value
+        # then eventually trigger the on_property_changed event:
+        self._on_property_changed(self.SELECTED_ANIMAL, value, prev)
+
+    @property
+    def animal_location(self) -> str:
+        return self._animal_location
+
+    @animal_location.setter
+    def animal_location(self, value: Union[str, Path]):
+        value = Path(value).as_posix()
+        prev, self._animal_location = self._animal_location, value
+        self._on_property_changed(self.ANIMAL_LOCATION, value, prev)
+        self._settings.setValue("system/animal_location", value)
+
+    @property
+    def log_level(self) -> int:
+        return self._log_level
+
+    @log_level.setter
+    def log_level(self, value: int):
+        prev, self._log_level = self._log_level, value
+        self._settings.setValue("system/log_level", value)
+        self._on_property_changed(self.LOG_LEVEL, value, prev)
+
+    # Transient Values
+
+    @property
+    def pellet_port(self) -> str:
+        return self._pellet_port
+
+    @pellet_port.setter
+    def pellet_port(self, value: str):
+        prev, self._pellet_port = self._pellet_port, value
+        self._on_property_changed(self.PELLET_PORT, value, prev)
+
+    @property
+    def measurement_graph(self) -> str:
+        return self._measurement_graph
+
+    @measurement_graph.setter
+    def measurement_graph(self, value: str) -> None:
+        prev, self._measurement_graph = self._measurement_graph, value
+        self._settings.setValue("ui/measurement_graph", value)
+        self._on_property_changed(self.MEASUREMENT_GRAPH, value, prev)
+
+    @property
+    def animal_metadata_source(self) -> str:
+        return self._animal_metadata_source
+
+    @animal_metadata_source.setter
+    def animal_metadata_source(self, value: str) -> None:
+        value = value.strip()
+        prev, self._animal_metadata_source = self._animal_metadata_source, value
+        self._settings.setValue("animal_metadata/source", value)
+        self._on_property_changed(self.ANIMAL_METADATA_SOURCE, value, prev)
+
+    @property
+    def softmouse_manifest_path(self) -> str:
+        return self._softmouse_manifest_path
+
+    @softmouse_manifest_path.setter
+    def softmouse_manifest_path(self, value: str) -> None:
+        value = value.strip()
+        prev, self._softmouse_manifest_path = self._softmouse_manifest_path, value
+        self._settings.setValue("softmouse/manifest_path", self._softmouse_manifest_path)
+        self._on_property_changed(self.SOFTMOUSE_MANIFEST_PATH, self._softmouse_manifest_path, prev)
+
+    @property
+    def softmouse_publication_mount(self) -> str:
+        return self._softmouse_publication_mount
+
+    @softmouse_publication_mount.setter
+    def softmouse_publication_mount(self, value: str) -> None:
+        value = value.strip()
+        prev, self._softmouse_publication_mount = self._softmouse_publication_mount, value
+        self._settings.setValue("softmouse/publication_mount", value)
+        self._on_property_changed(self.SOFTMOUSE_PUBLICATION_MOUNT, value, prev)
+
+    @property
+    def softmouse_name_column(self) -> str:
+        return self._softmouse_name_column
+
+    @softmouse_name_column.setter
+    def softmouse_name_column(self, value: str) -> None:
+        value = value.strip() or "Physical Tag"
+        prev, self._softmouse_name_column = self._softmouse_name_column, value
+        self._settings.setValue("softmouse/new_animal_name_column", value)
+        self._on_property_changed(self.SOFTMOUSE_NAME_COLUMN, value, prev)
+
+    @property
+    def softmouse_nightly_refresh(self) -> bool:
+        return self._softmouse_nightly_refresh
+
+    @softmouse_nightly_refresh.setter
+    def softmouse_nightly_refresh(self, value: bool) -> None:
+        value = bool(value)
+        prev, self._softmouse_nightly_refresh = self._softmouse_nightly_refresh, value
+        self._settings.setValue("softmouse/nightly_refresh", value)
+        self._on_property_changed(self.SOFTMOUSE_NIGHTLY_REFRESH, value, prev)

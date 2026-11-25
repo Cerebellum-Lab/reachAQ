@@ -4,15 +4,15 @@ import pytest
 
 from softmouse_https_source_test import COLONY, Session  # noqa: E402
 
-from tools.acquisition.model.animal_metadata_sync import AnimalMetadataSyncService
-from tools.acquisition.model.animal_registry import AnimalRegistry
-from tools.acquisition.model.animal_sources.config import SourceConfiguration, build_source
-from tools.acquisition.model.animal_sources.credentials import KEYRING_SERVICE, CredentialStore
-from tools.acquisition.model.animal_sources.softmouse import (
+from reachaq.app.model.animal_metadata_sync import AnimalMetadataSyncService
+from reachaq.app.model.animal_registry import AnimalRegistry
+from reachaq.app.model.animal_sources.config import SourceConfiguration, build_source
+from reachaq.app.model.animal_sources.credentials import KEYRING_SERVICE, CredentialStore
+from reachaq.app.model.animal_sources.softmouse import (
     LEGACY_KEYRING_SERVICE,
     SoftMouseSource,
 )
-from tools.acquisition.model.animal_sources.source_setup import list_choices, read_columns
+from reachaq.app.model.animal_sources.source_setup import list_choices, read_columns
 
 
 class FakeKeyring:
@@ -91,7 +91,7 @@ def test_a_password_from_the_old_publisher_service_still_works(tmp_path, session
 
 
 def test_setup_can_keep_the_old_publishers_password(tmp_path, session):
-    from tools.acquisition.model.animal_sources.source_setup import save_setup
+    from reachaq.app.model.animal_sources.source_setup import save_setup
 
     class Preferences:
         animal_metadata_source = ""

@@ -6,8 +6,8 @@ import struct
 
 import pytest
 
-from autotrainer.device.can_interface import CanInterface
-from autotrainer.device.device_interface import DigitalOutputs, Target
+from reachaq.device.can_interface import CanInterface
+from reachaq.device.device_interface import DigitalOutputs, Target
 
 
 class FakeJerryCan:
@@ -88,7 +88,7 @@ def test_a_transport_without_the_command_is_refused(interface):
 
 def pulse_status_frame(gpio_idx, phase=2, error=0):
     """A GPIO_PULSE_STATUS frame as the board sends it, decoded."""
-    from autotrainer.device.socketcan_jerrycan import JerryCANCmdType, decode_frame
+    from reachaq.device.socketcan_jerrycan import JerryCANCmdType, decode_frame
 
     can_id = (JerryCANCmdType.GPIO_PULSE_STATUS << 5) | 0x01
     payload = struct.pack("<BHIBi", 0, gpio_idx, 1000, phase, error)

@@ -6,12 +6,12 @@ on PoseModel, the order in pose_process, cropping a model that preserves
 scale) stays in core.
 """
 
-from autotrainer.inference.cropped_pose_model import (
+from reachaq.inference.cropped_pose_model import (
     INFERENCE_ROI_ENV_VAR,
     InferenceRoi,
     maybe_crop,
 )
-from autotrainer.pose_plugins.yolo import YoloPoseModel
+from reachaq.pose_plugins.yolo import YoloPoseModel
 
 
 def test_yolo_takes_the_live_batch_for_its_graph():
@@ -42,7 +42,7 @@ def test_a_yolo_model_is_never_cropped_and_the_roi_is_said_to_be_ignored(monkeyp
     """A YOLO graph runs at its imgsz whatever it is handed, so a crop saves no
     time and only changes the scale the model was trained at. YOLO is the live
     model because it is the fastest; it keeps running, on the full frame."""
-    from autotrainer.inference import cropped_pose_model
+    from reachaq.inference import cropped_pose_model
 
     warnings = []
     monkeypatch.setattr(cropped_pose_model.logger, "warning",

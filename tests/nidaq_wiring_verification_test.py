@@ -9,7 +9,7 @@ described.
 import json
 from types import SimpleNamespace
 
-from tools.acquisition.model.nidaq_wiring_verification import (
+from reachaq.app.model.nidaq_wiring_verification import (
     CONFIRMED,
     OPAQUE,
     SILENT,

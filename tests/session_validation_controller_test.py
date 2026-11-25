@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools.acquisition.model.session_validation_controller import (
+from reachaq.app.model.session_validation_controller import (
     SessionValidationController,
 )
 
@@ -22,7 +22,7 @@ def test_validation_controller_publishes_automatic_quick_report(tmp_path, monkey
             return {"profile": "quick", "counts": self.counts}
 
     monkeypatch.setattr(
-        "tools.acquisition.model.session_validation_controller.validate_session",
+        "reachaq.app.model.session_validation_controller.validate_session",
         lambda *_args, **_kwargs: Report(),
     )
     controller = SessionValidationController(mp_ctx=multiprocessing.get_context("fork"))
@@ -45,7 +45,7 @@ def test_validation_controller_uses_unique_manual_reports(tmp_path, monkeypatch)
             return {"profile": "fast"}
 
     monkeypatch.setattr(
-        "tools.acquisition.model.session_validation_controller.validate_session",
+        "reachaq.app.model.session_validation_controller.validate_session",
         lambda *_args, **_kwargs: Report(),
     )
     controller = SessionValidationController(mp_ctx=multiprocessing.get_context("fork"))
@@ -67,7 +67,7 @@ def test_validation_controller_delivers_every_state_outside_its_lock(tmp_path, m
             return {"profile": "quick", "counts": self.counts}
 
     monkeypatch.setattr(
-        "tools.acquisition.model.session_validation_controller.validate_session",
+        "reachaq.app.model.session_validation_controller.validate_session",
         lambda *_args, **_kwargs: Report(),
     )
     taken = []
@@ -102,7 +102,7 @@ def test_validation_controller_final_state_cannot_overtake_start_states(tmp_path
             return {"profile": "quick", "counts": self.counts}
 
     monkeypatch.setattr(
-        "tools.acquisition.model.session_validation_controller.validate_session",
+        "reachaq.app.model.session_validation_controller.validate_session",
         lambda *_args, **_kwargs: Report(),
     )
     delivered = []
@@ -134,7 +134,7 @@ def test_validation_controller_monitors_the_process_when_a_callback_raises(tmp_p
             return {"profile": "quick", "counts": self.counts}
 
     monkeypatch.setattr(
-        "tools.acquisition.model.session_validation_controller.validate_session",
+        "reachaq.app.model.session_validation_controller.validate_session",
         lambda *_args, **_kwargs: Report(),
     )
     delivered = []

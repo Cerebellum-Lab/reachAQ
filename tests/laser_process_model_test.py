@@ -1,8 +1,8 @@
 """LaserModel over a laser process: Run Pulse, a waited train, and a fault reaching the model.
 
 The laser process runs NidaqLaserController over the fake NI-DAQmx
-(auto-trainer-device/tests/laser_process_fake.py, loaded by path: tests/ and
-auto-trainer-device/tests are separate import roots).
+(tests/device/laser_process_fake.py, loaded by path: tests/ and
+tests/device are separate import roots).
 """
 
 import importlib.util
@@ -14,14 +14,14 @@ from pathlib import Path
 
 import pytest
 
-from autotrainer.device import LaserChannelId
-from autotrainer.device.laser import LaserPulseTrain
-from autotrainer.device.laser_process import LaserProcessController
+from reachaq.device import LaserChannelId
+from reachaq.device.laser import LaserPulseTrain
+from reachaq.device.laser_process import LaserProcessController
 
-from tools.acquisition.model.laser_model import LaserModel
+from reachaq.app.model.laser_model import LaserModel
 
 _FAKE_PATH = (Path(__file__).resolve().parents[1]
-              / "auto-trainer-device" / "tests" / "laser_process_fake.py")
+              / "tests" / "device" / "laser_process_fake.py")
 _spec = importlib.util.spec_from_file_location("laser_process_fake", _FAKE_PATH)
 fake = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fake)

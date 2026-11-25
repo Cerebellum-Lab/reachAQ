@@ -1,0 +1,2128 @@
+import dataclasses
+import logging
+import math
+import os
+import re
+import subprocess
+import threading
+import time
+import uuid
+from functools import partial
+from queue import Queue
+from uuid import UUID, uuid4
+from typing import Optional, Tuple, Dict, Union, List
+
+from reachaq.core.api import ApiEventKind, ApiDetectorKind
+from reachaq.core import (ObservableObject, SystemCommandKind, MessageHandler, AnimalSubject, Offset3DTuple,
+                              get_verbose_logger, Motor, EventManager, HardwareConfiguration,
+                              get_perf_now, SystemStatusMessageKind, MotorConfigurations)
+from reachaq.core.logging import log_hardware_initialization
+from reachaq.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from reachaq.core.event import post_api_detector_event_content
+from reachaq.core.message import SystemDataArgsKwargs
+from reachaq.device import (CanTransportConfiguration, CanTransportKind, DeviceConnectionProtocol, HAVE_CAN_DEVICE,
+                                DeviceConnection, CanDevice, CanFailure, CanFailureKind, CommandRefusedError,
+                                StepperConfig, ServoConfig, Device, ColorLed, Target, EmulationInterface,
+                                capture_can_diagnostics)
+from reachaq.device.device_interface import BOARD_STIM_LINE_OUTPUTS, stepper_travel_refusal
+from reachaq.device.can_device import (default_cover_pellet, default_load_pellet, default_move_retract,
+                                           default_release_pellet, default_send_pellet, sequence_stepper_targets)
+from reachaq.device.compound_movement_file import CompoundMovements
+from reachaq.device.motor_steps import MotorSteps
+from reachaq.behavior import PelletDeviceProtocol
+from reachaq.app.model.firmware_compatibility import FirmwareCompatibilityPolicy
+
+logger = get_verbose_logger(__name__)
+
+
+def _pellet_sequences(movements=None) -> Dict[str, MotorSteps]:
+    """The compound sequences CanDevice runs for LOAD_PELLET, SEND_PELLET, COVER_PELLET,
+    RELEASE_PELLET and SEND_RETRACT: those of `movements` (move_config.yaml) that are not empty,
+    else CanDevice's built-in defaults, as DeviceConnection.use_compound_movements applies them."""
+    sequences = {
+        "load_pellet": default_load_pellet(),
+        "send_pellet": default_send_pellet(),
+        "cover_pellet": default_cover_pellet(),
+        "release_pellet": default_release_pellet(),
+        "move_retract": default_move_retract(),
+    }
+    if isinstance(movements, CompoundMovements):
+        for name in sequences:
+            steps = getattr(movements, name)
+            if not steps.is_empty:
+                sequences[name] = steps
+    return sequences
+
+_nans_offset3dTuple = Offset3DTuple.get_nan()
+
+_AXIS_NAMES = {Motor.PELLET_X_MOTOR: "X", Motor.PELLET_Y_MOTOR: "Y", Motor.PELLET_Z_MOTOR: "Z"}
+
+#: The reason the Hardware Control STOP button gives; the alert says the operator pressed it.
+OPERATOR_STOP_REASON = "operator STOP"
+
+# What the stage refuses after an ESTOP until an operator's home succeeds: everything that
+# moves a stepper or a servo. SETs only store a position and are still sent.
+_REFUSED_WHILE_STOPPED = frozenset({
+    SystemCommandKind.MOVE_X, SystemCommandKind.MOVE_Y, SystemCommandKind.MOVE_Z,
+    SystemCommandKind.SEND_FIXED_XYZ, SystemCommandKind.SEND_HOME, SystemCommandKind.SEND_TO_LIMITS,
+    SystemCommandKind.LOAD_PELLET, SystemCommandKind.SEND_PELLET, SystemCommandKind.SEND_RETRACT,
+    SystemCommandKind.RELEASE_PELLET, SystemCommandKind.COVER_PELLET,
+    SystemCommandKind.MOVE_LOAD_SERVO, SystemCommandKind.MOVE_COVER_SERVO,
+})
+
+
+_reg_pellet_version_clean = re.compile("pellet ?:? *")
+class HardwareModel(ObservableObject, PelletDeviceProtocol):
+
+    PELLET_VERSION_PROPERTY = "pellet_version"
+    FIRMWARE_COMPATIBILITY_PROPERTY = "firmware_compatibility"
+
+    PELLET_IDENTIFIER_PROPERTY = "pellet_identifier"
+    CAN_ENABLED = "can_enabled"
+    PELLET_CONTROLLER_ENABLED = "pellet_controller_enabled"
+    NIDAQ_ENABLED = "nidaq_enabled"
+
+    PENDING_COMMAND_PROPERTY = "pending_command"
+    CAN_CONNECTION_STATE_PROPERTY = "can_connection_state"
+    PELLET_NEEDS_HOME_PROPERTY = "pellet_needs_home"
+    PELLET_DRIVER_FAULT_PROPERTY = "pellet_driver_fault"
+    LAST_COMMAND_REFUSAL_PROPERTY = "last_command_refusal"
+    #: The last ESTOP (a dict: wallTime, perfTime, reason, axes, operator, sent) while the
+    #: stage is stopped; None once a home cleared it.
+    PELLET_ESTOP_PROPERTY = "pellet_estop"
+
+    # Per axis x, y, z: the token of the latest SET queued, so a refusal of an older SET does
+    # not roll back a newer one (_forget_refused_set).
+    _latest_set_tokens: Tuple[Optional[UUID], Optional[UUID], Optional[UUID]] = (None, None, None)
+    # After a refused base position (block_presentation): the axes not SET since, and why.
+    # send_pellet is refused until none is left.
+    _presentation_blocked_axes: frozenset = frozenset()
+    _presentation_block_reason: str = ""
+    # token -> axis of each queued SET that lifts the block once the board acknowledges it.
+    _block_lifting_sets: Dict[UUID, int] = {}  # replaced, never mutated in place
+    # Incremented by every block_presentation: a SET sent under one block cannot lift another.
+    _block_generation: int = 0
+    # SETs that only move the stage for a while, or shift it from where it is: they do not
+    # stand in for the refused base position.
+    _SENDERS_NOT_CLEARING_THE_BLOCK = frozenset({"ordered_protocol", "processed_shift_xyz"})
+    # Class defaults as well as __init__'s, for models a test builds without __init__.
+    _estop_record: Optional[dict] = None
+    _estop_home_token: Optional[UUID] = None
+
+    DEVICE_ACK_TIMEOUT_ENGAGED = "device_ack_timeout_engaged"
+    DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED = "device_pellet_status_timeout_engaged"
+
+    # POS_X = "pos_x"
+    # POS_Y = "pos_y"
+    # POS_Z = "pos_z"
+    POS_XYZ = "pos_xyz"
+
+    SEND_X = "send_x"
+    SEND_Y = "send_y"
+    SEND_Z = "send_z"
+    SEND_XYZ = "send_xyz"
+
+    SET_X = "set_x"
+    SET_Y = "set_y"
+    SET_Z = "set_z"
+
+    def __init__(
+        self,
+        message_handler: MessageHandler,
+    ):
+        super().__init__(event_names=("device_event", "command_failed"))
+
+        self._lock = threading.RLock()  # **required** re-entrant lock !!
+        self._can_lifecycle_lock = threading.RLock()
+        self._safety_shutdown_lock = threading.Lock()
+        self._safety_shutdown_started = False
+        self._safety_shutdown_thread: Optional[threading.Thread] = None
+        self._connect_count = 0
+        self._command_queue: Optional[Queue] = None
+        self._can_recovery_lock = threading.Lock()
+        self._can_recovery_thread: Optional[threading.Thread] = None
+        self._can_recovery_cancel = threading.Event()
+        self._first_can_failure: Optional[CanFailure] = None
+        self._can_recovery_failure: Optional[CanFailure] = None
+        self._can_recovery_generation = 0
+        self._can_connection_state = {"state": "stopped", "error": ""}
+
+        self._event_manager = EventManager.default()
+        self._board_status_timeout: Optional[float] = None
+        self._device_ack_timeout_delay: Optional[float] = None
+        self._device_conn: Optional[DeviceConnectionProtocol] = None
+        # What the last connect wrote to the pellet controller (WRITE_MOTOR_CONFIGURATION).
+        self._motor_configurations: Optional[MotorConfigurations] = None
+        # The compound sequences the last connect applied (move_config.yaml, else the built-in ones).
+        self._pellet_sequences: Dict[str, MotorSteps] = _pellet_sequences()
+        self._can_device: Optional[CanDevice] = None
+        self._can_latency_observer = None
+        self._device_uuid_ack_timeout_engaged = False
+        self._device_pellet_status_timeout_engaged = False
+        self._device_initialization_complete = False
+        self._can_enabled = True
+        self._pellet_controller_enabled = True
+        self._nidaq_enabled = False
+
+        self._pending_tokens: Dict[UUID, Tuple[SystemCommandKind, float]] = {}
+        self._command_outcomes: Dict[UUID, Tuple[str, str]] = {}
+        # Stepper axes the board will refuse to move until each is homed, as
+        # its refusals said; cleared by an acknowledged home.
+        self._axes_needing_home: Tuple[str, ...] = ()
+        # Stepper axes whose driver reports a latched fault (status bit 0), as
+        # the board last said; the board clears it when a home re-proves them.
+        self._axes_with_driver_fault: Tuple[str, ...] = ()
+        self._last_command_refusal = ""
+        # The last ESTOP while the stage is stopped (PELLET_ESTOP_PROPERTY), and the token of
+        # the operator's home that clears it (home_after_estop).
+        self._estop_record: Optional[dict] = None
+        self._estop_home_token: Optional[UUID] = None
+
+        message_handler.property_changed += self._message_handler_property_changed
+        message_handler.ack_received += self._ack_received
+        message_handler.command_refused += self._command_refused
+        message_handler.decoded_message_received += self._decoded_device_message
+
+        self._dcs_config: Optional[DiamondTriangleOffsetConfig] = None
+        # Why moves given in DCS refuse while _dcs_config is None, when the app says (set_diamond_triangle_config).
+        self._dcs_unavailable_reason: Optional[str] = None
+        # Cache physical and requested coordinates separately so relative moves
+        # cannot silently overwrite the saved pellet-send position.
+        self._last_motor_coordinates = _nans_offset3dTuple
+        # what the motors report they've been SET (with possible drift corrected):
+        self._last_motor_send_coordinates = _nans_offset3dTuple
+        # What we've SET as coordinates:
+        self._last_requested_set_coordinates: Offset3DTuple = _nans_offset3dTuple
+
+        self._cover_arm_position: float = math.nan
+        self._load_arm_position: float = math.nan
+
+        self._pellet_version = ""
+        self._board_wire_schema_version = None
+        self._board_capabilities = 0
+        self._board_capabilities_received = threading.Event()
+        self._firmware_version_received = threading.Event()
+        self._can_is_emulation = False
+        self._firmware_policy = FirmwareCompatibilityPolicy.load()
+        self._firmware_compatibility = self._firmware_policy.evaluate("")
+        self._color_led: Optional[ColorLed] = None
+
+        self._device_ack_timeout_engaged = False
+        self._disconnect_event = threading.Event()
+        self._check_timedout_commands_thread: Optional[threading.Thread] = None
+
+    @property
+    def watchdog_reader_perf_c(self):
+        dev = self._device_conn
+        if dev is None:
+            return math.nan
+        return dev.watchdog_reader_perf_c
+
+    @property
+    def watchdog_writer_perf_c(self) -> float:
+        dev = self._device_conn
+        if dev is None:
+            return math.nan
+        return dev.watchdog_writer_perf_c
+
+    def _check_timedout_commands_handler(self):
+        while True:
+            if self._disconnect_event.wait(1):
+                break
+            dev = self._device_conn
+            if dev is None or not dev.device.connected:
+                logger.verbose("device not connected, exiting check loop")
+                break
+            perf_now = get_perf_now()
+            expired_tokens = set()
+            with self._lock:
+                for pending_token, (
+                    pending_cmd,
+                    pending_t_perf,
+                ) in self._pending_tokens.items():
+                    age_second = perf_now - pending_t_perf
+                    if age_second > 30:
+                        logger.warning(
+                            "Giving up on pending cmd %s for too long ; token=%s age=%s seconds",
+                            pending_cmd,
+                            pending_token,
+                            age_second,
+                        )
+                        expired_tokens.add(pending_token)
+                expired_motion = [
+                    self._pending_tokens[token][0] for token in expired_tokens
+                    if self._pending_tokens[token][0] in _REFUSED_WHILE_STOPPED
+                ]
+                for expired in expired_tokens:
+                    self._pending_tokens.pop(expired, None)
+                    self._remember_command_outcome(
+                        expired,
+                        "timed_out",
+                        "command acknowledgement was not received within 30 seconds",
+                    )
+                after_commands = list(self._pending_tokens.values())
+            if len(expired_tokens) > 0:
+                self._refresh_cmd_in_progress(after_commands)
+                if expired_motion:
+                    self.estop_if_moving(
+                        f"{expired_motion[0].name} was not acknowledged within 30 s", frame_only=True)
+
+    @property
+    def pending_tokens(self) -> List[str]:
+        return list(self._pending_tokens)
+
+    @property
+    def pellet_axes_needing_home(self) -> Tuple[str, ...]:
+        """Pellet stepper axes ("X", "Y", "Z") a refusal said need a home."""
+        return self._axes_needing_home
+
+    @property
+    def pellet_axes_with_driver_fault(self) -> Tuple[str, ...]:
+        """Pellet stepper axes ("X", "Y", "Z") whose driver reports a latched fault."""
+        return self._axes_with_driver_fault
+
+    @property
+    def last_command_refusal(self) -> str:
+        """The operator text of the board's last refusal, or ""."""
+        return self._last_command_refusal
+
+    # -- ESTOP -------------------------------------------------------------
+
+    @property
+    def pellet_estop(self) -> Optional[dict]:
+        """The last ESTOP while the stage is stopped, or None (PELLET_ESTOP_PROPERTY)."""
+        return self._estop_record
+
+    @property
+    def estop_active(self) -> bool:
+        """The stage was stopped and has not been homed since: motion is refused."""
+        return self._estop_record is not None
+
+    @property
+    def motion_possibly_in_flight(self) -> bool:
+        """A motion command is not finished, here or on the device, since the last stop.
+
+        CanDevice.motion_possibly_in_flight (accepted motion commands and stepper frames
+        awaiting their ack), or a motion token of this model still pending that was sent
+        after the last ESTOP: between a sequence's frames nothing awaits an ack, but the
+        next frame can go out before a teardown stops the device.
+        """
+        if getattr(self._can_device, "motion_possibly_in_flight", False) is True:
+            return True
+        record = self._estop_record
+        stopped_at = -math.inf if record is None else record.get("event", record)["perfTime"]
+        with self._lock:
+            return any(
+                command in _REFUSED_WHILE_STOPPED and started > stopped_at
+                for command, started in self._pending_tokens.values()
+            )
+
+    @property
+    def stepper_frame_in_flight(self) -> bool:
+        """A stepper frame was sent and its ack has not arrived (CanDevice.stepper_frame_in_flight)."""
+        return getattr(self._can_device, "stepper_frame_in_flight", False) is True
+
+    def estop(self, reason: str) -> bool:
+        """Stop every pellet stepper now (CanDevice.estop); False when it could not be sent.
+
+        Fire and forget, written from the calling thread, never queued. The device
+        reports it back (_on_device_estop): the stage is then stopped, every axis
+        needs a home, and motion is refused until an operator's home succeeds.
+        """
+        can_dev = self._can_device
+        if can_dev is None:
+            logger.error("Pellet ESTOP not sent, the pellet board is not connected: %s", reason)
+            return False
+        try:
+            return bool(can_dev.estop(str(reason)))
+        except Exception:
+            logger.exception("Pellet ESTOP failed: %s", reason)
+            return False
+
+    def estop_if_moving(self, reason: str, *, frame_only: bool = False) -> bool:
+        """estop(reason) only while motion is possibly in flight; an idle stage is left alone.
+
+        frame_only narrows it to a stepper frame awaiting its ack: a waiter that gives
+        up must not stop a sequence that is only waiting out a long delay frame.
+        """
+        moving = self.stepper_frame_in_flight if frame_only else self.motion_possibly_in_flight
+        if not moving:
+            return False
+        return self.estop(reason)
+
+    def home_after_estop(self) -> Optional[UUID]:
+        """The operator's home: release the ESTOP latch, then SEND_HOME.
+
+        The board refuses every move and home with -EPERM until the release
+        frame (CanDevice.release_estop, queued before the home). When this home
+        is acknowledged the stop is cleared and motion is allowed again; the
+        automatic homes (pellet machine, session end) are refused while stopped.
+        """
+        can_dev = self._can_device
+        if can_dev is None or self._device_conn is None:
+            logger.error("Pellet home not sent: the pellet board is not connected")
+            return None
+        with self._lock:  # the home's ack cannot be handled before its token is recorded
+            try:
+                can_dev.release_estop()
+            except Exception:
+                logger.exception("Pellet ESTOP release could not be queued; home not sent")
+                return None
+            token = self._send_with_token(self._device_conn, SystemCommandKind.SEND_HOME, _after_estop=True)
+            if self._estop_record is not None:
+                self._estop_home_token = token
+        return token
+
+    def _on_device_estop(self, reason: str, motors, sent: bool) -> None:
+        """CanDevice sent (or tried to send) an ESTOP: the stage is stopped until homed."""
+        axes = tuple(sorted(_AXIS_NAMES[m] for m in motors if m in _AXIS_NAMES))
+        operator = str(reason) == OPERATOR_STOP_REASON
+        # This ESTOP, as session metadata records it (recording.estops).
+        event = {
+            "wallTime": time.time(),
+            "perfTime": get_perf_now(),
+            "reason": str(reason),
+            "axes": list(axes),
+            "operator": operator,
+            # Which homes may release it: after a failure the session-end home may too;
+            # after the operator's STOP only an operator Home or a reconnect.
+            "kind": "operator" if operator else "failure",
+            "sent": bool(sent),
+        }
+        with self._lock:
+            prev = self._estop_record
+            if prev is not None and prev.get("kind") == "operator" and not operator:
+                # Sticky until the stop clears: a later failure stop must not let the
+                # session-end home release a latch the operator set (review I-C). The stop
+                # stays the operator's; the failure is kept, not hidden (recheck M-3).
+                event["kind"] = "operator"
+                record = {**prev, "later_failures": [*prev.get("later_failures", ()), dict(event)],
+                          "event": event}
+                logger.warning("Pellet stage already stopped by the operator; later failure recorded: %s",
+                               reason)
+            else:
+                record = {**event, "later_failures": [], "event": event}
+            self._estop_record = record
+            self._estop_home_token = None
+            prev_position, self._last_motor_coordinates = self._last_motor_coordinates, _nans_offset3dTuple
+        # The reported position is the board's plan, not a measurement: unknown until homed.
+        self._on_property_changed(self.POS_XYZ, _nans_offset3dTuple, prev_position)
+        self._set_axes_needing_home(tuple(sorted(set(axes) | set(self._axes_needing_home))))
+        self.property_changed(self.PELLET_ESTOP_PROPERTY, record, prev)
+        self._emit_device_event("state", "estop", data=dict(event))
+
+    def _clear_estop(self, why: str) -> None:
+        with self._lock:
+            prev, self._estop_record = self._estop_record, None
+            self._estop_home_token = None
+        if prev is not None:
+            logger.warning("Pellet stage %s: the stop (%s) is cleared, motion allowed again", why, prev["reason"])
+            self.property_changed(self.PELLET_ESTOP_PROPERTY, None, prev)
+
+    def _check_dcs_cfg(self, *, return_none: bool=False):
+        cfg = self._dcs_config
+        if cfg is None or not cfg.fully_valid:
+            if return_none:
+                return None
+            if cfg is None and self._dcs_unavailable_reason:
+                raise RuntimeError(f"DCS move refused: {self._dcs_unavailable_reason}")
+            raise RuntimeError(f"DCS config not defined or not fully valid: {None if cfg is None else cfg.__dict__}")
+        return cfg
+
+    def set_diamond_triangle_config(self, config: Optional[DiamondTriangleOffsetConfig], *,
+                                    unavailable_reason: Optional[str] = None):
+        """The DCS configuration moves given in DCS convert with; None refuses them.
+
+        `unavailable_reason` says why a None is held back rather than missing (the app's
+        stale DCS), and a refused move says it; it is dropped with any configuration.
+        """
+        self._dcs_config = config
+        self._dcs_unavailable_reason = unavailable_reason if config is None else None
+
+    @property
+    def load_arm_position(self) -> float:
+        return self._load_arm_position
+
+    @property
+    def cover_arm_position(self) -> float:
+        return self._cover_arm_position
+
+    @property
+    def motor_configurations(self) -> Optional[MotorConfigurations]:
+        """The motor configurations the last connect wrote to the pellet controller, or None
+        before one. A stepper moves at its configuration's maximum velocity and acceleration."""
+        return self._motor_configurations
+
+    @property
+    def last_position(self) -> Optional[Offset3DTuple]:
+        return self._last_motor_coordinates
+
+    @property
+    def last_dcs_position(self) -> Optional[Offset3DTuple]:
+        cfg = self._check_dcs_cfg(return_none=True)
+        if cfg is None:
+            return None
+        return cfg.motor_to_diamond(self._last_motor_coordinates)
+
+    @property
+    def last_set_position(self) -> Optional[Offset3DTuple]:
+        value = self._last_requested_set_coordinates
+        if any(map(math.isnan, value)):
+            return None
+        return value
+
+    @property
+    def last_dcs_set_position(self) -> Optional[Offset3DTuple]:
+        value = self._last_requested_set_coordinates
+        if any(map(math.isnan, value)):
+            return None
+        cfg = self._check_dcs_cfg(return_none=True)
+        if cfg is None:
+            return None
+        return cfg.motor_to_diamond(value)
+
+    @property
+    def device_ack_timeout_engaged(self):
+        return self._device_ack_timeout_engaged
+
+    @property
+    def pellet_status_timeout_engaged(self) -> bool:
+        return self._device_pellet_status_timeout_engaged
+
+    @device_ack_timeout_engaged.setter
+    def device_ack_timeout_engaged(self, value):
+        prev, self._device_ack_timeout_engaged = self._device_ack_timeout_engaged, value
+        if prev == value:
+            return
+        self.property_changed(self.DEVICE_ACK_TIMEOUT_ENGAGED, value, prev)
+        enabled = False
+        dev_conn = self._device_conn
+        if dev_conn is not None:
+            dev = dev_conn.device
+            if dev is not None:
+                iface = dev.device_interface
+                enabled = iface is not None and iface.is_open
+        # could be in app_model or system_machine, in react property changed, but ok here too:
+        post_api_detector_event_content(self._event_manager, ApiDetectorKind.deviceAckTimeOut, value, enabled)
+
+    @property
+    def send_x(self):
+        return self._last_motor_send_coordinates.x
+
+    @send_x.setter
+    def send_x(self, value):
+        prev, self._last_motor_send_coordinates = self._last_motor_send_coordinates, self._last_motor_send_coordinates.replace(x=value)
+        self._on_property_changed(self.SEND_X, value, prev.x)
+
+    @property
+    def send_y(self):
+        return self._last_motor_send_coordinates.y
+
+    @send_y.setter
+    def send_y(self, value):
+        prev, self._last_motor_send_coordinates = self._last_motor_send_coordinates, self._last_motor_send_coordinates.replace(y=value)
+        self._on_property_changed(self.SEND_Y, value, prev.y)
+
+    @property
+    def send_z(self):
+        return self._last_motor_send_coordinates.z
+
+    @send_z.setter
+    def send_z(self, value):
+        prev, self._last_motor_send_coordinates = self._last_motor_send_coordinates, self._last_motor_send_coordinates.replace(z=value)
+        self._on_property_changed(self.SEND_Z, value, prev.z)
+
+    @property
+    def motor_send_coordinates(self) -> Offset3DTuple:
+        return self._last_motor_send_coordinates
+
+    @property
+    def color_led(self) -> Optional[ColorLed]:
+        return self._color_led
+
+    @property
+    def pellet_version(self) -> str:
+        return self._pellet_version
+
+    @property
+    def firmware_compatibility(self) -> dict:
+        return self._firmware_compatibility.to_record()
+
+    @property
+    def pellet_commands_allowed(self) -> bool:
+        return self._firmware_compatibility.commands_allowed
+
+    @property
+    def can_enabled(self) -> bool:
+        return self._can_enabled
+
+    @property
+    def pellet_controller_enabled(self) -> bool:
+        return self._pellet_controller_enabled
+
+    @property
+    def nidaq_enabled(self) -> bool:
+        return self._nidaq_enabled
+
+    @property
+    def requires_connection(self) -> bool:
+        return self._can_enabled and self._pellet_controller_enabled
+
+    def _refuse_outside_travel(self, coord_idx: int, target: float) -> bool:
+        """True, after logging an error, when the absolute `target` (mm) of axis `coord_idx`
+        lies outside its travel in the loaded motor configurations (min_pos / max_pos in
+        motor_config.yaml). False when it is inside, or when no travel is configured."""
+        configurations = self._motor_configurations
+        if configurations is None:
+            return False
+        coord = "xyz"[coord_idx]
+        _, config = getattr(configurations, f"{coord}_config")
+        refusal = stepper_travel_refusal(coord, target, config)
+        if refusal is None:
+            return False
+        logger.error(refusal)
+        return True
+
+    def _axis_has_travel(self, coord_idx: int) -> bool:
+        """True when the loaded motor configurations limit axis `coord_idx` on either side."""
+        configurations = self._motor_configurations
+        if configurations is None:
+            return False
+        _, config = getattr(configurations, f"{'xyz'[coord_idx]}_config")
+        return (getattr(config, "minimum_position", None) is not None
+                or getattr(config, "maximum_position", None) is not None)
+
+    def refuse_xyz_outside_travel(self, xyz) -> bool:
+        """True, after logging an error per axis, when an absolute SET of `xyz` (motor mm)
+        would be refused on any axis: the caller then sets none of them, so the stage is never
+        left with some axes at the new position and the others at the previous one. The SET's
+        clamp to 0 applies first, as in _set_axis."""
+        refused = False
+        for coord_idx, value in enumerate(xyz):
+            target = 0 if value < 0 else value
+            if self._refuse_outside_travel(coord_idx, target):
+                refused = True
+        return refused
+
+    def refuse_shift_outside_travel(self, delta) -> bool:
+        """True, after logging an error per axis, when the relative SETs that the
+        intersession shift sends (`delta`, motor mm per axis; 0 sends nothing) would be
+        refused on any axis: the caller then shifts none of them. Each target is the
+        requested position plus the delta, with the SET's clamp to 0, as _set_axis computes it."""
+        refused = False
+        for coord_idx, value in enumerate(delta):
+            if value == 0:
+                continue
+            target = self._last_requested_set_coordinates[coord_idx] + value
+            if self._refuse_outside_travel(coord_idx, 0 if target < 0 else target):
+                refused = True
+        return refused
+
+    def block_presentation(self, reason: str) -> None:
+        """Refuse send_pellet, logging `reason`, until the board has accepted a SET of each of
+        x, y and z, from anything but a protocol target or the intersession shift. Called
+        after the animal's base position was refused, so the previous animal's position is
+        not used. A SET the board refuses, or never acknowledges, leaves its axis blocked.
+
+        The block state is read and written under _lock here, in _lift_presentation_block and
+        where _set_axis records a lifting SET, so an ack handled on the reader thread cannot
+        lift an axis of a block raised while it ran. Each call starts a new block generation:
+        _set_axis records a SET only when the generation it read before sending is still
+        current, so a SET sent under an earlier block lifts nothing of this one, whether its
+        ack arrives before or after the record. Those sections call nothing back."""
+        with self._lock:
+            self._presentation_blocked_axes = frozenset(range(3))
+            self._presentation_block_reason = str(reason)
+            self._block_lifting_sets = {}
+            self._block_generation += 1
+
+    def _lift_presentation_block(self, token) -> None:
+        """The board acknowledged `token`: when it is a SET that lifts the block, its axis is
+        no longer blocked."""
+        with self._lock:
+            coord_idx = self._block_lifting_sets.get(token)
+            if coord_idx is None:
+                return
+            self._block_lifting_sets = {t: i for t, i in self._block_lifting_sets.items() if t != token}
+            if coord_idx not in self._presentation_blocked_axes:
+                return
+            self._presentation_blocked_axes = self._presentation_blocked_axes - {coord_idx}
+            allowed = not self._presentation_blocked_axes
+        if allowed:
+            logger.notice("Pellet presentation allowed again: the board accepted x, y and z")
+
+    @property
+    def presentation_blocked(self) -> bool:
+        return bool(self._presentation_blocked_axes)
+
+    def _set_axis(self, value: float, *, absolute: bool = True,
+                  system_set_cmd: SystemCommandKind, coord_idx: int, sender: str="NA") -> Optional[UUID]:
+        coord = "xyz"[coord_idx]
+        logger.verbose("Sender=%s : SET_%s value=%.1f absolute=%s", sender, coord.upper(), value, absolute)
+        prev_value = self._last_requested_set_coordinates[coord_idx]
+        if absolute:
+            new_value = value
+        else:
+            if math.isnan(prev_value):
+                err_msg = (
+                    "Cannot SET axis with relative value"
+                    " when SET not already called/initialized with absolute value"
+                )
+                raise ValueError(err_msg)
+            new_value = prev_value + value
+        if new_value < 0:
+            value = 0 if absolute else -prev_value
+            new_value = 0
+            logger.verbose("Axis-%s: limited move to 0 ; value=%.3f absolute=%s",
+                         coord.upper(), value, absolute)
+        if self._refuse_outside_travel(coord_idx, new_value):
+            return None
+        if self._axis_has_travel(coord_idx):
+            # The board adds a relative SET to its own reported send position, which can
+            # differ from the requested one checked here (a SET it refused, a save_as_fixed
+            # step): send the checked absolute target, so it cannot add a different base.
+            data = SystemDataArgsKwargs(new_value, relative=False)
+        else:
+            data = SystemDataArgsKwargs(value, relative=not absolute)
+        block_generation = self._block_generation  # read before the send: see block_presentation
+        res = self._send_with_token(self._device_conn, system_set_cmd, data)
+        if res is not None:
+            tokens = list(self._latest_set_tokens)
+            tokens[coord_idx] = res
+            self._latest_set_tokens = tuple(tokens)
+            if sender not in self._SENDERS_NOT_CLEARING_THE_BLOCK and coord_idx in self._presentation_blocked_axes:
+                # Lifted on the board's ack (_lift_presentation_block), not here. The ack can be
+                # handled before this records the token (_send_with_token's listeners run in
+                # between): _ack_received writes the outcome under _lock before it lifts, so
+                # either it finds the token here or this finds the outcome. The token is
+                # recorded only under the block it was sent under: a block raised during or
+                # after the send (a new generation) is not lifted by it, early ack or late.
+                with self._lock:
+                    recorded = (block_generation == self._block_generation
+                                and coord_idx in self._presentation_blocked_axes)
+                    if recorded:
+                        self._block_lifting_sets = {**self._block_lifting_sets, res: coord_idx}
+                    acked = recorded and self._command_outcomes.get(res, ("",))[0] == "acknowledged"
+                if acked:
+                    self._lift_presentation_block(res)
+            self._last_requested_set_coordinates = self._last_requested_set_coordinates.replace(**{coord: new_value})
+            self._on_property_changed(f"set_{coord}", new_value, prev_value)
+        return res
+
+    def set_x(self, value: float, *, absolute: bool = True, sender: str="NA") -> Optional[UUID]:
+        return self._set_axis(value, absolute=absolute, system_set_cmd=SystemCommandKind.SET_X, coord_idx=0, sender=sender)
+
+    def set_y(self, value: float, *, absolute: bool = True, sender: str="NA") -> Optional[UUID]:
+        return self._set_axis(value, absolute=absolute, system_set_cmd=SystemCommandKind.SET_Y, coord_idx=1, sender=sender)
+
+    def set_z(self, value: float, *, absolute: bool = True, sender: str="NA") -> Optional[UUID]:
+        return self._set_axis(value, absolute=absolute, system_set_cmd=SystemCommandKind.SET_Z, coord_idx=2, sender=sender)
+
+    def set_dcs_x(self, value: float, *, absolute: bool = True, sender: str="NA") -> Optional[UUID]:
+        cfg = self._check_dcs_cfg()
+        value = cfg.diamond_to_motor(Offset3DTuple(value, 0, 0)).x
+        return self._set_axis(value, absolute=absolute, system_set_cmd=SystemCommandKind.SET_X, coord_idx=0, sender=sender)
+
+    def set_dcs_y(self, value: float, *, absolute: bool = True, sender: str="NA") -> Optional[UUID]:
+        cfg = self._check_dcs_cfg()
+        value = cfg.diamond_to_motor(Offset3DTuple(0, value, 0)).y
+        return self._set_axis(value, absolute=absolute, system_set_cmd=SystemCommandKind.SET_Y, coord_idx=1, sender=sender)
+
+    def set_dcs_z(self, value: float, *, absolute: bool = True, sender: str="NA") -> Optional[UUID]:
+        cfg = self._check_dcs_cfg()
+        value = cfg.diamond_to_motor(Offset3DTuple(0, 0, value)).z
+        return self._set_axis(value, absolute=absolute, system_set_cmd=SystemCommandKind.SET_Z, coord_idx=2, sender=sender)
+
+    #
+
+    def _move_axis(self, value: float, *, absolute: bool = True,
+                   system_move_cmd: SystemCommandKind, coord_idx: int) -> Optional[UUID]:
+        if not absolute:
+            prev_value = self._last_motor_coordinates[coord_idx]
+            if math.isnan(prev_value):
+                logger.warning("Axis-%s: relative movement requested, but no previous position is set",
+                               "XYZ"[coord_idx])
+                return None
+            value += prev_value
+        if self._refuse_outside_travel(coord_idx, value):
+            return None
+        res = self._send_with_token(self._device_conn, system_move_cmd, value)
+        return res
+
+    def move_x(self, value: float, *, absolute: bool = True) -> Optional[UUID]:
+        return self._move_axis(value, absolute=absolute, system_move_cmd=SystemCommandKind.MOVE_X, coord_idx=0)
+
+    def move_y(self, value: float, *, absolute: bool = True) -> Optional[UUID]:
+        return self._move_axis(value, absolute=absolute, system_move_cmd=SystemCommandKind.MOVE_Y, coord_idx=1)
+
+    def move_z(self, value: float, *, absolute: bool = True) -> Optional[UUID]:
+        return self._move_axis(value, absolute=absolute, system_move_cmd=SystemCommandKind.MOVE_Z, coord_idx=2)
+
+    def send_to_limits(self) -> Optional[UUID]:
+        return self._send_with_token(self._device_conn, SystemCommandKind.SEND_TO_LIMITS,
+                                     [Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR, Motor.PELLET_X_MOTOR])
+
+    def _refuse_sequence_outside_travel(self, name: str) -> bool:
+        """True, after logging an error per step, when a stepper target of the compound
+        sequence `name` (move_config.yaml) lies outside the configured travel: the whole
+        sequence is then refused before its first step. Targets are taken from the last
+        reported stepper position and the requested send position (the reported one before
+        any SET); a step relative to a position the host does not know is not checked,
+        CanDevice and CanInterface send nothing for it.
+
+        The send-position steps are checked from the board's reported send position too, the
+        base CanDevice adds send_*_rel to and the one predefined send goes to, when it differs
+        from the requested one (a SET the board refused, a save_as_fixed step). A predefined
+        send is refused while the send position of an axis with travel is not known at all."""
+        if self._motor_configurations is None:
+            return False
+        reported_send = self._last_motor_send_coordinates
+        send_position = Offset3DTuple(*(
+            requested if math.isfinite(requested) else reported
+            for requested, reported in zip(self._last_requested_set_coordinates, reported_send)
+        ))
+        steps = self._pellet_sequences[name].steps
+        refused = False
+        # Both walks yield the same steps in the same order; only the send-based values differ.
+        for (axis, target), (_, device_target) in zip(
+            sequence_stepper_targets(steps, self._last_motor_coordinates, send_position),
+            sequence_stepper_targets(steps, self._last_motor_coordinates, reported_send),
+        ):
+            coord_idx = "xyz".index(axis)
+            if math.isfinite(target) and self._refuse_outside_travel(coord_idx, target):
+                refused = True
+            if (math.isfinite(device_target) and device_target != target
+                    and self._refuse_outside_travel(coord_idx, device_target)):
+                refused = True
+        unknown = [
+            "XYZ"[idx] for idx, value in enumerate(send_position)
+            if not math.isfinite(value) and self._axis_has_travel(idx)
+        ]
+        if unknown and any(step.get("predefined") == "send" for step in steps):
+            logger.error("Pellet sequence %s refused: the send position of %s is not known",
+                         name, ", ".join(unknown))
+            return True
+        if refused:
+            logger.error("Pellet sequence %s refused: a step lies outside the configured travel", name)
+        return refused
+
+    def send_retract(self) -> Optional[UUID]:
+        if self._refuse_sequence_outside_travel("move_retract"):
+            return None
+        return self._send_with_token(self._device_conn, SystemCommandKind.SEND_RETRACT)
+
+    def send_home(self) -> Optional[UUID]:
+        return self._send_with_token(self._device_conn, SystemCommandKind.SEND_HOME)
+
+    def send_home_and_wait(self, *, timeout: float = 15.0, release_estop: bool = False) -> UUID:
+        """SEND_HOME and wait for its ack. With release_estop, while the stage is stopped,
+        it is home_after_estop's home (the latch released first; its ack clears the stop):
+        the session-end home is the one automatic home allowed to do that."""
+        if release_estop and self.estop_active:
+            if self._estop_record.get("kind") == "operator":
+                raise RuntimeError(
+                    "the pellet stage was stopped by the operator (operator STOP); only Hardware "
+                    "Control ▸ Home or a reconnect releases it")
+            token = self.home_after_estop()
+        else:
+            token = self.send_home()
+        if token is None:
+            raise RuntimeError("pellet home command was not queued")
+        self.wait_pending_command_acked(token, timeout=timeout)
+        return token
+
+    def load_pellet(self) -> Optional[UUID]:
+        if self._refuse_sequence_outside_travel("load_pellet"):
+            return None
+        return self._send_with_token(self._device_conn, SystemCommandKind.LOAD_PELLET)
+
+    def send_pellet(
+        self,
+        *,
+        embedded_tone=None,
+        pre_reveal_stimulus=None,
+    ) -> Optional[UUID]:
+        data = {}
+        if embedded_tone is not None:
+            data["embedded_tone"] = embedded_tone
+        if pre_reveal_stimulus is not None:
+            data["pre_reveal_stimulus"] = pre_reveal_stimulus
+        if self._presentation_blocked_axes:
+            logger.error("Pellet presentation refused: %s", self._presentation_block_reason)
+            return None
+        if self._refuse_sequence_outside_travel("send_pellet"):
+            return None
+        return self._send_with_token(
+            self._device_conn,
+            SystemCommandKind.SEND_PELLET,
+            data or None,
+        )
+
+    def release_pellet(self) -> Optional[UUID]:
+        if self._refuse_sequence_outside_travel("release_pellet"):
+            return None
+        return self._send_with_token(self._device_conn, SystemCommandKind.RELEASE_PELLET)
+
+    def cover_pellet(self) -> Optional[UUID]:
+        if self._refuse_sequence_outside_travel("cover_pellet"):
+            return None
+        return self._send_with_token(self._device_conn, SystemCommandKind.COVER_PELLET)
+
+    def attach_servo(self, servo: Motor) -> Optional[UUID]:
+        return self._send_with_token(self._device_conn, SystemCommandKind.SERVO_ATTACH, servo)
+
+    def detach_servo(self, servo: Motor) -> Optional[UUID]:
+        return self._send_with_token(self._device_conn, SystemCommandKind.SERVO_DETACH, servo)
+
+    def play_tone(self, frequency: int, duration: float) -> Optional[UUID]:
+        """Play a tone
+        :param frequency: in Hz (integer)
+        :param duration: in seconds (float)
+        """
+        duration_ms = round(duration * 1000)  # not int(): 1.001 * 1000 is 1000.999...
+        return self._send_with_token(self._device_conn, SystemCommandKind.PLAY_TONE, (frequency, duration_ms))
+
+    def pulse_stim(self, duration_us: int, stim_line: int = 3) -> Optional[UUID]:
+        """Pulse a pellet-board stimulus line, named as the board names it.
+
+        Board STIM2 and STIM3 only; STIM0 and STIM1 carry the firmware tone
+        confirmations. BOARD_STIM_LINE_OUTPUTS holds the off-by-one between the
+        board's labels and the host's DigitalOutputs.
+        """
+        output = BOARD_STIM_LINE_OUTPUTS.get(int(stim_line))
+        if output is None:
+            raise ValueError(
+                f"Board STIM{stim_line} cannot carry a stimulus pulse; use "
+                "board STIM2 or STIM3"
+            )
+        return self._send_with_token(
+            self._device_conn,
+            SystemCommandKind.PULSE_DIGITAL_OUTPUT,
+            (int(output.value), int(duration_us)),
+        )
+
+    def pulse_stim3(self, duration_us: int) -> Optional[UUID]:
+        """Pulse physical pellet-board STIM3, the line available before STIM2."""
+        return self.pulse_stim(duration_us, stim_line=3)
+
+    def delay(self, amount: float) -> Optional[UUID]:
+        return self._send_with_token(self._device_conn, SystemCommandKind.DELAY, amount)
+
+    def set_color_led(self, r: int, g: int, b: int):
+        """0 -> 100"""
+        return self._send_with_token(self._device_conn, SystemCommandKind.SET_RGB_LED, (r, g, b))
+
+    def load_config(self, config: HardwareConfiguration):
+        self._set_boolean_config(self.CAN_ENABLED, "_can_enabled", config.can_enabled)
+        self._set_boolean_config(
+            self.PELLET_CONTROLLER_ENABLED,
+            "_pellet_controller_enabled",
+            config.pellet_controller_enabled,
+        )
+        self._set_boolean_config(self.NIDAQ_ENABLED, "_nidaq_enabled", config.nidaq_enabled)
+        self.set_device_ack_timeout(config.min_ack_timeout)
+        self.set_board_status_timeout(config.board_status_timeout)
+
+    def _set_boolean_config(self, property_name: str, attr_name: str, value: bool) -> None:
+        prev = getattr(self, attr_name)
+        value = bool(value)
+        setattr(self, attr_name, value)
+        self._on_property_changed(property_name, value, prev)
+
+    def set_board_status_timeout(self, timeout: Optional[float]):
+        self._board_status_timeout = timeout
+        can_dev = self._can_device
+        if can_dev is None:
+            return
+        if timeout is None:
+            timeout = CanDevice.default_board_status_timeout_delay
+        can_dev.default_board_status_timeout_delay = timeout
+
+    def set_device_ack_timeout(self, delay: Optional[float]):
+        self._device_ack_timeout_delay = delay
+        can_dev = self._can_device
+        if can_dev is not None:
+            if delay is None:
+                delay = CanDevice.default_command_ack_timeout_duration
+            else:
+                delay = max(CanDevice.default_command_ack_timeout_duration, delay)
+            can_dev.default_command_ack_timeout_duration = delay
+            logger.notice("Using %s for default device ack timeout delay", delay)
+
+    @property
+    def connected(self) -> bool:
+        dev = self._device_conn
+        dev_dev = None if dev is None else dev.device
+        return dev_dev is not None and dev_dev.connected
+
+    def connect(
+        self,
+        cmd_queue: Queue,
+        *,
+        _recovery: bool = False,
+        _generation: Optional[int] = None,
+    ):
+        with self._can_lifecycle_lock:
+            return self._connect_locked(
+                cmd_queue,
+                _recovery=_recovery,
+                _generation=_generation,
+            )
+
+    def _connect_locked(
+        self,
+        cmd_queue: Queue,
+        *,
+        _recovery: bool,
+        _generation: Optional[int],
+    ):
+        if not self._can_enabled:
+            logger.notice("Skipping hardware connection because CAN bus is disabled in configuration")
+            log_hardware_initialization(logger, "SKIP | CAN/pellet controller | CAN disabled")
+            return
+        if not self._pellet_controller_enabled:
+            logger.notice("Skipping hardware connection because pellet controller is disabled in configuration")
+            log_hardware_initialization(logger, "SKIP | CAN/pellet controller | pellet controller disabled")
+            return
+        if not _recovery:
+            self._can_recovery_cancel.clear()
+            with self._can_recovery_lock:
+                self._can_recovery_generation += 1
+                self._first_can_failure = None
+                self._can_recovery_failure = None
+        self._command_queue = cmd_queue
+        if (
+            _generation is not None
+            and not self._can_recovery_is_current(_generation)
+        ):
+            return False
+        self._set_can_connection_state("connecting", generation=_generation)
+        connect_started = time.perf_counter()
+        self._emit_device_event("state", "connect_start")
+        transport = CanTransportConfiguration.from_environment()
+        self._firmware_version_received.clear()
+        self._board_wire_schema_version = None
+        self._board_capabilities = 0
+        self._can_is_emulation = transport.kind is CanTransportKind.EMULATION
+        self._update_firmware_compatibility("")
+        log_hardware_initialization(
+            logger,
+            "START | CAN/pellet controller | transport=%s channel=%s required_target=%s",
+            transport.kind.value,
+            transport.channel,
+            Target.PELLET_DEVICE.name,
+        )
+        logger.notice("%s: connect with %s", self, cmd_queue)
+        self._disconnect_event.clear()
+
+        prev_device = self._device_conn
+        if prev_device is not None:
+            logger.warning("auto-disconnecting from device before (re-)connect")
+            self._disconnect_transport()
+        with self._safety_shutdown_lock:
+            self._safety_shutdown_started = False
+            self._safety_shutdown_thread = None
+
+        self._connect_count += 1
+        self._last_motor_coordinates = \
+        self._last_requested_set_coordinates = \
+        self._last_motor_send_coordinates = _nans_offset3dTuple
+        self._device_pellet_status_timeout_engaged = False
+
+        # This is specific to wanting to be able to test UI changes w/the emulation interface, which is not
+        # configured to generate messages as frequently as the real device.
+        buffer_size = 10 if HAVE_CAN_DEVICE else 1
+        #
+        can_device = self._can_device = CanDevice(
+            buffer_size=buffer_size,
+            required_targets=(Target.PELLET_DEVICE,),
+            can_transport=transport,
+            failure_callback=self._on_can_failure,
+            operation_callback=self._on_internal_device_operation,
+            estop_callback=self._on_device_estop,
+        )
+        log_hardware_initialization(
+            logger,
+            "READY | CAN adapter created | transport=%s channel=%s elapsed=%.3fs",
+            transport.kind.value,
+            transport.channel,
+            time.perf_counter() - connect_started,
+        )
+        self._emit_device_event("state", "transport_created")
+        self.set_device_ack_timeout(self._device_ack_timeout_delay)  # ensure it's used
+        self.set_board_status_timeout(self._board_status_timeout)
+
+        can_device.property_changed += self._can_device_property_changed
+        can_device.latency_observer = self._can_latency_observer
+
+        device_conn = self._device_conn = DeviceConnection(
+            can_device,
+            cmd_queue,
+            name="can-device",
+            failure_callback=self._on_can_failure,
+        )
+        self._can_is_emulation = isinstance(
+            can_device.device_interface, EmulationInterface,
+        )
+        log_hardware_initialization(logger, "START | CAN connection worker | name=can-device")
+        device_conn.request_connect()
+        connection_started = time.perf_counter()
+        connection_timeout = 3.0
+        log_hardware_initialization(
+            logger,
+            "START | CAN connection readiness | timeout=%.1fs",
+            connection_timeout,
+        )
+        try:
+            device_conn.wait_connected(timeout=connection_timeout)
+        except Exception as exc:
+            log_hardware_initialization(
+                logger,
+                "FAILED | CAN connection readiness | elapsed=%.3fs error=%s",
+                time.perf_counter() - connection_started,
+                str(exc) or exc.__class__.__name__,
+                level=logging.ERROR,
+            )
+            raise
+        if (
+            _generation is not None
+            and not self._can_recovery_is_current(_generation)
+        ):
+            self._disconnect_transport_locked(command_outcome="cancelled")
+            return False
+        log_hardware_initialization(
+            logger,
+            "READY | CAN connection readiness | elapsed=%.3fs",
+            time.perf_counter() - connection_started,
+        )
+
+        send_dev_cmd = partial(self._send_command, device_conn)
+        def send_dev_ack_cmd(kind, data=None):
+            command_started = time.perf_counter()
+            log_hardware_initialization(logger, "START | pellet command | command=%s", kind.name)
+            tok = str(uuid.uuid4())
+            try:
+                with device_conn.await_acknowledge(
+                    {tok},
+                    timeout=can_device.default_command_ack_timeout_duration,
+                ):
+                    send_dev_cmd(kind, data, context=tok)
+            except Exception as exc:
+                log_hardware_initialization(
+                    logger,
+                    "FAILED | pellet command | command=%s elapsed=%.3fs error=%s",
+                    kind.name,
+                    time.perf_counter() - command_started,
+                    str(exc) or exc.__class__.__name__,
+                    level=logging.ERROR,
+                )
+                raise
+            log_hardware_initialization(
+                logger,
+                "READY | pellet command acknowledged | command=%s elapsed=%.3fs",
+                kind.name,
+                time.perf_counter() - command_started,
+            )
+
+        send_dev_ack_cmd(SystemCommandKind.REQUEST_VERSION)
+        if not self._firmware_version_received.wait(2.0):
+            raise RuntimeError(
+                "Pellet firmware version was not reported; motor initialization is blocked"
+            )
+        self._request_board_capabilities(can_device)
+        if not self.pellet_commands_allowed:
+            raise RuntimeError(
+                "Pellet firmware compatibility check failed: "
+                f"{self._firmware_compatibility.reason} "
+                f"(detected={self._pellet_version or 'unknown'})"
+            )
+
+        # load and set motors and move configs
+        # 1)
+        config_started = time.perf_counter()
+        log_hardware_initialization(logger, "START | pellet motor configuration")
+        self._motor_configurations = device_conn.load_default_motor_config()
+        # motor_config.yaml pellet.profile_ack_deadlines (missing: true). Off, every stepper
+        # frame waits the fixed ack timeout; a missed ack still stops the stage.
+        can_device.profile_ack_deadlines = bool(
+            getattr(self._motor_configurations, "profile_ack_deadlines", True))
+        log_hardware_initialization(
+            logger,
+            "READY | pellet motor configuration | elapsed=%.3fs",
+            time.perf_counter() - config_started,
+        )
+        # 2)
+        config_started = time.perf_counter()
+        log_hardware_initialization(logger, "START | pellet move configuration")
+        self._pellet_sequences = _pellet_sequences(device_conn.load_default_move_config())
+        log_hardware_initialization(
+            logger,
+            "READY | pellet move configuration | elapsed=%.3fs",
+            time.perf_counter() - config_started,
+        )
+        # Every initial connection and recovery establishes one deterministic,
+        # non-presenting mechanical state. Motor configuration is acknowledged
+        # above before homing because its limits and velocities govern HOME.
+        self._release_estop_before_connect_home(can_device, recovery=_recovery)
+        self._home_and_detach_pellet(send_dev_ack_cmd)
+        self._set_axes_needing_home(())  # the connect home was acknowledged
+        self._clear_estop("homed at connect")
+
+        self._device_initialization_complete = True
+
+        prev_thread = self._check_timedout_commands_thread
+        if prev_thread is None or not prev_thread.is_alive():
+            thread = self._check_timedout_commands_thread = threading.Thread(
+                target=self._check_timedout_commands_handler,
+                daemon=True,
+                name="check-timedout-commands",
+            )
+            thread.start()
+        log_hardware_initialization(
+            logger,
+            "READY | CAN/pellet controller | elapsed=%.3fs",
+            time.perf_counter() - connect_started,
+        )
+        if not self._set_can_connection_state("ready", generation=_generation):
+            self._disconnect_transport_locked(command_outcome="cancelled")
+            return False
+        return True
+
+    def _release_estop_before_connect_home(self, can_device, *, recovery: bool) -> None:
+        """Queue the ESTOP release ahead of the connect home, which a latched board refuses.
+
+        The latch outlives the app (only a board reset clears it), so an operator's
+        connect (start-up, Refresh Hardware, a calibration capture) always releases
+        it. An automatic recovery does not while this app has the stage stopped: its
+        home is then refused with -EPERM, the recovery stops, and the operator
+        decides, as for any refused connect home.
+        """
+        if recovery and self._estop_record is not None:
+            logger.error("CAN recovery leaves the pellet ESTOP latched (%s): Refresh Hardware to home",
+                         self._estop_record["reason"])
+            return
+        release = getattr(can_device, "release_estop", None)
+        if release is not None:
+            release()
+
+    @staticmethod
+    def _home_and_detach_pellet(send_acknowledged_command) -> None:
+        log_hardware_initialization(logger, "START | pellet XYZ home")
+        send_acknowledged_command(SystemCommandKind.SEND_HOME)
+        log_hardware_initialization(logger, "READY | pellet XYZ home")
+        for servo in (
+            Motor.PELLET_LOAD_SERVO,
+            Motor.PELLET_COVER_SERVO,
+        ):
+            log_hardware_initialization(
+                logger,
+                "START | pellet servo detach | motor=%s",
+                servo.name,
+            )
+            send_acknowledged_command(SystemCommandKind.SERVO_DETACH, servo)
+            log_hardware_initialization(
+                logger,
+                "READY | pellet servo detach | motor=%s",
+                servo.name,
+            )
+
+    def _disconnect_transport(self, *, command_outcome: str = "cancelled"):
+        with self._can_lifecycle_lock:
+            return self._disconnect_transport_locked(
+                command_outcome=command_outcome,
+            )
+
+    def _disconnect_transport_locked(self, *, command_outcome: str):
+        logger.verbose("disconnecting ..")
+        # Every teardown passes here (disconnect, safety shutdown, recovery, a failed
+        # connect). A stepper still running when the host lets go runs on: nothing on a
+        # v1.2 board stops it. So stop it while the bus is still ours, before the device
+        # is told to disconnect, which drops what is pending. An idle stage is left alone.
+        try:
+            self.estop_if_moving("the CAN connection was closed during a move")
+        except Exception:
+            logger.exception("Pellet ESTOP before the CAN teardown failed")
+        self._emit_device_event("state", "disconnect_start")
+        self._disconnect_event.set()
+        with self._lock:
+            for token in self._pending_tokens:
+                self._remember_command_outcome(
+                    token,
+                    command_outcome,
+                    "CAN transport closed before acknowledgement",
+                )
+            self._pending_tokens.clear()
+        can_dev = self._can_device
+        dev = self._device_conn
+        if dev is not None:
+            dev.request_disconnect()
+            if dev.join() is False:
+                raise RuntimeError(
+                    "failed CAN reader is still alive; refusing replacement transport"
+                )
+            self._device_conn = None
+        if can_dev is not None:
+            can_dev.property_changed -= self._can_device_property_changed
+            self._can_device = None
+        prev, self._pellet_version = self._pellet_version, ""
+        self._on_property_changed(self.PELLET_VERSION_PROPERTY, "", prev)
+        self._firmware_version_received.clear()
+        self._update_firmware_compatibility("")
+        prev_thread = self._check_timedout_commands_thread
+        if prev_thread is not None:
+            logger.debug("joining checktimedout commands thread")
+            prev_thread.join()
+        with self._lock:
+            self._pending_tokens.clear()
+        self._refresh_cmd_in_progress([])
+        self._device_initialization_complete = False
+        self._emit_device_event("state", "disconnected")
+
+    def _reset_socketcan(self, transport: Optional[CanTransportConfiguration]) -> None:
+        if transport is None:
+            return
+        if transport.kind != CanTransportKind.SOCKETCAN:
+            return
+
+        if os.environ.get("REACHAQ_PROHIBIT_PRIVILEGED_CAN_RESET") == "1" or \
+                "PYTEST_CURRENT_TEST" in os.environ:
+            raise RuntimeError("privileged CAN reset is prohibited under automated tests")
+
+        helper = "/usr/local/sbin/reachaq-reset-can"
+        helper_args = [helper, transport.channel]
+        command = helper_args if os.geteuid() == 0 else ["sudo", "-n", *helper_args]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            logger.error("Could not reset SocketCAN after safety shutdown: %s", exc)
+            return
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
+            logger.error("SocketCAN safety reset failed: %s", detail)
+        else:
+            logger.notice("SocketCAN safety reset completed")
+
+    def _run_safety_shutdown(self, reason: str) -> None:
+        logger.critical("Starting CAN safety shutdown: %s", reason)
+        self._emit_device_event(
+            "state",
+            "safety_shutdown_start",
+            data={"reason": reason},
+        )
+        can_dev = self._can_device
+        if can_dev is not None:
+            transport = can_dev.can_transport_configuration
+        else:
+            try:
+                transport = CanTransportConfiguration.from_environment()
+            except Exception:
+                logger.exception("Could not determine CAN transport for safety reset")
+                transport = None
+        try:
+            self._disconnect_transport()
+        except Exception:
+            logger.exception("Failed to close CAN transport during safety shutdown")
+        finally:
+            self._reset_socketcan(transport)
+        logger.notice("CAN safety shutdown finished")
+        self._emit_device_event(
+            "state",
+            "safety_shutdown_finished",
+            data={"reason": reason},
+        )
+
+    def safety_shutdown(self, reason: str, *, wait: bool = True) -> None:
+        """Recover after a confirmed CAN-domain failure.
+
+        This is intentionally not the generic application shutdown path: it
+        may restart the shared SocketCAN network interface.
+        """
+        self._can_recovery_cancel.set()
+        with self._can_recovery_lock:
+            self._can_recovery_generation += 1
+        with self._safety_shutdown_lock:
+            thread = self._safety_shutdown_thread
+            if not self._safety_shutdown_started:
+                self._safety_shutdown_started = True
+                thread = threading.Thread(
+                    target=self._run_safety_shutdown,
+                    args=(reason,),
+                    name="CanSafetyShutdown",
+                    daemon=False,
+                )
+                self._safety_shutdown_thread = thread
+                thread.start()
+
+        if wait and thread is not None and thread is not threading.current_thread():
+            thread.join(20)
+            if thread.is_alive():
+                logger.error("CAN safety shutdown did not finish within 20 seconds")
+
+    def disconnect(self):
+        """Close only this application's device worker and CAN socket."""
+        self._can_recovery_cancel.set()
+        with self._can_recovery_lock:
+            self._can_recovery_generation += 1
+        self._disconnect_transport()
+        self._set_can_connection_state("stopped")
+
+    def _can_device_property_changed(self, name: str, value, prev_value):
+        logger.debug("_device_property_changed: %s : %s -> %s", name, prev_value, value)
+        props = Device
+        # only translate/relay what we want:
+        is_dev_comm_err_possible = False
+        if name == props.UUID_ACK_TIMEOUT_ENGAGED:
+            self.device_ack_timeout_engaged = value
+            is_dev_comm_err_possible = True
+        elif name == props.PELLET_STATUS_TIMEOUT_ENGAGED:
+            post_api_detector_event_content(
+                self._event_manager,
+                ApiDetectorKind.pelletStatusMessageInterruption,
+                value,
+                True,
+            )
+            self._device_pellet_status_timeout_engaged = value
+            self.property_changed(self.DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED, value, prev_value)
+            is_dev_comm_err_possible = True
+        #
+        if is_dev_comm_err_possible:
+            engaged = any((
+                self._device_uuid_ack_timeout_engaged,
+                self._device_pellet_status_timeout_engaged,
+            ))
+
+    def _reported_position(self, status) -> float:
+        """A stepper's reported position, or NaN while the stage is stopped: the board
+        reports where it planned the axis to be, which an ESTOP made unknown until a home."""
+        return math.nan if self._estop_record is not None else status.position
+
+    def _message_handler_property_changed(self, name: str, value, old_value):
+        props = MessageHandler
+        if name == props.STEPPER_X_PROPERTY:
+            prev = self._last_motor_coordinates
+            new = prev.replace(x=self._reported_position(value))
+            self._last_motor_coordinates = new
+            self.send_x = value.send_position
+            self._note_driver_fault("X", value)
+            self._on_property_changed(self.POS_XYZ, new, prev)
+
+        elif name == props.STEPPER_Y_PROPERTY:
+            prev = self._last_motor_coordinates
+            new = prev.replace(y=self._reported_position(value))
+            self._last_motor_coordinates = new
+            self.send_y = value.send_position
+            self._note_driver_fault("Y", value)
+            self._on_property_changed(self.POS_XYZ, new, prev)
+
+        elif name == props.STEPPER_Z_PROPERTY:
+            prev = self._last_motor_coordinates
+            new = prev.replace(z=self._reported_position(value))
+            self._last_motor_coordinates = new
+            self.send_z = value.send_position
+            self._note_driver_fault("Z", value)
+            self._on_property_changed(self.POS_XYZ, new, prev)
+
+        elif name == props.COVER_ARM_ANGLE_PROPERTY:
+            self._cover_arm_position = value
+
+        elif name == props.LOAD_ARM_ANGLE_PROPERTY:
+            self._load_arm_position = value
+
+        elif name == props.FIRMWARE_VERSION_PROPERTY and value is not None:
+            version = str(value).lower()
+            if version.find("module") != -1:
+                version = version.replace("module", "").strip()
+            if version.find("pellet") != -1:
+                clean_v = _reg_pellet_version_clean.sub("", version).strip()
+                prev, self._pellet_version = self._pellet_version, clean_v
+                self._on_property_changed(self.PELLET_VERSION_PROPERTY, clean_v, prev)
+                self._update_firmware_compatibility(clean_v)
+                self._firmware_version_received.set()
+        elif name == props.COLOR_LED:
+            self._color_led = value
+
+    def _request_board_capabilities(self, can_device) -> None:
+        """Ask the board what it can do, before judging it on the answer.
+
+        The compatibility check runs at connect and reads a bitmask the board
+        has never been asked for, so a required capability could never be
+        satisfied: the mask was still zero when it was evaluated. A firmware
+        that answers (2.3.0 and later) fills it in here; one that does not
+        (2.2.0 and earlier) leaves it zero, which is exactly why those
+        versions list their capabilities as optional.
+
+        Not reaching the board is not fatal. Silence is what older firmware
+        does, and the policy for those versions expects it.
+        """
+        interface = getattr(getattr(can_device, "device_interface", None),
+                            "request_capabilities", None)
+        if interface is None:
+            return
+        self._board_capabilities_received.clear()
+        try:
+            if not interface():
+                return
+        except Exception as error:
+            logger.debug("capabilities request was not sent: %s", error)
+            return
+        if not self._board_capabilities_received.wait(1.0):
+            logger.info(
+                "pellet board did not answer the capabilities request; "
+                "treating it as a firmware that cannot")
+
+    def _decoded_device_message(self, kind, data, perf_time, wall_time) -> None:
+        if kind != SystemStatusMessageKind.BOARD_CAPABILITIES:
+            return
+        self._board_wire_schema_version = int(data.wire_schema_version)
+        self._board_capabilities = int(data.capabilities)
+        self._board_capabilities_received.set()
+        self._update_firmware_compatibility(self._pellet_version)
+
+    def _update_firmware_compatibility(self, version: str) -> None:
+        previous = self._firmware_compatibility
+        current = self._firmware_policy.evaluate(
+            version,
+            wire_schema_version=self._board_wire_schema_version,
+            capabilities=self._board_capabilities,
+            emulation=self.__dict__.get("_can_is_emulation", False),
+        )
+        self._firmware_compatibility = current
+        self._on_property_changed(
+            self.FIRMWARE_COMPATIBILITY_PROPERTY,
+            current.to_record(),
+            previous.to_record(),
+        )
+
+    def set_can_latency_observer(self, observer) -> None:
+        """Route CAN command latency stages to the session's latency record."""
+        self._can_latency_observer = observer
+        device = getattr(self, "_can_device", None)
+        if device is not None:
+            device.latency_observer = observer
+
+    def _send_with_token(self, device: Optional[DeviceConnectionProtocol], cmd: SystemCommandKind, data=None,
+                         *, _after_estop: bool = False) -> Optional[UUID]:
+        record = self._estop_record
+        if record is not None and cmd in _REFUSED_WHILE_STOPPED and not _after_estop:
+            logger.error(
+                "Pellet %s refused: the stage was stopped (%s). Home it with Hardware Control ▸ Home first",
+                cmd.name, record["reason"])
+            return None
+        with self._lock:
+            # ensure only 1 command can be sent at the same time
+            # NB: there are multiple threads which can act on this instance,
+            # and we don't want to try to send 2 messages at the same time,
+            # or the pending command token might be overwritten.
+            tok = self.__send_with_token(device, cmd, data)
+            commands_tuple = list(self._pending_tokens.values())
+        if tok is not None:
+            self._refresh_cmd_in_progress(commands_tuple)
+        return tok
+
+    def _on_can_failure(self, failure: CanFailure) -> None:
+        if (
+            failure.kind in {
+                CanFailureKind.TRANSPORT,
+                CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT,
+            }
+            and not failure.diagnostics
+        ):
+            try:
+                can_device = self._can_device
+                transport = (
+                    can_device.can_transport_configuration
+                    if can_device is not None
+                    else CanTransportConfiguration.from_environment()
+                )
+                if transport.kind is CanTransportKind.SOCKETCAN:
+                    failure = dataclasses.replace(
+                        failure,
+                        diagnostics=capture_can_diagnostics(transport.channel),
+                    )
+            except Exception:
+                logger.exception("Could not capture CAN counters before recovery")
+        logger.error(
+            "Terminal CAN failure: kind=%s command=%s context=%s error=%s",
+            failure.kind.value,
+            failure.command,
+            failure.context,
+            failure.error,
+        )
+        recoverable = failure.kind in {
+            CanFailureKind.TRANSPORT,
+            CanFailureKind.ACKNOWLEDGEMENT_TIMEOUT,
+        }
+        with self._can_recovery_lock:
+            if self._first_can_failure is None:
+                self._first_can_failure = failure
+            else:
+                logger.error(
+                    "Preserving first CAN diagnostic failure (%s); later failure: %s",
+                    self._first_can_failure.error,
+                    failure.error,
+                )
+            if recoverable and self._can_recovery_failure is not None:
+                logger.error(
+                    "CAN recovery already owned by %s; suppressed duplicate recovery: %s",
+                    self._can_recovery_failure.error,
+                    failure.error,
+                )
+                return
+            if recoverable:
+                self._can_recovery_failure = failure
+
+        with self._lock:
+            pending = tuple(self._pending_tokens.items())
+        if pending and failure.kind is CanFailureKind.TRANSPORT:
+            for token, (command, _started) in pending:
+                with self._lock:
+                    self._remember_command_outcome(
+                        token,
+                        "unknown",
+                        "CAN connection was lost before acknowledgement",
+                    )
+                self.command_failed(CanFailure(
+                    CanFailureKind.OPERATION_UNKNOWN,
+                    f"CAN connection was lost while {command.name} was in flight; "
+                    "the operation was not replayed and its physical outcome is unknown",
+                    command=command,
+                    context=str(token),
+                    category=failure.category,
+                    error_code=failure.error_code,
+                    exception_type=failure.exception_type,
+                    diagnostics=failure.diagnostics,
+                ))
+        else:
+            if failure.context:
+                try:
+                    failed_token = UUID(str(failure.context))
+                except (TypeError, ValueError):
+                    failed_token = None
+                if failed_token is not None:
+                    with self._lock:
+                        if failed_token in self._pending_tokens:
+                            self._remember_command_outcome(
+                                failed_token,
+                                "failed",
+                                failure.error,
+                            )
+            self.command_failed(failure)
+
+        self._emit_device_event(
+            "state",
+            "can_failure",
+            data={
+                "kind": failure.kind.value,
+                "error": failure.error,
+                "category": failure.category,
+                "error_code": failure.error_code,
+                "exception_type": failure.exception_type,
+                "diagnostics": failure.diagnostics,
+            },
+            context=failure.context,
+        )
+        if not recoverable:
+            return
+        self._set_can_connection_state("failed", error=failure.error)
+        with self._can_recovery_lock:
+            self._can_recovery_generation += 1
+            generation = self._can_recovery_generation
+        thread = threading.Thread(
+            target=self._run_can_recovery,
+            args=(failure, generation),
+            name="CanRecovery",
+            daemon=True,
+        )
+        with self._can_recovery_lock:
+            self._can_recovery_thread = thread
+        thread.start()
+
+    def report_can_watchdog_failure(self, error: str) -> None:
+        self._on_can_failure(CanFailure(
+            CanFailureKind.TRANSPORT,
+            str(error),
+            category="watchdog_timeout",
+            exception_type="WatchdogTimeout",
+        ))
+
+    def _run_can_recovery(
+        self,
+        failure: CanFailure,
+        generation: Optional[int] = None,
+    ) -> None:
+        if generation is None:
+            with self._can_recovery_lock:
+                self._can_recovery_generation += 1
+                generation = self._can_recovery_generation
+                self._can_recovery_failure = failure
+        try:
+            command_queue = self._command_queue
+            if command_queue is None:
+                logger.error("CAN recovery cannot start without the original command queue")
+                return
+            if not self._can_recovery_is_current(generation):
+                return
+            self._set_can_connection_state(
+                "recovering", error=failure.error, generation=generation,
+            )
+            self._emit_device_event(
+                "state", "recovery_start",
+                data={"error": failure.error, "generation": generation},
+            )
+            transport = (
+                self._can_device.can_transport_configuration
+                if self._can_device is not None
+                else CanTransportConfiguration.from_environment()
+            )
+            delays = (0.0, 0.5, 1.5)
+            last_error = failure.error
+            for attempt, delay in enumerate(delays, start=1):
+                if self._can_recovery_cancel.wait(delay):
+                    logger.info("CAN recovery cancelled during application shutdown")
+                    return
+                if not self._can_recovery_is_current(generation):
+                    return
+                try:
+                    self._disconnect_transport(command_outcome="unknown")
+                except Exception as exc:
+                    last_error = str(exc) or exc.__class__.__name__
+                    logger.exception(
+                        "Failed to close failed CAN socket before recovery attempt %s; "
+                        "replacement transport will not be opened",
+                        attempt,
+                    )
+                    continue
+                if attempt == 2 and transport.kind is CanTransportKind.SOCKETCAN:
+                    try:
+                        self._reset_socketcan(transport)
+                    except Exception as exc:
+                        last_error = str(exc) or exc.__class__.__name__
+                        logger.exception("SocketCAN reset before recovery attempt failed")
+                try:
+                    connected = self.connect(
+                        command_queue,
+                        _recovery=True,
+                        _generation=generation,
+                    )
+                except CommandRefusedError as exc:
+                    # The bus works; the board refused (an E-stop, a driver
+                    # fault). Another attempt would only be refused again.
+                    error = f"CAN recovery stopped: {exc.refusal.message}"
+                    logger.error("%s", error)
+                    self._emit_device_event(
+                        "state", "recovery_refused",
+                        data={"error": error, "generation": generation},
+                    )
+                    self._close_stopped_recovery(generation)
+                    self._set_can_connection_state("failed", error=error, generation=generation)
+                    return
+                except Exception as exc:
+                    last_error = str(exc) or exc.__class__.__name__
+                    logger.exception("CAN recovery attempt %s/%s failed", attempt, len(delays))
+                    self._emit_device_event(
+                        "state",
+                        "recovery_attempt_failed",
+                        data={
+                            "attempt": attempt,
+                            "error": last_error,
+                            "generation": generation,
+                        },
+                    )
+                    continue
+                if not connected:
+                    return
+                if not self._can_recovery_is_current(generation):
+                    self._disconnect_transport()
+                    return
+
+                logger.notice("CAN recovery completed on attempt %s", attempt)
+                self._emit_device_event(
+                    "state",
+                    "recovery_ready",
+                    data={"attempt": attempt, "generation": generation},
+                )
+                self._set_can_connection_state("ready", generation=generation)
+                with self._can_recovery_lock:
+                    if generation == self._can_recovery_generation:
+                        self._can_recovery_failure = None
+                return
+
+            error = f"CAN recovery exhausted after {len(delays)} attempts: {last_error}"
+            logger.error("%s", error)
+            self._emit_device_event(
+                "state", "recovery_exhausted",
+                data={"error": error, "generation": generation},
+            )
+            self._close_stopped_recovery(generation)
+            self._set_can_connection_state(
+                "failed", error=error, generation=generation,
+            )
+        finally:
+            with self._can_recovery_lock:
+                if generation == self._can_recovery_generation:
+                    self._can_recovery_thread = None
+
+    def _close_stopped_recovery(self, generation: int) -> None:
+        """Close the transport a stopped recovery's last attempt left open.
+
+        That attempt can fail after the transport is up (a refused home, no
+        version reply). Left open, connected stays True, so Refresh Hardware
+        and the subsystem retry skip the connect that would home the axes.
+        """
+        with self._can_lifecycle_lock:
+            if not self._can_recovery_is_current(generation):
+                return  # a newer connect owns the transport
+            try:
+                self._disconnect_transport(command_outcome="unknown")
+            except Exception:
+                logger.exception("Failed to close the CAN transport after recovery stopped")
+
+    def _can_recovery_is_current(self, generation: int) -> bool:
+        with self._can_recovery_lock:
+            return generation == self._can_recovery_generation
+
+    def _set_can_connection_state(
+        self,
+        state: str,
+        *,
+        error: str = "",
+        generation: Optional[int] = None,
+    ) -> bool:
+        with self._can_recovery_lock:
+            if (
+                generation is not None
+                and generation != self._can_recovery_generation
+            ):
+                logger.warning(
+                    "Ignoring stale CAN state %s from generation %s",
+                    state,
+                    generation,
+                )
+                return False
+            previous = self._can_connection_state
+            value = {"state": str(state), "error": str(error or "")}
+            self._can_connection_state = value
+        self._on_property_changed(self.CAN_CONNECTION_STATE_PROPERTY, value, previous)
+        return True
+
+    def __send_with_token(self, device: DeviceConnectionProtocol, cmd: SystemCommandKind, data=None) -> Optional[UUID]:
+        token = uuid4()
+        perf_now = get_perf_now()
+        observer = self._can_latency_observer
+        if observer is not None:
+            try:
+                observer("token", {"token": str(token), "kind": cmd.name, "perf": perf_now})
+            except Exception:
+                logger.exception("CAN latency observer failed")
+        logger.debug("send_command cmd=%s token=%s nbr=%s", cmd, token, len(self._pending_tokens))
+        if self._send_command(device, cmd, data, token):
+            self._pending_tokens[token] = (cmd, perf_now)
+            self._remember_command_outcome(token, "pending", "")
+            return token
+        else:
+            logger.verbose("send_command failed, device not setup yet: cmd=%s token=%s", cmd, token)
+            if cmd is SystemCommandKind.SEND_PELLET:
+                self._on_can_failure(CanFailure(
+                    kind=CanFailureKind.COMMAND,
+                    error=f"Command {cmd.name} could not be queued",
+                    command=cmd,
+                    context=str(token),
+                    perf_time=perf_now,
+                ))
+            return None
+
+    # noinspection PyMethodMayBeStatic
+    def _send_command(self,
+                      device: DeviceConnectionProtocol,
+                      cmd: SystemCommandKind,
+                      data=None,
+                      context=None) -> bool:
+        with self._safety_shutdown_lock:
+            if self._safety_shutdown_started:
+                logger.warning("Ignoring %s because CAN safety shutdown is active", cmd)
+                return False
+            if device is not None:
+                self._emit_device_event(
+                    "outbound",
+                    cmd,
+                    data=data,
+                    context=context,
+                )
+                device.send_message(cmd, data, context)
+                return True
+        return False
+
+    def _emit_device_event(
+        self,
+        direction,
+        kind,
+        *,
+        data=None,
+        context=None,
+        target=None,
+        perf_time=None,
+        wall_time=None,
+    ) -> None:
+        try:
+            self.device_event(
+                direction,
+                kind,
+                data,
+                context,
+                target,
+                time.perf_counter() if perf_time is None else float(perf_time),
+                time.time() if wall_time is None else float(wall_time),
+            )
+        except Exception:
+            logger.exception("Unable to publish structured device event")
+
+    def _on_internal_device_operation(
+        self, kind, data, context, target, perf_time, wall_time,
+    ) -> None:
+        """Persist commands executed inside a configured compound movement."""
+        self._emit_device_event(
+            "outbound",
+            kind,
+            data=data,
+            context=context,
+            target=target,
+            perf_time=perf_time,
+            wall_time=wall_time,
+        )
+
+    def set_motors_drift(self, drift: Offset3DTuple):
+        """Apply the pellet motor drift. CanInterface moves the saved send position to
+        SET - drift, so that is refused, with nothing sent, when it lies outside the travel."""
+        if self._device_conn is None:
+            return
+        refused = False
+        for coord_idx, (requested, axis_drift) in enumerate(zip(self._last_requested_set_coordinates, drift)):
+            target = requested - axis_drift
+            if math.isfinite(target) and self._refuse_outside_travel(coord_idx, target):
+                refused = True
+        if refused:
+            return
+        self._send_with_token(self._device_conn, SystemCommandKind.SET_MOTOR_DRIFT, drift)
+        # this ensure the next send_to_fixed_pos command will get the corrected position:
+        for cmd_kind in (SystemCommandKind.SET_X, SystemCommandKind.SET_Y, SystemCommandKind.SET_Z):
+            self._send_with_token(
+                self._device_conn,
+                cmd_kind,
+                SystemDataArgsKwargs(0, relative=True),
+            )
+
+    def set_auto_correct_motor_drift(self, enabled: bool):
+        if self._device_conn is None:
+            return
+        self._send_with_token(
+            self._device_conn,
+            SystemCommandKind.SET_AUTO_CORRECT_DRIFT,
+            enabled,
+        )
+        if not enabled:
+            logger.verbose("Doing SET_X/Y/Z relative=0 to clear possible motors drift")
+            for cmd_kind in (SystemCommandKind.SET_X, SystemCommandKind.SET_Y, SystemCommandKind.SET_Z):
+                self._send_with_token(
+                    self._device_conn,
+                    cmd_kind,
+                    SystemDataArgsKwargs(0, relative=True),
+                )
+
+    def _refresh_cmd_in_progress(self, commands_tuple: List[Tuple[SystemCommandKind, float]]):
+        if len(commands_tuple) == 0:
+            self.property_changed(HardwareModel.PENDING_COMMAND_PROPERTY, None, True)
+        else:
+            # NB: sort on cmd perf_counter:
+            list_after = (cmd.name for cmd, _ in sorted(commands_tuple, key=lambda t: t[1]))
+            self.property_changed(
+                HardwareModel.PENDING_COMMAND_PROPERTY, " - ".join(list_after), None
+            )
+
+    def _ack_received(self, token: UUID, *, perf_c: Optional[float]=None):
+        with self._lock:
+            popped = self._pending_tokens.pop(token, None)
+            if popped is not None:
+                self._remember_command_outcome(token, "acknowledged", "")
+            commands_in_prog = list(self._pending_tokens.values())
+        if popped is None:
+            # this can happen at device connection
+            (logger.debug if not self._device_initialization_complete else logger.warning)(
+                "Received unexpected ack token: %s", token)
+        else:
+            self._refresh_cmd_in_progress(commands_in_prog)
+            self._lift_presentation_block(token)
+            if popped[0] in {SystemCommandKind.SEND_HOME, SystemCommandKind.SEND_TO_LIMITS}:
+                # Both home all three axes, and only the whole sequence is acknowledged.
+                with self._lock:
+                    stopped = self._estop_record is not None
+                    clears_stop = stopped and token == self._estop_home_token
+                if stopped and not clears_stop:
+                    # A home sent before the stop: it does not vouch for the stage now.
+                    logger.warning("Pellet home %s acknowledged, but the stage was stopped since; "
+                                   "it still needs a home", token)
+                else:
+                    self._set_axes_needing_home(())
+                    if clears_stop:
+                        self._clear_estop("homed after the stop")
+
+    def _command_refused(self, token, *, perf_c: Optional[float] = None, refusal=None):
+        """The board refused the command of this token: it ended and will never be acknowledged.
+
+        A command an ESTOP ended (refusal.stopped_by_estop) ends as "stopped"; its
+        physical outcome is unknown, and the ESTOP raises its own alert.
+        """
+        stopped = bool(getattr(refusal, "stopped_by_estop", False))
+        with self._lock:
+            popped = self._pending_tokens.pop(token, None)
+            if popped is not None:
+                self._remember_command_outcome(token, "stopped" if stopped else "refused", refusal.message)
+            commands_in_prog = list(self._pending_tokens.values())
+        if popped is not None:
+            self._refresh_cmd_in_progress(commands_in_prog)
+            self._forget_refused_set(popped[0], token, refusal)
+        # Below ERROR: the device has logged it at ERROR already, and every
+        # ERROR record lands in the footer, where AppModel shows the notice.
+        logger.warning("Pellet board refused command %s (token=%s): %s",
+                       getattr(refusal.command, "name", refusal.command), token, refusal.message)
+        if refusal.needs_home:
+            names = {_AXIS_NAMES[m] for m in refusal.needs_home}
+            self._set_axes_needing_home(tuple(sorted(names | set(self._axes_needing_home))))
+        prev, self._last_command_refusal = self._last_command_refusal, refusal.message
+        self.property_changed(self.LAST_COMMAND_REFUSAL_PROPERTY, refusal.message, prev)
+        command = refusal.command if popped is None else popped[0]
+        self._emit_device_event(
+            "state",
+            "command_refused",
+            data={
+                "command": getattr(command, "name", str(command)),
+                "step": refusal.step,
+                "error": refusal.error,
+                "error_name": refusal.error_name,
+                "resent": refusal.resent,
+                "needs_home": list(self._axes_needing_home),
+                "message": refusal.message,
+            },
+            context=None if token is None else str(token),
+        )
+        # A refusal is not a CAN fault: COMMAND and OPERATION_UNKNOWN start no recovery.
+        self.command_failed(CanFailure(
+            CanFailureKind.OPERATION_UNKNOWN if refusal.outcome_unknown or stopped else CanFailureKind.COMMAND,
+            refusal.message,
+            command=command,
+            context=None if token is None else str(token),
+            category="estop" if stopped else "board_refusal",
+            error_code=int(refusal.error),
+        ))
+
+    def _forget_refused_set(self, command, token, refusal) -> None:
+        """A refused SET_X/Y/Z left the board's send position where it was: put the requested
+        one back to the reported one (nan when that is not known), so the travel checks of the
+        next relative SET and sequence use the base the board really has.
+
+        Only on an axis with travel configured; without one the requested position is left as
+        it always was. Not when the outcome is unknown (-EBUSY on a resend), nor when a newer
+        SET of the axis was queued since. Silent: set_<axis> is not notified, since AppModel
+        saves every set_<axis> change into the selected animal as an operator edit."""
+        coord_idx = {SystemCommandKind.SET_X: 0, SystemCommandKind.SET_Y: 1, SystemCommandKind.SET_Z: 2}.get(command)
+        if coord_idx is None or not self._axis_has_travel(coord_idx):
+            return
+        if getattr(refusal, "outcome_unknown", False) or self._latest_set_tokens[coord_idx] != token:
+            return
+        coord = "xyz"[coord_idx]
+        reported = self._last_motor_send_coordinates[coord_idx]
+        self._last_requested_set_coordinates = self._last_requested_set_coordinates.replace(**{coord: reported})
+
+    def _set_axes_needing_home(self, axes: Tuple[str, ...]) -> None:
+        prev, self._axes_needing_home = self._axes_needing_home, tuple(axes)
+        if prev != self._axes_needing_home:
+            self.property_changed(self.PELLET_NEEDS_HOME_PROPERTY, self._axes_needing_home, prev)
+
+    def _note_driver_fault(self, axis: str, status) -> None:
+        """Keep the axis in, or out of, the faulted set as its status byte says.
+
+        Only DRIVER_FAULT (bit 0) is read. ENABLE_OFF (bit 1) is informational:
+        it sets no fault, no blocker and no log.
+        """
+        faulted = set(self._axes_with_driver_fault)
+        if bool(getattr(status, "driver_fault", False)):
+            faulted.add(axis)
+        else:
+            faulted.discard(axis)
+        self._set_axes_with_driver_fault(tuple(sorted(faulted)))
+
+    def _set_axes_with_driver_fault(self, axes: Tuple[str, ...]) -> None:
+        prev, self._axes_with_driver_fault = self._axes_with_driver_fault, tuple(axes)
+        if prev == self._axes_with_driver_fault:
+            return
+        # Below ERROR: every ERROR record lands in the footer, and the status
+        # panel and the Record blocker already report the fault.
+        if not prev:
+            logger.warning(
+                "Pellet stepper driver fault on axis %s: home the pellet axes to clear it",
+                ", ".join(self._axes_with_driver_fault))
+        elif not self._axes_with_driver_fault:
+            logger.info("Pellet stepper driver fault no longer reported")
+        self.property_changed(
+            self.PELLET_DRIVER_FAULT_PROPERTY, self._axes_with_driver_fault, prev)
+
+    def wait_pending_command_acked(
+        self,
+        token,
+        *,
+        timeout: float = 3,
+        raise_on_timeout: bool = True,
+    ):
+        p_start = time.perf_counter()
+        p_timeout = p_start + timeout
+        logger.verbose("Waiting ack pending command %s", token)
+        while True:
+            with self._lock:
+                outcome, error = self._command_outcomes.get(
+                    token,
+                    ("unknown_token", "command token is not known"),
+                )
+                if outcome == "acknowledged":
+                    logger.debug("Got ack for token=%s ; delay=%.6f",
+                                 token, time.perf_counter() - p_start)
+                    return
+                if outcome not in {"pending"}:
+                    raise RuntimeError(
+                        f"command token={token} ended as {outcome}: {error}"
+                    )
+            p_now = time.perf_counter()
+            if p_now > p_timeout:
+                break
+            time.sleep(0.0025)  # 2.5 ms
+        with self._lock:
+            pending = self._pending_tokens.pop(token, None)
+            if pending is not None:
+                self._remember_command_outcome(
+                    token,
+                    "timed_out",
+                    f"acknowledgement was not received within {timeout} seconds",
+                )
+            commands_in_progress = list(self._pending_tokens.values())
+        if pending is not None:
+            self._refresh_cmd_in_progress(commands_in_progress)
+            if pending[0] in _REFUSED_WHILE_STOPPED:
+                self.estop_if_moving(f"{pending[0].name} was not acknowledged within {timeout:g} s",
+                                     frame_only=True)
+        if raise_on_timeout:
+            raise RuntimeError(f"timeout waiting ack of pending token={token}")
+        logger.warning("timeout waiting ack token %s, but continuing", token)
+
+    def _remember_command_outcome(
+        self,
+        token: UUID,
+        outcome: str,
+        error: str,
+    ) -> None:
+        self._command_outcomes[token] = (str(outcome), str(error or ""))
+        while len(self._command_outcomes) > 1024:
+            self._command_outcomes.pop(next(iter(self._command_outcomes)))

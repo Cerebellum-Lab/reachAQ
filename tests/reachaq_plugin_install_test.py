@@ -18,7 +18,7 @@ PLUGIN_SCRIPT = INSTALL_DIR / "reachaq-plugin-install.sh"
 PLUGIN_LIB = INSTALL_DIR / "plugin-install-lib.sh"
 MAIN_SCRIPT = INSTALL_DIR / "reachaq-linux-install.sh"
 
-AGPL_NOTICE = "auto-trainer-pose-yolo installs ultralytics, which is AGPL-3.0."
+AGPL_NOTICE = "reachaq-pose-yolo installs ultralytics, which is AGPL-3.0."
 
 FAKE_CONDA = r"""#!/usr/bin/env bash
 # Logs every call. `env list` lists $FAKE_ENVS; `run -n ENV python ...` runs
@@ -85,7 +85,7 @@ def _make_env(envs, name, *, entry_points=(), packages=()):
         (dist / "METADATA").write_text(
             "Metadata-Version: 2.1\nName: fake-plugins\nVersion: 1.0\n")
         (dist / "entry_points.txt").write_text(
-            "[autotrainer.pose_backends]\n"
+            "[reachaq.pose_backends]\n"
             + "".join(f"{name} = fake_module:THING\n" for name in entry_points))
     for package in packages:
         (root / package).mkdir()
@@ -154,7 +154,9 @@ def test_plugin_installer_warns_before_installing_yolo(tmp_path):
     assert function.index(AGPL_NOTICE) < function.index('pip install -e "$INSTALL_REPO/plugins/')
 
     conda, envs, env = _fake_conda(tmp_path)
-    _make_env(envs, "reachaq")
+    root = _make_env(envs, "reachaq", packages=("torch",))
+    # The one-CUDA-runtime check that ends the run reads torch.version.cuda.
+    (root / "torch" / "__init__.py").write_text("class version:\n    cuda = '12.8'\n")
     env["REACHAQ_INSTALL_ENV"] = "reachaq"
 
     completed = _run_plugin_script("yolo", env=env)
@@ -165,6 +167,7 @@ def test_plugin_installer_warns_before_installing_yolo(tmp_path):
     assert pip_line in completed.stdout
     assert completed.stdout.index(AGPL_NOTICE) < completed.stdout.index(pip_line)
     assert "PASS  Pose plugins | Install yolo pose plugin" in completed.stdout
+    assert "PASS  Pose plugins | Verify one CUDA runtime per engine" in completed.stdout
     # yolo needs no TensorFlow; only deeplabcut brings those steps.
     assert "TensorFlow" not in completed.stdout
 
@@ -221,6 +224,23 @@ def test_installed_pose_plugins_lists_known_entry_points(tmp_path):
     assert "missing: " in lines
 
 
+def test_installed_pose_plugins_reads_the_v3_group_too(tmp_path):
+    """v3 registered its plugins under autotrainer.pose_backends; the first update
+    after the rename must still restore them."""
+    conda, envs, env = _fake_conda(tmp_path)
+    dist = _make_env(envs, "v3") / "auto_trainer_pose_deeplabcut-1.0.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: auto-trainer-pose-deeplabcut\nVersion: 1.0\n")
+    (dist / "entry_points.txt").write_text(
+        "[autotrainer.pose_backends]\ndeeplabcut = fake_module:THING\n")
+
+    completed = _source_lib('echo "v3: $(installed_pose_plugins v3 | tr "\\n" " ")"\n', env, conda)
+
+    assert completed.returncode == 0, completed.stderr
+    assert "v3: deeplabcut " in completed.stdout.splitlines()
+
+
 def test_legacy_pose_engines_infers_plugins_from_old_packages(tmp_path):
     conda, envs, env = _fake_conda(tmp_path)
     _make_env(envs, "dlc-only", packages=("deeplabcut",))
@@ -264,14 +284,15 @@ def test_a_failed_probe_of_an_existing_env_fails_the_step(tmp_path):
         + 'PLUGINS_TO_RESTORE=(yolo)\n'
         'installed_pose_plugins broken; echo "installed status=$?"\n'
         'legacy_pose_engines broken; echo "legacy status=$?"\n'
-        'run_step "Find pose plugins to restore" find_plugins_to_restore broken\n'
-        'echo "states=${RESULT_STATES[*]} kept=${PLUGINS_TO_RESTORE[*]}"\n',
+        'find_plugins_to_restore broken; echo "find status=$?"\n'
+        'echo "kept=${PLUGINS_TO_RESTORE[*]}"\n',
         env, conda)
 
     assert completed.returncode == 0, completed.stderr
     assert "installed status=3" in completed.stdout
     assert "legacy status=3" in completed.stdout
-    assert "states=FAIL kept=yolo" in completed.stdout
+    assert "find status=3" in completed.stdout
+    assert "kept=yolo" in completed.stdout
     assert "probe python broke in broken" in completed.stderr
     assert "Probing the pose plugins of conda environment broken failed" in completed.stderr
 
@@ -299,9 +320,62 @@ def test_a_failed_archive_probe_is_reported_without_stopping_the_rebuild():
     archive = source[source.index("archive_conda_environment() {"):]
     archive = archive[:archive.index("\n}\n")]
 
+    # Stopping here would leave no environment of that name, and the rerun
+    # would restore nothing: a WARN, not a FAIL.
     assert 'if ! find_plugins_to_restore "$archive_name"; then' in archive
-    assert 'record_result FAIL "Find pose plugins to restore from $archive_name"' in archive
+    assert 'warn_step "Find pose plugins to restore from $archive_name"' in archive
     assert archive.rstrip().endswith("fi")
+
+
+def test_a_failed_step_stops_and_names_itself(tmp_path):
+    conda, envs, env = _fake_conda(tmp_path)
+
+    completed = _source_lib(
+        REPORT_PRELUDE + 'REPORT_PRINTED=false; RERUN_HINT=again.sh\n'
+        'run_step "First" true\n'
+        'run_step "Broken step" sh -c "echo why >&2; exit 7"\n'
+        'echo "NOT REACHED"\n',
+        env, conda)
+
+    assert completed.returncode == 1
+    assert "NOT REACHED" not in completed.stdout
+    assert "[FAIL] Broken step (exit 7)" in completed.stderr
+    assert "why" in completed.stderr
+    report = completed.stdout[completed.stdout.index("reachAQ install report"):]
+    assert "PASS  Test | First" in report
+    assert "FAIL  Test | Broken step (exit 7)" in report
+    assert "STOPPED at step: Test | Broken step" in report
+    assert "Failed command: sh -c" in report
+    assert "rerun again.sh" in report
+
+
+def test_a_warning_is_reported_without_stopping(tmp_path):
+    conda, envs, env = _fake_conda(tmp_path)
+
+    completed = _source_lib(
+        REPORT_PRELUDE + 'REPORT_PRINTED=false; WARN_COUNT=0\n'
+        'warn_step "Odd host" "override set"\n'
+        'run_step "After" true\n'
+        'print_report\n',
+        env, conda)
+
+    assert completed.returncode == 0, completed.stderr
+    assert "[WARN] Odd host: override set" in completed.stderr
+    assert "WARN  Test | Odd host (override set)" in completed.stdout
+    assert "PASS=1 FAIL=0 SKIP=0 WARN=1" in completed.stdout
+    assert "completed with warnings" in completed.stdout
+
+
+def test_no_installer_step_carries_on_after_a_failure():
+    for script in (MAIN_SCRIPT, PLUGIN_SCRIPT, PLUGIN_LIB):
+        source = script.read_text()
+        assert "continuing" not in source, script.name
+        # A FAIL recorded by hand must stop like run_step does.
+        lines = source.splitlines()
+        for index, line in enumerate(lines):
+            if "record_result FAIL" in line and script is not PLUGIN_LIB:
+                following = "\n".join(lines[index:index + 6])
+                assert "stop_install" in following, (script.name, line)
 
 
 def test_plugin_library_has_no_side_effects_when_sourced(tmp_path):
@@ -367,7 +441,7 @@ def test_main_installer_verifies_each_restored_plugin():
 
     assert 'conda_run python - "$INSTALL_REPO" "${PLUGINS_TO_RESTORE[@]}"' in verify
     assert "import torch" in verify
-    assert 'f"autotrainer.pose_plugins.{name}.plugin"' in verify
+    assert 'f"reachaq.pose_plugins.{name}.plugin"' in verify
 
 
 def test_installer_scripts_parse():

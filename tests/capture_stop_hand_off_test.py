@@ -14,7 +14,7 @@ import ast
 import pytest
 
 import source_contract
-from autotrainer.video import video_capture
+from reachaq.video import video_capture
 
 
 def _stop_recording():

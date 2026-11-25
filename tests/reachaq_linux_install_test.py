@@ -8,11 +8,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SCRIPT = REPO_ROOT / "tools" / "install" / "reachaq-linux-install.sh"
 PLUGIN_LIB = REPO_ROOT / "tools" / "install" / "plugin-install-lib.sh"
 DESKTOP_INSTALL_SCRIPT = REPO_ROOT / "tools" / "install" / "install-reachaq-desktop.sh"
-TOOLS_PROJECT = REPO_ROOT / "tools" / "pyproject.toml"
-DEVICE_PROJECT = REPO_ROOT / "auto-trainer-device" / "pyproject.toml"
+PROJECT = REPO_ROOT / "pyproject.toml"
 SOFTMOUSE_SERVICE = (
     REPO_ROOT
-    / "tools"
+    / "src"
+    / "reachaq"
     / "softmouse_sync"
     / "systemd"
     / "reachaq-softmouse-publisher.service"
@@ -39,7 +39,7 @@ def test_portable_installer_is_executable_and_rejects_options():
     assert "Run it with no options" in completed.stderr
 
 
-def test_portable_installer_always_attempts_complete_workflow():
+def test_portable_installer_runs_one_complete_workflow():
     source = INSTALL_SCRIPT.read_text()
 
     assert 'run_step "Install Miniconda" install_miniconda' in source
@@ -76,6 +76,102 @@ def test_portable_installer_builds_python_310_with_both_pose_engines():
     assert '--target "$runtime_dir"' in library
     assert 'run_step "Verify Python dependencies" verify_python_dependencies' in source
     assert 'run_step "Install Spinnaker Python binding" install_spinnaker_binding' in source
+    # One CUDA runtime: checked once the plugins are back, before the GPU runs.
+    single = source.index('run_step "Verify one CUDA runtime per engine" verify_single_cuda_runtime')
+    assert source.index('run_step "Restore $name pose plugin"') < single
+    assert single < source.index('run_step "Verify PyTorch GPU preflight"')
+
+
+def test_portable_installer_checks_the_platform_before_changing_anything():
+    source = INSTALL_SCRIPT.read_text()
+    flow = source[source.index('begin_category "Preflight"'):]
+
+    first_step = flow.index("run_step ")
+    assert flow[first_step:].startswith('run_step "Check supported platform" check_supported_platform')
+    check = source[source.index("check_supported_platform() {"):]
+    check = check[:check.index("\n}\n")]
+    assert 'python3 "$SCRIPT_DIR/platform_check.py"' in check
+    assert 'if [ "$INSTALL_UNSUPPORTED" = "1" ]; then' in check
+    assert "warn_step" in check
+    assert "INSTALL_UNSUPPORTED=${REACHAQ_INSTALL_UNSUPPORTED:-0}" in source
+
+
+def test_portable_installer_ships_no_flir_software():
+    source = INSTALL_SCRIPT.read_text()
+
+    assert not (REPO_ROOT / "vendor" / "spinnaker").exists()
+    assert "vendor/spinnaker" not in source
+    assert "SPINNAKER_DOWNLOADS=${REACHAQ_SPINNAKER_DOWNLOADS:-$HOME/Downloads}" in source
+    assert "INSTALL_SPINNAKER=${REACHAQ_INSTALL_SPINNAKER:-1}" in source
+    # The SDK is found before the long conda build, the binding after it.
+    sdk = source.index('run_step "Install Spinnaker SDK" install_spinnaker_sdk')
+    assert sdk < source.index('run_step "Create conda environment"')
+    assert source.index('run_step "Install Spinnaker Python binding"') > source.index(
+        'run_step "Create conda environment"')
+    for step in ("Install Spinnaker SDK", "Configure FLIR camera access",
+                 "Install Spinnaker Python binding", "Verify Spinnaker cameras"):
+        assert f'skip_step "{step}" "$SPINNAKER_SKIPPED"' in source, step
+
+
+def test_spinnaker_sdk_licence_is_left_to_the_operator():
+    source = INSTALL_SCRIPT.read_text()
+    install = source[source.index("install_spinnaker_sdk() {"):]
+    install = install[:install.index("\n}\n")]
+
+    # An inherited DEBIAN_FRONTEND=noninteractive would answer the prompt, and
+    # without a terminal it cannot be shown at all.
+    assert 'run_as_root env -u DEBIAN_FRONTEND apt-get install -y "$deb_dir"/*.deb' in install
+    assert "[ ! -t 0 ]" in install
+    # The FLIR packages ask for their licence through debconf; a
+    # noninteractive frontend would decline it, or a preseed accept it, on
+    # the operator's behalf.
+    assert "noninteractive" not in install.replace("Not DEBIAN_FRONTEND=noninteractive", "")
+    assert "accepted-flir-eula" not in source
+    assert "debconf-set-selections" not in source
+
+
+def test_usbfs_memory_unit_is_tracked_and_reversible():
+    unit = (REPO_ROOT / "src" / "reachaq" / "hardware" / "reachaq-usbfs-memory.service").read_text()
+
+    assert "Type=oneshot" in unit and "RemainAfterExit=yes" in unit
+    commands = [line for line in unit.splitlines() if line.startswith("Exec")]
+    assert any(line.startswith("ExecStart") and "echo 1000 >" in line for line in commands)
+    assert any(line.startswith("ExecStop") and "echo 16 >" in line for line in commands)
+    assert "WantedBy=multi-user.target" in unit
+
+
+def test_generic_import_check_names_only_modules_in_the_checkout():
+    """After the 1.4 rename it still imported reachAQ and checked tools, which
+    no longer exist, so every install stopped at Verify generic imports."""
+    source = INSTALL_SCRIPT.read_text()
+    block = source[source.index("verify_imports() {"):]
+    block = block[:block.index("\nPY\n")]
+    imported = re.findall(r"^import (reachaq(?:\.\w+)+)$", block, re.M)
+    assert imported, "no reachaq imports found"
+    for name in imported:
+        package = REPO_ROOT / "src" / Path(*name.split("."))
+        assert package.is_dir() or package.with_suffix(".py").is_file(), name
+    assert not re.search(r"^import (reachAQ|tools)\b", block, re.M)
+    checked = re.search(r"for module in \(([^)]*)\):", block).group(1)
+    for name in (part.strip() for part in checked.split(",")):
+        assert name == "*plugins" or name in imported, name
+
+
+def test_portable_installer_upgrades_a_v3_install():
+    source = INSTALL_SCRIPT.read_text()
+
+    # Before the settings directory is created: an empty ~/reachAQ would block the move.
+    migrate = source.index('run_step "Migrate v3 settings" migrate_v3_settings')
+    assert migrate < source.index('run_step "Create runtime directories" make_runtime_directories')
+    assert 'python3 "$INSTALL_REPO/src/reachaq/core/settings_migration.py"' in source
+    # Before anything is installed into the environment, so no old finder or script survives it.
+    uninstall = source.index('run_step "Uninstall v3 auto-trainer distributions" uninstall_v3_distributions')
+    assert uninstall < source.index('run_step "Install PyTorch pose engine" install_torch_engine')
+    # Right after the package the units start: a later stop must not leave a
+    # unit naming a v3 module.
+    refresh = source.index('run_step "Refresh installed SoftMouse units" refresh_installed_user_units')
+    editable = source.index('run_step "Install reachAQ editable package" install_editable_package')
+    assert editable < refresh < source.index('run_step "Restore $name pose plugin"')
 
 
 def test_portable_installer_archives_an_environment_on_another_python():
@@ -109,7 +205,7 @@ def test_every_focused_test_the_installer_runs_exists():
     source = INSTALL_SCRIPT.read_text()
     block = source[source.index("run_focused_tests() {"):]
     block = block[:block.index("\n}\n")]
-    entries = re.findall(r"((?:auto-trainer-[a-z]+/)?tests/[\w/]+\.py(?:::\w+)?)", block)
+    entries = re.findall(r"(tests/[\w/]+\.py(?:::\w+)?)", block)
     assert entries, "no focused tests found"
     missing = []
     for entry in entries:
@@ -151,7 +247,7 @@ def test_latency_setup_script_is_tracked_and_reversible():
     A rig that is already installed should not have to run a full install to
     change a governor, and every action has to have a documented way back.
     """
-    script = REPO_ROOT / "tools" / "hardware" / "reachaq-latency-setup.sh"
+    script = REPO_ROOT / "src" / "reachaq" / "hardware" / "reachaq-latency-setup.sh"
     assert script.is_file()
     text = script.read_text()
 
@@ -165,7 +261,7 @@ def test_latency_setup_script_is_tracked_and_reversible():
 
 
 def test_cpu_governor_unit_is_tracked_and_installable():
-    unit = REPO_ROOT / "tools" / "hardware" / "reachaq-cpu-governor.service"
+    unit = REPO_ROOT / "src" / "reachaq" / "hardware" / "reachaq-cpu-governor.service"
     assert unit.is_file()
     text = unit.read_text()
 
@@ -205,14 +301,14 @@ def test_portable_installer_covers_softmouse_rfid_requirements():
     assert "tests/animal_metadata_cli_test.py" in source
     assert "tests/animal_sources_test.py" in source
     assert "tests/softmouse_https_source_test.py" in source
-    assert "auto-trainer-device/tests/rfid_reader_test.py" in source
+    assert "tests/device/rfid_reader_test.py" in source
     assert "resolves outside the current checkout" in source
 
 
 def test_desktop_launcher_installer_creates_terminal_entry(tmp_path):
     home = tmp_path / "home"
     desktop = home / "Desktop"
-    config_dir = home / "Autotrainer"
+    config_dir = home / "reachAQ"
     fake_conda = tmp_path / "conda"
     home.mkdir()
     desktop.mkdir()
@@ -266,12 +362,10 @@ def test_desktop_launcher_installer_creates_terminal_entry(tmp_path):
 
 
 def test_softmouse_rfid_python_dependencies_are_packaged():
-    tools_project = TOOLS_PROJECT.read_text()
-    device_project = DEVICE_PROJECT.read_text()
+    project = PROJECT.read_text()
 
-    for dependency in ("openpyxl", "requests", "keyring"):
-        assert dependency in tools_project
-    assert "pyserial" in device_project
+    for dependency in ("openpyxl", "requests", "keyring", "pyserial"):
+        assert dependency in project
 
 
 def test_softmouse_service_supports_installer_conda_locations():
@@ -289,7 +383,7 @@ def test_documented_conda_application_launches_stream_terminal_output():
     for document in REPO_ROOT.rglob("*.md"):
         for line_number, line in enumerate(document.read_text().splitlines(), start=1):
             if "conda run" in line and (
-                "python -m reachAQ.app" in line or "auto-trainer-headless" in line
+                "python -m reachaq.app" in line or "reachaq-headless" in line
             ):
                 launch_lines.append((document, line_number, line))
 

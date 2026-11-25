@@ -22,24 +22,24 @@ from types import SimpleNamespace
 import pytest
 from PySide6.QtWidgets import QMessageBox
 
-from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
-from autotrainer.core.event.api_event_kind import ApiEventKind
-from autotrainer.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
-from autotrainer.inference.multires_calibration import library, store
-from autotrainer.inference.multires_calibration.fit import BoardSpec
-from autotrainer.inference.multires_calibration.geometry import presets_from_base
-from autotrainer.inference.multires_calibration.report import QualityReport
+from reachaq.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
+from reachaq.core.event.api_event_kind import ApiEventKind
+from reachaq.inference.analysis.prepare_jetson_data import DEFAULT_CAM_OFFSET_FILE_NAME
+from reachaq.inference.multires_calibration import library, store
+from reachaq.inference.multires_calibration.fit import BoardSpec
+from reachaq.inference.multires_calibration.geometry import presets_from_base
+from reachaq.inference.multires_calibration.report import QualityReport
 from multires_calibration_fakes import BASE, FIT
 from multires_synthetic import synthetic_rig
-from tools.acquisition.model.app_model_status import AppModelStatus
-from tools.acquisition.model.calibration_install import decide_install, install_calibration, override_record
-from tools.acquisition.model.dcs_state import DcsState
-from tools.acquisition.view import main_window as main_window_module
-from tools.acquisition.view.calibration_dialog import CalibrationRequest
-from tools.acquisition.view.main_window import MainWindow
+from reachaq.app.model.app_model_status import AppModelStatus
+from reachaq.app.model.calibration_install import decide_install, install_calibration, override_record
+from reachaq.app.model.dcs_state import DcsState
+from reachaq.app.view import main_window as main_window_module
+from reachaq.app.view.calibration_dialog import CalibrationRequest
+from reachaq.app.view.main_window import MainWindow
 
 
-calibration_install_module = importlib.import_module("tools.acquisition.model.calibration_install")
+calibration_install_module = importlib.import_module("reachaq.app.model.calibration_install")
 
 NOW = datetime(2026, 10, 23, 14, 5, 6)
 RIG = synthetic_rig(noise_px=0.0)

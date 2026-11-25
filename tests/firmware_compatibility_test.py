@@ -1,5 +1,5 @@
 import threading
-from tools.acquisition.model.firmware_compatibility import FirmwareCompatibilityPolicy
+from reachaq.app.model.firmware_compatibility import FirmwareCompatibilityPolicy
 
 
 def test_policy_accepts_exact_legacy_version_with_visible_fallback():
@@ -93,7 +93,7 @@ def test_a_required_capability_is_asked_for_before_it_is_judged():
     flashing it and watching the host refuse to connect.
     """
     from types import SimpleNamespace
-    from tools.acquisition.model.hardware_model import HardwareModel
+    from reachaq.app.model.hardware_model import HardwareModel
 
     model = HardwareModel.__new__(HardwareModel)
     model._board_capabilities = 0
@@ -124,7 +124,7 @@ def test_a_board_that_cannot_answer_is_not_treated_as_a_failure():
     policy decide rather than refusing the connection.
     """
     from types import SimpleNamespace
-    from tools.acquisition.model.hardware_model import HardwareModel
+    from reachaq.app.model.hardware_model import HardwareModel
 
     model = HardwareModel.__new__(HardwareModel)
     model._board_capabilities = 0
@@ -211,7 +211,7 @@ def test_every_capability_name_in_the_shipped_policy_is_known():
     """A name missing from CAPABILITY_BITS makes load() reject every version."""
     import yaml
     from pathlib import Path
-    from tools.acquisition.model.firmware_compatibility import CAPABILITY_BITS
+    from reachaq.app.model.firmware_compatibility import CAPABILITY_BITS
 
     path = Path(__file__).resolve().parents[1] / "config/pellet-firmware-compatibility.yaml"
     record = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -227,7 +227,7 @@ def test_every_capability_name_in_the_shipped_policy_is_known():
 
 
 def test_bit_6_does_not_collide_with_the_bits_reserved_for_timing_and_io():
-    from tools.acquisition.model.firmware_compatibility import CAPABILITY_BITS
+    from reachaq.app.model.firmware_compatibility import CAPABILITY_BITS
 
     assert CAPABILITY_BITS["stepper_driver_fault"] == 1 << 6
     assert CAPABILITY_BITS["sync_listener"] == 1 << 4

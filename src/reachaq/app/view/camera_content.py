@@ -1,0 +1,214 @@
+import time
+from typing import Dict, Optional
+
+from numpy import ndarray
+
+from PySide6.QtCore import Slot, Qt
+from PySide6.QtWidgets import QGridLayout, QSizePolicy
+
+from reachaq.core import NotificationCenter, TriggerNotification, Notification
+from reachaq.core.logging import get_verbose_logger
+from reachaq.inference import PoseLocation
+from reachaq.video import VideoRecordMode
+
+from reachaq.pyside.capture.QtCaptureView import ImageData
+from reachaq.pyside import QCaptureView
+from reachaq.pyside.content_widget import ContentWidget, invoke_method
+
+from reachaq.app.model.app_model import AppModel
+from reachaq.app.model.video_capture_model import VideoCaptureModel
+from reachaq.app.view.capture_telemetry_panel import CaptureTelemetryPanel
+
+logger = get_verbose_logger(__name__)
+
+#: A displayed frame older than this (seconds) is no current view of the camera: the
+#: reference-image check then can't tell, rather than judge a frozen picture.
+DISPLAYED_FRAME_MAX_AGE = 1.0
+
+
+class CameraContent(ContentWidget):
+    def __init__(self, app_model: AppModel, capture_model: VideoCaptureModel):
+        super().__init__()
+
+        self._app_model = app_model
+        self._model = capture_model
+
+        self._text_overlay: Optional[str] = None
+        self._text_overlay_color = Qt.GlobalColor.yellow
+        # The newest frame shown (refresh_image), which Record's reference-image check registers,
+        # and when it was shown (time.monotonic()).
+        self._displayed_frame: Optional[ndarray] = None
+        self._displayed_at: Optional[float] = None
+
+        layout = QGridLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        capture_view = self._capture_view = QCaptureView()
+        capture_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        settings = self._settings = capture_view.settings
+        capture_model.record_mode = VideoRecordMode.TRIGGER
+        settings.setIsVideoCaptureEnabled(capture_model.is_enabled)
+        settings.setIsVideoRecordEnabled(capture_model.is_recording_enabled)
+        settings.setRecordMode(VideoRecordMode.TRIGGER)
+        settings.setRecordModeVisible(False)
+        settings.setStillImageCaptureEnabled(capture_model.is_still_capture_enabled)
+        settings.setStillImageCaptureInterval(capture_model.still_image_capture_interval)
+
+        capture_view.setCameras(capture_model.camera_list)
+        capture_view.setCamera(capture_model.camera_source)
+        capture_view.camera_changed.connect(self._camera_source_changed)
+
+        settings.capture_enabled_changed.connect(self._camera_enabled_changed)
+        settings.record_enabled_changed.connect(self._recording_enabled_changed)
+        settings.record_mode_changed.connect(self._recording_enabled_changed)
+        settings.image_capture_enabled_changed.connect(self._is_still_image_capture_enabled_changed)
+        settings.image_capture_interval_changed.connect(self._still_image_capture_interval_changed)
+
+        layout.addWidget(self._capture_view)
+
+        # Below the video, collapsed. It expands into the preview rather than
+        # pushing it, so opening it costs a fixed sliver of video rather than
+        # reflowing the panel.
+        telemetry_panel = self._telemetry_panel = CaptureTelemetryPanel(
+            app_model.session_telemetry)
+        layout.addWidget(telemetry_panel)
+
+        self.setLayout(layout)
+
+        NotificationCenter.default_center().add_observer(TriggerNotification.CAPTURE_ID, self._trigger_received)
+
+        capture_model.property_changed += self._on_model_property_changed
+        app_model.property_changed += self._on_app_model_property_changed
+        self._refresh_calibration_tag()
+
+        # Swap because model shape is row x col == height x width
+        capture_view.setShape(capture_model.shape[1], capture_model.shape[0])
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(name={self._model.name!r})"
+
+    @property
+    def camera_view(self) -> QCaptureView:
+        return self._capture_view
+
+    def close(self):
+        NotificationCenter.default_center().remove_observer(TriggerNotification.CAPTURE_ID, self._trigger_received)
+        self._model.property_changed -= self._on_model_property_changed
+        self._app_model.property_changed -= self._on_app_model_property_changed
+        # The panel holds a running timer and an observer on the telemetry
+        # model, which outlives this view; leaving either attached keeps the
+        # widget alive and ticking after it is gone.
+        self._telemetry_panel.close()
+        super().close()
+
+    @Slot(ndarray, float)
+    def refresh_image(self, data: ndarray, fps: float, frame_id: int = -1):
+        self._displayed_frame, self._displayed_at = data, time.monotonic()
+        row, col = data.shape
+        self._capture_view.refresh_image(
+            ImageData(data, col, row, frame_id), fps)
+
+    def displayed_frame(self) -> Optional[ndarray]:
+        """The newest frame this view was given, at the camera's capture geometry; None before
+        the first, after capture stopped, and when it is older than DISPLAYED_FRAME_MAX_AGE
+        (the camera stalled), so the reference-image check can't tell instead of judging an
+        old picture. The queue hands each frame over as its own copy, so it is not overwritten."""
+        if self._displayed_at is None or time.monotonic() - self._displayed_at > DISPLAYED_FRAME_MAX_AGE:
+            return None
+        return self._displayed_frame
+
+    @invoke_method
+    def set_is_editable(self, is_editable: bool):
+        self._capture_view.set_is_editable(is_editable)
+
+    @invoke_method
+    def set_is_capture_active(self, is_active: bool):
+        if not is_active:
+            # A stopped camera has no current view; its last frame is not one.
+            self._displayed_frame = self._displayed_at = None
+        self._capture_view.set_is_capture_active(is_active)
+
+    @invoke_method
+    def update_image(self):
+        self._capture_view.update_image()
+        self._capture_view.update_pose()
+
+    @invoke_method
+    def set_overlay_parts(self, parts) -> None:
+        self._capture_view.set_overlay_parts(parts)
+
+    @invoke_method
+    def refresh_pose(self, points: Dict[str, PoseLocation],
+                     frame_id: int = -1):
+        self._capture_view.refresh_pose(points, frame_id)
+
+    def _camera_source_changed(self, camera):
+        self._model.camera_source = camera
+
+    def _camera_enabled_changed(self, is_enabled):
+        self._model.is_enabled = is_enabled
+
+    def _recording_enabled_changed(self, is_enabled):
+        self._model.is_recording_enabled = is_enabled
+        self._model.record_mode = VideoRecordMode.TRIGGER
+
+    def _is_still_image_capture_enabled_changed(self, is_enabled):
+        self._model.is_still_capture_enabled = is_enabled
+
+    def _still_image_capture_interval_changed(self, interval: float):
+        self._model.still_image_capture_interval = interval
+
+    @invoke_method
+    def _trigger_received(self, notification: Notification):
+        if self._model.is_enabled and self._model.record_mode == VideoRecordMode.TRIGGER:
+            self._capture_view.recording_indicator_changed.emit(notification.context)
+
+    @invoke_method
+    def _on_app_model_property_changed(self, name, value, _):
+        if name == AppModel.Props.CAMERA_CALIBRATION:
+            self._refresh_calibration_tag()
+
+    def _refresh_calibration_tag(self) -> None:
+        """"2D only" beside the camera's name while the active calibration does not calibrate
+        it, with the reason as the tooltip."""
+        reason = self._app_model.uncalibrated_reasons.get(self._model.name)
+        self._capture_view.setTag("" if reason is None else "2D only", reason or "")
+
+    @invoke_method
+    def _on_model_property_changed(self, name, value, _):
+        if name == VideoCaptureModel.CAMERA_PROP:
+            self._capture_view.setCamera(value)
+        elif name == VideoCaptureModel.IS_ENABLED_PROP:
+            self._settings.setIsVideoCaptureEnabled(value)
+        elif name == VideoCaptureModel.IS_RECORDING_ENABLED_PROP:
+            self._settings.setIsVideoRecordEnabled(value)
+        elif name == VideoCaptureModel.RECORD_MODE_PROP:
+            self._settings.setRecordMode(value)
+        elif name == VideoCaptureModel.IS_STILL_CAPTURE_ENABLED_PROP:
+            self._settings.setStillImageCaptureEnabled(value)
+        elif name == VideoCaptureModel.STILL_IMAGE_CAPTURE_INTERVAL_PROP:
+            self._settings.setStillImageCaptureInterval(value)
+        elif name == VideoCaptureModel.SHAPE_PROP:
+            if value is not None and value[0] != 0 and value[1] != 0:
+                # Swap because model shape is row x col == height x width
+                self._capture_view.setShape(value[1], value[0])
+        elif name == VideoCaptureModel.CAMERA_LIST_PROP:
+            self._capture_view.setCameras(self._model.camera_list)
+            self._capture_view.setCamera(self._model.camera_source)
+        elif name == VideoCaptureModel.TEXT_OVERLAY_PROP:
+            self._text_overlay = value
+            self._capture_view.set_text_overlay(
+                value,
+                color=self._text_overlay_color,
+            )
+        elif name == VideoCaptureModel.TEXT_OVERLAY_COLOR_PROP:
+            color = getattr(Qt.GlobalColor, value, None)
+            if color is None:
+                logger.warning("unknown text overlay color %s", value)
+                color = Qt.GlobalColor.yellow
+            self._text_overlay_color = color
+            self._capture_view.set_text_overlay(self._text_overlay, color=self._text_overlay_color)
+        elif name == VideoCaptureModel.DISPLAY_DOTS_DETECTION_PROP:
+            self._capture_view.set_display_dots_detection(value)

@@ -10,7 +10,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from autotrainer.pyside.capture.QtGLImageView import (  # noqa: E402
+from reachaq.pyside.capture.QtGLImageView import (  # noqa: E402
     is_subsumed_by_composite,
     overlay_colour_for,
 )
@@ -27,7 +27,7 @@ def qapp():
 
 
 def _dialog(qapp, shown=()):
-    from tools.acquisition.view.overlay_parts_dialog import OverlayPartsDialog
+    from reachaq.app.view.overlay_parts_dialog import OverlayPartsDialog
     return OverlayPartsDialog(PARTS, shown)
 
 

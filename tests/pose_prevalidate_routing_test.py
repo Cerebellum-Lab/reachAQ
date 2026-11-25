@@ -12,14 +12,14 @@ import pathlib
 
 import pytest
 
-from autotrainer.inference.backend_selection import (
+from reachaq.inference.backend_selection import (
     PoseBackendNotInstalled,
     pre_validate_model,
 )
 
 import source_contract
 
-APP_MODEL = "tools/acquisition/model/app_model.py"
+APP_MODEL = "src/reachaq/app/model/app_model.py"
 
 
 def test_a_directory_no_backend_recognises_is_refused(tmp_path):

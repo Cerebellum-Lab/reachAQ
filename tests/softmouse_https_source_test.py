@@ -2,7 +2,7 @@ import csv
 
 import pytest
 
-from tools.softmouse_sync.https_source import (
+from reachaq.softmouse_sync.https_source import (
     SoftMouseCredentials,
     SoftMouseHttpsConfiguration,
     SoftMouseHttpsSource,

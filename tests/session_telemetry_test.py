@@ -3,7 +3,7 @@ import math
 
 import pytest
 
-from tools.acquisition.model.session_telemetry import SessionTelemetry
+from reachaq.app.model.session_telemetry import SessionTelemetry
 
 
 @pytest.fixture
@@ -370,7 +370,7 @@ def test_a_recording_rebaselines_counters_that_were_already_running():
 
 
 def test_stim_p99_and_latency_status_are_reported(telemetry):
-    from tools.acquisition.model.session_telemetry import describe_latency_status
+    from reachaq.app.model.session_telemetry import describe_latency_status
 
     telemetry.begin(0.0)
     telemetry.record_stim_p99(3.4)
@@ -416,7 +416,7 @@ def test_summary_after_end_keeps_the_stim_p99_the_session_ended_with(telemetry):
     ({"status": "complete", "loops": {"pose": {"summary": {}}}}, "complete"),
 ])
 def test_the_latency_status_line_for_each_outcome(status, expected):
-    from tools.acquisition.model.session_telemetry import describe_latency_status
+    from reachaq.app.model.session_telemetry import describe_latency_status
 
     assert describe_latency_status(status) == expected
 
@@ -434,7 +434,7 @@ def _alignment(frames_recorded, present_by_camera):
 def test_exact_counts_come_from_the_session_files(tmp_path):
     """The live counters are only good to a report period either way; the
     session's own files say exactly what was recorded, dropped and posed."""
-    from tools.acquisition.model.session_telemetry import exact_session_capture
+    from reachaq.app.model.session_telemetry import exact_session_capture
 
     left = tmp_path / "left_processed_frames.txt"
     right = tmp_path / "right_processed_frames.txt"
@@ -460,7 +460,7 @@ def test_exact_counts_come_from_the_session_files(tmp_path):
 
 
 def test_exact_counts_without_live_pose_still_report_drops(tmp_path):
-    from tools.acquisition.model.session_telemetry import exact_session_capture
+    from reachaq.app.model.session_telemetry import exact_session_capture
 
     exact = exact_session_capture(
         _alignment(10, {"left": 8}),
@@ -586,7 +586,7 @@ def test_a_new_cameras_first_report_does_not_break_a_reading_in_progress():
 
 def test_no_exact_counts_when_the_timeline_could_not_be_aligned():
     """A failed merge writes its diagnostics with no frames and no counts."""
-    from tools.acquisition.model.session_telemetry import exact_session_capture
+    from reachaq.app.model.session_telemetry import exact_session_capture
 
     failed = {
         "primaryFrameCount": 0,

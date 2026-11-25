@@ -25,15 +25,15 @@ measurements behind them, are tested with the plugin
 import pytest
 import yaml
 
-from autotrainer.inference import pose_plugins
-from autotrainer.inference.backend_selection import (
+from reachaq.inference import pose_plugins
+from reachaq.inference.backend_selection import (
     POSE_BACKEND_ENV_VAR,
     POSE_CONFIDENCE_THRESHOLD_ENV_VAR,
     TENSORFLOW_BACKEND,
     TORCH_BACKEND,
     confidence_threshold,
 )
-from autotrainer.inference.pose_algorithm import PoseAlgorithm
+from reachaq.inference.pose_algorithm import PoseAlgorithm
 
 
 def _project(root, model_name=None):
@@ -85,7 +85,7 @@ def test_an_unresolvable_model_is_resolved_once(monkeypatch, tmp_path):
         calls.append(model_path)
         return real(model_path)
 
-    from autotrainer.inference import backend_selection
+    from reachaq.inference import backend_selection
     monkeypatch.setattr(backend_selection, "resolve", counting)
     confidence_threshold(None, {}, model_path=str(tmp_path))
     assert calls == [str(tmp_path)]

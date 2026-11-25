@@ -6,12 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from autotrainer.core import ObservableObject, SystemCommandKind, SystemStatusMessageKind
-from autotrainer.device import DeviceApi, DeviceConnection
-from autotrainer.device.can_device import CanDevice
-from tools.acquisition.model import hardware_model as hardware_model_module
-from tools.acquisition.model.hardware_model import HardwareModel
-from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+from reachaq.core import ObservableObject, SystemCommandKind, SystemStatusMessageKind
+from reachaq.device import DeviceApi, DeviceConnection
+from reachaq.device.can_device import CanDevice
+from reachaq.app.model import hardware_model as hardware_model_module
+from reachaq.app.model.hardware_model import HardwareModel
+from reachaq.app.model.session_data_recorder import SessionDataRecorder
 
 
 def _device(seen):

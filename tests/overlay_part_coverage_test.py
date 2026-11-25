@@ -16,9 +16,9 @@ import os
 
 import pytest
 
-from autotrainer.core.pose_elements import SceneElement
-from autotrainer.inference import pose_plugins
-from autotrainer.inference.backend_selection import (
+from reachaq.core.pose_elements import SceneElement
+from reachaq.inference import pose_plugins
+from reachaq.inference.backend_selection import (
     TENSORFLOW_BACKEND,
     confidence_threshold,
 )
@@ -45,14 +45,14 @@ def qapp():
 
 
 def _view(qapp):
-    from autotrainer.pyside.capture.QtGLImageView import QGLImageView
+    from reachaq.pyside.capture.QtGLImageView import QGLImageView
     view = QGLImageView(width=256, height=256)
     view._width = view._height = 256.0
     return view
 
 
 def _points(parts):
-    from autotrainer.inference import PoseLocation
+    from reachaq.inference import PoseLocation
     return {part: PoseLocation(index, 10.0 + index, 20.0)
             for index, part in enumerate(parts)}
 
@@ -140,7 +140,7 @@ def test_narrowing_hides_parts_already_on_screen(qapp):
 
 
 def test_a_part_outside_the_frame_is_not_drawn(qapp):
-    from autotrainer.inference import PoseLocation
+    from reachaq.inference import PoseLocation
     view = _view(qapp)
     view.set_points({"Pellet": PoseLocation(0, 10.0, 10.0),
                      "Star": PoseLocation(1, -5.0, 10.0)})
@@ -174,7 +174,7 @@ def test_the_gate_can_be_reapplied_once_the_model_is_known():
     therefore has to be applied again when the pose process reports the model
     it actually loaded.
     """
-    from autotrainer.inference.pose_algorithm import PoseAlgorithm
+    from reachaq.inference.pose_algorithm import PoseAlgorithm
 
     algorithm = PoseAlgorithm()
     assert algorithm._plot_threshold == pytest.approx(0.9)
@@ -186,7 +186,7 @@ def test_the_gate_can_be_reapplied_once_the_model_is_known():
 
 
 def test_regating_is_idempotent():
-    from autotrainer.inference.pose_algorithm import PoseAlgorithm
+    from reachaq.inference.pose_algorithm import PoseAlgorithm
 
     algorithm = PoseAlgorithm(confidence_threshold=0.25)
     algorithm.set_confidence_threshold(0.25)

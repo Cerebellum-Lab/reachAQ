@@ -25,17 +25,17 @@ from PySide6.QtGui import QFocusEvent, QKeyEvent, QMouseEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from autotrainer.device import (  # noqa: E402
+from reachaq.device import (  # noqa: E402
     LaserChannelId,
     LaserOperationState,
     LaserPulseTrain,
     LaserSynchronizedPulseTrain,
     NidaqLaserController,
 )
-from autotrainer.device import nidaq_laser  # noqa: E402
-from tools.acquisition.model.trial_action import LaserPulseProfile  # noqa: E402
-from tools.acquisition.view import laser_control_content  # noqa: E402
-from tools.acquisition.view.laser_control_content import (  # noqa: E402
+from reachaq.device import nidaq_laser  # noqa: E402
+from reachaq.app.model.trial_action import LaserPulseProfile  # noqa: E402
+from reachaq.app.view import laser_control_content  # noqa: E402
+from reachaq.app.view.laser_control_content import (  # noqa: E402
     _ERROR_STATUS_COLOR,
     LaserControlContent,
 )
@@ -53,7 +53,7 @@ def _daqmx_fake():
     from pathlib import Path
 
     path = Path(__file__).resolve().parents[1].joinpath(
-        "auto-trainer-device", "tests", "nidaq_daqmx_fake.py")
+        "tests", "device", "nidaq_daqmx_fake.py")
     spec = importlib.util.spec_from_file_location("nidaq_daqmx_fake", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

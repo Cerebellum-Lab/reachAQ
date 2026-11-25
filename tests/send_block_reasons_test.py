@@ -6,7 +6,7 @@ string. Sharing it directly means one subsystem clearing its hold releases a
 pellet the other still wants held.
 """
 
-from tools.acquisition.model.send_block_reasons import SendBlockReasons
+from reachaq.app.model.send_block_reasons import SendBlockReasons
 
 
 def test_no_reasons_means_no_block():

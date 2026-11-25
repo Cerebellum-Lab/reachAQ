@@ -14,12 +14,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from autotrainer.core import (
+from reachaq.core import (
     ObservableObject,
     ProjectInfo,
     SystemStatusMessageKind,
 )
-from tools.acquisition.model.session_data_recorder import (
+from reachaq.app.model.session_data_recorder import (
     SessionDataRecorder,
     _PressureRing,
 )

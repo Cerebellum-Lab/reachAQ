@@ -12,8 +12,8 @@ import yaml
 
 torch = pytest.importorskip("torch")
 
-from autotrainer.inference import backend_selection, pose_plugins  # noqa: E402
-from autotrainer.inference.backend_selection import (  # noqa: E402
+from reachaq.inference import backend_selection, pose_plugins  # noqa: E402
+from reachaq.inference.backend_selection import (  # noqa: E402
     KEYPOINT_CONFIDENCE_THRESHOLD,
     TORCH_BACKEND,
     build_pose_model,
@@ -21,9 +21,9 @@ from autotrainer.inference.backend_selection import (  # noqa: E402
     pre_validate_model,
     selected_backend,
 )
-from autotrainer.inference.keypoint import KeypointPoseModel  # noqa: E402
-from autotrainer.inference.keypoint.network import STRIDE, KeypointNet, decode  # noqa: E402
-from autotrainer.inference.keypoint.train import SIDECAR, WEIGHTS, _targets  # noqa: E402
+from reachaq.inference.keypoint import KeypointPoseModel  # noqa: E402
+from reachaq.inference.keypoint.network import STRIDE, KeypointNet, decode  # noqa: E402
+from reachaq.inference.keypoint.train import SIDECAR, WEIGHTS, _targets  # noqa: E402
 
 
 def _ideal_output(points, cells):
@@ -131,9 +131,9 @@ def test_a_yolo_model_without_its_plugin_says_why(tmp_path, monkeypatch):
     monkeypatch.setattr(pose_plugins, "_entry_points", lambda: [])
     pose_plugins.reset_discovery()
     try:
-        with pytest.raises(ImportError, match="auto-trainer-pose-yolo") as raised:
+        with pytest.raises(ImportError, match="reachaq-pose-yolo") as raised:
             pre_validate_model(str(tmp_path))
-        assert "autotrainer.inference.keypoint.train" in str(raised.value)
+        assert "reachaq.inference.keypoint.train" in str(raised.value)
         with pytest.raises(ImportError, match="reachaq-plugin-install.sh yolo"):
             build_pose_model(str(tmp_path))
     finally:

@@ -9,8 +9,8 @@ from board_clock_chain_synthetic import (
     IO_ADDRESS, IO_BOOT, PELLET_ADDRESS, PELLET_BOOT, RATE, barcode_line, clock_rig, linear_clock,
     rig_ni_endpoints, rig_ni_to_host, synthetic_rig, wandering_clock,
 )
-from tools.acquisition.model import board_clock_chain as chain
-from tools.latency import clocks
+from reachaq.app.model import board_clock_chain as chain
+from reachaq.latency import clocks
 
 NI_TO_HOST = rig_ni_to_host()  # the host clock of every rig below reads NI seconds plus 1000
 

@@ -3,19 +3,18 @@
 Complete the portable install and each applicable hardware guide before using a
 physical subsystem.
 
-Bundled Spinnaker Python artifacts are organized under `vendor/spinnaker` by
-operating system and architecture. `tools.platform_support` resolves Linux
-x86-64 and the retained Windows x86-64 artifact from the shared
-manifest. Windows hardware operation is not qualified by this repository; the
-artifact and platform-neutral interfaces are retained to avoid an architectural
-rewrite if that deployment is needed later.
+reachAQ ships no Spinnaker software: the SDK and its Python binding are
+installed from the customer's own download (see the
+[FLIR Spinnaker guide](flir-spinnaker.md)). Windows hardware operation is not
+qualified by this repository; the platform-neutral interfaces are kept to
+avoid an architectural rewrite if that deployment is needed later.
 
 ## Runtime paths
 
 ```bash
 export REACHAQ_REPO="$HOME/Documents/reachAQ"
 export REACHAQ_ENV="reachaq"
-export REACHAQ_CONFIG="$HOME/Autotrainer/system_configuration.yaml"
+export REACHAQ_CONFIG="$HOME/reachAQ/system_configuration.yaml"
 export REACHAQ_DATA="$HOME/Documents/rawdatalocal"
 mkdir -p "$(dirname "$REACHAQ_CONFIG")" "$REACHAQ_DATA"
 ```
@@ -24,7 +23,7 @@ Seed a configuration only when one does not already exist:
 
 ```bash
 if [ ! -f "$REACHAQ_CONFIG" ]; then
-  cp "$REACHAQ_REPO/tools/hardware/reachaq_system_configuration.example.yaml" \
+  cp "$REACHAQ_REPO/src/reachaq/hardware/reachaq_system_configuration.example.yaml" \
     "$REACHAQ_CONFIG"
 fi
 ```
@@ -105,7 +104,7 @@ no GPU preflight is required when the operator later selects Running:
 
 ```bash
 cd "$REACHAQ_REPO"
-conda run --no-capture-output -n "$REACHAQ_ENV" python -m reachAQ.app \
+conda run --no-capture-output -n "$REACHAQ_ENV" python -m reachaq.app \
   --no-live-inference \
   -c "$REACHAQ_CONFIG"
 ```
@@ -115,7 +114,7 @@ intentional. Headless mode has no idle operator control, so it starts
 acquisition by default:
 
 ```bash
-conda run --no-capture-output -n "$REACHAQ_ENV" auto-trainer-headless \
+conda run --no-capture-output -n "$REACHAQ_ENV" reachaq-headless \
   --no-live-inference \
   -c "$REACHAQ_CONFIG"
 ```
@@ -124,7 +123,7 @@ When CAN hardware is enabled, source the validated rig environment first:
 
 ```bash
 set -a
-source "$REACHAQ_REPO/tools/hardware/reachaq_hardware.env.example"
+source "$REACHAQ_REPO/src/reachaq/hardware/reachaq_hardware.env.example"
 set +a
 ```
 
@@ -132,7 +131,7 @@ The boot service and application use different variable namespaces:
 
 - `/etc/default/reachaq-can` supplies `REACHAQ_CAN_*` values to
   `reachaq-can.service`, which configures and brings up the Linux interface.
-- The launching process supplies `AUTOTRAINER_CAN_*` values to reachAQ, which
+- The launching process supplies `REACHAQ_CAN_*` values to reachAQ, which
   opens the already-active interface.
 
 The service does not export its values into user applications. Source the
@@ -142,16 +141,16 @@ application channel must match:
 
 ```bash
 . /etc/default/reachaq-can
-test "$AUTOTRAINER_CAN_CHANNEL" = "$REACHAQ_CAN_INTERFACE"
+test "$REACHAQ_CAN_CHANNEL" = "$REACHAQ_CAN_INTERFACE"
 systemctl is-enabled reachaq-can.service
 systemctl is-active reachaq-can.service
-ip -details link show "$AUTOTRAINER_CAN_CHANNEL"
+ip -details link show "$REACHAQ_CAN_CHANNEL"
 ```
 
 The retired Anschutz hardware profile has been removed. ReachAQ targets the
 pellet board through the selected JerryCAN, SocketCAN, or emulation transport;
 transport selection does not change the pellet-board command model. Use
-`AUTOTRAINER_CAN_TRANSPORT=emulation` only for software testing.
+`REACHAQ_CAN_TRANSPORT=emulation` only for software testing.
 
 ## Pellet motor coordinates
 
@@ -169,7 +168,7 @@ freshness, while SET reports the saved send position in the same coordinates.
 
 ## Motor travel limits
 
-`pellet.x`, `pellet.y` and `pellet.z` in `~/Autotrainer/motor_config.yaml` can
+`pellet.x`, `pellet.y` and `pellet.z` in `~/reachAQ/motor_config.yaml` can
 each set `min_pos` and `max_pos`, the stage's travel in board millimetres.
 christielab10 uses `min_pos: 0` and `max_pos: 35` on all three axes. Either key
 can be left out: that side is then not limited. A value that is not a finite
@@ -268,8 +267,8 @@ Not checked:
   after a new SET it can therefore bring back the previous send position. It
   never saves a position the board has not held already.
 - **The maintenance tools that bypass the acquisition app**: the pellet
-  delivery tool (`tools/pellet_delivery`), `scripts/can_console.py` and
-  `tools/hardware/validate_can_hardware.py`. They command the board directly
+  delivery tool (`src/reachaq/pellet_delivery`), `scripts/can_console.py` and
+  `src/reachaq/hardware/validate_can_hardware.py`. They command the board directly
   and do not read the travel.
 
 The 3D calibration scout searches the configured travel (see
@@ -353,7 +352,7 @@ runaway (1.0 → 15.5 mm) is stopped 0.88 s after it was sent. A
 3D-calibration waypoint's arrival wait uses the same move deadline.
 
 If the profile deadlines false-trip, set `pellet.profile_ack_deadlines: false`
-in `~/Autotrainer/motor_config.yaml` and Refresh Hardware; the stop protection
+in `~/reachAQ/motor_config.yaml` and Refresh Hardware; the stop protection
 stays: every stepper frame then waits the fixed acknowledgement timeout (3 s, or the
 hardware configuration's `min_ack_timeout` when larger) and a missed acknowledgement still sends the ESTOP. A
 missing key means true.
@@ -391,8 +390,8 @@ operator's STOP it is skipped. The pellet machine's re-homes and an automatic
 CAN recovery never release a stop this app made: they are refused until an
 operator Home or a reconnect.
 
-The maintenance tools (`tools/pellet_delivery`, `scripts/can_console.py`,
-`tools/hardware/validate_can_hardware.py`) do not send ESTOP.
+The maintenance tools (`src/reachaq/pellet_delivery`, `scripts/can_console.py`,
+`src/reachaq/hardware/validate_can_hardware.py`) do not send ESTOP.
 
 ## Software-only camera launch
 
@@ -400,14 +399,14 @@ The maintenance tools (`tools/pellet_delivery`, `scripts/can_console.py`,
 run; it does not overwrite physical camera serials on close:
 
 ```bash
-conda run --no-capture-output -n "$REACHAQ_ENV" python -m reachAQ.app \
+conda run --no-capture-output -n "$REACHAQ_ENV" python -m reachaq.app \
   --random-cameras \
   --no-live-inference \
   -c "$REACHAQ_CONFIG"
 ```
 
 For a fully separate software configuration, use
-`tools/hardware/reachaq_random_camera_configuration.example.yaml` with a
+`src/reachaq/hardware/reachaq_random_camera_configuration.example.yaml` with a
 separate Preferences configuration directory.
 
 ## Desktop launcher
@@ -442,7 +441,7 @@ The default installed files are:
 The installer replaces an obsolete `ReachAQ-startup` shell fragment in that
 same desktop directory.
 Launcher paths are stored in `~/.config/reachaq/launcher.conf`. Optional
-`AUTOTRAINER_*` and `REACHAQ_*` runtime values can be placed as literal
+`REACHAQ_*` and `REACHAQ_*` runtime values can be placed as literal
 `KEY=VALUE` lines in `~/.config/reachaq/runtime.env`; the launcher parses this
 file as data and does not source it as shell code. Re-run the launcher installer
 after moving the repository, changing the Conda environment, or changing the
@@ -466,8 +465,8 @@ first on `PATH` instead; it starts the same checkout.
 
 The application also holds a lock of its own,
 `$XDG_RUNTIME_DIR/reachaq/app.lock`, however it is started: through either
-launcher, the environment's console script, `python -m reachAQ.app`, or
-`auto-trainer-headless`. A second start exits with status 3 and names the
+launcher, the environment's console script, `python -m reachaq.app`, or
+`reachaq-headless`. A second start exits with status 3 and names the
 running instance's PID. `-h` still works while one runs.
 
 ```bash
@@ -499,12 +498,12 @@ bump past 58 is acceptable.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `REACHAQ_CONFIG_DIR` | `~/Autotrainer` | The per-computer settings directory: `system_configuration.yaml`, the motor and move files, `animals/`, the 3D calibration and the hardware tools' records. Every default that names one of those files is built from it (`autotrainer.core.config_directory`). Read at start-up. The installer uses it when `REACHAQ_INSTALL_CONFIG_DIR` is unset. Put it in `runtime.env` so the launcher exports it. |
+| `REACHAQ_CONFIG_DIR` | `~/reachAQ` | The per-computer settings directory: `system_configuration.yaml`, the motor and move files, `animals/`, the 3D calibration and the hardware tools' records. Every default that names one of those files is built from it (`reachaq.core.config_directory`). Read at start-up. The installer uses it when `REACHAQ_INSTALL_CONFIG_DIR` is unset. Put it in `runtime.env` so the launcher exports it. |
 | `REACHAQ_STIM_RT_PRIORITY` | `80` | SCHED_FIFO priority for the stim capture loop. `0`, `off` or `false` disables it. See the [latency tuning guide](latency-tuning.md). |
 | `REACHAQ_POSE_BACKEND` | `tensorflow` where installed, else `torch` | Selects the engine a DeepLabCut model runs on: `tensorflow` or `torch`. It applies to DeepLabCut models only, which need the optional DeepLabCut plugin (`tensorflow` also needs the plugin's TensorFlow engine, which its installer adds). A keypoint or YOLO model ignores it and always runs on `torch`. For a model no installed plugin can run, or no model, it still selects the GPU runtime the live-inference preflight probes, so the two cannot disagree. |
 | `REACHAQ_POSE_CONFIDENCE_THRESHOLD` | per engine | Confidence a keypoint needs to count as present and to enter 3D triangulation. The default comes from the pose backend that runs the model, because every engine reports on its own scale: 0.1 for keypoint and YOLO models, and for DeepLabCut 0.9 on `tensorflow` (which saturates its likelihood at 1.0) and 0.6 on `torch`, with measured per-backbone refinements. The DeepLabCut PyTorch default is provisional and should be re-derived on held-out frames. |
 | `REACHAQ_INFERENCE_ROI` | unset | `x,y,width,height`. Crops live frames to this window before inference and shifts the returned coordinates back into full-frame space. Unset means full frame. |
-| `REACHAQ_CAN_FRAME_LOG` | unset | `1` turns python-can's per-frame log lines back on: every received frame, and the socketcan "tx" line for every sent one. Unset, python-can's logger is held at WARNING, because those lines were about 270 log records a second on the CAN reader thread; python-can's few open and close INFO/DEBUG lines go quiet with them, and its warnings still pass. The application's own CAN lines, such as "CAN reader throughput", and the kernel receive stamps in `device.csv` are unaffected. Applies to `reachaq`, `auto-trainer-local` and `auto-trainer-headless`; `can_console.py` and the pellet-delivery tool still log every frame. Read at start-up, so a diagnostic run needs a restart. |
+| `REACHAQ_CAN_FRAME_LOG` | unset | `1` turns python-can's per-frame log lines back on: every received frame, and the socketcan "tx" line for every sent one. Unset, python-can's logger is held at WARNING, because those lines were about 270 log records a second on the CAN reader thread; python-can's few open and close INFO/DEBUG lines go quiet with them, and its warnings still pass. The application's own CAN lines, such as "CAN reader throughput", and the kernel receive stamps in `device.csv` are unaffected. Applies to `reachaq`, `reachaq` and `reachaq-headless`; `can_console.py` and the pellet-delivery tool still log every frame. Read at start-up, so a diagnostic run needs a restart. |
 
 `REACHAQ_POSE_BACKEND=torch` requires a shuffle trained with the PyTorch
 engine; a project trained under TensorFlow has no `pytorch_config.yaml` and the
@@ -595,8 +594,10 @@ on the workstation on that date; the hardware entries are from 2026-09-09.
   environment, archived by the installer, kept as a fallback. Its TensorFlow
   has no GPU (its cuDNN 8 was overwritten), so DeepLabCut TensorFlow models run
   on the CPU there; YOLO models still use the GPU.
-- Spinnaker system runtime 3.2.0.57 (verified); bundled Python wheel 3.2.0.62,
-  which lists both cameras against it (verified).
+- Spinnaker system runtime 3.2.0.57 (verified); Python wheel 3.2.0.62, which
+  lists both cameras against it (verified). reachAQ bundled that wheel until
+  2026-11; the installer now keeps an installed 3.2 binding and otherwise takes
+  one from the FLIR download.
 - NI-DAQmx 26.3.1 (verified) and PXI Platform Services 26.3; configured
   PXI-6713 output alias `PXI1Slot4` and PXI-6221 sampled-input alias
   `PXI1Slot5`. Kernel modules `nitiork`, `niwfrk` and `nixsrk` are built

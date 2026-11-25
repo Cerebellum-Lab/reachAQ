@@ -21,28 +21,28 @@ from unittest import mock
 import pytest
 import verboselogs
 
-import autotrainer.core
-from autotrainer.behavior.behavior_algorithm import BehaviorAlgoStatus
+import reachaq.core
+from reachaq.behavior.behavior_algorithm import BehaviorAlgoStatus
 
-from autotrainer.core import EventManager, MessageHandler, SystemMessageHandler, ProjectInfo, \
+from reachaq.core import EventManager, MessageHandler, SystemMessageHandler, ProjectInfo, \
     PersistenceConfiguration
-from autotrainer.core.analysis import ReachAnalysis
-from autotrainer.core.multiproc import make_daemon_timer, DaemonTimer
-from autotrainer.device import MotorConfigurationFile, CompoundMovements
-from autotrainer.inference.analysis import IntersessionResponse
+from reachaq.core.analysis import ReachAnalysis
+from reachaq.core.multiproc import make_daemon_timer, DaemonTimer
+from reachaq.device import MotorConfigurationFile, CompoundMovements
+from reachaq.inference.analysis import IntersessionResponse
 
-from autotrainer.core.capture import CaptureProcessStatus
-from autotrainer.core.interfaces import RecordingEndingReason
-from autotrainer.inference import PoseAlgorithm, PoseResponse, InferenceStatus
+from reachaq.core.capture import CaptureProcessStatus
+from reachaq.core.interfaces import RecordingEndingReason
+from reachaq.inference import PoseAlgorithm, PoseResponse, InferenceStatus
 
-from autotrainer.behavior import SystemMachine, PelletDeviceProtocol, BehaviorAlgorithm, \
+from reachaq.behavior import SystemMachine, PelletDeviceProtocol, BehaviorAlgorithm, \
     InferenceProtocol, SystemState
-from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
-from autotrainer.behavior.pellet import PelletState
-from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.behavior_model import BehaviorModel
-from tools.acquisition.model.hardware_model import HardwareModel
-from tools.acquisition.model.user_preferences import UserPreferences
+from reachaq.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from reachaq.behavior.pellet import PelletState
+from reachaq.app.model.app_model import AppModel
+from reachaq.app.model.behavior_model import BehaviorModel
+from reachaq.app.model.hardware_model import HardwareModel
+from reachaq.app.model.user_preferences import UserPreferences
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ fake_perf_now = 0  # used to control time.perf_counter() in BehaviorAlgo/SystemM
 @pytest.fixture(autouse=True)
 def isolate_host_can(monkeypatch):
     """Never let an automated test control the workstation's SocketCAN link."""
-    monkeypatch.setenv("AUTOTRAINER_CAN_TRANSPORT", "emulation")
+    monkeypatch.setenv("REACHAQ_CAN_TRANSPORT", "emulation")
 
 
 # ~/Documents/rawdatalocal, where christielab10 records its real sessions.
@@ -69,8 +69,8 @@ def _own_monkeypatch():
     # Not the test's monkeypatch, which a test can undo(): the undo() that
     # test_saving_resumes_once_a_load_completes used to call lifted the
     # isolation below with its own patches, and its app's teardown then tried
-    # to unlink the operator's real ~/.config/Colorado/
-    # autotrainer_running_status.env (refused by the guard on christielab10 on
+    # to unlink the operator's real ~/.config/reachAQ/
+    # running_status.env (refused by the guard on christielab10 on
     # 2026-10-01).
     return pytest.MonkeyPatch.context()
 
@@ -88,15 +88,15 @@ def isolated_default_data_root(tmp_path_factory) -> Generator[Path, None, None]:
     in the operator's ~/Documents/rawdatalocal/20261001/christielab10.
     """
     root = tmp_path_factory.mktemp("default-data")
-    # autotrainer.core.logging.get_log_file_location builds this folder from
-    # Path.home() itself, out of this patch's reach; only tools/pellet_delivery
+    # reachaq.core.logging.get_log_file_location builds this folder from
+    # Path.home() itself, out of this patch's reach; only src/reachaq/pellet_delivery
     # calls it, no test does, and the guard refuses it.
     with _own_monkeypatch() as patch:
         patch.setattr(PersistenceConfiguration, "DEFAULT_OUTPUT_PATH", root)
         yield root
 
 
-# ~/.config/Colorado/autotrainer_running_status.env, beside the operator's
+# ~/.config/reachAQ/running_status.env, beside the operator's
 # preferences file. Read at import, before any fixture replaces it.
 PRODUCTION_STATUS_FILE_PATH = AppModel.status_file_path
 
@@ -124,12 +124,12 @@ def app_launch_env(tmp_path) -> dict:
 
     The child resolves its default data folder from its own HOME, out of the
     fixture above's reach, so it gets a HOME under tmp_path. What else the
-    child finds under HOME (~/Autotrainer, ~/.config) moves with it, so its
-    ~/Autotrainer is given the motor and move files the motor_config fixture
+    child finds under HOME (~/reachAQ, ~/.config) moves with it, so its
+    ~/reachAQ is given the motor and move files the motor_config fixture
     gives in-process tests.
     """
     home = tmp_path.joinpath("home")
-    autotrainer = home.joinpath("Autotrainer")
+    autotrainer = home.joinpath("reachAQ")
     autotrainer.mkdir(parents=True)
     for default in (MotorConfigurationFile.DEFAULT_LOCATION, CompoundMovements.DEFAULT_LOCATION):
         shutil.copy(repo_root_tests_subdir.joinpath(default.name), autotrainer)
@@ -149,7 +149,7 @@ class DataRootWriteRefused(RuntimeError):
 class DataRootGuard:
     """Refuse, and record, every write a test makes under the operator's folders.
 
-    They are the data folder and ~/.config/Colorado, which holds the
+    They are the data folder and ~/.config/reachAQ, which holds the
     preferences file and the running-status file.
 
     It is an audit hook (PEP 578), so it sees each file and folder this process
@@ -197,15 +197,15 @@ class DataRootGuard:
     # What starts reachAQ: its entry modules, by -m or by path, and its
     # console scripts (pyproject.toml).
     _APP_MODULES = (
-        "tools.acquisition.headless",
-        "tools.acquisition.gui",
-        "tools.acquisition.run_acquisition",
-        "reachAQ.app",
+        "reachaq.app.headless",
+        "reachaq.app.gui",
+        "reachaq.app.run_acquisition",
+        "reachaq.app",
     )
-    _APP_SCRIPTS = ("reachaq", "auto-trainer-local", "auto-trainer-headless")
-    # QSettings' file for organisation "Colorado", application "Auto Trainer"
+    _APP_SCRIPTS = ("reachaq", "reachaq-headless")
+    # QSettings' file for organisation "reachAQ", application "reachAQ"
     # (user_preferences.py).
-    PREFERENCES_FILE_NAME = "Auto Trainer.conf"
+    PREFERENCES_FILE_NAME = "reachAQ.conf"
 
     def __init__(self, default_output_path: Path, preferences_folder: Path):
         # The default is under HOME, which each process resolves for itself.
@@ -486,7 +486,7 @@ def release_multiprocessing_resources(app):
 def mock_get_perf_now(monkeypatch):
     global fake_perf_now
     fake_perf_now = 0
-    monkeypatch.setattr(autotrainer.core, "_get_perf_now", simulate_get_perf_now)
+    monkeypatch.setattr(reachaq.core, "_get_perf_now", simulate_get_perf_now)
 
 
 @pytest.fixture(autouse=True)
@@ -534,7 +534,7 @@ def diamond_triangle_config(diamond_config_path) -> DiamondTriangleOffsetConfig:
 
 @pytest.fixture
 def trainer_config_dir(tmp_path):
-    cfg_dir = tmp_path.joinpath("Autotrainer")
+    cfg_dir = tmp_path.joinpath("reachAQ")
     cfg_dir.mkdir()
     return cfg_dir
 
@@ -594,7 +594,7 @@ def make_log_dict_multiproc(capture_multiprocess_logs, monkeypatch):
             'disable_existing_loggers': False,
             'handlers': {
                 'queue': {
-                    'class': 'autotrainer.core.logging.WithThreadIdQueueHandler',
+                    'class': 'reachaq.core.logging.WithThreadIdQueueHandler',
                     'queue': capture_multiprocess_logs,
                     'level': logging.NOTSET,  # pass everything to the listener
                 }
@@ -607,7 +607,7 @@ def make_log_dict_multiproc(capture_multiprocess_logs, monkeypatch):
                 # FORCE NOTSET to relay everything so that file handler can properly get DEBUG as well
             },
             # but eventual level of other loggers have to be defined here:
-            'loggers': copy.deepcopy(autotrainer.core.logging._limit_loggers_level),  # noqa
+            'loggers': copy.deepcopy(reachaq.core.logging._limit_loggers_level),  # noqa
         }
     return wrapped_make_log_dict
 

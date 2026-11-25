@@ -7,15 +7,15 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from autotrainer.core import (  # noqa: E402
+from reachaq.core import (  # noqa: E402
     LaserChannelConfiguration,
     LaserChannelId,
 )
-from tools.acquisition.model.laser_plot_process import (  # noqa: E402
+from reachaq.app.model.laser_plot_process import (  # noqa: E402
     LaserPlotProcess,
     STREAM_CURVE_NAMES,
 )
-from tools.acquisition.view.laser_control_content import (  # noqa: E402
+from reachaq.app.view.laser_control_content import (  # noqa: E402
     _LaserChannelTab,
 )
 

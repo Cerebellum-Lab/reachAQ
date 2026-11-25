@@ -27,8 +27,8 @@ import pytest
 
 import source_contract
 
-from autotrainer.core.fixed_array_multiqueue import BufferResult
-from autotrainer.core.fixed_array_multiqueue import FixedArrayMultiQueue
+from reachaq.core.fixed_array_multiqueue import BufferResult
+from reachaq.core.fixed_array_multiqueue import FixedArrayMultiQueue
 
 SHAPE = (8, 8)
 CAMERAS = 2
@@ -110,7 +110,7 @@ def test_the_pose_process_uses_the_drain():
     left to check here is that the live path still goes through it, and that
     queue depth still decides whether it runs.
     """
-    from autotrainer.inference import pose_process
+    from reachaq.inference import pose_process
 
     call = source_contract.one_call(pose_process, "take_newest_live_batch")
     assert source_contract.keyword_name(call, "drain") == "live_drain", (
@@ -132,7 +132,7 @@ def test_the_live_queue_is_not_depth_one():
     a silent change from 2 to 1 would not.
     """
     call = source_contract.one_call(
-        "tools/acquisition/model/app_model.py", "FixedArrayMultiQueue")
+        "src/reachaq/app/model/app_model.py", "FixedArrayMultiQueue")
     depth = call.args[0] if call.args else source_contract.keyword(call, "depth")
     assert isinstance(depth, ast.Constant), (
         "the live queue depth is no longer a literal; check it by hand")
@@ -152,7 +152,7 @@ def test_capture_offers_frames_without_blocking():
     would still have slipped through.
     """
     call = source_contract.one_call(
-        "auto-trainer-video/src/autotrainer/video/video_capture.py",
+        "src/reachaq/video/video_capture.py",
         "net_q_put")
     assert source_contract.keyword_equals(call, "block", False), (
         "the capture loop must offer frames to inference without blocking")

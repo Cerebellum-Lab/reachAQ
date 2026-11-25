@@ -11,7 +11,7 @@ import types
 
 import pytest
 
-from autotrainer.device.nidaq_signal_stream import (
+from reachaq.device.nidaq_signal_stream import (
     NidaqSignalStreamController,
 )
 

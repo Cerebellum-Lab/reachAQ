@@ -10,10 +10,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from autotrainer.behavior.pellet import PelletState
-from autotrainer.behavior.pellet_trial import HardwareErrorKind, TrialOutcome
-from autotrainer.core import MessageHandler, Motor, SystemCommandKind
-from autotrainer.device import (
+from reachaq.behavior.pellet import PelletState
+from reachaq.behavior.pellet_trial import HardwareErrorKind, TrialOutcome
+from reachaq.core import MessageHandler, Motor, SystemCommandKind
+from reachaq.device import (
     CanFailure,
     CanFailureKind,
     CommandRefusal,
@@ -21,9 +21,9 @@ from autotrainer.device import (
     StepperStatus,
     Target,
 )
-from tools.acquisition.model.subsystem_status import SubsystemId, SubsystemState
-from tools.acquisition.model.trial_action import PreparedState, PreparedTrialOperation
-from tools.acquisition.model.trial_protocol_schedule import LaserTriggerRoute
+from reachaq.app.model.subsystem_status import SubsystemId, SubsystemState
+from reachaq.app.model.trial_action import PreparedState, PreparedTrialOperation
+from reachaq.app.model.trial_protocol_schedule import LaserTriggerRoute
 
 _XYZ = (Motor.PELLET_X_MOTOR, Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR)
 
@@ -116,7 +116,7 @@ def test_on_error_shows_in_the_footer_and_opens_no_window(monkeypatch):
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
-    from tools.acquisition.view import main_window
+    from reachaq.app.view import main_window
 
     app = QApplication.instance() or QApplication([])
     footer = []

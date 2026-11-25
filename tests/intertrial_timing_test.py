@@ -1,6 +1,6 @@
 import pytest
 
-from tools.acquisition.model.intertrial_timing import (
+from reachaq.app.model.intertrial_timing import (
     MAX_TARGET_SECONDS,
     InterTrialDecision,
     InterTrialReason,

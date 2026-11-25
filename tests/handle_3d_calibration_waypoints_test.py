@@ -23,23 +23,23 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from autotrainer.core import CameraConfiguration, Offset3DTuple, SystemCommandKind
-from autotrainer.core.capture import CaptureProcessStatus
-from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
-from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
-from autotrainer.device import MotorConfigurationFile
-from autotrainer.inference.multires_calibration import store
-from autotrainer.inference.multires_calibration.extract import distinct_waypoints
-from autotrainer.inference.multires_calibration.fit import BoardSpec, CaptureCamera
-from autotrainer.inference.multires_calibration.geometry import PresetGeometry, PresetSet, presets_for_cameras
-from autotrainer.inference.multires_calibration.pipeline import (
+from reachaq.core import CameraConfiguration, Offset3DTuple, SystemCommandKind
+from reachaq.core.capture import CaptureProcessStatus
+from reachaq.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
+from reachaq.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from reachaq.device import MotorConfigurationFile
+from reachaq.inference.multires_calibration import store
+from reachaq.inference.multires_calibration.extract import distinct_waypoints
+from reachaq.inference.multires_calibration.fit import RIG_CHARUCO_BOARD, BoardSpec, CaptureCamera
+from reachaq.inference.multires_calibration.geometry import PresetGeometry, PresetSet, presets_for_cameras
+from reachaq.inference.multires_calibration.pipeline import (
     WAYPOINT_LOG,
     calibrated_preset_sets,
     load_waypoint_log,
     write_waypoint_log,
 )
-from autotrainer.inference.multires_calibration.report import QualityReport
-from autotrainer.inference.multires_calibration.scout import (
+from reachaq.inference.multires_calibration.report import QualityReport
+from reachaq.inference.multires_calibration.scout import (
     Bounds,
     ScoutAborted,
     ScoutResult,
@@ -48,11 +48,11 @@ from autotrainer.inference.multires_calibration.scout import (
     save_move_list,
     scout_grid,
 )
-from autotrainer.video.video_record import VideoRecordMode
-from tools.acquisition.model import handle_3d_calibration as h3d
-from tools.acquisition.model import hardware_model as hardware_model_module
-from tools.acquisition.model.hardware_model import HardwareModel
-from tools.acquisition.model.handle_3d_calibration import (
+from reachaq.video.video_record import VideoRecordMode
+from reachaq.app.model import handle_3d_calibration as h3d
+from reachaq.app.model import hardware_model as hardware_model_module
+from reachaq.app.model.hardware_model import HardwareModel
+from reachaq.app.model.handle_3d_calibration import (
     calibrate_waypoint_capture,
     capture_presets,
     default_params,
@@ -442,14 +442,14 @@ def test_a_move_that_is_not_queued_stops_the_capture():
 # see the stage still moving: the settle alone has to cover the move, as if the ack meant
 # only "received".
 
-CHRISTIELAB10_MOTOR_CONFIG = Path(__file__).parents[1] / "auto-trainer-device" / "tests" / "christielab10_motor_config.yaml"
+CHRISTIELAB10_MOTOR_CONFIG = Path(__file__).parents[1] / "tests" / "device" / "christielab10_motor_config.yaml"
 
 
 @pytest.fixture(autouse=True)
 def _no_motor_config_file(tmp_path_factory, monkeypatch):
-    """The scout reads the stage travel from ~/Autotrainer/motor_config.yaml; these tests do
+    """The scout reads the stage travel from ~/reachAQ/motor_config.yaml; these tests do
     not see the computer's own file. A test that wants one writes it to the location."""
-    location = tmp_path_factory.mktemp("autotrainer") / "motor_config.yaml"
+    location = tmp_path_factory.mktemp("reachaq") / "motor_config.yaml"
     monkeypatch.setattr(MotorConfigurationFile, "DEFAULT_LOCATION", location)
     return location
 
@@ -551,7 +551,7 @@ class _Subscribers:
 
 def test_the_hardware_model_keeps_the_motor_configurations_it_writes_at_connect(hardware_model, monkeypatch):
     # The capture times its settles from these, so they must be what connect sent the motors
-    # (WRITE_MOTOR_CONFIGURATION, from ~/Autotrainer/motor_config.yaml), not a package default.
+    # (WRITE_MOTOR_CONFIGURATION, from ~/reachAQ/motor_config.yaml), not a package default.
     written = _motor_configurations(x=(120.0, 600.0), y=(120.0, 600.0), z=(120.0, 600.0))
     assert hardware_model.motor_configurations is None, "nothing is written before a connect"
 
@@ -608,9 +608,9 @@ def test_capture_params_set_gain_1_db_and_turn_camera_gamma_off():
     assert "gamma" in default_params and default_params["gamma"] is None
     # spinnaker_cam imports PySpin when it loads; PySpin is on the rig.
     pytest.importorskip("PySpin")
-    from autotrainer.video.camera.camera_base import CameraBase
-    from autotrainer.video.camera.spinnaker_cam import SpinCam
-    from autotrainer.video.video_manager import VideoManager
+    from reachaq.video.camera.camera_base import CameraBase
+    from reachaq.video.camera.spinnaker_cam import SpinCam
+    from reachaq.video.video_manager import VideoManager
 
     # The camera URL as VideoCaptureModel.load_configuration builds it from the params, read
     # back the way the capture process reads it. SpinCam's own default gamma is 0.7, so a
@@ -660,7 +660,7 @@ def test_the_capture_is_calibrated_into_the_session_beside_its_sources(tmp_path,
     log = run_waypoints(_Motor(clock, travel=0.0), plan_waypoints(start, moves, _dcs()),
                         sleep=clock.sleep, now=clock.now, clock=clock.now)
     presets = capture_presets(LIVE_PARAMS)
-    previous = tmp_path / "Autotrainer" / DEFAULT_3D_CALIB_DIR_NAME
+    previous = tmp_path / "reachAQ" / DEFAULT_3D_CALIB_DIR_NAME
     calls = []
 
     def fake_calibrate_capture(capture, **kwargs):
@@ -866,6 +866,105 @@ def test_the_capture_triggers_recording_like_a_session(tmp_path, monkeypatch):
         recording = mine.index(("wait_for_capture_status", CaptureProcessStatus.RECORDING))
         off = mine.index(("on_trigger_recording", False))
         assert start < on < recording < off
+
+
+def test_the_library_board_setting_reaches_the_calibration(tmp_path, monkeypatch):
+    from reachaq.inference.multires_calibration import library
+
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.calibration_library_root = tmp_path / "calibrations"
+    library.update_settings(app_model.calibration_library_root, board={
+        "kind": "charuco", "square_mm": 4.0, "rows": 6, "cols": 8, "marker_mm": 3.0, "dictionary": "DICT_4X4_50"})
+    boards = []
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: SimpleNamespace(verified=[True]))
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture",
+                        lambda *a, **k: boards.append(k["board"]) or (None, SimpleNamespace(id="cal"),
+                                                                      SimpleNamespace(verdict="pass")))
+    for name in ("left", "right"):
+        (tmp_path / "session" / f"{name}_recording.mp4").write_bytes(b"")
+        (tmp_path / "session" / f"{name}_recording_timestamps.txt").write_text("")
+
+    make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert boards == [BoardSpec(kind="charuco", marker_mm=3.0, dictionary="DICT_4X4_50")]
+
+
+@pytest.mark.parametrize("library", [False, True], ids=["no_library", "no_board_key"])
+def test_without_a_board_setting_the_calibration_uses_the_rig_charuco_board(tmp_path, monkeypatch, library):
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    if library:
+        app_model.calibration_library_root = tmp_path / "calibrations"
+    boards = []
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: SimpleNamespace(verified=[True]))
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture",
+                        lambda *a, **k: boards.append(k["board"]) or (None, SimpleNamespace(id="cal"),
+                                                                      SimpleNamespace(verdict="pass")))
+    for name in ("left", "right"):
+        (tmp_path / "session" / f"{name}_recording.mp4").write_bytes(b"")
+        (tmp_path / "session" / f"{name}_recording_timestamps.txt").write_text("")
+
+    make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert boards == [BoardSpec(kind="charuco", marker_mm=3.0, dictionary="DICT_4X4_50")]
+
+
+@pytest.mark.parametrize("settings, expected", [
+    ({}, "per_view"),
+    ({"fit": "motor_frame"}, "motor_frame"),
+    ({"board": {"kind": "checkerboard"}}, "motor_frame"),
+])
+def test_the_fit_setting_reaches_the_calibration(tmp_path, monkeypatch, settings, expected):
+    from reachaq.inference.multires_calibration import library
+
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.calibration_library_root = tmp_path / "calibrations"
+    if settings:
+        library.update_settings(app_model.calibration_library_root, **settings)
+    modes = []
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: SimpleNamespace(verified=[True]))
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture",
+                        lambda *a, **k: modes.append(k["fit_mode"]) or (None, SimpleNamespace(id="cal"),
+                                                                        SimpleNamespace(verdict="pass")))
+    for name in ("left", "right"):
+        (tmp_path / "session" / f"{name}_recording.mp4").write_bytes(b"")
+        (tmp_path / "session" / f"{name}_recording_timestamps.txt").write_text("")
+
+    make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert modes == [expected]
+
+
+@pytest.mark.parametrize("settings, key", [
+    ({"fit": "bundle"}, "fit"),
+    ({"fit_principal_point": "middle"}, "fit_principal_point"),
+])
+def test_a_bad_fit_setting_stops_the_calibration_before_any_motion(tmp_path, monkeypatch, settings, key):
+    from reachaq.inference.multires_calibration import library
+
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.calibration_library_root = tmp_path / "calibrations"
+    library.update_settings(app_model.calibration_library_root, **settings)
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: calls.append(("run_waypoints",)))
+
+    with pytest.raises(ValueError, match=key):
+        make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert not [call for call in calls if call[0] == "motor"] and ("run_waypoints",) not in calls
+
+
+def test_a_bad_board_setting_stops_the_calibration_before_any_motion(tmp_path, monkeypatch):
+    from reachaq.inference.multires_calibration import library
+
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.calibration_library_root = tmp_path / "calibrations"
+    library.update_settings(app_model.calibration_library_root, board={"kind": "charuco", "marker_mm": 5.0,
+                                                                        "dictionary": "DICT_4X4_50"})
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: calls.append(("run_waypoints",)))
+
+    with pytest.raises(ValueError, match=r"board\.marker_mm"):
+        make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert not [call for call in calls if call[0] == "motor"] and ("run_waypoints",) not in calls
 
 
 def test_cameras_that_do_not_stop_fail_a_capture_that_ran(tmp_path, monkeypatch):
@@ -1379,7 +1478,7 @@ def test_a_saved_list_outside_todays_box_is_scouted_again(tmp_path, monkeypatch)
     # 14 points, one-axis moves, the last outside today's box (motor x 0.6-20).
     points = [(1.0 + i, 20.0, 60.0) for i in range(13)] + [(500.0, 20.0, 60.0)]
     save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
-                   datetime(2026, 11, 20))
+                   datetime(2026, 11, 20), RIG_CHARUCO_BOARD)
     run()
     assert seen["scouts"] == 1
 
@@ -1392,7 +1491,7 @@ def test_the_saved_list_is_checked_against_the_configured_travel(tmp_path, monke
     app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(14, z=30.0)])
     points = [(1.0 + i, 20.0, 30.0) for i in range(14)]
     save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
-                   datetime(2026, 11, 20))
+                   datetime(2026, 11, 20), RIG_CHARUCO_BOARD)
     run()
     assert seen["scouts"] == 0
     assert [motor for *_, motor in seen["plans"][-1]] == points
@@ -1400,10 +1499,24 @@ def test_the_saved_list_is_checked_against_the_configured_travel(tmp_path, monke
     # Outside the travel (z 36): scouted again, with the travel.
     points = [(1.0 + i, 20.0, 36.0) for i in range(14)]
     save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
-                   datetime(2026, 11, 20))
+                   datetime(2026, 11, 20), RIG_CHARUCO_BOARD)
     run()
     assert seen["scouts"] == 1
     assert seen["travel"] == ((None, None), (None, None), (0.0, 35.0))
+
+
+@pytest.mark.parametrize("saved_board", [None, BoardSpec()], ids=["no_board", "checkerboard"])
+def test_a_list_scouted_with_another_board_is_scouted_again(tmp_path, monkeypatch, saved_board):
+    # A list from before the ChArUco board names none, so it was scouted with the checkerboard,
+    # whose views are whole-board ones; the ChArUco board, the default now, is usable in more.
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(14)])
+    points = [(1.0 + i, 20.0, 60.0) for i in range(14)]
+    save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
+                   datetime(2026, 11, 20), saved_board)
+    run()
+    assert seen["scouts"] == 1
+    saved = yaml.safe_load((tmp_path / "calibrations" / "scout_move_list.yaml").read_text())
+    assert saved["board"]["kind"] == "charuco"
 
 
 def test_a_fault_before_waypoint_0_sends_no_waypoint_command():
@@ -1504,7 +1617,8 @@ def test_a_camera_the_chosen_list_leaves_short_gets_advice(tmp_path, monkeypatch
 def test_a_saved_list_with_fewer_than_12_points_is_not_used(tmp_path, monkeypatch):
     app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(14)])
     save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml",
-                   [(1.0 + i, 20.0, 60.0) for i in range(11)], ["left", "right"], datetime(2026, 11, 20))
+                   [(1.0 + i, 20.0, 60.0) for i in range(11)], ["left", "right"], datetime(2026, 11, 20),
+                   RIG_CHARUCO_BOARD)
     run()
     assert seen["scouts"] == 1
 
@@ -1643,7 +1757,7 @@ def test_the_capture_teardown_stops_a_stage_still_moving_before_the_cameras(tmp_
 
 def test_each_arrival_wait_is_bounded_by_its_own_moves_profile(monkeypatch):
     # Review I-5: the arrival wait gets the per-move ack deadline, not a fixed 2 s.
-    from autotrainer.device.motion_deadline import ack_deadline, profile_time
+    from reachaq.device.motion_deadline import ack_deadline, profile_time
 
     clock = _Clock()
     motor = _scout_motor(clock)

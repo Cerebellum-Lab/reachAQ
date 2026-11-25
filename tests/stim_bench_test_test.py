@@ -1,14 +1,14 @@
 import pytest
 
-from tools.acquisition.model.laser_firing import LaserFiring
-from tools.acquisition.model.stim_bench_test import (
+from reachaq.app.model.laser_firing import LaserFiring
+from reachaq.app.model.stim_bench_test import (
     BenchRecipe,
     StimTestResult,
     bench_wait_seconds,
     refuse_reason,
 )
-from tools.acquisition.model.trial_action import LaserPulseProfile
-from tools.acquisition.model.trial_protocol_schedule import LaserTriggerRoute
+from reachaq.app.model.trial_action import LaserPulseProfile
+from reachaq.app.model.trial_protocol_schedule import LaserTriggerRoute
 
 
 def make_profile(**overrides):

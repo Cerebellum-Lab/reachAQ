@@ -7,7 +7,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
-from tools.acquisition.view.multi_selection_menu import MultiSelectionMenu
+from reachaq.app.view.multi_selection_menu import MultiSelectionMenu
 
 
 def _app():

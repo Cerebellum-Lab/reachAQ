@@ -15,21 +15,21 @@ The timer and clock are injected so these run instantly and deterministically.
 
 import pytest
 
-from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
+from reachaq.device import LaserChannelConfiguration, LaserSystemConfiguration
 
-from tools.acquisition.model.cue_timing import CueTimingConfiguration
-from tools.acquisition.model.reach_state_source import (
+from reachaq.app.model.cue_timing import CueTimingConfiguration
+from reachaq.app.model.reach_state_source import (
     ReachStateConfiguration,
     ReachStateResolver,
     ReachStateSource,
 )
-from tools.acquisition.model.trial_action import (
+from reachaq.app.model.trial_action import (
     ToneProfile,
     TrialActionCompiler,
     TrialActionExecutor,
     TrialCompileContext,
 )
-from tools.acquisition.model.trial_protocol_schedule import TrialProtocolRow
+from reachaq.app.model.trial_protocol_schedule import TrialProtocolRow
 
 
 LASERS = LaserSystemConfiguration.from_channels((
@@ -432,7 +432,7 @@ def test_tone_2_skipped_for_want_of_pellet_evidence_is_a_warning(caplog):
 
 @pytest.mark.parametrize("present, fires", [(True, True), (False, False)])
 def test_a_pellet_roi_answers_the_gate(present, fires):
-    from tools.acquisition.model.reach_state_source import RoiPelletPresenceProvider
+    from reachaq.app.model.reach_state_source import RoiPelletPresenceProvider
 
     class _State:
         def latest(self):

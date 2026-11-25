@@ -15,7 +15,8 @@ REPO = Path(__file__).resolve().parents[1]
 # tools/pyproject.toml, which stayed at ">= 3.8" while every other package moved
 # to 3.10; the omission was invisible because the test only checked what it was
 # told about. One level deep, so vendored trees are not swept in.
-PYPROJECTS = sorted(REPO.glob("*/pyproject.toml")) + [REPO / "pyproject.toml"]
+PYPROJECTS = (sorted(REPO.glob("*/pyproject.toml")) + sorted(REPO.glob("plugins/*/pyproject.toml"))
+              + [REPO / "pyproject.toml"])
 
 
 @pytest.mark.parametrize("path", PYPROJECTS, ids=lambda p: p.parent.name)
@@ -35,12 +36,13 @@ def test_every_package_is_covered():
 
     Naming the packages that must be present, rather than re-deriving them with
     the same glob the list uses, which would assert nothing. The previous
-    version globbed only "auto-trainer-*" and so was blind to tools/ in exactly
-    the same way the hand-maintained list was.
+    version globbed only one directory pattern and so was blind to tools/ in
+    exactly the same way the hand-maintained list was.
     """
     covered = set(PYPROJECTS)
-    required = {REPO / "pyproject.toml", REPO / "tools" / "pyproject.toml"}
-    required.update(REPO.glob("auto-trainer-*/pyproject.toml"))
+    required = {REPO / "pyproject.toml",
+                REPO / "plugins" / "deeplabcut" / "pyproject.toml",
+                REPO / "plugins" / "yolo" / "pyproject.toml"}
     missing = required - covered
     assert not missing, (
         "these declare a Python floor but are not checked: "

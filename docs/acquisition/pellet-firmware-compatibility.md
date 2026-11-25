@@ -42,7 +42,7 @@ for non-finite or out-of-order timestamps; `_translate_time_sync` catches it,
 logs a warning and drops that exchange, so a bad exchange does not abort the
 read. The `2.4.0` entry is therefore not in the table above. It is added
 at that firmware's release, and only in a reachAQ that has this fix; a checkout
-has it when `auto-trainer-device/src/autotrainer/device/board_clock.py` defines
+has it when `src/reachaq/device/board_clock.py` defines
 `MIN_SLOPE_SPAN_SECONDS`.
 
 ## Updating a rig to new firmware
@@ -67,7 +67,7 @@ checkout that was read, and should be the rig's operator checkout, normally
 `~/Documents/reachAQ`:
 
 ```bash
-conda run -n reachaq python -c "import tools.acquisition.model.firmware_compatibility as m; r = m.FirmwareCompatibilityPolicy.load().evaluate('2.3.0'); print(m.__file__); print(r.version, 'listed' if r.supported else 'NOT LISTED', 'requires', list(r.required_capabilities))"
+conda run -n reachaq python -c "import reachaq.app.model.firmware_compatibility as m; r = m.FirmwareCompatibilityPolicy.load().evaluate('2.3.0'); print(m.__file__); print(r.version, 'listed' if r.supported else 'NOT LISTED', 'requires', list(r.required_capabilities))"
 ```
 
 ### If startup refuses the board
@@ -97,7 +97,7 @@ shutdown starts, and the log names the reason:
   - `EIO -5`: a driver fault stopped the home, or the drivers failed to
     re-prove. Refresh Hardware once, which homes again
     (`HardwareModel._connect_locked` in
-    `tools/acquisition/model/hardware_model.py`). If that home is refused
+    `src/reachaq/app/model/hardware_model.py`). If that home is refused
     too, reboot the pellet board and check its 12 V supply.
   - `EBUSY -16` on the home: an axis is busy or stuck. Reboot the pellet
     board.
@@ -112,7 +112,7 @@ session. Collect the rig evidence with the pellet board connected, lasers off or
 shutters closed, and reachAQ closed:
 
 ```bash
-conda run --no-capture-output -n reachaq python tools/hardware/qualify_pellet_firmware.py --expect-version 2.3.0
+conda run --no-capture-output -n reachaq python src/reachaq/hardware/qualify_pellet_firmware.py --expect-version 2.3.0
 ```
 
 It checks version and capabilities against the list, finds where board STIM2
@@ -121,7 +121,7 @@ their return to low, confirms the board refuses pulses on tone lines, counts
 50 short pulses at both ends under normal CAN traffic, checks that no event
 claims board time without the capability for it, and reconnects and reboots
 the board. It writes a JSON record under
-`~/Autotrainer/pellet_firmware_qualification/` and exits non-zero if any check
+`~/reachAQ/pellet_firmware_qualification/` and exits non-zero if any check
 fails. It drives STIM0-STIM3 and plays tones, but moves no motor and opens no
 shutter.
 

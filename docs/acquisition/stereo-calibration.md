@@ -32,8 +32,9 @@ used, see
 
 ## Steps
 
-1. **Mount the board on the motor.** It is the 4 mm board with 6 x 8 inner
-   corners. Mount it so it moves with the stage and every camera to be
+1. **Mount the board on the motor.** It is the 4 mm ChArUco board with 6 x 8
+   inner corners, or the plain 4 mm checkerboard if the library's settings name it
+   (see [The calibration board](#the-calibration-board)). Mount it so it moves with the stage and every camera to be
    calibrated sees it at the start position. The board is only translated, never tilted, and its
    orientation on the stage does not need to be measured: the fit solves for it.
 2. Choose **Tools → Make 3D calibration**, tick the cameras to calibrate and
@@ -53,7 +54,7 @@ used, see
    The settle after each move is `distance / v_max + v_max / a_max + 0.25 s`, at
    least 0.25 s, with `v_max` and `a_max` the moving axis's maximum velocity and
    acceleration as the app wrote them to the motors at connect (from
-   `~/Autotrainer/motor_config.yaml`). An axis without a usable configuration
+   `~/reachAQ/motor_config.yaml`). An axis without a usable configuration
    settles 1.0 s, and so does waypoint 0 when the motor has reported no position
    before it. On christielab10 (120 mm/s and 600 mm/s² on every axis) the settles
    run from 0.45 s to 0.59 s, the longest for the 17 mm x move. Each settle is
@@ -196,7 +197,7 @@ only re-aiming the camera helps.
 
 1. **Grid.** 4 x 4 x 3 = 48 points evenly spaced inside the stage's configured
    travel: `min_pos` and `max_pos` under `pellet.x`, `pellet.y` and `pellet.z`
-   in `~/Autotrainer/motor_config.yaml` (0-35 mm on every axis on
+   in `~/reachAQ/motor_config.yaml` (0-35 mm on every axis on
    christielab10; see [Motor travel limits](../linux-install/runtime-configuration.md#motor-travel-limits)).
    The scout reads that file itself, so it has the travel before any connect.
    On an axis with no travel configured, the box is the one the hand-written
@@ -275,6 +276,141 @@ cameras, ticking **Scout again**, or deleting the file, scouts again. If a camer
 being swapped, tick **Scout again** or the saved list is reused. A scout run
 with **Scout again** replaces the saved list only when it passes for every
 camera, as any scout does; otherwise the old list stays.
+
+### The calibration board
+
+The calibration uses the rig's 4 mm ChArUco board unless the library's
+`calibrations/settings.yaml` has a `board` entry that names another. With no
+`board` key it is exactly this:
+
+```yaml
+board:
+  kind: charuco          # the default; checkerboard selects the plain board
+  square_mm: 4.0
+  rows: 6                # inner corners, not squares
+  cols: 8
+  marker_mm: 3.0
+  dictionary: DICT_4X4_50
+```
+
+That is `cv2.aruco.CharucoBoard((9, 7), 4.0, 3.0, cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50))`:
+9 x 7 squares of 4 mm with a 3 mm marker in each white square, 8 x 6 = 48 inner
+corners, the same corner grid as the checkerboard. A key left out takes the
+ChArUco board's value. To calibrate with the old checkerboard instead:
+
+```yaml
+board:
+  kind: checkerboard
+  square_mm: 4.0
+  rows: 6
+  cols: 8
+```
+
+(`marker_mm` and `dictionary` are refused for a checkerboard.) Calibrations made
+before the ChArUco board record no `kind`, and read as the checkerboard. The entry is checked when **Make 3D calibration** starts,
+before the stage moves: an unknown key, kind or dictionary, a marker not smaller
+than its square, or a dictionary with fewer markers than the board needs (31
+for 9 x 7) stops it with an error naming the key. There is no switch in the
+calibration dialog for it.
+
+**Why ChArUco.** Every ChArUco corner is identified by the markers beside it,
+so a camera that sees only part of the board still uses the part it sees. A
+view counts when it holds at least 12 corners spanning at least two rows and two
+columns (`MIN_CHARUCO_CORNERS`); the checkerboard is found whole or not at all.
+At each waypoint a corner is kept when it was found in at least half of the
+frames that found the board, and its position is the median over those frames.
+A corner whose detections disagree by more than 1 px is dropped, not the view.
+The board's corner order is fixed by the markers, so no camera's corners are
+ever reversed. Only the `subpix` corner refinement applies.
+
+**Making and printing a board.** A replacement board must be identical to the
+rig's: `cv2.aruco.CharucoBoard((9, 7), 4.0, 3.0, DICT_4X4_50)`, drawn by
+`generateImage((w, h), marginSize=0, borderBits=1)` with the legacy pattern off
+(the OpenCV 4.11 default, which `BoardSpec.charuco_board()` also sets
+explicitly): 9 x 7 squares of 4.0 mm, 36 x 28 mm overall, the top-left square
+black, a 3.0 mm marker (4 x 4 bits plus a 1-bit border) in each white square,
+markers 0 to 30. Generate it with the tool rather than by hand, from the
+reachAQ environment at the repository root:
+
+```bash
+python -m reachaq.calibration.make_charuco_board ~/charuco_board
+# or, for the board a library's settings.yaml names:
+python -m reachaq.calibration.make_charuco_board ~/charuco_board --library ~/reachAQ/calibrations
+```
+
+It writes `charuco_9x7_4mm_3mm_DICT_4X4_50_2400dpi.png`, one board at 2400 dpi
+(3402 x 2646 px), and `charuco_9x7_4mm_3mm_DICT_4X4_50_letter.pdf`, a US-letter
+page at 1200 dpi with 24 boards in a 4 x 6 grid, 8 mm apart with dashed cut
+lines midway, the spec on a header line, and a 50 mm ruler with 1 mm ticks. The
+page is black and white only, stored losslessly, so the marker edges stay sharp.
+
+1. Print the PDF at **100 % / Actual size**. Turn off "fit to page", "shrink
+   to fit" and any scaling in the print dialog. Use **matte** paper: a gloss
+   finish throws specular highlights that hide markers.
+2. Before cutting, measure the **50 mm ruler** with calipers. It must read
+   50.0 mm (within about 0.1 mm); if not, the printer scaled the page, so fix
+   the print settings and print again. Then check one board: 9 squares across
+   must measure 36.0 mm.
+3. Cut out the best-printed board along the dashed lines, leaving the white
+   margin, and mount it flat on a rigid backing.
+
+The fit measures the motor scale against the board's squares, so a board
+printed 1 % large reads as a 1 % motor scale error (`motor_scale_dev`).
+
+The report gives one line per camera with a ChArUco board, `views used N of M
+waypoints, median K corners per view`, so partial coverage is visible; the
+coverage images and every pair check use only the corners found.
+`calibration.yaml` records `kind`, `marker_mm` and `dictionary` under `board`
+for a ChArUco board only; a checkerboard calibration's `board` entry is as before.
+The capture folder keeps its name, `4mm_6r_8c_4x`.
+
+### The fit: per_view or motor_frame
+
+The stage does not only translate the board: on christielab10's session010
+(2026-11-23) the board turned slightly between waypoints, and at z 35 it stood
+about 3 mm short of where it was commanded. The `motor_frame` fit assumes a
+pure translation to the commanded position and sat at 15-20 px RMS there. The
+`per_view` fit (`multires_calibration/per_view.py`) gives each waypoint its own
+board rotation, shared by every camera, and holds the board's position to the
+commanded one through a fitted similarity `s R m + t` with a robust slack of
+0.4 mm (soft-L1). A waypoint whose slack is an outlier (more than 3 MADs, and at
+least 1.2 mm, above the median) loses that hold and is listed; its corners
+still count. The commanded positions are what fix the focal length: every view
+is the same plane orientation, so with the positions left free the focal length
+is undetermined.
+
+`calibrations/settings.yaml` picks the fit with `fit: per_view` or
+`fit: motor_frame`. Unset, it is `per_view` for a ChArUco board and
+`motor_frame` for the checkerboard, whose cross-camera corner order depends on
+the motor-frame model. `calibration.yaml` records `fit: per_view` under
+`capture` for a per-view calibration only.
+
+The per-view fit adds stage-accuracy notes to the report: the similarity's scale
+and RMS, each waypoint more than 1 mm from its commanded position by name (for
+example `waypoint 13: board 3.3 mm short of commanded z`), each waypoint's board
+tilt and its axis in the motor frame, and every waypoint's residual. They are
+measured numbers. The report's stage-accuracy block grades them (see The quality
+report): it warns and never fails.
+
+`fit_principal_point: centre` holds every camera's principal point at the image
+centre in the per-view fit (default `free`). The board only translates, so its
+views barely separate the principal point from the camera's position: on
+christielab10's session002 (2026-11-24) the free principal points landed 0.9-1.4
+ROI half-sides off centre.
+
+`placement: affine` (default `similarity`) holds the views to an affine stage
+model, A m + t, instead of s R m + t: a scale per motor axis and the angles
+between the axes, which the report gives as `stage axes: scale x ..., y ..., z
+...; angles xy ..., xz ..., yz ...`. Use it with `fit_principal_point: centre`:
+with the principal point free, the z scale trades against the focal length and
+the principal point, and a synthetic fit came out 2 % short in fx.
+
+**Deferred until after Dec 31:** a two-stage fit (intrinsics first),
+installed-model grading, and nominal-lens checks. Until then `focal_pair_rel`
+is the plain relative difference between two cameras' focal lengths, which
+warns above 10 % (every christielab10 camera has an 8.5 mm lens). A
+`calibrations/settings.yaml` that still has `lenses` or `pixel_um` keys is
+accepted; the calibration ignores them and logs that it did.
 
 ### The calibration library
 
@@ -529,7 +665,7 @@ The capture creates a session folder in the normal data location. In it:
   install as the session's record, and when a fail is kept out.
 
 An install adds `.new` to the **calibration library** (next section) as a new
-entry, `<configuration location>/calibrations/<id>/` (default `~/Autotrainer`),
+entry, `<configuration location>/calibrations/<id>/` (default `~/reachAQ`),
 and makes it the active entry; the app loads it from there. If the active
 pointer cannot be written, the entry is removed again and the previous
 calibration stays active, so the install can be retried. A `.new` folder holding
@@ -544,7 +680,7 @@ library took over.
 ## Calibration library
 
 Every calibration is kept as an immutable entry under
-`<configuration location>/calibrations/` (`~/Autotrainer/calibrations/`):
+`<configuration location>/calibrations/` (`~/reachAQ/calibrations/`):
 
 ```
 calibrations/
@@ -778,7 +914,7 @@ preset is never substituted, because its pixels are not the frames' pixels.
 **Offline analysis** resolves the calibration a session used from its metadata,
 `hardware.configured.calibration3d`:
 
-- `id` finds the calibration under `--calib-root` (default `~/Autotrainer`),
+- `id` finds the calibration under `--calib-root` (default `~/reachAQ`),
   whether it is the active folder or a dated backup. With no id, the session's
   start time picks the calibration that was active then.
 - `preset` names the preset to read. With a format-3 calibration, a session
@@ -829,6 +965,28 @@ possible with 2 cameras` (always so with 2 calibrated cameras), or `... not
 possible for any camera` with 3 or more. The JSON keeps the same text as
 `verdict_note`.
 
+Each camera has two reprojection RMS values, and only one of them is graded:
+
+- `reprojection_rms_px` grades the camera. It comes from the camera's own planar
+  fit: `cv2.calibrateCamera` on its corners, with every view's board pose free.
+  It uses the joint fit's distortion model (k1 k2 p1 p2, k3 held at 0). With
+  `fit_principal_point: centre`, the principal point is held where the joint fit
+  put it. Because the poses are free, stage error cannot enter it. It measures
+  the camera model and the corner detection alone.
+- `joint_reprojection_rms_px` is the same camera's RMS in the stage-tied joint
+  fit. There, each view's board is held to its commanded position through the
+  stage model. Any board placement that the stage model does not describe adds
+  to it, so it only warns: it grades the stage model, not the camera. When it is
+  well above `reprojection_rms_px`, read the stage-accuracy block.
+
+The stage-accuracy block reports measured numbers only. It names no cause.
+
+The text report lists the stage-accuracy metrics after the others, under
+`Stage accuracy (measured; warns, never fails):`. They are
+`motor_scale_dev`, `stage_slack_rms_mm` and `stage_repeat_mm`. The last two
+come from the per-view fit's placement, so a motor-frame fit has only
+`motor_scale_dev`.
+
 Only the calibrated cameras are graded. A pair metric is graded for every pair
 of them that saw the board at the same position, and its camera is the pair,
 for example `left-right`.
@@ -837,8 +995,9 @@ for example `left-right`.
 | --- | --- | --- | --- | --- |
 | `views_kept` | camera | < 20 | < 10 | Distinct positions where this camera's board detection was kept (at most 36) |
 | `covisible_views` | camera | < 8 | < 4 | Its views that another calibrated camera also saw. The fit does not need them; they expose stage geometry the model leaves out (axis skew) |
-| `reprojection_rms_px` | camera | > 0.5 | > 1.0 | RMS distance between detected corners and the fit's projection, sensor px |
-| `preset_reprojection_rms_px` | camera, per preset | none | none | Informational. The same RMS in that preset's pixels (sensor RMS / binning); the note names the preset |
+| `reprojection_rms_px` | camera | > 0.5 | > 1.0 | RMS distance between detected corners and the camera's own planar fit (every view's board pose free), sensor px |
+| `joint_reprojection_rms_px` | camera | > 1.0 | none | RMS distance between detected corners and the stage-tied joint fit's projection, sensor px. Includes stage error, so it only warns |
+| `preset_reprojection_rms_px` | camera, per preset | none | none | Informational. The joint RMS in that preset's pixels (sensor RMS / binning); the note names the preset |
 | `coverage_roi_fraction` | camera | < 0.5 | < 0.25 | Fraction of the base preset's sensor window inside the union of the detected-corner hulls |
 | `coverage_frame_fraction` | camera | none | none | Informational. The same coverage as a fraction of the full 1440 x 1080 sensor frame |
 | `fx_fy_ratio_dev` | camera | > 0.01 | > 0.03 | \|fx/fy - 1\|; a large value is a sign of a poorly constrained fit |
@@ -851,10 +1010,12 @@ for example `left-right`.
 | `epipolar_error_px` | pair | > 0.5 | > 1.0 | Mean symmetric epipolar distance, sensor px, over positions both cameras saw |
 | `square_size_rel_error` | pair | > 0.01 | > 0.03 | \|mean triangulated square - 4 mm\| / 4 mm |
 | `loo_triangulation_px` | camera, 3 or more cameras | > 0.5 | > 1.0 | Median distance, sensor px, between this camera's corners and the points the other calibrated cameras triangulate, projected into it, over positions it and at least two others saw |
-| `motor_scale_dev` | capture | > 0.01 | none | \|motor scale - 1\|: true travel (from the board's squares) against commanded travel |
+| `motor_scale_dev` | capture | > 0.01 | none | Stage accuracy. \|motor scale - 1\|: true travel (from the board's squares) against commanded travel |
+| `stage_slack_rms_mm` | motor axis (x, y, z) | > 1.0 | none | Stage accuracy, per-view fit only. RMS over every view of where the board was minus where the stage model put it, along that motor axis |
+| `stage_repeat_mm` | waypoint pair | > 0.5 | none | Stage accuracy, per-view fit only, for a position visited twice. Distance between the board positions the fit placed at the two visits; the note gives it per axis |
 | `waypoints_unverified` | capture | > 0 | none | Positions where the motor's reported position did not come within 0.05 mm of the command in time. Verified means the motor reported the commanded position, not a traced arrival |
 | `waypoints_unreached` | capture | none | > 0 | Positions where the reported position was more than 0.1 mm from the commanded one on some axis. The fit places the board at the commanded position, so any such view is in the wrong place. A position with no finite reported position is not counted |
-| `cross_check_delta_px` | binned preset | > 1.5 | none | Largest difference in fx, fy, cx or cy between a direct fit in the preset's own pooled frames and the mapped sensor fit, preset px. Informational: the direct fit has a noise floor near 0.5 px |
+| `cross_check_delta_px` | binned preset | > 1.5 | none | Largest difference in fx, fy, cx or cy between a direct fit in the preset's own pooled frames and the mapped sensor fit, preset px. With the per-view fit, the sensor fit it is compared with is refitted on exactly the views and corners the preset found, and the direct fit weighs its residuals in sensor px, so the two solve the same problem. With `fit_principal_point: centre` both hold the principal point at the mapped value, so the delta covers fx and fy only; the principal-point mapping is checked exactly, without a fit, by `tests/inference/multires_geometry_test.py`. Informational: the direct fit has a noise floor near 0.5 px |
 | `cross_check_corner_offset_px` | binned preset | > 0.1 | > 0.25 | Mean offset between corners detected in the preset's pooled frames and the sensor corners mapped into it, preset px. Tests the pixel-centre mapping itself |
 | `camera_rotation_change_deg` | camera, vs previous | > 0.5 | none | Rotation relative to the motor axes since the previous calibration; above the limit the report says the camera moved |
 | `baseline_change_mm` | pair, vs previous | > 1.0 | none | Change of the vector between the two camera centres since the previous calibration, for every pair both calibrations have |
@@ -957,7 +1118,7 @@ lists the geometries.
 - **The anipose file is checked in aniposelib 0.8.0 itself, in a separate
   virtualenv.** aniposelib needs opencv-contrib-python, which would replace the
   reachaq environment's cv2, so reachaq never imports it.
-  `auto-trainer-inference/tests/multires_anipose_compat_check.py` writes a
+  `tests/inference/multires_anipose_compat_check.py` writes a
   calibration of the synthetic 3-camera rig in the reachaq environment, then
   loads each of its TOMLs with `CameraGroup.load` in the virtualenv and checks
   the cameras, the metadata keys and `CameraGroup.project` against the fit's
@@ -967,9 +1128,9 @@ lists the geometries.
   python3 -m venv ~/anipose-check-venv
   ~/anipose-check-venv/bin/pip install aniposelib==0.8.0 toml
   PYTHONPATH=<the repo's package src dirs> python \
-      auto-trainer-inference/tests/multires_anipose_compat_check.py --write-inputs OUT
+      tests/inference/multires_anipose_compat_check.py --write-inputs OUT
   for t in OUT/*.toml; do ~/anipose-check-venv/bin/python \
-      auto-trainer-inference/tests/multires_anipose_compat_check.py "$t" "${t%.toml}.json"; done
+      tests/inference/multires_anipose_compat_check.py "$t" "${t%.toml}.json"; done
   ```
 
   It is not part of the pytest suite. The DeepLabCut pickle is tested against
@@ -984,16 +1145,26 @@ always to the legacy reader.
 
 **Before deploying.**
 
-1. Back up `~/Autotrainer/diamond_triangle_offset.yaml` (the default
+1. Back up `~/reachAQ/diamond_triangle_offset.yaml` (the default
    configuration folder; use your own if the configuration location was
    changed). A rollback may need it.
 2. Note the version now installed, so you know what to roll back to.
+3. **The calibration board changes with this code.** It calibrates with the
+   ChArUco board unless `calibrations/settings.yaml` names another (see
+   [The calibration board](#the-calibration-board)). Deploy it together with
+   mounting the ChArUco board, or, to keep the checkerboard for now, add
+   `board: {kind: checkerboard}` to settings.yaml before the next calibration.
+   With the checkerboard still mounted and no `board` setting, the scout finds
+   no board and says "board type mismatch?"; a capture would find no views.
+   A scout list saved before this code was scouted with the checkerboard and is
+   scouted again once. A rollback reads a ChArUco calibration.yaml as a
+   checkerboard (the board is only informational after the fit).
 
 **Rolling back to v3.1.0, in order.**
 
 1. Stop the app.
 2. Install v3.1.0.
-3. If `~/Autotrainer/diamond_triangle_offset.yaml` contains a `calibration_id:`
+3. If `~/reachAQ/diamond_triangle_offset.yaml` contains a `calibration_id:`
    line, put back the backup from before the deploy, or remove the file.
    Otherwise v3.1.0 fails to load its configuration.
 4. Start the app.
@@ -1061,7 +1232,7 @@ a rig, the dialog's default becomes the scout.
 
 ## Where the maths lives
 
-`auto-trainer-inference/src/autotrainer/inference/multires_calibration/`:
+`src/reachaq/inference/multires_calibration/`:
 
 | Module | Holds |
 | --- | --- |
@@ -1074,7 +1245,7 @@ a rig, the dialog's default becomes the scout.
 | `library.py` | the calibration library: entries, the active pointer, decisions, import |
 | `pipeline.py` | `calibrate_capture`, which ties them together |
 
-Capture and install live in `tools/acquisition`: `model/handle_3d_calibration.py`
+Capture and install live in `src/reachaq/app`: `model/handle_3d_calibration.py`
 (waypoints, pauses, `capture_settings`), `model/calibration_install.py`,
 `model/dcs_state.py` (VALID, STALE or MISSING), `model/calibration_reminder.py`,
 `model/calibration_geometry.py` (the live preset from the camera configuration)
@@ -1172,8 +1343,8 @@ itself holds no videos.
 ```python
 from pathlib import Path
 
-from autotrainer.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
-from autotrainer.inference.multires_calibration.pipeline import calibrate_capture
+from reachaq.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
+from reachaq.inference.multires_calibration.pipeline import calibrate_capture
 
 base = PresetGeometry(binning=4, width=256, height=256, offset_x=52, offset_y=6)
 index, report = calibrate_capture(
@@ -1209,4 +1380,4 @@ print(report.to_text())
   `calibration3dFailed` API event; any other outcome posts
   `calibration3dCompleted`.
 - A synthetic rig for capture-free tests, with known K, dist, R and T, is in
-  `auto-trainer-inference/tests/multires_synthetic.py`.
+  `tests/inference/multires_synthetic.py`.

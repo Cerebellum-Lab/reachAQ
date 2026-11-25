@@ -5,8 +5,8 @@ import textwrap
 
 import pytest
 
-from tools.acquisition import instance_lock
-from tools.acquisition.instance_lock import AlreadyRunning, acquire_instance_lock
+from reachaq.app import instance_lock
+from reachaq.app.instance_lock import AlreadyRunning, acquire_instance_lock
 
 pytestmark = pytest.mark.skipif(instance_lock.fcntl is None, reason="flock is POSIX only")
 
@@ -35,7 +35,7 @@ def test_a_holder_that_dies_does_not_leave_a_stale_lock(tmp_path):
     path = tmp_path / "reachaq" / "app.lock"
     holder = textwrap.dedent(f"""
         import os
-        from tools.acquisition.instance_lock import acquire_instance_lock
+        from reachaq.app.instance_lock import acquire_instance_lock
         lock = acquire_instance_lock({str(path)!r})
         os._exit(0)  # no clean shutdown; the kernel must still release it
     """)

@@ -6,21 +6,21 @@ from unittest import mock
 
 import pytest
 
-from autotrainer.core import PersistenceConfiguration, SystemConfiguration
-from autotrainer.core.diamond_triangle_config import DiamondTriangleOffsetConfig
-from autotrainer.device.compound_movement_file import CompoundMovements
-from autotrainer.device.motor_configuration_file import MotorConfigurationFile
-from tools.acquisition.args import make_autotrainer_parser
-from tools.acquisition.model.app_model import AppModel
-from tools.acquisition.model.nidaq_channel_plan import build_nidaq_acquisition_configuration
-from tools.acquisition.model.nidaq_discovery import simulated_nidaq_devices
-from tools.acquisition.model.nidaq_timing import build_nidaq_timing_plan
-from tools.acquisition.model.user_preferences import UserPreferences
-from tools.acquisition import instance_lock
-from tools.acquisition.instance_lock import AlreadyRunning, acquire_instance_lock
-from tools.simulation import sim_home
-from tools.simulation.sim_home import SIMULATION_ENVIRONMENT, prepare_simulation
-from tools.simulation.sim_configuration import build_simulation_configuration
+from reachaq.core import PersistenceConfiguration, SystemConfiguration
+from reachaq.core.diamond_triangle_config import DiamondTriangleOffsetConfig
+from reachaq.device.compound_movement_file import CompoundMovements
+from reachaq.device.motor_configuration_file import MotorConfigurationFile
+from reachaq.app.args import make_reachaq_parser
+from reachaq.app.model.app_model import AppModel
+from reachaq.app.model.nidaq_channel_plan import build_nidaq_acquisition_configuration
+from reachaq.app.model.nidaq_discovery import simulated_nidaq_devices
+from reachaq.app.model.nidaq_timing import build_nidaq_timing_plan
+from reachaq.app.model.user_preferences import UserPreferences
+from reachaq.app import instance_lock
+from reachaq.app.instance_lock import AlreadyRunning, acquire_instance_lock
+from reachaq.simulation import sim_home
+from reachaq.simulation.sim_home import SIMULATION_ENVIRONMENT, prepare_simulation
+from reachaq.simulation.sim_configuration import build_simulation_configuration
 
 
 needs_flock = pytest.mark.skipif(instance_lock.fcntl is None, reason="flock is POSIX only")
@@ -52,7 +52,7 @@ def home(tmp_path, monkeypatch):
 
 
 def _parse(*argv):
-    return make_autotrainer_parser().parse_args(["--simulate", *argv])
+    return make_reachaq_parser().parse_args(["--simulate", *argv])
 
 
 def _prepare(args):
@@ -74,7 +74,7 @@ def test_prepare_writes_only_under_sim_home(home, tmp_path):
     assert run.home == home.joinpath(".reachaq-sim").resolve()
     created = _files(tmp_path) - before
     assert created and all(path.resolve().is_relative_to(run.home) for path in created), sorted(created)
-    assert not home.joinpath("Autotrainer").exists()
+    assert not home.joinpath("reachAQ").exists()
     assert run.config_path.is_file() and run.preferences_path.is_file()
     assert run.bus_path.parent.is_dir() and run.bus_path.parent.parent == run.home / "runs"
     assert run.lock_path == run.home / "app.lock"
@@ -191,7 +191,7 @@ def test_environment_set(home, tmp_path):
     assert os.environ["REACHAQ_SIMULATION"] == "1"
     assert os.environ["REACHAQ_SIM_BUS"] == run.bus_path.as_posix()
     assert float(os.environ["REACHAQ_SIM_EPOCH"]) > 0
-    assert os.environ["AUTOTRAINER_CAN_TRANSPORT"] == "emulation"
+    assert os.environ["REACHAQ_CAN_TRANSPORT"] == "emulation"
     assert float(os.environ["REACHAQ_SIM_CAMERA_FPS"]) == 150.0
     assert float(os.environ["REACHAQ_SIM_CAMERA_EXPOSURE_S"]) == pytest.approx(0.002)
     assert os.environ["REACHAQ_SIM_LINE_ALIASES"] == "{}"
@@ -238,7 +238,7 @@ def test_a_held_home_refuses_before_creating_it(home, tmp_path):
 
 
 @needs_flock
-@pytest.mark.parametrize("main", ["tools.acquisition.headless", "tools.acquisition.gui"])
+@pytest.mark.parametrize("main", ["reachaq.app.headless", "reachaq.app.gui"])
 def test_a_main_on_a_held_home_exits_already_running(main, tmp_path, app_launch_env):
     sim = tmp_path / "sim"
     held = acquire_instance_lock(sim / "app.lock")
@@ -254,13 +254,13 @@ def test_a_main_on_a_held_home_exits_already_running(main, tmp_path, app_launch_
 
 
 def test_calibration_is_loaded_from_the_home(home, tmp_path, monkeypatch):
-    from autotrainer.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
-    from autotrainer.inference import calibration_FLIR
+    from reachaq.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
+    from reachaq.inference import calibration_FLIR
     from types import SimpleNamespace
 
-    import autotrainer.core.logging as core_logging
-    from tools.acquisition import headless
-    from tools.acquisition.model import app_model
+    import reachaq.core.logging as core_logging
+    from reachaq.app import headless
+    from reachaq.app.model import app_model
 
     args = _parse("--sim-home", (tmp_path / "sim").as_posix())
     run = _prepare(args)
@@ -318,10 +318,10 @@ def _recording_app_model(built):
 def test_main_window_builds_app_model_with_the_home_calibration(simulate, home, tmp_path, monkeypatch):
     from PySide6.QtWidgets import QApplication
 
-    from tools.acquisition.view import main_window
+    from reachaq.app.view import main_window
 
     app = QApplication.instance() or QApplication([])
-    args = make_autotrainer_parser().parse_args(
+    args = make_reachaq_parser().parse_args(
         ["--simulate", "--sim-home", (tmp_path / "sim").as_posix()] if simulate
         else ["--preferences-file", (tmp_path / "rig.ini").as_posix()])
     run = _prepare(args) if simulate else None
@@ -345,9 +345,9 @@ def test_run_acquisition_hands_the_sim_calibration_to_the_window(home, tmp_path,
     from types import SimpleNamespace
 
     import PySide6.QtWidgets
-    from autotrainer.model import EnvironmentProvider
-    from tools.acquisition import run_acquisition as run_module
-    from tools.acquisition.view import disabled_style, main_window
+    from reachaq.model import EnvironmentProvider
+    from reachaq.app import run_acquisition as run_module
+    from reachaq.app.view import disabled_style, main_window
 
     args = _parse("--sim-home", (tmp_path / "sim").as_posix())
     args.live_inference, args.dev = None, False

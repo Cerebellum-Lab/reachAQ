@@ -31,23 +31,23 @@ from PySide6.QtWidgets import (  # noqa: E402
     QWidget,
 )
 
-from autotrainer.core import (  # noqa: E402
+from reachaq.core import (  # noqa: E402
     LaserChannelConfiguration,
     LaserChannelId,
     LaserSystemConfiguration,
     NidaqPortConfiguration,
     NidaqSignalStreamConfiguration,
 )
-from tools.acquisition.model.nidaq_channel_plan import (  # noqa: E402
+from reachaq.app.model.nidaq_channel_plan import (  # noqa: E402
     build_nidaq_acquisition_configuration,
 )
-from tools.acquisition.model.trial_action import LaserPulseProfile  # noqa: E402
-from tools.acquisition.view.compact_panel import (  # noqa: E402
+from reachaq.app.model.trial_action import LaserPulseProfile  # noqa: E402
+from reachaq.app.view.compact_panel import (  # noqa: E402
     COMPACT_FONT_POINT_SIZE,
     CollapsibleSection,
     ElidedLabel,
 )
-from tools.acquisition.view.laser_control_content import (  # noqa: E402
+from reachaq.app.view.laser_control_content import (  # noqa: E402
     _ERROR_STATUS_COLOR,
     LaserControlContent,
 )

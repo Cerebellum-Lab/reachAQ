@@ -11,13 +11,13 @@ directly instead of building a widget.
 
 import pytest
 
-from tools.acquisition.model.trial_protocol_schedule import TrialProtocolRow
+from reachaq.app.model.trial_protocol_schedule import TrialProtocolRow
 
 
 @pytest.fixture(scope="module")
 def content():
     return pytest.importorskip(
-        "tools.acquisition.view.protocol_content",
+        "reachaq.app.view.protocol_content",
         reason="Protocol panel requires PySide6",
     )
 

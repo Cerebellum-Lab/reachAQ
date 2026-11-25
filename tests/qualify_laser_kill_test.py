@@ -2,13 +2,13 @@ import hashlib, importlib.util, io, json, os, queue, signal, sys, threading, tim
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
-from autotrainer.core import SystemConfiguration
-from autotrainer.device import nidaq_laser
-from tools.acquisition.model import laser_kill_matrix as matrix
-from tools.acquisition.model.laser_kill_matrix import (
+from reachaq.core import SystemConfiguration
+from reachaq.device import nidaq_laser
+from reachaq.app.model import laser_kill_matrix as matrix
+from reachaq.app.model.laser_kill_matrix import (
     HELD_UNTIL_RESET, SAFE_ON_DEATH, UNKNOWN, KillCase, LevelSample, from_record, judge)
 
-_TOOL = Path(__file__).resolve().parents[1] / "tools" / "hardware" / "qualify_laser_kill.py"
+_TOOL = Path(__file__).resolve().parents[1] / "src" / "reachaq" / "hardware" / "qualify_laser_kill.py"
 _spec = importlib.util.spec_from_file_location("qualify_laser_kill", _TOOL)
 tool = importlib.util.module_from_spec(_spec)
 sys.modules.setdefault("qualify_laser_kill", tool)
@@ -18,7 +18,7 @@ _REAL_MAKE_SPAWN = tool.make_spawn   # the autouse guard below replaces the modu
 
 _REPO = Path(__file__).resolve().parents[1]
 _fake_spec = importlib.util.spec_from_file_location(
-    "nidaq_daqmx_fake", _REPO / "auto-trainer-device" / "tests" / "nidaq_daqmx_fake.py")
+    "nidaq_daqmx_fake", _REPO / "tests" / "device" / "nidaq_daqmx_fake.py")
 fake = importlib.util.module_from_spec(_fake_spec)
 sys.modules.setdefault("nidaq_daqmx_fake", fake)
 _fake_spec.loader.exec_module(fake)
@@ -175,9 +175,9 @@ def test_a_refused_victim_is_a_row_with_its_reason_and_no_kill():
 
 def test_the_victim_command_names_the_row():
     args = tool.parse_args(["--dry-run", "--config", "/tmp/c.yaml", "--level", "1.5"])
-    command = tool.victim_command("python", Path("/w/tools/hardware/laser_kill_victim.py"), args,
+    command = tool.victim_command("python", Path("/w/src/reachaq/hardware/laser_kill_victim.py"), args,
                                   KillCase("abort", "hardware", "pulse", 2))
-    assert command[:2] == ["python", "/w/tools/hardware/laser_kill_victim.py"]
+    assert command[:2] == ["python", "/w/src/reachaq/hardware/laser_kill_victim.py"]
     for flag in ("--timing=hardware", "--waveform=pulse", "--mode=abort", "--level=1.5", "--config=/tmp/c.yaml"):
         assert flag in command
 

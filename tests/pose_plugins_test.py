@@ -10,8 +10,8 @@ import sys
 
 import pytest
 
-from autotrainer.inference import pose_plugins
-from autotrainer.inference.pose_plugins import (
+from reachaq.inference import pose_plugins
+from reachaq.inference.pose_plugins import (
     AmbiguousPoseModel,
     KEYPOINT_PLUGIN,
     PoseBackendNotInstalled,
@@ -102,15 +102,15 @@ def test_importing_pose_plugins_loads_no_engine():
 
     Checked in a fresh interpreter, because this one has imported plenty.
     """
-    # .../auto-trainer-inference/src/autotrainer/inference/pose_plugins.py
+    # .../src/reachaq/inference/pose_plugins.py
     inference_src = pathlib.Path(pose_plugins.__file__).resolve().parents[2]
     repo_root = inference_src.parents[1]
-    source_dirs = [str(inference_src), str(repo_root / "auto-trainer-core" / "src")]
+    source_dirs = [str(inference_src), str(repo_root / "reachaq" / "src")]
     script = (
         "import sys\n"
         f"sys.path[:0] = {source_dirs!r}\n"
-        "import autotrainer.inference.pose_plugins\n"
-        "autotrainer.inference.pose_plugins.discover_plugins()\n"
+        "import reachaq.inference.pose_plugins\n"
+        "reachaq.inference.pose_plugins.discover_plugins()\n"
         "leaked = [name for name in ('deeplabcut', 'ultralytics', 'tensorflow') if name in sys.modules]\n"
         "print(','.join(leaked))\n"
     )
@@ -174,9 +174,9 @@ def test_a_known_layout_without_its_plugin_names_the_install_command(
     with pytest.raises(PoseBackendNotInstalled) as raised:
         resolve(str(tmp_path))
     message = str(raised.value)
-    assert "auto-trainer-pose-yolo" in message
+    assert "reachaq-pose-yolo" in message
     assert "reachaq-plugin-install.sh yolo" in message
-    assert raised.value.distribution == "auto-trainer-pose-yolo"
+    assert raised.value.distribution == "reachaq-pose-yolo"
     assert raised.value.model_path == str(tmp_path)
 
 
@@ -186,7 +186,7 @@ def test_a_yolo_model_without_its_plugin_points_at_the_keypoint_trainer(
     (tmp_path / "yolo_pose.yaml").write_text("bodyparts: [a]\n")
     with pytest.raises(PoseBackendNotInstalled) as raised:
         resolve(str(tmp_path))
-    assert "autotrainer.inference.keypoint.train" in str(raised.value)
+    assert "reachaq.inference.keypoint.train" in str(raised.value)
 
 
 def test_a_claiming_plugin_with_a_missing_engine_names_it(tmp_path, entry_points):
@@ -229,7 +229,7 @@ def test_a_deeplabcut_project_without_its_plugin_names_the_distribution(
     """Real discovery, so nothing core still ships may claim the project.
 
     The one thing taken away is the plugin's own entry point, so the test
-    means the same on a machine that has auto-trainer-pose-deeplabcut
+    means the same on a machine that has reachaq-pose-deeplabcut
     installed as on one without it.
     """
     installed = list(pose_plugins._entry_points())
@@ -244,7 +244,7 @@ def test_a_deeplabcut_project_without_its_plugin_names_the_distribution(
     finally:
         reset_discovery()
     assert raised.value.engine == "DeepLabCut"
-    assert raised.value.distribution == "auto-trainer-pose-deeplabcut"
+    assert raised.value.distribution == "reachaq-pose-deeplabcut"
     assert raised.value.missing == ()
     assert "reachaq-plugin-install.sh deeplabcut" in str(raised.value)
 
@@ -265,7 +265,7 @@ def test_a_keypoint_model_without_torch_names_the_missing_engine(tmp_path, entry
     with pytest.raises(PoseBackendNotInstalled) as raised:
         resolve(str(tmp_path))
     assert raised.value.missing == ("torch",)
-    assert raised.value.distribution == "auto-trainer"
+    assert raised.value.distribution == "reachaq"
     assert raised.value.engine == "keypoint"
     assert "torch" in str(raised.value)
     assert "reachaq-plugin-install.sh keypoint" not in str(raised.value)

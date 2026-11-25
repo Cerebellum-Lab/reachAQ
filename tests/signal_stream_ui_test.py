@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QSizePolicy  # noqa: E402
 
-from autotrainer.core import (  # noqa: E402
+from reachaq.core import (  # noqa: E402
     LaserChannelConfiguration,
     LaserChannelId,
     LaserSystemConfiguration,
@@ -20,29 +20,29 @@ from autotrainer.core import (  # noqa: E402
     NidaqSignalStreamConfiguration,
     ObservableObject,
 )
-from autotrainer.device import (  # noqa: E402
+from reachaq.device import (  # noqa: E402
     LaserCalibrationRamp,
     LaserPulseTrain,
     NidaqSignalSampleBlock,
     NullLaserController,
 )
-from tools.acquisition.model.laser_model import LaserModel  # noqa: E402
-from tools.acquisition.model.laser_plot_process import LaserPlotProcess  # noqa: E402
-from tools.acquisition.model.app_model import AppModel  # noqa: E402
-from tools.acquisition.model.nidaq_signal_monitor_model import (  # noqa: E402
+from reachaq.app.model.laser_model import LaserModel  # noqa: E402
+from reachaq.app.model.laser_plot_process import LaserPlotProcess  # noqa: E402
+from reachaq.app.model.app_model import AppModel  # noqa: E402
+from reachaq.app.model.nidaq_signal_monitor_model import (  # noqa: E402
     NidaqSignalMonitorModel,
 )
-from tools.acquisition.model.nidaq_sample_ring import SharedNidaqSampleRing  # noqa: E402
-from tools.acquisition.model.nidaq_channel_plan import (  # noqa: E402
+from reachaq.app.model.nidaq_sample_ring import SharedNidaqSampleRing  # noqa: E402
+from reachaq.app.model.nidaq_channel_plan import (  # noqa: E402
     build_nidaq_acquisition_configuration,
 )
-from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts  # noqa: E402
-from tools.acquisition.view.analysis_content import AnalysisContent  # noqa: E402
-from tools.acquisition.view.laser_control_content import (  # noqa: E402
+from reachaq.app.model.nidaq_discovery import NidaqDevicePorts  # noqa: E402
+from reachaq.app.view.analysis_content import AnalysisContent  # noqa: E402
+from reachaq.app.view.laser_control_content import (  # noqa: E402
     LaserControlContent,
     _LaserChannelTab,
 )
-from tools.acquisition.view.rolling_stream_buffer import RollingStreamBuffer  # noqa: E402
+from reachaq.app.view.rolling_stream_buffer import RollingStreamBuffer  # noqa: E402
 
 
 @pytest.fixture(scope="module")

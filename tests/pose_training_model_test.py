@@ -13,7 +13,7 @@ import time
 import pytest
 import yaml
 
-from tools.acquisition.model.pose_training_model import (
+from reachaq.app.model.pose_training_model import (
     DEPLOY_HISTORY,
     PoseTrainingModel,
     TrainingState,
@@ -133,7 +133,7 @@ def test_deploy_history_records_and_returns_the_previous_model(tmp_path):
 # -- AppModel wiring ----------------------------------------------------------
 
 def test_arming_a_recording_pauses_training(app_model, tmp_path):
-    from tools.acquisition.model.app_model_status import SessionRecordingStatus
+    from reachaq.app.model.app_model_status import SessionRecordingStatus
     training = app_model.pose_training
     training.models_root = str(tmp_path / "models")
     training._context = multiprocessing.dummy
@@ -146,7 +146,7 @@ def test_arming_a_recording_pauses_training(app_model, tmp_path):
 
 
 def test_deploy_is_refused_while_not_ready_and_writes_no_history(app_model, tmp_path):
-    from tools.acquisition.model.app_model_status import SessionRecordingStatus
+    from reachaq.app.model.app_model_status import SessionRecordingStatus
     training = app_model.pose_training
     root = training.models_root = str(tmp_path / "models")
     app_model._recording_session.status = SessionRecordingStatus.RECORDING
@@ -159,8 +159,8 @@ def test_the_real_child_trains_a_dataset_into_a_live_model_directory(tmp_path, m
     """Spawned process, real dataset and trainer, one epoch on the CPU."""
     numpy = pytest.importorskip("numpy")
     pytest.importorskip("torch")
-    from autotrainer.inference import pose_plugins
-    from autotrainer.inference.keypoint.dataset import FRAME_SIZE, LABELLED, PoseDataset
+    from reachaq.inference import pose_plugins
+    from reachaq.inference.keypoint.dataset import FRAME_SIZE, LABELLED, PoseDataset
 
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
     data = PoseDataset.create(str(tmp_path / "sets"), "tiny", ["a", "b"])
@@ -201,8 +201,8 @@ def test_a_stop_before_training_begins_exits_without_training(tmp_path):
     import threading
     pytest.importorskip("torch")
     numpy = pytest.importorskip("numpy")
-    from autotrainer.inference.keypoint.dataset import FRAME_SIZE, LABELLED, PoseDataset
-    from tools.acquisition.model.pose_training_model import run_training
+    from reachaq.inference.keypoint.dataset import FRAME_SIZE, LABELLED, PoseDataset
+    from reachaq.app.model.pose_training_model import run_training
     data = PoseDataset.create(str(tmp_path / "sets"), "tiny", ["a"])
     data.add_image(numpy.zeros((FRAME_SIZE, FRAME_SIZE), "uint8"), "s1", "s1_left",
                    points=numpy.array([[10, 10]]), status=LABELLED)
@@ -219,7 +219,7 @@ def test_a_stop_before_training_begins_exits_without_training(tmp_path):
 
 def test_a_gpu_job_is_stopped_when_training_pauses_for_a_recording(tmp_path):
     import threading
-    from tools.acquisition.model.pose_training_model import JobCancelled
+    from reachaq.app.model.pose_training_model import JobCancelled
     model = PoseTrainingModel(str(tmp_path / "models"))
     outcome = {}
 
@@ -242,8 +242,8 @@ def test_a_gpu_job_is_stopped_when_training_pauses_for_a_recording(tmp_path):
 
 def test_resume_is_blocked_with_a_reason_once_labels_change(tmp_path):
     numpy = pytest.importorskip("numpy")
-    from autotrainer.inference.keypoint.dataset import FRAME_SIZE, LABELLED, PoseDataset
-    from tools.acquisition.model.pose_training_model import RUN_FILE
+    from reachaq.inference.keypoint.dataset import FRAME_SIZE, LABELLED, PoseDataset
+    from reachaq.app.model.pose_training_model import RUN_FILE
     data = PoseDataset.create(str(tmp_path / "sets"), "tiny", ["a"])
     frame = data.add_image(numpy.zeros((FRAME_SIZE, FRAME_SIZE), "uint8"), "s1", "s1_left",
                            points=numpy.array([[10, 10]]), status=LABELLED)

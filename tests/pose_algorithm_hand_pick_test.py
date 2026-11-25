@@ -95,7 +95,7 @@ def test_the_algorithm_selects_hands_without_pandas():
     """A revert would be silent: the result is identical, only slower."""
     import inspect
 
-    from autotrainer.inference.pose_algorithm import PoseAlgorithm
+    from reachaq.inference.pose_algorithm import PoseAlgorithm
 
     source = inspect.getsource(PoseAlgorithm)
     assert 'sort_values(by="likelihood"' not in source
@@ -117,7 +117,7 @@ BASES = ["H_flat", "H_spread", "H_grab"]
 
 def _pandas_choice(frames, hand):
     """What process_hand_data plus the old frame pick produced."""
-    from autotrainer.inference.analysis.prepare_jetson_data import process_hand_data
+    from reachaq.inference.analysis.prepare_jetson_data import process_hand_data
 
     parts = [option + base for option in ("R", "L") for base in BASES]
     columns = pandas.MultiIndex.from_product(

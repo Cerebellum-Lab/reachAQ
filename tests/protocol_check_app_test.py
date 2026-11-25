@@ -21,11 +21,11 @@ import pytest  # noqa: E402
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from autotrainer.core import SystemConfiguration  # noqa: E402
-from autotrainer.device.laser import NullLaserController  # noqa: E402
+from reachaq.core import SystemConfiguration  # noqa: E402
+from reachaq.device.laser import NullLaserController  # noqa: E402
 
 from nidaq_timing_test import _pinned_christielab10  # noqa: E402
-from tools.acquisition.model.nidaq_channel_plan import (  # noqa: E402
+from reachaq.app.model.nidaq_channel_plan import (  # noqa: E402
     build_nidaq_acquisition_configuration,
 )
 
@@ -111,7 +111,7 @@ def _behavior_content(app_model):
     reads as it is made; a stand-in with one takes its place. Record's state
     comes from the app model alone.
     """
-    from tools.acquisition.view.behavior_content import BehaviorContent
+    from reachaq.app.view.behavior_content import BehaviorContent
 
     inference = SimpleNamespace(
         IS_ENABLED="is_enabled", STATUS="status", MODEL_LOCATION="model_location",
@@ -185,8 +185,8 @@ def test_a_laser_tab_pick_is_what_the_check_reads(rig):
 
 
 def test_check_protocol_lists_every_finding_and_copies_them(rig, qapp, monkeypatch):
-    from tools.acquisition.view import protocol_check_dialog
-    from tools.acquisition.view.protocol_content import ProtocolContent
+    from reachaq.app.view import protocol_check_dialog
+    from reachaq.app.view.protocol_content import ProtocolContent
 
     app_model = rig(_without_laser_2s_stim_line(CHRISTIELAB10.laser))
     shown, modal = [], []
@@ -253,7 +253,7 @@ def test_a_laser_opened_on_an_earlier_plan_cannot_take_a_board_trigger(rig):
 
 def test_a_fault_in_the_check_is_logged_once_and_still_holds_record_back(
         rig, monkeypatch, caplog):
-    from tools.acquisition.model import app_model as app_model_module
+    from reachaq.app.model import app_model as app_model_module
 
     app_model = rig()
 
@@ -274,7 +274,7 @@ def test_a_fault_in_the_check_is_logged_once_and_still_holds_record_back(
 
 
 def test_record_waits_for_a_check_another_thread_is_running(rig, monkeypatch):
-    from tools.acquisition.model import app_model as app_model_module
+    from reachaq.app.model import app_model as app_model_module
 
     app_model = rig(_without_laser_2s_stim_line(CHRISTIELAB10.laser))
     assert _protocol_lines(app_model)

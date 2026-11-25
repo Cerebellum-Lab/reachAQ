@@ -20,14 +20,14 @@ import pytest  # noqa: E402
 from PySide6.QtCore import QEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from autotrainer.core import (  # noqa: E402
+from reachaq.core import (  # noqa: E402
     LaserChannelConfiguration,
     LaserChannelId,
     LaserSystemConfiguration,
 )
-from tools.acquisition.model.app_model import AppModel  # noqa: E402
-from tools.acquisition.model.trial_action import LaserPulseProfile  # noqa: E402
-from tools.acquisition.view.laser_control_content import (  # noqa: E402
+from reachaq.app.model.app_model import AppModel  # noqa: E402
+from reachaq.app.model.trial_action import LaserPulseProfile  # noqa: E402
+from reachaq.app.view.laser_control_content import (  # noqa: E402
     _ERROR_STATUS_COLOR,
     LaserControlContent,
 )

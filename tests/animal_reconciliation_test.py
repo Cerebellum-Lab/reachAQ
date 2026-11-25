@@ -4,8 +4,8 @@ import shutil
 
 import pytest
 
-from autotrainer.core import AnimalSubject, ExternalIdentity
-from tools.acquisition.model.animal_reconciliation import (
+from reachaq.core import AnimalSubject, ExternalIdentity
+from reachaq.app.model.animal_reconciliation import (
     AnimalReconciliationChoices,
     reconcile_animals,
 )
@@ -69,7 +69,7 @@ def test_app_model_condensation_rolls_back_mid_transaction(app_model, monkeypatc
     original_survivor = survivor_path.read_bytes()
     original_loser = loser_path.read_bytes()
 
-    from tools.acquisition.model import app_model as app_model_module
+    from reachaq.app.model import app_model as app_model_module
 
     real_replace = app_model_module.os.replace
     call_count = 0

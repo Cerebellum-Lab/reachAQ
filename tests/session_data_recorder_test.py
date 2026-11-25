@@ -14,16 +14,16 @@ import h5py
 import numpy as np
 import pytest
 
-from autotrainer.core import (
+from reachaq.core import (
     ObservableObject,
     ProjectInfo,
     SystemCommandKind,
     SystemStatusMessageKind,
 )
-from tools.acquisition.model import session_data_recorder
-from tools.acquisition.model.session_boundary import SessionBoundary
-from tools.acquisition.model.session_data_recorder import SessionDataRecorder
-from tools.session_validation import ValidationProfile, validate_session
+from reachaq.app.model import session_data_recorder
+from reachaq.app.model.session_boundary import SessionBoundary
+from reachaq.app.model.session_data_recorder import SessionDataRecorder
+from reachaq.session_validation import ValidationProfile, validate_session
 
 
 class _EventSource(ObservableObject):
@@ -244,8 +244,8 @@ def test_structured_device_ledger_captures_decoded_input_and_output():
 
 
 def test_a_refused_command_row_carries_its_token_and_the_boards_code():
-    from autotrainer.core import Motor
-    from autotrainer.device import CommandRefusal, RefusedCommandClass
+    from reachaq.core import Motor
+    from reachaq.device import CommandRefusal, RefusedCommandClass
 
     handler = _EventSource("decoded_message_received")
     laser = _EventSource("trace_received")
@@ -2471,7 +2471,7 @@ def test_board_clock_chain_uses_rows_outside_the_session_window(tmp_path):
 
 
 def test_board_clock_chain_failure_never_fails_finalization(tmp_path, monkeypatch):
-    from tools.acquisition.model import board_clock_chain
+    from reachaq.app.model import board_clock_chain
 
     def explode(*_args, **_kwargs):
         raise ValueError("synthetic chain failure")
@@ -2491,7 +2491,7 @@ def test_board_clock_chain_failure_never_fails_finalization(tmp_path, monkeypatc
 
 
 def test_board_clock_chain_record_that_cannot_be_written_is_replaced(tmp_path, monkeypatch):
-    from tools.acquisition.model import board_clock_chain
+    from reachaq.app.model import board_clock_chain
 
     # alignment.json is written with allow_nan=False: a NaN would fail the whole write.
     monkeypatch.setattr(
@@ -2548,7 +2548,7 @@ def test_board_clock_chain_does_not_read_the_spool_without_a_barcode_report(tmp_
 
 
 def test_board_clock_chain_record_with_keys_json_cannot_sort_is_replaced(tmp_path, monkeypatch):
-    from tools.acquisition.model import board_clock_chain
+    from reachaq.app.model import board_clock_chain
 
     # The writer sorts keys; a record that dumps without sorting must not slip past the backstop.
     monkeypatch.setattr(
@@ -2654,7 +2654,7 @@ def test_alignment_pairs_post_roll_barcode_frames_past_the_ni_fits_end_by_host_t
 
 
 def test_board_clock_chain_is_given_the_ni_fit(monkeypatch):
-    from tools.acquisition.model import board_clock_chain
+    from reachaq.app.model import board_clock_chain
 
     seen = {}
     monkeypatch.setattr(
@@ -2701,7 +2701,7 @@ def _spooled_arrays(rows_indices, perf_of, channels):
 
 def test_board_clock_chain_is_given_the_ni_endpoints_and_never_the_stamps(monkeypatch):
     from board_clock_chain_synthetic import synthetic_rig
-    from tools.acquisition.model import board_clock_chain
+    from reachaq.app.model import board_clock_chain
 
     rows, channels, indices = synthetic_rig()
     arrays, made = _spooled_arrays(indices, lambda index: 1000.0 + index / 10_000.0, channels)
@@ -2847,12 +2847,12 @@ def test_a_clap_and_a_barcode_report_reach_the_chain_as_the_recorder_wrote_them(
     their own author wrote. This runs one clap and one barcode report through
     all three and checks the columns and names the chain reads.
     """
-    from autotrainer.device import CanTransportConfiguration, Target
-    from autotrainer.device.can_interface import CanInterface
-    from autotrainer.device.socketcan_jerrycan import (
+    from reachaq.device import CanTransportConfiguration, Target
+    from reachaq.device.can_interface import CanInterface
+    from reachaq.device.socketcan_jerrycan import (
         JerryCANCmdType, JerryCANMsg, JerryCANTimestampKind, JerryCANTiming, SyncBarcode, SyncClapObserved,
     )
-    from tools.acquisition.model import board_clock_chain as chain
+    from reachaq.app.model import board_clock_chain as chain
 
     io_module, boot = 0x08, 0xB007
     interface = CanInterface(

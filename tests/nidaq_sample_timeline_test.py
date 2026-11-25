@@ -2,12 +2,12 @@ import math
 
 import numpy as np
 
-from autotrainer.core import (
+from reachaq.core import (
     NidaqSignalChannelConfiguration,
     NidaqSignalStreamConfiguration,
 )
-from autotrainer.device import NidaqSignalSampleBlock
-from tools.acquisition.model.nidaq_sample_ring import SharedNidaqSampleRing
+from reachaq.device import NidaqSignalSampleBlock
+from reachaq.app.model.nidaq_sample_ring import SharedNidaqSampleRing
 
 
 def test_one_epoch_anchor_keeps_times_monotonic_across_jittered_blocks():

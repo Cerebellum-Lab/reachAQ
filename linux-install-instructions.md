@@ -4,8 +4,11 @@ This is the entry point for Ubuntu reachAQ setup. Portable, repeatable host
 commands live in a tracked installer; vendor drivers and rig-specific settings
 are separated into focused guides.
 
-Supported reference platform: Ubuntu 22.04 x86_64. Other distributions
-require matching vendor packages; Jetson/aarch64 is not supported.
+Supported platforms are listed in
+[supported platforms](docs/linux-install/supported-platforms.md) (today Ubuntu
+22.04 x86_64, NVIDIA driver 570.26+, compute capability 7.5-12.0, Spinnaker
+3.2). The installer checks the host first and refuses one that is not on the
+list unless `REACHAQ_INSTALL_UNSUPPORTED=1` is set.
 
 ## Installation map
 
@@ -19,15 +22,16 @@ Complete only the hardware categories present on the target rig.
 | 3b | NI DAQ/PXI | [NI-DAQmx and PXI/MXI guide](docs/linux-install/ni-daq-pxi.md), including the `intel_iommu=off` boot parameter Intel hosts need for NI DMA |
 | 3c | Pellet CAN | [PEAK SocketCAN guide](docs/linux-install/peak-socketcan.md) |
 | 3d | Live inference | [NVIDIA guide](docs/linux-install/nvidia-inference.md) |
-| 3e | SoftMouse/RFID | [SoftMouse/RFID guide](tools/softmouse_sync/CONFIGURATION_GUIDE.md) |
+| 3e | SoftMouse/RFID | [SoftMouse/RFID guide](src/reachaq/softmouse_sync/CONFIGURATION_GUIDE.md) |
 | 3f | Closed-loop stim timing | [Latency tuning guide](docs/linux-install/latency-tuning.md) |
 | 4 | Rig configuration and launch | [Runtime guide](docs/linux-install/runtime-configuration.md) |
 
-The portable installer does **not** install FLIR, NI, PEAK out-of-tree, or
+The portable installer does **not** install NI, PEAK out-of-tree, or
 NVIDIA kernel drivers and does not select camera serials, DAQ channels, CAN
 bitrate, or an inference model. It does install everything that lives in the
 Python environment: PyTorch and its CUDA user-space libraries, the pose plugins
-the environment already had, and the Spinnaker Python binding once the Spinnaker SDK is present. It installs the
+the environment already had, and the Spinnaker SDK and Python binding from the
+operator's own FLIR download (reachAQ ships no FLIR software). It installs the
 portable `can-utils` and `iproute2` packages, but it does not install or enable
 `reachaq-can.service`; that service is intentionally a separate, reviewed
 hardware step.
@@ -56,8 +60,8 @@ git status --short --branch
 The script installs general Ubuntu/Qt/build packages, creates the Python 3.10
 conda environment, installs Python dependencies and the editable project,
 installs PyTorch, reinstalls the pose plugins the environment already had,
-initializes Git LFS, installs the Spinnaker Python binding when the SDK is
-present, creates runtime directories, configures the operator's `dialout`
+initializes Git LFS, installs the Spinnaker SDK and Python binding from the
+operator's download, creates runtime directories, configures the operator's `dialout`
 membership for USB serial access, and runs generic verification. It also
 installs the Linux Secret Service/keyring components needed to store SoftMouse
 credentials securely.
@@ -69,7 +73,10 @@ cd "$HOME/Documents/reachAQ"
 ./tools/install/reachaq-linux-install.sh
 ```
 
-The script accepts no options and attempts every portable category. It
+For FLIR cameras, first save the Spinnaker download in `~/Downloads`; see the
+[FLIR Spinnaker guide](docs/linux-install/flir-spinnaker.md).
+
+The script accepts no options and runs every portable category. It
 automatically installs Miniconda when Conda is absent, includes test
 dependencies, runs the focused tests, installs PyTorch's CUDA user-space
 libraries, and verifies PyTorch on the GPU. No pose plugin is installed by
@@ -87,22 +94,30 @@ the kernel driver or install a system-wide CUDA toolkit.
 - An environment on another Python version cannot be upgraded in place, so it
   is kept, renamed `reachaq-py<version>-<date>`, and a fresh one is built. Run
   the archive with
-  `conda run --no-capture-output -n <archive> python -m reachAQ.app`.
+  `conda run --no-capture-output -n <archive> python -m reachaq.app`.
 - The pose plugins the environment had are reinstalled from the checkout, into
   a rebuilt environment too. An environment from before the plugins existed
   gets the DeepLabCut plugin if it has `deeplabcut` installed and the YOLO
   plugin if it has `ultralytics`. To drop a plugin for good, uninstall both its
   distribution and its engine package (for example
-  `pip uninstall auto-trainer-pose-yolo ultralytics`) before rerunning the
+  `pip uninstall reachaq-pose-yolo ultralytics`) before rerunning the
   installer, otherwise it restores the plugin.
 - `REACHAQ_INSTALL_SYSTEM=0` skips the steps that need root (apt packages,
-  groups, limits, systemd) and reports them as `SKIP`. Use it to rerun on a rig
-  that already has them, for example after `reachaq-sync`.
-- It does not use `set -e`; one failed command does not stop later categories.
-- Every step is recorded as `PASS`, `FAIL`, `SKIP`, or `PLAN`.
-- A complete summary is always printed at the end.
-- The final process exit is nonzero if any step failed, after all eligible steps
-  have run.
+  groups, limits, systemd, FLIR camera access) and reports them as `SKIP`. Use
+  it to rerun on a rig that already has them, for example after `reachaq-sync`.
+  An installed Spinnaker SDK is still checked; one that is missing stops the
+  install, because installing it needs root.
+- Run it as the operator, not with `sudo`: it asks for sudo itself, and under
+  sudo every per-user path would be root's. It refuses to run under `sudo`.
+- `REACHAQ_INSTALL_SPINNAKER=0` leaves out the Spinnaker steps on a host
+  without FLIR cameras; `REACHAQ_SPINNAKER_DOWNLOADS` names the folder holding
+  the Spinnaker download (default `~/Downloads`).
+- The first failed step stops the install. The summary printed at the end
+  names that step and its failed command, and the output just above it says
+  why; nothing after it has run. The exit status is nonzero.
+- Every step is recorded as `PASS`, `FAIL`, `SKIP` (left out on purpose, with
+  the reason), or `WARN` (worth knowing, did not stop the install, such as an
+  unsupported platform accepted with `REACHAQ_INSTALL_UNSUPPORTED=1`).
 - Re-running the same no-argument command is the supported repair and
   verification workflow.
 - If the installer adds the operator to `dialout`, log out and back in before
@@ -114,8 +129,10 @@ the kernel driver or install a system-wide CUDA toolkit.
   and logs a warning; acquisition is unaffected. See the
   [latency tuning guide](docs/linux-install/latency-tuning.md).
 - The installer enables `reachaq-cpu-governor.service`, which sets the
-  `performance` CPU governor at boot. This is the one systemd unit the
-  installer enables; `reachaq-can.service` remains a separate reviewed step.
+  `performance` CPU governor at boot, and, for FLIR cameras,
+  `reachaq-usbfs-memory.service`, which sets the USB-FS buffer to 1000 MB.
+  These are the systemd units the installer enables; `reachaq-can.service`
+  remains a separate reviewed step.
 - The report separately verifies SoftMouse imports/keyring availability, RFID
   imports/device permissions, and the tracked nightly systemd units.
 - The generic import check verifies module file paths against the current
@@ -126,10 +143,10 @@ the kernel driver or install a system-wide CUDA toolkit.
 
 ### FLIR/Spinnaker cameras
 
-Follow the [FLIR Spinnaker guide](docs/linux-install/flir-spinnaker.md) to
-install the vendor SDK, udev rules, and operator groups. Then rerun the
-portable installer: it installs the matching bundled Python wheel and lists
-the cameras it can see.
+The portable installer installs the SDK, udev rule, operator groups, USB-FS
+memory and Python binding from the operator's own download, and lists the
+cameras it can see. The [FLIR Spinnaker guide](docs/linux-install/flir-spinnaker.md)
+says what to download and what each step does.
 
 ### NI-DAQmx and PXI/MXI
 
@@ -157,7 +174,7 @@ That guide installs these root-owned system artifacts:
 Adding the operator to the `reachaq` group requires a full logout/login before
 the application can use its non-interactive safety reset. The service
 configuration and application environment are separate; make
-`REACHAQ_CAN_INTERFACE` and `AUTOTRAINER_CAN_CHANNEL` select the same channel.
+`REACHAQ_CAN_INTERFACE` and `REACHAQ_CAN_CHANNEL` select the same channel.
 
 ### NVIDIA live inference
 
@@ -181,9 +198,9 @@ Start it with `reachaq`, or the desktop icon. A safe first launch after
 configuration, without live inference:
 
 ```bash
-conda run --no-capture-output -n reachaq python -m reachAQ.app \
+conda run --no-capture-output -n reachaq python -m reachaq.app \
   --no-live-inference \
-  -c "$HOME/Autotrainer/system_configuration.yaml"
+  -c "$HOME/reachAQ/system_configuration.yaml"
 ```
 
 `--no-capture-output` makes application logs stream to the launching terminal.
@@ -194,7 +211,7 @@ operator selects Running.
 
 ## Completion checklist
 
-- [ ] Portable installer report has no unexplained `FAIL` entries.
+- [ ] Portable installer report has no `FAIL` entry and no unexplained `WARN`.
 - [ ] Only physically present hardware categories were installed.
 - [ ] FLIR cameras, if used, appear as `spinnaker://` sources.
 - [ ] NI devices, if used, appear in `nilsdev` and Python `nidaqmx` discovery.
@@ -205,7 +222,7 @@ operator selects Running.
   succeeds without prompting.
 - [ ] Root-owned installed CAN files match the reviewed repository versions;
   `/etc/default/reachaq-can` retains any intentional rig-specific values.
-- [ ] The application `AUTOTRAINER_CAN_CHANNEL` matches service
+- [ ] The application `REACHAQ_CAN_CHANNEL` matches service
   `REACHAQ_CAN_INTERFACE`.
 - [ ] If inference is enabled, the report passes the PyTorch GPU check, and,
   with the DeepLabCut plugin, the TensorFlow and both-engines GPU checks.

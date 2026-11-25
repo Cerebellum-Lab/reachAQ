@@ -1,5 +1,5 @@
-from tools.acquisition.model.acquisition_controller import AcquisitionController
-from tools.acquisition.model.subsystem_status import SubsystemId, SubsystemState
+from reachaq.app.model.acquisition_controller import AcquisitionController
+from reachaq.app.model.subsystem_status import SubsystemId, SubsystemState
 
 
 def test_acquisition_lifecycle_is_idempotent():

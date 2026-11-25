@@ -8,17 +8,17 @@ point, not a fake one.
 
 import pytest
 
-from autotrainer.inference import backend_selection
-from autotrainer.inference import pose_plugins
-from autotrainer.inference.backend_selection import (
+from reachaq.inference import backend_selection
+from reachaq.inference import pose_plugins
+from reachaq.inference.backend_selection import (
     POSE_BACKEND_ENV_VAR,
     TORCH_BACKEND,
     confidence_threshold,
     pre_validate_model,
     selected_backend,
 )
-from autotrainer.inference.pose_plugins import PoseBackendNotInstalled, resolve
-from autotrainer.pose_plugins.yolo.plugin import YOLO_CONFIDENCE_THRESHOLD
+from reachaq.inference.pose_plugins import PoseBackendNotInstalled, resolve
+from reachaq.pose_plugins.yolo.plugin import YOLO_CONFIDENCE_THRESHOLD
 
 
 def _only(monkeypatch, *installed):
@@ -73,7 +73,7 @@ def test_a_claiming_plugin_with_a_missing_engine_names_it_and_the_alternative(
         resolve(str(tmp_path))
     assert raised.value.missing == ("ultralytics",)
     assert "reachaq-plugin-install.sh yolo" in str(raised.value)
-    assert "autotrainer.inference.keypoint.train" in str(raised.value)
+    assert "reachaq.inference.keypoint.train" in str(raised.value)
 
 
 def test_a_yolo_model_is_checked_against_the_yolo_layout(tmp_path, engines):

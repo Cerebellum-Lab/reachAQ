@@ -1,12 +1,12 @@
 import pytest
 
-from tools.acquisition.model.experiment_compiler import compile_experiment
-from tools.acquisition.model.trial_protocol_schedule import (
+from reachaq.app.model.experiment_compiler import compile_experiment
+from reachaq.app.model.trial_protocol_schedule import (
     ProtocolPatch,
     ProtocolScope,
     TrialOverride,
 )
-from tools.acquisition.model.trial_protocol_set import (
+from reachaq.app.model.trial_protocol_set import (
     ExperimentComposition,
     ExperimentSetEntry,
     TrialProtocolSet,

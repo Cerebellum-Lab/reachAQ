@@ -11,7 +11,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-from tools.acquisition.model.nidaq_wiring_verification import (
+from reachaq.app.model.nidaq_wiring_verification import (
     CONFIRMED,
     DRIVER,
     OPAQUE,
@@ -21,7 +21,7 @@ from tools.acquisition.model.nidaq_wiring_verification import (
     WiringPoint,
 )
 
-_TOOL = Path(__file__).resolve().parents[1] / "tools" / "hardware" / "verify_nidaq_wiring.py"
+_TOOL = Path(__file__).resolve().parents[1] / "src" / "reachaq" / "hardware" / "verify_nidaq_wiring.py"
 _spec = importlib.util.spec_from_file_location("verify_nidaq_wiring", _TOOL)
 verify = importlib.util.module_from_spec(_spec)
 sys.modules.setdefault("verify_nidaq_wiring", verify)

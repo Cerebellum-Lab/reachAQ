@@ -4,15 +4,15 @@ import inspect
 import re
 from types import SimpleNamespace
 
-import tools
+import reachaq.app
 
 
 def test_we_can_import_acquisition_main_window():
-    from tools.acquisition.view import main_window
+    from reachaq.app.view import main_window
 
 
 def test_main_window_subscribes_only_existing_callbacks():
-    from tools.acquisition.view.main_window import MainWindow
+    from reachaq.app.view.main_window import MainWindow
 
     source = inspect.getsource(MainWindow.__init__)
     callback_names = set(re.findall(r"\+= self\.(\w+)", source))
@@ -22,8 +22,8 @@ def test_main_window_subscribes_only_existing_callbacks():
 
 
 def test_hardware_switches_use_persistent_file_submenu_and_deferred_refresh():
-    from tools.acquisition.view.hardware_status_content import HardwareStatusContent
-    from tools.acquisition.view.main_window import MainWindow
+    from reachaq.app.view.hardware_status_content import HardwareStatusContent
+    from reachaq.app.view.main_window import MainWindow
 
     menu_source = inspect.getsource(MainWindow._configure_menubar)
     apply_source = inspect.getsource(MainWindow._apply_hardware_menu_values)
@@ -37,7 +37,7 @@ def test_hardware_switches_use_persistent_file_submenu_and_deferred_refresh():
 
 
 def test_hardware_menu_checkmarks_follow_loaded_configuration():
-    from tools.acquisition.view.main_window import MainWindow
+    from reachaq.app.view.main_window import MainWindow
 
     class ActionStub:
         def __init__(self):
@@ -90,11 +90,11 @@ def test_hardware_menu_checkmarks_follow_loaded_configuration():
 
 
 def test_we_can_import_headless():
-    from tools.acquisition import headless
+    from reachaq.app import headless
 
 
 def test_we_can_import_pellet_delivery_window():
-    from tools.pellet_delivery.view import main_window
+    from reachaq.pellet_delivery.view import main_window
 
 
 class _EnableRecorder:
@@ -109,11 +109,11 @@ def test_the_daq_monitor_is_offered_only_while_idle():
     # It pauses the application's NI-DAQ stream, which in System Mode is the
     # acquisition's. The action was enabled only once, after a DAQ ports
     # discovery, and otherwise stayed enabled in every state.
-    from tools.acquisition.model.app_model_status import (
+    from reachaq.app.model.app_model_status import (
         AppModelStatus,
         SessionRecordingStatus,
     )
-    from tools.acquisition.view.main_window import MainWindow
+    from reachaq.app.view.main_window import MainWindow
 
     controls = (
         "_app_model_status_combo", "run_action", "preferences_action",

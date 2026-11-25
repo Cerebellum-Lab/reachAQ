@@ -7,10 +7,10 @@ there is no backend registry and no configuration key for it.
 
 | Subsystem | Contract | Backends | Selection point |
 |---|---|---|---|
-| Camera | `autotrainer.video.camera.camera_backend.CameraBackend` | `SpinCam` (`spinnaker://`), `RandomCam` (`random://`), `PlaybackCam` (`playback://`), `SimulatedCam` (`sim://`) | the camera URL's scheme, in `VideoManager.create_camera` (`video_manager.py`); `--random-cameras` rewrites the scheme for one run |
-| NI-DAQ input stream | `autotrainer.device.nidaq_input_backend.NidaqInputBackend` | `NidaqSignalStreamController`, `SimulatedNidaqStream` | `make_nidaq_input_backend`, called by the stream worker (`nidaq_signal_monitor_model.py`) and both preflight workers (`nidaq_preflight.py`); device discovery is `discover_nidaq_devices` (`nidaq_discovery.py`) |
-| Laser | `autotrainer.device.laser.LaserControllerProtocol` | `NidaqLaserController`, `NullLaserController`, `SimulatedLaserController` | `make_laser_controller`, called by `LaserModel`'s two construction points (`configure_nidaq`, `open_controller`) |
-| Motor/pellet board over CAN | `autotrainer.device.motor_pellet_backend.MotorPelletBackend` (a subset of `DeviceInterface`) | `CanInterface` (pyjerrycan, SocketCAN, PCAN transports), `EmulationInterface` | `CanDevice._make_device_interface`, from `AUTOTRAINER_CAN_TRANSPORT` |
+| Camera | `reachaq.video.camera.camera_backend.CameraBackend` | `SpinCam` (`spinnaker://`), `RandomCam` (`random://`), `PlaybackCam` (`playback://`), `SimulatedCam` (`sim://`) | the camera URL's scheme, in `VideoManager.create_camera` (`video_manager.py`); `--random-cameras` rewrites the scheme for one run |
+| NI-DAQ input stream | `reachaq.device.nidaq_input_backend.NidaqInputBackend` | `NidaqSignalStreamController`, `SimulatedNidaqStream` | `make_nidaq_input_backend`, called by the stream worker (`nidaq_signal_monitor_model.py`) and both preflight workers (`nidaq_preflight.py`); device discovery is `discover_nidaq_devices` (`nidaq_discovery.py`) |
+| Laser | `reachaq.device.laser.LaserControllerProtocol` | `NidaqLaserController`, `NullLaserController`, `SimulatedLaserController` | `make_laser_controller`, called by `LaserModel`'s two construction points (`configure_nidaq`, `open_controller`) |
+| Motor/pellet board over CAN | `reachaq.device.motor_pellet_backend.MotorPelletBackend` (a subset of `DeviceInterface`) | `CanInterface` (pyjerrycan, SocketCAN, PCAN transports), `EmulationInterface` | `CanDevice._make_device_interface`, from `REACHAQ_CAN_TRANSPORT` |
 
 Every factory returns today's class unless `REACHAQ_SIMULATION=1` is set, so a
 rig run constructs exactly what it did before. The simulated backends are

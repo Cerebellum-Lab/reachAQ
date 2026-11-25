@@ -9,15 +9,15 @@ import logging
 from types import SimpleNamespace
 from uuid import uuid4
 
-from autotrainer.core import MessageHandler, SystemCommandKind
-from autotrainer.device import (
+from reachaq.core import MessageHandler, SystemCommandKind
+from reachaq.device import (
     CanInterface,
     CanTransportConfiguration,
     Motor,
     StepperStatus,
     Target,
 )
-from tools.acquisition.model.hardware_model import HardwareModel
+from reachaq.app.model.hardware_model import HardwareModel
 
 
 def _interface():
@@ -85,7 +85,7 @@ def _driver_fault_warnings(caplog):
 
 def test_a_driver_fault_bit_names_its_axis_until_the_board_clears_it(hardware_model, caplog):
     published = _faults_published(hardware_model)
-    with caplog.at_level(logging.DEBUG, logger="tools.acquisition.model.hardware_model"):
+    with caplog.at_level(logging.DEBUG, logger="reachaq.app.model.hardware_model"):
         for axis in "XYZ":
             _report(hardware_model, axis, 0x02)
         _report(hardware_model, "Y", 0x03)  # 0x03 for the faulted driver, 0x02 for the others
@@ -101,7 +101,7 @@ def test_a_driver_fault_bit_names_its_axis_until_the_board_clears_it(hardware_mo
 
 def test_two_faulted_axes_are_listed_in_order_and_logged_once(hardware_model, caplog):
     published = _faults_published(hardware_model)
-    with caplog.at_level(logging.DEBUG, logger="tools.acquisition.model.hardware_model"):
+    with caplog.at_level(logging.DEBUG, logger="reachaq.app.model.hardware_model"):
         _report(hardware_model, "Z", 0x03)
         _report(hardware_model, "X", 0x03)  # arrives second, sorts first
         _report(hardware_model, "X", 0x03)
@@ -113,7 +113,7 @@ def test_two_faulted_axes_are_listed_in_order_and_logged_once(hardware_model, ca
 def test_enable_off_alone_raises_no_fault_and_no_needs_home(hardware_model, caplog):
     """A v1.3 board with no heartbeat reports ENABLE_OFF on every motor after 30 s idle."""
     published = _faults_published(hardware_model)
-    with caplog.at_level(logging.DEBUG, logger="tools.acquisition.model.hardware_model"):
+    with caplog.at_level(logging.DEBUG, logger="reachaq.app.model.hardware_model"):
         for axis in "XYZ":
             _report(hardware_model, axis, 0x02)
     assert hardware_model.pellet_axes_with_driver_fault == ()

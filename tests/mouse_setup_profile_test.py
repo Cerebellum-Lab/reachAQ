@@ -1,6 +1,6 @@
 import pytest
 
-from tools.acquisition.model.mouse_setup_profile import (
+from reachaq.app.model.mouse_setup_profile import (
     CameraGeometry,
     MouseSetupError,
     MouseSetupProfile,

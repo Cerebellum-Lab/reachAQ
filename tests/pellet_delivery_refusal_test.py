@@ -1,8 +1,8 @@
 """The pellet-delivery tool clears "command pending" on a refusal, as on an ack."""
 
-from autotrainer.core import Motor, ObservableObject, SystemCommandKind
-from autotrainer.device import CommandRefusal, RefusedCommandClass
-from tools.pellet_delivery.model.app_model import AppModel
+from reachaq.core import Motor, ObservableObject, SystemCommandKind
+from reachaq.device import CommandRefusal, RefusedCommandClass
+from reachaq.pellet_delivery.model.app_model import AppModel
 
 
 def _model_waiting_on(token):

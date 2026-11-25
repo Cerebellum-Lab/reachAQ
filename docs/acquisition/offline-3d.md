@@ -19,7 +19,7 @@ cameras, 16 keypoints) takes about 75 s, which the detection no longer waits
 for. Stopping live inference meanwhile abandons the pass: `points3d.h5`
 and `reprojections.h5` are then not written, though a temporary `*.tmp` file
 may be left beside them. Run from the command line (`python -m
-autotrainer.inference.analysis`), it runs before the result is printed.
+reachaq.inference.analysis`), it runs before the result is printed.
 
 It does not depend on the left-right step. A session whose calibration has no
 left and right camera, or whose left or right is swapped, still triangulates

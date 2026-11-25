@@ -17,11 +17,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox
 
-from autotrainer.inference.multires_calibration.store import CALIBRATION_FORMAT, INDEX_FILE
-from tools.acquisition.model.calibration_reminder import calibration_due, due_label_text, reminder_text
-from tools.acquisition.model.user_preferences import UserPreferences
-from tools.acquisition.view import main_window as main_window_module
-from tools.acquisition.view.main_window import MainWindow
+from reachaq.inference.multires_calibration.store import CALIBRATION_FORMAT, INDEX_FILE
+from reachaq.app.model.calibration_reminder import calibration_due, due_label_text, reminder_text
+from reachaq.app.model.user_preferences import UserPreferences
+from reachaq.app.view import main_window as main_window_module
+from reachaq.app.view.main_window import MainWindow
 
 NOW = datetime(2026, 10, 23, 14, 5, 6)
 MENU_PATH = "Tools → Make 3D calibration"

@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from tools.session_validation import ValidationProfile, validate_session
-from tools.session_validation.cli import main
+from reachaq.session_validation import ValidationProfile, validate_session
+from reachaq.session_validation.cli import main
 
 
 def _write(path, value):
@@ -910,8 +910,8 @@ def test_session_manifest_matches_a_listed_file_whatever_its_spelling(tmp_path):
 def test_validation_passes_after_the_post_stop_trial_ledger_update(tmp_path):
     from datetime import datetime
 
-    from autotrainer.core import ProjectInfo
-    from tools.acquisition.model.session_data_recorder import SessionDataRecorder
+    from reachaq.core import ProjectInfo
+    from reachaq.app.model.session_data_recorder import SessionDataRecorder
 
     project = ProjectInfo(root=str(tmp_path), device_id="test",
                           when=datetime(2026, 1, 2, 3, 4, 5), session=7)

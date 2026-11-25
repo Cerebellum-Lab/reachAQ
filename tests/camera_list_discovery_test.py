@@ -1,7 +1,7 @@
 import pytest
 
-from autotrainer.video.camera_discovery import CameraDiscoveryError
-from tools.acquisition.model import video_capture_model
+from reachaq.video.camera_discovery import CameraDiscoveryError
+from reachaq.app.model import video_capture_model
 
 
 def test_camera_list_distinguishes_zero_hardware_from_discovery_failure(monkeypatch):

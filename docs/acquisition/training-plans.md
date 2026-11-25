@@ -3,7 +3,7 @@
 A training plan moves a subject through phases (for example close pellet, then
 standard position) based on its pellet-trial results. It is separate from the
 ordered trial protocol, which says what each trial does; a plan can run with or
-without one. The engine is `auto-trainer-behavior/src/autotrainer/behavior/training/`.
+without one. The engine is `src/reachaq/behavior/training/`.
 
 ## Files
 
@@ -13,7 +13,7 @@ configuration loads and leaves the plan list empty; fix it and load the
 configuration again. `planId` must be unique in the directory and every
 `phaseId` unique across all plans, because saved progress names phases by id.
 
-An example is `auto-trainer-behavior/tests/fixtures/training_plans/reach-shaping.json`.
+An example is `tests/behavior/fixtures/training_plans/reach-shaping.json`.
 The full schema is in the docstring of `training/schema.py`. In short:
 
 ```json

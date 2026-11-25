@@ -16,13 +16,13 @@ from uuid import uuid4
 
 import pytest
 
-from autotrainer.core import Motor, SystemCommandKind
-from autotrainer.core.message import SystemStatusMessageKind
-from autotrainer.device import CanDevice, CommandRefusal, DeviceApi, RefusedCommandClass, Target
-from autotrainer.device.device_interface import Acknowledge
+from reachaq.core import Motor, SystemCommandKind
+from reachaq.core.message import SystemStatusMessageKind
+from reachaq.device import CanDevice, CommandRefusal, DeviceApi, RefusedCommandClass, Target
+from reachaq.device.device_interface import Acknowledge
 
-import tools.acquisition.model.hardware_model as hardware_model_module
-from tools.acquisition.model.hardware_model import HardwareModel, OPERATOR_STOP_REASON
+import reachaq.app.model.hardware_model as hardware_model_module
+from reachaq.app.model.hardware_model import HardwareModel, OPERATOR_STOP_REASON
 
 _XYZ = (Motor.PELLET_X_MOTOR, Motor.PELLET_Y_MOTOR, Motor.PELLET_Z_MOTOR)
 
@@ -101,7 +101,7 @@ def test_the_operators_stop_is_recorded_as_the_operators(hardware_model):
 
 
 def test_position_reports_are_ignored_while_stopped(hardware_model):
-    from autotrainer.core import MessageHandler
+    from reachaq.core import MessageHandler
 
     _stopped(hardware_model)
     status = SimpleNamespace(position=15.49, send_position=15.5, driver_fault=False)

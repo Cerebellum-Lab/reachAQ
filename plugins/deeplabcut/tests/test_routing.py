@@ -7,12 +7,12 @@ the plugin is found through its entry point, not a fake one.
 
 import pytest
 
-from autotrainer.inference import pose_plugins
-from autotrainer.inference.backend_selection import (
+from reachaq.inference import pose_plugins
+from reachaq.inference.backend_selection import (
     POSE_BACKEND_ENV_VAR,
     pre_validate_model,
 )
-from autotrainer.inference.pose_plugins import PoseBackendNotInstalled, resolve
+from reachaq.inference.pose_plugins import PoseBackendNotInstalled, resolve
 
 
 def test_a_claiming_plugin_with_a_missing_engine_names_it(
@@ -35,7 +35,7 @@ def test_a_claiming_plugin_with_its_engine_is_returned(
 
 def test_a_deeplabcut_project_is_still_checked_as_one(tmp_path, monkeypatch):
     """The DeepLabCut path keeps the check it always had."""
-    from autotrainer.pose_plugins.deeplabcut import DlcPoseModel
+    from reachaq.pose_plugins.deeplabcut import DlcPoseModel
 
     monkeypatch.setattr(pose_plugins, "_installed", lambda module: True)
     monkeypatch.setenv(POSE_BACKEND_ENV_VAR, "tensorflow")

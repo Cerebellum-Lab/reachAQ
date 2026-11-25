@@ -72,7 +72,7 @@ recognised. Operators label, train and deploy one inside the app with
 terminal, train one from an exported dataset with:
 
 ```bash
-python -m autotrainer.inference.keypoint.train DATASET OUTPUT --bodyparts NAMES
+python -m reachaq.inference.keypoint.train DATASET OUTPUT --bodyparts NAMES
 ```
 
 `DATASET` holds `images/{train,val}/*.png` and `labels/{train,val}/*.txt` (one
@@ -87,11 +87,33 @@ reachAQ no longer installs `ultralytics`: it is AGPL-3.0. A YOLO model
 directory (`yolo_pose.yaml`) is refused at start-up with a message saying so.
 Retrain it as a keypoint model, or install the optional AGPL plugin
 (`./tools/install/reachaq-plugin-install.sh yolo`, distribution
-`auto-trainer-pose-yolo`) to keep
+`reachaq-pose-yolo`) to keep
 running it.
 
 The PyTorch build covers compute capability 7.5 through 12.0: T1000, RTX A2000
 and RTX 5060 Ti.
+
+### One CUDA runtime
+
+The base install carries one CUDA user-space runtime: PyTorch's CUDA 12.8, as
+`nvidia-*-cu12` wheels in `site-packages/nvidia`. The DeepLabCut plugin adds
+the only other one allowed, TensorFlow's CUDA 11.8 and cuDNN 8.6, in
+`<env>/lib/reachaq-tensorflow-cuda11` (a `README-reachaq.txt` there says so),
+reached only through the environment's `LD_LIBRARY_PATH`. The installer's
+`Verify one CUDA runtime per engine` step (`tools/install/cuda_runtime_check.py`)
+fails on anything else: `nvidia-*` wheels of another CUDA major in
+site-packages, `LD_LIBRARY_PATH` pointing into PyTorch's wheels, or the
+TensorFlow runtime left behind without the plugin. Its message names what to
+remove.
+
+To remove the DeepLabCut plugin and its runtime:
+
+```bash
+conda run -n reachaq python -m pip uninstall -y reachaq-pose-deeplabcut deeplabcut tensorflow
+rm -rf "$(conda run -n reachaq python -c 'import sys; print(sys.prefix)')/lib/reachaq-tensorflow-cuda11"
+conda env config vars list -n reachaq   # LD_LIBRARY_PATH: keep only your own entries
+conda env config vars unset -n reachaq LD_LIBRARY_PATH   # if it held only TensorFlow's
+```
 
 ### Keep these if you change the environment by hand
 
@@ -124,7 +146,7 @@ repeat the reachAQ preflight by hand:
 
 ```bash
 conda run -n reachaq python - <<'PY'
-from autotrainer.inference import detect_gpu_runtime
+from reachaq.inference import detect_gpu_runtime
 
 print(detect_gpu_runtime(required_backend="torch"))
 print(detect_gpu_runtime(required_backend="tensorflow"))
@@ -139,18 +161,18 @@ starts. A failure leaves the GUI idle.
 
 ```bash
 # Honor the saved inference setting
-conda run --no-capture-output -n reachaq python -m reachAQ.app \
-  -c "$HOME/Autotrainer/system_configuration.yaml"
+conda run --no-capture-output -n reachaq python -m reachaq.app \
+  -c "$HOME/reachAQ/system_configuration.yaml"
 
 # Disable inference for one run
-conda run --no-capture-output -n reachaq python -m reachAQ.app \
+conda run --no-capture-output -n reachaq python -m reachaq.app \
   --no-live-inference \
-  -c "$HOME/Autotrainer/system_configuration.yaml"
+  -c "$HOME/reachAQ/system_configuration.yaml"
 
 # Require inference for one run
-conda run --no-capture-output -n reachaq python -m reachAQ.app \
+conda run --no-capture-output -n reachaq python -m reachaq.app \
   --live-inference \
-  -c "$HOME/Autotrainer/system_configuration.yaml"
+  -c "$HOME/reachAQ/system_configuration.yaml"
 ```
 
 The command-line overrides are not persisted. Use the **Live inference** switch

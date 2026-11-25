@@ -13,7 +13,9 @@
 # REACHAQ_INSTALL_ENV (default reachaq) and REACHAQ_INSTALL_REPO select the
 # environment and checkout, as for the main installer.
 #
-# Do not enable `set -e`: every step is attempted and reported.
+# A failed step stops the script and the report names it (run_step in
+# plugin-install-lib.sh); it does not use `set -e`, so the report is always
+# printed.
 
 set -o pipefail
 
@@ -33,8 +35,10 @@ RESULT_DETAILS=()
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
+WARN_COUNT=0
 REPORT_PRINTED=false
 REPORT_TITLE="reachAQ pose plugin install report"
+RERUN_HINT="tools/install/reachaq-plugin-install.sh $*"
 CONDA_BIN=""
 
 # shellcheck source=plugin-install-lib.sh
@@ -71,8 +75,7 @@ if [ -z "$CONDA_BIN" ]; then
     record_result FAIL "Locate conda" "conda not found"
     printf '%s\n' \
         'conda was not found. Build the environment first with tools/install/reachaq-linux-install.sh.' >&2
-    print_report
-    exit 1
+    stop_install "Locate conda"
 fi
 record_result PASS "Locate conda" "$CONDA_BIN"
 if ! conda_env_exists "$INSTALL_ENV"; then
@@ -80,8 +83,7 @@ if ! conda_env_exists "$INSTALL_ENV"; then
     printf '%s\n' \
         "Conda environment $INSTALL_ENV does not exist. This script installs plugins into an existing environment only;" \
         'build it first with tools/install/reachaq-linux-install.sh.' >&2
-    print_report
-    exit 1
+    stop_install "Locate conda environment"
 fi
 record_result PASS "Locate conda environment" "$INSTALL_ENV"
 
@@ -89,9 +91,7 @@ begin_category "Pose plugins"
 for name in "$@"; do
     run_step "Install $name pose plugin" install_pose_plugin "$name"
 done
+run_step "Verify one CUDA runtime per engine" conda_run python "$SCRIPT_DIR/cuda_runtime_check.py"
 
 print_report
-if [ "$FAIL_COUNT" -gt 0 ]; then
-    exit 1
-fi
 exit 0

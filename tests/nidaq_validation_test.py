@@ -9,13 +9,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools.acquisition.model.nidaq_validation import (
+from reachaq.app.model.nidaq_validation import (
     NidaqConfigurationInvalid,
     chassis_identification_note,
     require_valid_nidaq_configuration,
     validate_nidaq_configuration,
 )
-from tools.acquisition.model.nidaq_routing import UNIDENTIFIED
+from reachaq.app.model.nidaq_routing import UNIDENTIFIED
 
 
 def _device(name="PXI1Slot5", terminals=("PFI0", "PFI1", "PXI_Clk10"),
@@ -281,7 +281,7 @@ def test_a_digital_stream_line_on_a_board_that_cannot_clock_it_is_refused():
 
 
 def _refused_plan(**values):
-    from autotrainer.core import NidaqTimingPlan
+    from reachaq.core import NidaqTimingPlan
 
     fields = dict(requested_mode="auto", resolved_mode="unavailable",
                   is_valid=False, master_device="Clocks", reason="refused")
@@ -290,16 +290,16 @@ def _refused_plan(**values):
 
 
 def test_a_refused_plan_gives_its_masters_board():
-    from autotrainer.core import NidaqTimingConfiguration
-    from tools.acquisition.model.nidaq_validation import refused_plan_clock_source
+    from reachaq.core import NidaqTimingConfiguration
+    from reachaq.app.model.nidaq_validation import refused_plan_clock_source
 
     assert refused_plan_clock_source(
         _refused_plan(), NidaqTimingConfiguration()) == "/Clocks/ai/SampleClock"
 
 
 def test_an_explicit_sample_clock_source_is_the_clock():
-    from autotrainer.core import NidaqTimingConfiguration
-    from tools.acquisition.model.nidaq_validation import refused_plan_clock_source
+    from reachaq.core import NidaqTimingConfiguration
+    from reachaq.app.model.nidaq_validation import refused_plan_clock_source
 
     timing = NidaqTimingConfiguration(sync_mode="external",
                                       sample_clock_source="/Other/PFI3",
@@ -312,15 +312,15 @@ def test_a_timing_master_override_is_the_refused_plans_master():
     # The plan's own choice, overridden by timingMaster, as a valid plan's.
     import dataclasses
 
-    from autotrainer.core import (
+    from reachaq.core import (
         NidaqDeviceIdentity,
         NidaqSignalChannelConfiguration,
         NidaqSignalStreamConfiguration,
         NidaqTimingConfiguration,
     )
-    from tools.acquisition.model.nidaq_discovery import NidaqDevicePorts
-    from tools.acquisition.model.nidaq_timing import build_nidaq_timing_plan
-    from tools.acquisition.model.nidaq_validation import refused_plan_clock_source
+    from reachaq.app.model.nidaq_discovery import NidaqDevicePorts
+    from reachaq.app.model.nidaq_timing import build_nidaq_timing_plan
+    from reachaq.app.model.nidaq_validation import refused_plan_clock_source
 
     def board(name, serial, **values):
         return NidaqDevicePorts(
@@ -348,8 +348,8 @@ def test_a_timing_master_override_is_the_refused_plans_master():
 
 
 def test_independent_boards_a_masterless_plan_a_valid_one_and_none_give_no_clock():
-    from autotrainer.core import NidaqTimingConfiguration
-    from tools.acquisition.model.nidaq_validation import refused_plan_clock_source
+    from reachaq.core import NidaqTimingConfiguration
+    from reachaq.app.model.nidaq_validation import refused_plan_clock_source
 
     timing = NidaqTimingConfiguration()
     assert refused_plan_clock_source(
@@ -467,7 +467,7 @@ def test_an_export_line_clash_needs_no_boards_to_be_refused():
 def test_the_remedys_line_is_not_one_the_laser_takes():
     # The laser's clock lines moved to PXI_Trig4 and PXI_Trig5: the free line
     # suggested skips them, as the plan's suggestion does (one suggester).
-    from tools.acquisition.model.nidaq_validation import free_backplane_line
+    from reachaq.app.model.nidaq_validation import free_backplane_line
 
     laser = _christielab10_lasers(backplane_clock_line="PXI_Trig4",
                                   pulse_clock_line="PXI_Trig5")

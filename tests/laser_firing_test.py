@@ -1,13 +1,13 @@
 import pytest
 from types import SimpleNamespace
 
-from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
-from tools.acquisition.model.laser_firing import (
+from reachaq.device import LaserChannelConfiguration, LaserSystemConfiguration
+from reachaq.app.model.laser_firing import (
     LaserFiring,
     amplitude_refusal,
     resolve_laser_firing,
 )
-from tools.acquisition.model.trial_protocol_schedule import LaserTriggerRoute
+from reachaq.app.model.trial_protocol_schedule import LaserTriggerRoute
 
 
 def configuration(**laser_2):

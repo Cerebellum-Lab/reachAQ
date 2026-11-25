@@ -1,24 +1,24 @@
 import pytest
 
-from autotrainer.core.delay_distribution import (
+from reachaq.core.delay_distribution import (
     MINIMUM_CUE_INTERVAL_MS,
     PUBLISHED_4S_VALUES,
     DelayPreset,
 )
-from autotrainer.device import LaserChannelConfiguration, LaserSystemConfiguration
+from reachaq.device import LaserChannelConfiguration, LaserSystemConfiguration
 
-from tools.acquisition.model.stimulus_profile_repository import (
+from reachaq.app.model.stimulus_profile_repository import (
     PROFILE_SCHEMA_VERSION,
     StimulusProfileLibrary,
 )
-from tools.acquisition.model.trial_action import (
+from reachaq.app.model.trial_action import (
     CueIntervalProfile,
     LaserPulseProfile,
     ToneProfile,
     TrialActionCompiler,
     TrialCompileContext,
 )
-from tools.acquisition.model.trial_protocol_schedule import (
+from reachaq.app.model.trial_protocol_schedule import (
     PROTOCOL_SCHEMA_VERSION,
     TrialProtocolRow,
 )
