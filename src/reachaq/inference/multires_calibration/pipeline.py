@@ -681,7 +681,10 @@ def _cross_checks(
                 # reference is therefore the sensor fit on exactly the views and corners the
                 # preset found, and the direct fit weighs its residuals in sensor px
                 # (pixel_scale), so the two solve the same problem and differ only by the
-                # detection in binned frames and the K mapping, which this check is for.
+                # detection in binned frames and the K mapping, which this check is for. With
+                # fix_principal_point both hold cx, cy at the mapped value, so the delta covers
+                # fx and fy only; the principal-point mapping has an exact, fit-free test
+                # (multires_geometry_test).
                 reference = _fit(
                     fit_mode, _same_corners(observations, preset_observations, board), board, fit.image_size,
                     tuple(videos), initial=fit, **(per_view_options or {}),

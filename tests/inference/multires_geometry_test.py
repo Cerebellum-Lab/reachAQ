@@ -122,6 +122,30 @@ def test_projection_then_mapping_equals_projection_with_mapped_intrinsics():
         np.testing.assert_allclose(via_mapped_k, expected, rtol=0.0, atol=1e-9, err_msg=g.name)
 
 
+def _board_mapping_error_px(K_preset: np.ndarray, g: PresetGeometry) -> float:
+    """Largest distance, in preset px, between the board's corners projected through K_SENSOR and
+    mapped into preset g, and the same corners projected through K_preset; no fit involved."""
+    from reachaq.inference.multires_calibration.fit import RIG_CHARUCO_BOARD
+
+    board = RIG_CHARUCO_BOARD.object_points().astype(float)
+    rvec, tvec = np.array([0.05, -0.08, 0.02]), np.array([-14.0, -10.0, 190.0])
+    sensor_px = cv2.projectPoints(board, rvec, tvec, K_SENSOR, DIST)[0].reshape(-1, 2)
+    preset_px = cv2.projectPoints(board, rvec, tvec, K_preset, DIST)[0].reshape(-1, 2)
+    return float(np.max(np.linalg.norm(preset_px - sensor_to_preset_points(sensor_px, g), axis=1)))
+
+
+@pytest.mark.parametrize("g", presets_from_base(BASE), ids=lambda g: g.name)
+def test_the_principal_point_mapping_is_exact_on_the_board(g):
+    # The fit-based cross-check (cross_check_delta_px) holds the principal point with
+    # fit_principal_point: centre, so it covers fx and fy only. The principal-point part of
+    # map_intrinsics is checked here exactly instead: 0 px when it agrees with the point
+    # mapping, and the error itself when it does not.
+    assert _board_mapping_error_px(map_intrinsics(K_SENSOR, g), g) < 1e-9
+    off = map_intrinsics(K_SENSOR, g)
+    off[0, 2] += 5.0
+    assert _board_mapping_error_px(off, g) == pytest.approx(5.0, abs=1e-9)
+
+
 def test_presets_for_cameras_derives_each_cameras_own_window_at_every_binning():
     # Each camera keeps its own window: left is the rig's bin-4 preset, camera4 a bin-2 one
     # elsewhere on the sensor. bin2 and bin4 sets exist only where every window is whole there.
