@@ -12,7 +12,7 @@ as before.
 |---|---|---|
 | Critical | Banner, plus a dialog | The recording stopped early (primary camera failed, the data drive filled, writing did not finish); a camera or pose writer did not close; video, timestamps or session data incomplete; the configuration could not be loaded |
 | Critical | Banner | Data drive below 1 minute (the "Recording stopped early" dialog follows) |
-| Error | Banner, plus a dialog | Pellet stage stopped (an ESTOP: a move not acknowledged, the board still moving, a failed calibration capture, the connection closed during a move); it clears when Hardware Control ▸ Home succeeds |
+| Error | Banner, plus a dialog | Pellet stage stopped (an ESTOP, or STOP on pellet firmware 2.4.0: a move not acknowledged, the board still moving, a failed calibration capture, the connection closed during a move, a fault the board reported: watchdog, limit fault, pressed switch, step DMA); it clears when Hardware Control ▸ Home succeeds |
 | Error | Banner | A subsystem failed: a camera, reach camera synchronization, live pose, the pellet board (CAN), the NI-DAQ input stream, the laser, the RFID reader; a refused NI-DAQ plan; a pellet motor driver fault; recording failed to start (nothing was recorded); an internal software error |
 | Warning | Banner | Data drive below 30 or 10 minutes; projected capacity below the session length; pellet axes need homing; pellet stage stopped by the operator (STOP); camera synchronization incomplete |
 

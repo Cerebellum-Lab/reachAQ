@@ -15,7 +15,8 @@ from .device_interface import (DeviceInterface, Target, Motor, ServoConfig, Step
                                BoardTimeSync, BoardCapabilities, DigitalPulseStatus,
                                SyncClapObservation, SyncBarcodeReport,
                                Tone, AnalogOutput, AnalogOutputs, PressureReading,
-                               ColorLed, StepperStatus, ServoStatus, Status)
+                               ColorLed, StepperStatus, StepperFault, ServoStatus, Status,
+                               CAPABILITY_STEPPER_MOTION_SAFETY)
 from .emulation_interface import EmulationInterface
 from .can_device import CanDevice, HAVE_CAN_DEVICE, sequence_stepper_targets
 from .can_failure import CanFailure, CanFailureKind

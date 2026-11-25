@@ -12,7 +12,8 @@ from .device_interface import (DeviceInterface, ServoConfig, StepperConfig,
                                StepperStatus, ServoStatus, Target, DigitalOutputs,
                                Motor, AnalogOutputs, Version,
                                PelletDigitalInputs, Acknowledge, ColorLed,
-                               BOARD_STIM_LINE_OUTPUTS, TONE_CONFIRMATION_FREQUENCIES_HZ
+                               BOARD_STIM_LINE_OUTPUTS, TONE_CONFIRMATION_FREQUENCIES_HZ,
+                               CAPABILITY_STEPPER_MOTION_SAFETY,
                                )
 from .can_interface import motor_to_str
 
@@ -98,6 +99,10 @@ class EmulationInterface(DeviceInterface):
 
         self._messages = _SharedList(lock=self._thread_lock)
         self.estop_frames = []
+        # STEPPER_STOP motor masks, in order. The emulator reports no capabilities, so the
+        # host stops it with ESTOP; a test sets board_capabilities to bit 9 for STOP.
+        self.stop_frames = []
+        self.board_capabilities = None
     def _set_pellet_address(self, addr):
         pass
 
@@ -330,6 +335,19 @@ class EmulationInterface(DeviceInterface):
                 add(self._configs[Motor.PELLET_Z_MOTOR])
 
             self._messages.append(Acknowledge(uuid=EmulationInterface.next_uuid()))
+        return self._is_open
+
+    @property
+    def has_stepper_motion_safety(self) -> bool:
+        caps = self.board_capabilities
+        return caps is not None and bool(int(caps) & CAPABILITY_STEPPER_MOTION_SAFETY)
+
+    def stepper_stop(self, motor_mask: int = 0) -> bool:
+        # ACKed 0 with uuid 0, as pellet 2.4.0 ACKs a STOP the host sends with uuid 0.
+        self.stop_frames.append(int(motor_mask))
+        logger.info("STEPPER_STOP mask=%#x", int(motor_mask))
+        if self._is_open:
+            self._messages.append(Acknowledge(uuid=0, error=0))
         return self._is_open
 
     def estop(self, asserted: bool = True) -> bool:

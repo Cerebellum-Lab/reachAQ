@@ -4,6 +4,36 @@ All notable changes to reachAQ are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/). Releases before 3.0.0 are not listed.
 
+## [Unreleased]
+
+## [4.1.0] - 2026-11-25
+
+### Added
+
+- Pellet firmware 2.4.0 (capability bit 9, `stepper_motion_safety`): every host
+  stop is an all-axes `STEPPER_STOP` on such a board, ESTOP on 2.3.1; a STOP also
+  goes out at every teardown. `STEPPER_FAULT` frames and the `-ETIME`, `-EFAULT`
+  and `-EIO` ACKs stop every axis and raise the blocking stopped-stage alert; each
+  fault is written to `streams/device.csv` and `recording.stepperFaults`. A
+  FIXED_XYZ refused for `NEEDS_HOME` prompts a home and a resend, without a stop.
+  Status bits `NEEDS_HOME` and `HOMED_SINCE_BOOT` gate automatic motion and
+  Record. `BOOT_CHAIN` bootloader responses decode, and an unknown bootloader
+  subcommand no longer ends the CAN reader. The 2.4.0 allowlist entry requires
+  `stepper_motion_safety`.
+- The pellet capabilities are forgotten when the board reboots mid-session or
+  stops sending timing trailers, and asked for again; stops are ESTOP until it
+  answers. A pyjerrycan host refuses to connect to a board with bit 9, since it
+  cannot send STOP.
+
+### Changed
+
+- Every stepper target is clamped to its axis's `max_pos` from
+  `motor_config.yaml` (at most 15 turns, as before), matching pellet 2.4.0's
+  per-axis travel caps.
+- Decided: the host's acknowledgement deadlines stay shorter than pellet
+  2.4.0's own per-move watchdog, so the host's STOP fires first on a stall and
+  the board's watchdog is the backstop.
+
 ## [4.0.1] - 2026-11-25
 
 ### Fixed

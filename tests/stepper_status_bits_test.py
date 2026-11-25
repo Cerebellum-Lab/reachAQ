@@ -137,3 +137,26 @@ def test_a_fault_that_relatches_after_a_home_shows_again(hardware_model):
     _report(hardware_model, "Z", 0x03)
     assert hardware_model.pellet_axes_with_driver_fault == ("Z",)
     assert hardware_model.pellet_axes_needing_home == (), "the fault is reported, needs-home is not inferred"
+
+
+def test_translate_stepper_status_carries_the_2_4_0_home_bits():
+    # Pellet 2.4.0 (capability bit 9): bit 2 NEEDS_HOME, bit 3 HOMED_SINCE_BOOT.
+    both = _interface()._translate_stepper_status(_wire(status=0x0C))
+    assert both.needs_home is True and both.homed_since_boot is True
+    assert both.driver_fault is False and both.enable_off is False
+
+    homed = _interface()._translate_stepper_status(_wire(status=0x08))
+    assert homed.needs_home is False and homed.homed_since_boot is True
+
+    none = _interface()._translate_stepper_status(_wire(status=0x00))
+    assert none.needs_home is False and none.homed_since_boot is False
+
+
+def test_the_2_4_0_home_bits_are_not_a_driver_fault(hardware_model):
+    hardware_model._board_capabilities = 0x217
+    published = _faults_published(hardware_model)
+
+    _report(hardware_model, "X", 0x0C)
+
+    assert hardware_model.pellet_axes_with_driver_fault == ()
+    assert published == []

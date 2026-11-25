@@ -75,6 +75,9 @@ class SystemStatusMessageKind(IntEnum):
     SYNC_BARCODE_REPORT = 312
     """The timekeeper's SYNC_BARCODE report as a SyncBarcodeReport (clock-chain evidence)."""
 
+    PELLET_STEPPER_FAULT = 313
+    """A pellet 2.4.0 STEPPER_FAULT as a device.StepperFault: why the board stopped or refused a stepper."""
+
     COLOR_LED = 403
     """Message is the original ColorLed message"""
 
