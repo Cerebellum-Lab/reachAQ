@@ -4,7 +4,15 @@ All notable changes to reachAQ are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/). Releases before 3.0.0 are not listed.
 
-## [Unreleased] - 4.0.0
+## [4.0.1] - 2026-11-25
+
+### Fixed
+
+- The installer's one-CUDA-runtime check reads the environment `conda run` runs in
+  (`CONDA_PREFIX`), so its plugin-installer test no longer fails on a rig that has the
+  DeepLabCut plugin installed.
+
+## [4.0.0] - 2026-11-25
 
 The project is renamed from Autotrainer to reachAQ throughout. There are no
 compatibility aliases: every v3 name below stops working. Upgrade with the
