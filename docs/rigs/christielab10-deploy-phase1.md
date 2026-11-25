@@ -451,7 +451,7 @@ are already in place, hence `REACHAQ_INSTALL_SYSTEM=0`):
 `~/Documents/rawdatalocal` holds 2026 sessions only, so `reachaq-convert-pose-h5` is not
 needed there.
 
-### Rollback to v3.2.2 (the last v3 release)
+### Rollback to v3.2.3 (the last v3 release)
 
 With reachAQ closed and the publisher stopped (step 2):
 
@@ -459,7 +459,7 @@ With reachAQ closed and the publisher stopped (step 2):
    `~/Autotrainer`, every rewritten file and `launcher.conf` byte for byte, and removes the
    copied `~/.config/reachAQ/*.conf`.
 2. `conda run -n reachaq python -m pip uninstall -y reachaq reachaq-pose-deeplabcut reachaq-pose-yolo`
-3. `git checkout v3.2.2`, then `REACHAQ_INSTALL_SYSTEM=0 ./tools/install/reachaq-linux-install.sh`.
+3. `git checkout v3.2.3`, then `REACHAQ_INSTALL_SYSTEM=0 ./tools/install/reachaq-linux-install.sh`.
 4. Put the v3 SoftMouse unit back, since v3's installer does not replace installed units:
 
    ```bash

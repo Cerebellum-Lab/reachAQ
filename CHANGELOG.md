@@ -58,6 +58,34 @@ installer, which migrates the settings; see "Upgrading from v3" in
   uninstalls every `auto-trainer*` distribution, restores the pose plugins v3
   registered, and replaces installed SoftMouse user units that still name a v3
   module.
+- The installer stops at the first failed step and names it, checks the platform
+  list (Ubuntu 22.04, NVIDIA driver 570.26 or later), uses the Spinnaker SDK and
+  binding the customer downloads (3.2, no vendored FLIR wheels) and checks that the
+  environment carries one CUDA runtime per engine.
+- ChArUco calibration boards are the default (`board:` in the calibration
+  settings; the plain checkerboard stays available), with partial board views, a
+  board generator (`reachaq.calibration.make_charuco_board`) and a per-view fit in
+  which board poses follow the stage. The per-camera reprojection grade uses each
+  camera's own refit; stage accuracy is reported separately and only warns.
+
+## [3.2.3] - 2026-11-24
+
+### Fixed
+
+- The pellet stage is stopped (ESTOP, all axes) when a stepper move or home is not
+  acknowledged within its expected time, when the board reports a motion command
+  busy, when a scout waypoint is not reached, when a capture or calibration fails
+  or ends while the stage moves, and when the application disconnects or closes
+  mid-move. A timed-out move is no longer re-sent. After a stop, the stage must be
+  homed before it moves again; a blocking alert says why, and the stop is recorded
+  in the session metadata.
+
+### Added
+
+- An always-enabled STOP button for the pellet stage.
+- `pellet.profile_ack_deadlines` in `motor_config.yaml` (default on): per-move
+  acknowledgement deadlines from each move's distance, speed and acceleration.
+  Off falls back to a fixed 3 s timeout, which still stops the stage.
 
 ## [3.2.2] - 2026-11-24
 
