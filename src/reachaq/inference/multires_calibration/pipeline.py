@@ -680,60 +680,39 @@ def _cross_checks(
         ]
         offset = _corner_offset(preset_observations, observations, g)
         try:
-            delta = _preset_delta(observations, preset_observations, fit, g, board, tuple(videos), fit_mode,
-                                  per_view_options)
+            reference, extra = fit, {}
+            if fit_mode != FIT_MOTOR_FRAME:
+                # Like with like. The per-view fit's focal length rests on the stage model, so
+                # a subset of the corners moves it: on christielab10's session004 the sensor
+                # fit on only the corners inside the 256 preset's window moved fx 0.9 %. The
+                # reference is therefore the sensor fit on exactly the views and corners the
+                # preset found, and the direct fit weighs its residuals in sensor px
+                # (pixel_scale), so the two solve the same problem and differ only by the
+                # detection in binned frames and the K mapping, which this check is for.
+                reference = _fit(
+                    fit_mode, _same_corners(observations, preset_observations, board), board, fit.image_size,
+                    tuple(videos), initial=fit, **(per_view_options or {}),
+                )
+                extra = {"pixel_scale": float(g.binning)}
+            # Started from the reference mapped to the preset, not from the planar start,
+            # which is degenerate in focal length: from it, the 512 preset's fit on the
+            # synthetic capture ran out of evaluations. The start does not move the optimum:
+            # from the mapped K, from one 1 % and 2 px off, and from the edge-convention
+            # mapping, the fit reached the same K to 1e-4 px.
+            direct = _fit(
+                fit_mode, preset_observations, board, (g.width, g.height), tuple(videos),
+                initial=_mapped_fit(reference, g), **(per_view_options or {}), **extra,
+            )
         except (RuntimeError, ValueError) as error:
             logger.warning("cross-check %s: the direct fit failed: %s", g.name, error)
             notes.append(f"cross-check {g.name}: the direct fit in the preset's pixels failed: {error}")
             checks.append(PresetCrossCheck(geometry=g, max_intrinsic_delta_px=math.inf, corner_offset_px=offset))
             continue
+        delta = max(
+            _intrinsic_delta(direct.cameras[cam].K, map_intrinsics(reference.cameras[cam].K, g)) for cam in videos
+        )
         checks.append(PresetCrossCheck(geometry=g, max_intrinsic_delta_px=delta, corner_offset_px=offset))
     return checks
-
-
-def _preset_delta(
-    observations: Sequence[WaypointObservation],
-    preset_observations: Sequence[WaypointObservation],
-    fit: MotorFrameFit,
-    g: PresetGeometry,
-    board: BoardSpec,
-    cameras: Sequence[str],
-    fit_mode: str = FIT_MOTOR_FRAME,
-    per_view_options: Optional[Mapping] = None,
-) -> float:
-    """The largest |direct fit's K - the reference's K mapped into g| over `cameras`, in preset
-    px: the direct fit on `preset_observations`, the corners detected in preset g's frames, and
-    the reference fitted on the sensor corners. Raises what the fits raise."""
-    reference, options, extra = fit, dict(per_view_options or {}), {}
-    if fit_mode != FIT_MOTOR_FRAME:
-        # Like with like. The per-view fit's focal length rests on the stage model, so
-        # a subset of the corners moves it: on christielab10's session004 the sensor
-        # fit on only the corners inside the 256 preset's window moved fx 0.9 %. The
-        # reference is therefore the sensor fit on exactly the views and corners the
-        # preset found, and the direct fit weighs its residuals in sensor px
-        # (pixel_scale), so the two solve the same problem and differ only by the
-        # detection in binned frames and the K mapping, which this check is for.
-        # Both free the principal point, even when the installed fit holds it: held, the
-        # direct fit keeps it at the mapped value under test, so a principal-point mapping
-        # error cannot show (a 5 px cx error read 0.7-0.9 preset px, under the warn).
-        options.pop("fix_principal_point", None)
-        reference = _fit(
-            fit_mode, _same_corners(observations, preset_observations, board), board, fit.image_size,
-            tuple(cameras), initial=fit, **options,
-        )
-        extra = {"pixel_scale": float(g.binning)}
-    # Started from the reference mapped to the preset, not from the planar start,
-    # which is degenerate in focal length: from it, the 512 preset's fit on the
-    # synthetic capture ran out of evaluations. The start does not move the optimum:
-    # from the mapped K, from one 1 % and 2 px off, and from the edge-convention
-    # mapping, the fit reached the same K to 1e-4 px.
-    direct = _fit(
-        fit_mode, preset_observations, board, (g.width, g.height), tuple(cameras),
-        initial=_mapped_fit(reference, g), **options, **extra,
-    )
-    return max(
-        _intrinsic_delta(direct.cameras[cam].K, map_intrinsics(reference.cameras[cam].K, g)) for cam in cameras
-    )
 
 
 def _still_frames(
