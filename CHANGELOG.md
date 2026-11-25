@@ -6,6 +6,8 @@ All notable changes to reachAQ are recorded here. The format follows
 
 ## [Unreleased]
 
+## [4.1.0] - 2026-11-25
+
 ### Added
 
 - Pellet firmware 2.4.0 (capability bit 9, `stepper_motion_safety`): every host
