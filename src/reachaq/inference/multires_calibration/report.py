@@ -24,16 +24,13 @@ status UNDETERMINED and value None: it is neither a pass nor a fail and does not
 verdict. When no camera can be checked (always so with 2 fitted cameras), the report's
 verdict_note says so, so the verdict does not read as a fully checked pass.
 
-Three RMS per camera. reprojection_rms_px, which grades the camera, is the installed camera
-model's (installed_rms_px): the fit's own K and distortion, held, against the detected
-corners, with each view's board pose solved on its own (solvePnP). Stage error cannot enter
-it, since every pose is free, but a wrong K or distortion does. planar_rms_px is the camera's
-planar refit, intrinsics and poses both free: a diagnostic, not graded, since it measures
-only whether some camera model fits the corners. joint_reprojection_rms_px is the same
-camera's RMS in the stage-tied joint fit, where each view's board is held to its commanded
-position through the stage model; any board placement the model does not describe adds to
-it, so it only warns. The stage itself is reported in its own block (STAGE_METRICS), which
-warns and never fails.
+Two RMS per camera. reprojection_rms_px, which grades the camera, is its own planar fit's
+(planar_rms_px): its intrinsics against its corners with every view's board pose free, so it
+measures the camera model and the corner detection alone. joint_reprojection_rms_px is the
+same camera's RMS in the stage-tied joint fit, where each view's board is held to its
+commanded position through the stage model; any board placement the model does not describe
+adds to it, so it only warns. The
+stage itself is graded in its own block (STAGE_METRICS), which warns and never fails.
 
 The fit has 2 to 6 cameras. Per-camera metrics are graded for every fitted camera, and the
 pair metrics for every co-visible pair (two cameras that saw the board at a common
@@ -90,15 +87,11 @@ DEFAULT_THRESHOLDS: Thresholds = {
     # The views a camera shares with another fitted camera; the fit does not need them, but
     # they expose stage geometry the model leaves out (axis skew).
     "covisible_views": (8.0, 4.0),
-    # The installed camera model (installed_rms_px): the fit's K and distortion, held, against
-    # the corners, every view's board pose solved on its own, so stage error cannot enter it.
+    # Each camera's own planar fit (planar_rms_px): its corners against its intrinsics with
+    # every view's board pose free, so stage error cannot enter it.
     "reprojection_rms_px": (0.5, 1.0),
-    # Informational: the camera's planar refit (planar_rms_px), intrinsics and poses free, so
-    # it is the floor any camera model reaches on these corners. Not graded.
-    "planar_rms_px": (None, None),
-    # The same camera's RMS in the stage-tied joint fit: the installed model's residual plus
-    # whatever the stage model leaves (board placement, tilt). A warning about the stage
-    # model, never a fail.
+    # The same camera's RMS in the stage-tied joint fit: the planar residual plus whatever the
+    # stage model leaves (board placement, tilt). A warning about the stage model, never a fail.
     "joint_reprojection_rms_px": (1.0, None),
     "coverage_roi_fraction": (0.5, 0.25),
     "fx_fy_ratio_dev": (0.01, 0.03),
@@ -356,12 +349,11 @@ def build_report(
     graded, and only their corners in `observations` are used. The pair checks cover every
     pair of them that saw the board at a common waypoint.
 
-    Each camera's graded reprojection_rms_px is the installed model's (installed_rms_px). Its
-    planar refit (planar_rms_px, not graded) holds the principal point at the fit's when
-    `fix_principal_point` (the per-view fit's `fit_principal_point: centre`). Its RMS in the
-    joint fit is joint_reprojection_rms_px, which only warns, and is also reported in the
-    pixels of every preset in `presets`. A per-view fit's placement adds the stage-accuracy
-    metrics (STAGE_METRICS).
+    Each camera's graded reprojection_rms_px is its own planar fit's (planar_rms_px), which
+    holds the principal point at the fit's when `fix_principal_point` (the per-view fit's
+    `fit_principal_point: centre`). Its RMS in the joint fit is joint_reprojection_rms_px,
+    which only warns, and is also reported in the pixels of every preset in `presets`. A
+    per-view fit's placement adds the stage-accuracy metrics (STAGE_METRICS).
 
     `cameras` is every capture camera's verdict, in capture order; a fitted camera it leaves
     out is calibrated, and by default every fitted camera is. The verdict is "fail" if any
@@ -416,10 +408,8 @@ def build_report(
     for cam in fitted:
         model = fit.cameras[cam]
         fx, fy = model.K[0, 0], model.K[1, 1]
-        installed, installed_note = installed_rms_px(observations, board, cam, model)
-        add("reprojection_rms_px", cam, installed, "sensor px", installed_note)
         planar, planar_note = planar_rms_px(observations, board, fit.image_size, cam, model, fix_principal_point)
-        add("planar_rms_px", cam, planar, "sensor px", planar_note)
+        add("reprojection_rms_px", cam, planar, "sensor px", planar_note)
         rms = fit.rms_px.get(cam, math.inf)
         add("joint_reprojection_rms_px", cam, rms, "sensor px", JOINT_RMS_NOTE)
         for g in presets:
@@ -538,46 +528,8 @@ PLACEMENT_FLAG_MM = 1.0
 # A planar fit needs views of the board in this many poses to separate the intrinsics.
 _PLANAR_MIN_VIEWS = 3
 _PLANAR_CRITERIA = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 100, 1e-10)
-INSTALLED_RMS_NOTE = "the installed K and distortion, every view's board pose solved on its own"
-PLANAR_RMS_NOTE = "not graded: the camera's planar refit, intrinsics and every view's board pose free"
-JOINT_RMS_NOTE = "the stage-tied joint fit: the installed model's residual plus what the stage model leaves"
-
-
-def installed_rms_px(
-    observations: Sequence[WaypointObservation],
-    board: BoardSpec,
-    camera: str,
-    model: CameraModel,
-) -> Tuple[float, str]:
-    """(RMS px, note) of `camera`'s installed model against its valid corners in every view
-    (fit.usable_view): `model`'s K and distortion held, each view's board pose solved on its
-    own by solvePnP and refined by Levenberg-Marquardt. Nothing ties a view to the stage, so
-    stage error cannot enter it; a K or distortion the corners do not support does. +inf, with
-    a note, when the camera has no view or a pose cannot be solved."""
-    obj = np.asarray(board.object_points(), float)
-    K = np.array(model.K, float)
-    dist = np.asarray(model.dist, float).ravel()
-    squared, count = 0.0, 0
-    for o in observations:
-        corners = o.corners.get(camera)
-        if corners is None or not usable_view(corners, board):
-            continue
-        ok = valid_corners(corners)
-        image, points = np.asarray(corners, float)[ok], obj[ok]
-        try:
-            solved, rvec, tvec = cv2.solvePnP(points, image, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
-            if not solved:
-                return math.inf, f"installed-model check failed: no board pose at waypoint {o.index}"
-            rvec, tvec = cv2.solvePnPRefineLM(points, image, K, dist, rvec, tvec)
-        except cv2.error as err:
-            return math.inf, f"installed-model check failed: {str(err).strip().splitlines()[-1]}"
-        projected = cv2.projectPoints(points, rvec, tvec, K, dist)[0].reshape(-1, 2)
-        squared += float(np.sum((projected - image) ** 2))
-        count += len(image)
-    if not count:
-        return math.inf, "installed-model check not possible: no view"
-    # Per corner, as cv2.calibrateCamera reports its RMS.
-    return math.sqrt(squared / count), INSTALLED_RMS_NOTE
+PLANAR_RMS_NOTE = "the camera's own planar fit, every view's board pose free"
+JOINT_RMS_NOTE = "the stage-tied joint fit: the planar residual plus what the stage model leaves"
 
 
 def planar_rms_px(
@@ -593,10 +545,10 @@ def planar_rms_px(
     distortion model (k1 k2 p1 p2, k3 held at 0), started from `model`'s intrinsics and, with
     `fix_principal_point`, holding its principal point there.
 
-    Every view is a near-parallel plane, so the planar fit cannot pin the focal length, and
-    its free intrinsics also take up much of a wrong installed model: it is a diagnostic, the
-    floor any camera model reaches on these corners, and is not graded. +inf, with a note,
-    when the camera has fewer than _PLANAR_MIN_VIEWS views or the fit fails."""
+    Every view is a near-parallel plane, so the planar fit cannot pin the focal length; its
+    RMS is still the camera model's own residual, since the free poses take up any stage
+    error. +inf, with a note, when the camera has fewer than _PLANAR_MIN_VIEWS views or the
+    fit fails."""
     obj = board.object_points().astype(np.float32)
     image_points, object_points = [], []
     for o in observations:

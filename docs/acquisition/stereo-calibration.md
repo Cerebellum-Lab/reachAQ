@@ -977,26 +977,19 @@ possible with 2 cameras` (always so with 2 calibrated cameras), or `... not
 possible for any camera` with 3 or more. The JSON keeps the same text as
 `verdict_note`.
 
-Each camera has three reprojection RMS values, and only one of them is graded:
+Each camera has two reprojection RMS values, and only one of them is graded:
 
-- `reprojection_rms_px` grades the installed camera model: the fit's own K and
-  distortion, held, against the detected corners. Each view's board pose is
-  solved on its own (`cv2.solvePnP`, refined by Levenberg-Marquardt). Because
-  the poses are free, stage error cannot enter it; a K or distortion that the
-  corners do not support does. A free board pose takes up much of a focal-length
-  error as depth, so it is not a focal-length check: on a synthetic capture
-  whose stage error moved fx 7-16 %, it read 0.56-0.57 px, which warns.
-- `planar_rms_px` is the camera's planar refit: `cv2.calibrateCamera` on its
-  corners, with the intrinsics and every view's board pose free, started from the
-  fit's intrinsics. It uses the joint fit's distortion model (k1 k2 p1 p2, k3
-  held at 0). With `fit_principal_point: centre`, the principal point is held
-  where the joint fit put it. It is the floor any camera model reaches on these
-  corners, so it is not graded.
+- `reprojection_rms_px` grades the camera. It comes from the camera's own planar
+  fit: `cv2.calibrateCamera` on its corners, with every view's board pose free.
+  It uses the joint fit's distortion model (k1 k2 p1 p2, k3 held at 0). With
+  `fit_principal_point: centre`, the principal point is held where the joint fit
+  put it. Because the poses are free, stage error cannot enter it. It measures
+  the camera model and the corner detection alone.
 - `joint_reprojection_rms_px` is the same camera's RMS in the stage-tied joint
   fit. There, each view's board is held to its commanded position through the
   stage model. Any board placement that the stage model does not describe adds
-  to it, so it only warns. When it is well above `reprojection_rms_px`, read the
-  stage-accuracy block.
+  to it, so it only warns: it grades the stage model, not the camera. When it is
+  well above `reprojection_rms_px`, read the stage-accuracy block.
 
 The stage-accuracy block reports measured numbers only. It names no cause.
 
@@ -1014,8 +1007,7 @@ for example `left-right`.
 | --- | --- | --- | --- | --- |
 | `views_kept` | camera | < 20 | < 10 | Distinct positions where this camera's board detection was kept (at most 36) |
 | `covisible_views` | camera | < 8 | < 4 | Its views that another calibrated camera also saw. The fit does not need them; they expose stage geometry the model leaves out (axis skew) |
-| `reprojection_rms_px` | camera | > 0.5 | > 1.0 | RMS distance between detected corners and the installed K and distortion, every view's board pose solved on its own, sensor px |
-| `planar_rms_px` | camera | none | none | Informational. RMS of the camera's planar refit (intrinsics and every view's board pose free), sensor px |
+| `reprojection_rms_px` | camera | > 0.5 | > 1.0 | RMS distance between detected corners and the camera's own planar fit (every view's board pose free), sensor px |
 | `joint_reprojection_rms_px` | camera | > 1.0 | none | RMS distance between detected corners and the stage-tied joint fit's projection, sensor px. Includes stage error, so it only warns |
 | `preset_reprojection_rms_px` | camera, per preset | none | none | Informational. The joint RMS in that preset's pixels (sensor RMS / binning); the note names the preset |
 | `coverage_roi_fraction` | camera | < 0.5 | < 0.25 | Fraction of the base preset's sensor window inside the union of the detected-corner hulls |
@@ -1043,10 +1035,6 @@ for example `left-right`.
 
 - An informational metric has no limits: it is recorded so months can be
   compared and never changes the verdict.
-- `reprojection_rms_px` has not always meant the installed model's RMS. In a
-  report with no `joint_reprojection_rms_px` key it is the joint fit's RMS; in
-  one with `joint_reprojection_rms_px` but no `planar_rms_px` it is the planar
-  refit's. Compare months by meaning, not by name.
 - `stereo_reprojection_rms_px` keeps the name it had with two cameras, but it
   pools every calibrated camera's corners, however many cameras there are.
 - The change metrics appear only when the previous calibration is a format-2
