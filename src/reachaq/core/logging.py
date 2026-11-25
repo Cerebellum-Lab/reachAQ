@@ -645,7 +645,6 @@ def setup_logging(
     # logger.debug("Setup logging ; base_logger=%s", repr_logger(base_logger))
 
     get_verbose_logger("transitions").setLevel(logger_level)
-    get_verbose_logger("tools").setLevel(logger_level)
     get_verbose_logger("reachaq").setLevel(logger_level)
     get_verbose_logger("inference_algorithms").setLevel(logger_level)
 

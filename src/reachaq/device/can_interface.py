@@ -1501,6 +1501,22 @@ class CanInterface(DeviceInterface):
         logger.debug("motor=%s: tentative request addr=%s tgt=%s => res=%s", motor, addr, target, res)
         return res == 0
 
+    def estop(self, asserted: bool = True) -> bool:
+        """
+        Assert or release the E-stop on every board: one broadcast frame, no uuid, no ack.
+
+        The firmware's handler (lib/jerrycan/modules/stepper.c) stops every
+        stepper when the payload is non-zero and latches; a zero payload
+        releases the latch, after which each axis still needs a home. Both
+        the pyjerrycan and SocketCAN backends broadcast it to node 0x1F.
+
+        Returns:
+            bool: True if the frame was written to the bus
+        """
+        res = self._jc.EStop(bool(asserted))
+        logger.debug("EStop(%s) res=%s", bool(asserted), res)
+        return res == 0
+
     def send_heartbeat(self) -> bool:
         """
         Send a heartbeat message to the target; causes an LED to blink briefly.

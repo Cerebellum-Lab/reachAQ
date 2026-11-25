@@ -16,7 +16,7 @@ from reachaq.pyside.content_widget import ContentWidget, invoke_method
 from reachaq.app.model.app_model import AppModel
 from reachaq.app.model.app_model_status import AppModelStatus
 
-from reachaq.app.model.hardware_model import HardwareModel
+from reachaq.app.model.hardware_model import HardwareModel, OPERATOR_STOP_REASON
 
 
 logger = get_verbose_logger(__name__)
@@ -186,10 +186,24 @@ class HardwareControlContent(ContentWidget):
         button_layout = QVBoxLayout()
         button_layout.setSpacing(4)
         #
+        # STOP is not a command widget: it stays enabled while a command runs, and goes
+        # to the hardware model directly, never through the pellet machine.
+        self._stop_button = QPushButton("STOP")
+        self._stop_button.setObjectName("pelletStopButton")
+        self._stop_button.setToolTip("Stop every pellet axis now (ESTOP). Home before continuing.")
+        self._stop_button.setStyleSheet("QPushButton { color: white; background-color: #b42318; font-weight: bold; }")
+        self._stop_button.clicked.connect(self._on_stop_clicked)
+        button_layout.addWidget(self._stop_button)
+        #
+        def home():
+            # After a stop only the operator's home releases the board's latch.
+            if self._hardware_model.estop_active:
+                return self._hardware_model.home_after_estop()
+            return pellet_machine.move_home(force=True)
+
         button = QPushButton("Home")
         add_cmd_widget(button)
-        button.clicked.connect(
-            lambda: log_hardware_cmd(partial(pellet_machine.move_home, force=True)))
+        button.clicked.connect(lambda: log_hardware_cmd(home))
         button_layout.addWidget(button)
         #
         button = QPushButton("Load")
@@ -343,15 +357,23 @@ class HardwareControlContent(ContentWidget):
         for widget in self._commands_widgets:
             widget.setEnabled(enabled)
 
+    def _on_stop_clicked(self) -> None:
+        logger.notice("User-control: STOP pressed")
+        self._hardware_model.estop(OPERATOR_STOP_REASON)
+
     def _refresh_enabled_state(self) -> None:
-        panel_enabled = (
+        connected = bool(self._hardware_model.pellet_version)
+        commands_enabled = (
             self._capture_active
-            and bool(self._hardware_model.pellet_version)
+            and connected
             and self._hardware_model.pellet_commands_allowed
         )
-        self.setEnabled(panel_enabled)
+        # The panel stays enabled while the board is connected, so STOP does too: with
+        # a command running, outside a capture, and with a firmware the commands refuse.
+        self.setEnabled(connected)
+        self._stop_button.setEnabled(connected)
         self.set_commands_enabled(
-            panel_enabled and not self._hardware_model.pending_tokens
+            commands_enabled and not self._hardware_model.pending_tokens
         )
 
     @invoke_method

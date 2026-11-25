@@ -11013,6 +11013,9 @@ class AppModel(ObservableObject):
 
     def on_close(self):
         logger.debug("AppModel.on_close")
+        # A stage still moving is stopped first, before the session save below can wait:
+        # nothing on a v1.2 pellet board stops a stepper once the host is gone.
+        self._hardware.estop_if_moving("reachAQ is closing")
         # Closing saves a running session first, as a stop does, while it can
         # still finish. The window has already stopped acquisition, asking and
         # waiting, so this is for a headless close. The stop below does not
@@ -12068,8 +12071,26 @@ class AppModel(ObservableObject):
             )
             logger.warning("Session-end pellet home skipped: pellet board not Ready")
             return
+        estop = self._hardware.pellet_estop
+        home_options = {}
+        if estop is not None and estop.get("kind") == "operator":
+            # Only a failure stop may be cleared by the session end (Ben, 2026-11-24).
+            self._recording_session.finish_end_action(
+                "pellet_home",
+                status="skipped",
+                error="the pellet stage was stopped by the operator (operator STOP); "
+                      "home it with Hardware Control or reconnect",
+            )
+            logger.warning("Session-end pellet home skipped: the operator pressed STOP")
+            return
+        if estop is not None:
+            # The one automatic home allowed after a stop (Ben, 2026-11-24): it releases
+            # the board's latch, and its ack clears needs-home and the stopped state.
+            logger.warning("Session-end pellet home after a stop (%s): releasing the ESTOP latch and homing",
+                           estop["reason"])
+            home_options["release_estop"] = True
         try:
-            token = self._hardware.send_home_and_wait(timeout=15.0)
+            token = self._hardware.send_home_and_wait(timeout=15.0, **home_options)
         except Exception as error:
             message = str(error) or error.__class__.__name__
             logger.exception("Session-end pellet home failed")
@@ -12225,6 +12246,10 @@ class AppModel(ObservableObject):
         hard = self._hardware
         if name == hard.CAN_CONNECTION_STATE_PROPERTY:
             self._on_can_connection_state_changed(value)
+        elif name == hard.PELLET_ESTOP_PROPERTY:
+            if value is not None:
+                # Kept with the session the stop happened in; Record resets them.
+                self._recording_session.add_estop(value.get("event", value))
         elif name in {
             hard.FIRMWARE_COMPATIBILITY_PROPERTY,
             hard.PELLET_NEEDS_HOME_PROPERTY,
@@ -13075,6 +13100,10 @@ class AppModel(ObservableObject):
                     "endActions": [
                         dict(action)
                         for action in self._recording_session.end_actions
+                    ],
+                    "estops": [
+                        dict(estop)
+                        for estop in self._recording_session.estops
                     ],
                     "storage": dict(
                         self._recording_session.storage_telemetry
