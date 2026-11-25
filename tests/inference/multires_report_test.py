@@ -23,6 +23,7 @@ from reachaq.inference.multires_calibration.geometry import PresetGeometry, pres
 from reachaq.inference.multires_calibration.pipeline import per_camera_rule
 from reachaq.inference.multires_calibration.report import (
     DEFAULT_THRESHOLDS,
+    INSTALLED_RMS_NOTE,
     LOO_UNDETERMINED_NOTE,
     STAGE_HEADING,
     STAGE_METRICS,
@@ -35,6 +36,7 @@ from reachaq.inference.multires_calibration.report import (
     QualityReport,
     build_report,
     coverage_fraction,
+    installed_rms_px,
     planar_rms_px,
     write_coverage_images,
 )
@@ -727,28 +729,84 @@ def test_undetermined_loo_is_shown_and_not_a_pass():
     assert QualityReport.from_json(report.to_json()) == report
 
 
-# The graded RMS (Ben, 2026-11-24): each camera's own planar fit, so stage error cannot fail
-# a calibration; the stage-tied joint RMS only warns, and the stage has its own block.
+# The graded RMS (Ben, 2026-11-24): the installed camera model (the fit's K and distortion)
+# against the detected corners, each view's board pose solved on its own, so stage error
+# cannot enter it but a wrong camera model does. The planar refit is a diagnostic only, and
+# the stage-tied joint RMS only warns.
 
 
-def test_the_graded_rms_is_each_cameras_planar_fit(rig, fitted):
+def _installed_rms(observations, board, cam, model):
+    """The installed model's RMS by cv2.calibrateCamera with every intrinsic and distortion
+    term held: only the poses are free, as in a per-view solvePnP."""
+    obj = board.object_points().astype(np.float32)
+    image = [o.corners[cam].astype(np.float32).reshape(-1, 1, 2) for o in observations if cam in o.corners]
+    held = (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_FOCAL_LENGTH | cv2.CALIB_FIX_PRINCIPAL_POINT
+            | cv2.CALIB_FIX_K1 | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3 | cv2.CALIB_FIX_TANGENT_DIST)
+    dist = np.zeros(5)
+    dist[:len(np.ravel(model.dist))] = np.ravel(model.dist)
+    return cv2.calibrateCamera([obj] * len(image), image, IMAGE_SIZE, np.array(model.K, float), dist, flags=held)[0]
+
+
+def test_the_graded_rms_is_the_installed_model_with_each_views_pose_solved(rig, fitted):
     report = report_for(fitted, rig.observations, rig.board, swept_roi(rig.observations))
-    obj = rig.board.object_points().astype(np.float32)
     for cam in CAMERAS:
         model = fitted.cameras[cam]
-        image = [o.corners[cam].astype(np.float32).reshape(-1, 1, 2) for o in rig.observations if cam in o.corners]
-        dist = np.zeros(5)
-        dist[:4] = np.ravel(model.dist)[:4]
-        rms = cv2.calibrateCamera([obj] * len(image), image, IMAGE_SIZE, np.array(model.K, float), dist,
-                                  flags=cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_K3)[0]
         graded = metric(report, "reprojection_rms_px", cam)
-        assert graded.value == pytest.approx(rms, rel=1e-3)
-        assert graded.value == pytest.approx(planar_rms_px(rig.observations, rig.board, IMAGE_SIZE, cam, model)[0])
+        assert graded.value == pytest.approx(_installed_rms(rig.observations, rig.board, cam, model), rel=1e-4)
+        assert graded.value == pytest.approx(installed_rms_px(rig.observations, rig.board, cam, model)[0])
+        assert graded.status == "pass" and (graded.warn, graded.fail) == (0.5, 1.0)
+        assert graded.note == INSTALLED_RMS_NOTE
+        # The planar refit frees the intrinsics too, so it fits at least as well; it is not graded.
+        planar = metric(report, "planar_rms_px", cam)
+        assert planar.value == pytest.approx(planar_rms_px(rig.observations, rig.board, IMAGE_SIZE, cam, model)[0])
+        assert planar.value <= graded.value + 1e-6
+        assert (planar.warn, planar.fail) == (None, None) and planar.status == "pass"
         # Free poses fit at least as well as poses tied to the stage.
         assert graded.value <= fitted.rms_px[cam] + 1e-6
         joint = metric(report, "joint_reprojection_rms_px", cam)
         assert joint.value == pytest.approx(fitted.rms_px[cam], rel=1e-12)
         assert (joint.warn, joint.fail) == (1.0, None)
+
+
+def test_a_wrong_installed_model_is_graded_and_the_true_one_passes(rig):
+    cam = CAMERAS[0]
+    truth = rig.truth.cameras[cam]
+    true_rms, _ = installed_rms_px(rig.observations, rig.board, cam, truth)
+    assert true_rms < 0.15  # the corner noise, 0.1 px per coordinate
+    # The board pose cannot take up a distortion the camera does not have (0.72 px measured).
+    bent = dataclasses.replace(truth, dist=np.array([0.3, 0.0, 0.0, 0.0, 0.0]))
+    assert installed_rms_px(rig.observations, rig.board, cam, bent)[0] > 0.5
+    none, note = installed_rms_px([], rig.board, cam, truth)
+    assert none == math.inf and "no view" in note
+
+
+# A stage error the motor-frame fit takes into the focal length (review 4b, I-2): the board
+# stood 4 mm further along motor z than commanded at 10 of the 37 waypoints.
+LOST_Z = {w: (0.0, 0.0, 4.0) for w in range(20, 30)}
+
+
+def test_stage_error_taken_into_the_focal_length_is_graded_on_the_installed_model():
+    lost = synthetic_rig(noise_px=0.1, stage_offsets=LOST_Z)
+    fit = fit_motor_frame(lost.observations, lost.board, IMAGE_SIZE, CAMERAS)
+    # The stage error moved the focal lengths 7-16 %.
+    errors = [abs(fit.cameras[c].K[0, 0] / lost.truth.cameras[c].K[0, 0] - 1.0) for c in CAMERAS]
+    assert min(errors) > 0.07, errors
+    report = report_for(fit, lost.observations, lost.board, swept_roi(lost.observations))
+    for cam in CAMERAS:
+        # Measured 0.57 (left, fx -15.5 %) and 0.56 px (right, fx -7.6 %), four times the clean
+        # capture's 0.14: a free board pose takes up most of a focal error as depth, so the
+        # installed model warns here and does not reach the 1.0 px fail.
+        graded = metric(report, "reprojection_rms_px", cam)
+        assert graded.status == "warn" and 0.5 < graded.value < 1.0, graded
+        # The planar refit takes the error up in its own intrinsics, so it cannot see it.
+        assert metric(report, "planar_rms_px", cam).value < 0.2
+
+
+def test_a_clean_capture_passes_on_the_installed_model(rig, fitted):
+    report = report_for(fitted, rig.observations, rig.board, swept_roi(rig.observations))
+    for cam in CAMERAS:
+        graded = metric(report, "reprojection_rms_px", cam)
+        assert graded.status == "pass" and graded.value < 0.2, graded
 
 
 def test_holding_the_principal_point_holds_it_in_the_planar_fit(rig, fitted):
@@ -768,12 +826,13 @@ def tilting_rig():
     return synthetic_rig(noise_px=0.1, tilt_deg=3.0, stage_error_mm=0.05)
 
 
-def test_stage_error_passes_on_the_planar_rms_and_only_warns_on_the_joint_rms(tilting_rig):
+def test_a_tilting_stage_only_warns_on_the_joint_rms(tilting_rig):
     fit = fit_motor_frame(tilting_rig.observations, tilting_rig.board, IMAGE_SIZE, CAMERAS)
     report = report_for(fit, tilting_rig.observations, tilting_rig.board, swept_roi(tilting_rig.observations))
     for cam in CAMERAS:
+        # The motor-frame fit's K takes up a little of the tilt: 0.25 px on the installed model.
         graded = metric(report, "reprojection_rms_px", cam)
-        assert graded.status == "pass" and graded.value < 0.2, graded
+        assert graded.status == "pass", graded
         joint = metric(report, "joint_reprojection_rms_px", cam)
         assert joint.status == "warn" and joint.value > 1.0, joint
 
