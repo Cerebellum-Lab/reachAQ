@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 
 from reachaq.inference.multires_calibration.fit import (
+    CHARUCO,
     INTRINSIC_NAMES,
     BoardSpec,
     CameraModel,
@@ -61,6 +62,8 @@ _FIXED_SLOTS = {"left": 0, "right": 1}
 _TEXTURE_PX_PER_MM = 50
 _SUPERSAMPLE = 3
 _BLACK, _WHITE, _BACKGROUND = 20, 235, 100
+# The rig's ChArUco board: 9 x 7 squares of 4 mm, 3 mm DICT_4X4_50 markers, 8 x 6 inner corners.
+CHARUCO_BOARD = BoardSpec(kind=CHARUCO, marker_mm=3.0, dictionary="DICT_4X4_50")
 
 
 @dataclass
@@ -68,6 +71,9 @@ class SyntheticRig:
     truth: MotorFrameFit
     observations: List[WaypointObservation]
     board: BoardSpec
+    # waypoint index -> (R, t) of the board in the motor frame as it truly stood,
+    # X = R @ P + t, when the rig was built with a board tilt or stage error; else empty
+    view_poses: Optional[dict] = None
 
     def world_corners(self, motor_mm) -> np.ndarray:
         """(rows*cols, 3) motor-frame board corners at the commanded position `motor_mm`."""
@@ -84,6 +90,12 @@ def synthetic_rig(
     image_size=(1440, 1080),
     frame_rotation_deg: float = 0.0,
     frame_rotation_axis: Tuple[float, float, float] = (0.3, -0.5, 0.81),
+    tilt_deg: float = 0.0,
+    stage_error_mm: float = 0.0,
+    stage_seed: int = 7,
+    stage_offsets: Optional[Mapping[int, Sequence[float]]] = None,
+    tilt_pivot_mm: Sequence[float] = (0.0, 0.0, 0.0),
+    axis_scale: Sequence[float] = (1.0, 1.0, 1.0),
 ) -> SyntheticRig:
     """`cameras` (up to 6, left and right by default), 37 waypoints, and Gaussian corner
     noise of `noise_px` per coordinate.
@@ -138,10 +150,37 @@ def synthetic_rig(
         rvec, tvec = _look_at(eye, centre, down=scene @ np.array([0.0, 1.0, 0.0]))
         models[cam] = CameraModel(K=K, dist=np.array(dist, float), rvec=rvec, tvec=tvec)
 
+    # A stage that does not only translate: each waypoint's board turned by up to `tilt_deg`
+    # about an axis in its plane, and placed off its commanded position by up to
+    # `stage_error_mm` on each axis (true mm). Drawn from their own generator, so the corner
+    # noise, and the default rig, are unchanged.
+    stage = np.random.default_rng(stage_seed)
+    view_poses = {}
+    offsets = {} if stage_offsets is None else {int(w): np.asarray(v, float) for w, v in stage_offsets.items()}
+    # A stage whose steps per mm are off per axis: it moves axis_scale[i] true mm (times
+    # motor_scale) per commanded mm on motor axis i.
+    scale_axes = np.asarray(axis_scale, float)
+    if tilt_deg or stage_error_mm or offsets or np.any(scale_axes != 1.0):
+        R_b = cv2.Rodrigues(board_rvec)[0]
+        for w, m in enumerate(motor):
+            phi = stage.uniform(0, 2 * np.pi)
+            angle = np.radians(stage.uniform(0, tilt_deg))
+            R_tilt = cv2.Rodrigues(np.array([np.cos(phi), np.sin(phi), 0.0]) * angle)[0]
+            # `stage_offsets` adds a fixed error at named waypoints, such as lost steps at one z.
+            error = stage.uniform(-stage_error_mm, stage_error_mm, 3) + offsets.get(w, 0.0)
+            # The board turns about `tilt_pivot_mm`, a point in the board's frame (corner 0 by
+            # default): its mount, wherever that is, stays put.
+            pivot = np.asarray(tilt_pivot_mm, float)
+            R_v = R_b @ R_tilt
+            view_poses[w] = (R_v, motor_scale * (scale_axes * np.asarray(m, float) + error) + R_b @ pivot - R_v @ pivot)
     rng = np.random.default_rng(seed)
     observations, sq_err = [], {cam: {} for cam in models}
     for w, m in enumerate(motor):
-        X = _world_corners(board, board_rvec, motor_scale, m)
+        if w in view_poses:
+            R_v, t_v = view_poses[w]
+            X = board.object_points() @ R_v.T + t_v
+        else:
+            X = _world_corners(board, board_rvec, motor_scale, m)
         corners = {}
         for cam, model in models.items():
             if cam in seen and w not in seen[cam]:
@@ -166,7 +205,7 @@ def synthetic_rig(
         per_view_rms_px={cam: {w: float(np.sqrt(v.mean())) for w, v in e.items()} for cam, e in sq_err.items()},
         param_std={cam: {name: 0.0 for name in INTRINSIC_NAMES} for cam in models},
     )
-    return SyntheticRig(truth=truth, observations=observations, board=board)
+    return SyntheticRig(truth=truth, observations=observations, board=board, view_poses=view_poses)
 
 
 def render_board_frame(
@@ -177,7 +216,8 @@ def render_board_frame(
     `X_board_world` is the board's (rows*cols, 3) inner corners in the motor frame, in
     object_points order (SyntheticRig.world_corners gives them). The image is the full
     chessboard: (cols+1) x (rows+1) squares, reaching one square beyond the inner
-    corners on every side, inside a one-square white margin, on a grey background.
+    corners on every side, inside a one-square white margin, on a grey background. A
+    ChArUco `board` is drawn as cv2's generateImage draws it (marginSize 0, borderBits 1).
 
     The board plane maps to the image by the homography fitted from
     board.object_points()[:, :2] to cv2.projectPoints(X_board_world, model.rvec,
@@ -219,6 +259,15 @@ def _board_texture(board: BoardSpec) -> Tuple[np.ndarray, np.ndarray]:
     x0 = y0 = -2.0 * sq
     nx = int(round((board.cols + 3) * sq * ppm))
     ny = int(round((board.rows + 3) * sq * ppm))
+    texture_to_mm = np.array([[1.0 / ppm, 0.0, x0 + 0.5 / ppm], [0.0, 1.0 / ppm, y0 + 0.5 / ppm], [0.0, 0.0, 1.0]])
+    if board.kind == CHARUCO:
+        # generateImage's pixel (0, 0) is the board's outer corner, one square before inner corner 0.
+        margin = int(round(sq * ppm))
+        size = (nx - 2 * margin, ny - 2 * margin)
+        drawn = board.charuco_board().generateImage(size, marginSize=0, borderBits=1)
+        drawn = np.where(drawn < 128, _BLACK, _WHITE).astype(np.uint8)
+        texture = cv2.copyMakeBorder(drawn, margin, margin, margin, margin, cv2.BORDER_CONSTANT, value=_WHITE)
+        return texture, texture_to_mm
     # Texel i is centred half a texel in from its left edge, so every square edge falls
     # exactly between two texels and no texel straddles one.
     x = x0 + (np.arange(nx) + 0.5) / ppm
@@ -229,7 +278,6 @@ def _board_texture(board: BoardSpec) -> Tuple[np.ndarray, np.ndarray]:
     # looks the same turned 180 degrees, like the real one.
     black = on_board & ((a + b) % 2 == 0)
     texture = np.where(black, _BLACK, _WHITE).astype(np.uint8)
-    texture_to_mm = np.array([[1.0 / ppm, 0.0, x0 + 0.5 / ppm], [0.0, 1.0 / ppm, y0 + 0.5 / ppm], [0.0, 0.0, 1.0]])
     return texture, texture_to_mm
 
 

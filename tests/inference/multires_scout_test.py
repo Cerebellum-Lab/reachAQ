@@ -299,6 +299,20 @@ def test_saved_list_reused_only_for_same_serials(tmp_path):
     assert load_move_list(path, ["20142630", "19230001", "19230002", "19239999"]) is None
     assert load_move_list(path, ["20142630", "19230001", "19239999"]) is None
     assert load_move_list(tmp_path / "missing.yaml", ["20142630"]) is None
+
+
+def test_a_saved_list_records_its_board_and_is_refused_for_another(tmp_path):
+    from reachaq.inference.multires_calibration.fit import RIG_CHARUCO_BOARD
+
+    path = tmp_path / "scout_move_list.yaml"
+    points = [(1.0, 2.0, 3.0), (2.0, 2.0, 3.0)]
+    save_move_list(path, points, ["a", "b"], datetime(2026, 11, 24), RIG_CHARUCO_BOARD)
+    assert load_move_list(path, ["a", "b"], RIG_CHARUCO_BOARD) == points
+    assert load_move_list(path, ["a", "b"], BoardSpec()) is None
+    assert load_move_list(path, ["a", "b"]) == points  # no board asked for: not checked
+    save_move_list(path, points, ["a", "b"], datetime(2026, 11, 24))  # no board: the checkerboard
+    assert load_move_list(path, ["a", "b"], BoardSpec()) == points
+    assert load_move_list(path, ["a", "b"], RIG_CHARUCO_BOARD) is None
     path.write_text("points: [oops", encoding="utf-8")
     assert load_move_list(path, ["20142630", "19230001", "19230002"]) is None
 

@@ -25,7 +25,9 @@ calibrate_capture turns it into a calibration folder (store.py):
    than 2 calibrated cameras refuse the calibration (CalibrationRefused).
 3. Every calibrated camera is put in one 180-degree board order
    (fit.reconcile_corner_order); the report notes a camera that had to be reversed.
-4. The calibrated cameras are fitted jointly, once, in sensor pixels (fit.fit_motor_frame),
+4. The calibrated cameras are fitted jointly, once, in sensor pixels: by default with a free
+   board pose per view for a ChArUco board (per_view.fit_per_view), with the motor-frame
+   model for a checkerboard (fit.fit_motor_frame); `fit_mode` picks either,
    and every preset's intrinsics are mapped from that fit (geometry.map_intrinsics) when
    the store writes it: an anipose TOML for every calibrated camera in sensor pixels and
    for each preset set, plus the left-right extras where left and right share a geometry.
@@ -78,15 +80,19 @@ from reachaq.inference.multires_calibration.extract import (
     MIN_CAMERAS,
     detect_board,
     extract_observations,
+    median_corners,
     normalize_corner_order,
 )
 from reachaq.inference.multires_calibration.fit import (
+    CHARUCO,
     BoardSpec,
     CaptureCamera,
     MotorFrameFit,
     WaypointObservation,
     fit_motor_frame,
     reconcile_corner_order,
+    usable_view,
+    valid_corners,
 )
 from reachaq.inference.multires_calibration.geometry import (
     PresetGeometry,
@@ -94,6 +100,13 @@ from reachaq.inference.multires_calibration.geometry import (
     map_intrinsics,
     presets_for_cameras,
     sensor_to_preset_points,
+)
+from reachaq.inference.multires_calibration.per_view import (
+    FIT_MODES,
+    FIT_MOTOR_FRAME,
+    FIT_PER_VIEW,
+    default_fit_mode,
+    fit_per_view,
 )
 from reachaq.inference.multires_calibration.report import (
     CameraVerdict,
@@ -348,11 +361,14 @@ def calibrate_capture(
     *,
     output_dir: Path,
     presets: Sequence[PresetGeometry],
-    board: BoardSpec = BoardSpec(),
+    board: Optional[BoardSpec] = None,
     previous_dir: Optional[Path] = None,
     refine: str = "subpix",
     preset_sets: Optional[Sequence[PresetSet]] = None,
     live_geometries: Optional[Mapping[str, PresetGeometry]] = None,
+    fit_mode: Optional[str] = None,
+    fix_principal_point: bool = False,
+    placement: str = "similarity",
 ) -> Tuple[CalibrationIndex, QualityReport]:
     """Calibrate every preset in `presets` from the capture in `capture_dir` and write the
     calibration to `output_dir`, which must not exist yet.
@@ -366,12 +382,18 @@ def calibrate_capture(
     fit from the calibrated cameras only (calibrated_preset_sets), so a camera left 2D only
     neither duplicates a set nor costs the others a binning; it must name every camera.
     `previous_dir` is the calibration this one replaces, if any. `refine` is
-    extract.detect_board's corner refinement.
+    extract.detect_board's corner refinement. `fit_mode` is per_view.FIT_PER_VIEW or
+    FIT_MOTOR_FRAME; None is per_view.default_fit_mode(board). The cross-checks use the same.
+    `fix_principal_point` holds the per-view fit's principal points, and `placement` picks its
+    stage model, "similarity" or "affine" (per_view.fit_per_view).
+    `board` defaults to the one the capture's waypoints.yaml records (capture_board).
 
     Only the cameras that meet per_camera_rule are fitted; the report's `cameras` gives
     every camera's verdict. Raises CalibrationRefused, writing nothing, when fewer than 2 do.
     """
     capture_dir, output_dir = Path(capture_dir), Path(output_dir)
+    if fit_mode is not None and fit_mode not in FIT_MODES:
+        raise ValueError(f"fit_mode must be one of {FIT_MODES}, got {fit_mode!r}")
     # Refused before minutes of extraction and fitting, not after.
     if output_dir.exists():
         raise FileExistsError(f"{output_dir} already exists; a calibration folder is never overwritten")
@@ -379,6 +401,9 @@ def calibrate_capture(
     if not presets:
         raise ValueError("no presets to calibrate")
     log = load_waypoint_log(capture_dir / WAYPOINT_LOG)
+    if board is None:
+        board = capture_board(log)
+    fit_mode = default_fit_mode(board) if fit_mode is None else fit_mode
     cameras = tuple(capture_cameras(log))
     if not MIN_CAMERAS <= len(cameras) <= MAX_CAMERAS:
         raise ValueError(f"a capture has {MIN_CAMERAS} to {MAX_CAMERAS} cameras, the log lists {len(cameras)}")
@@ -428,11 +453,13 @@ def calibrate_capture(
     observations, reversed_order = reconcile_corner_order(kept, board, image_size, calibrated)
     logger.info("calibration capture: %d distinct waypoints; fitting %d of %d cameras",
                 len(observations), len(calibrated), len(cameras))
-    fit = fit_motor_frame(observations, board, image_size, calibrated)
+    per_view_options = fit_options(fit_mode, fix_principal_point, placement)
+    fit = _fit(fit_mode, observations, board, image_size, calibrated, **per_view_options)
 
     notes: List[str] = []
     cross_checks = _cross_checks(
-        {cam: videos[cam] for cam in calibrated}, extraction.segments, observations, fit, presets, board, refine, notes
+        {cam: videos[cam] for cam in calibrated}, extraction.segments, observations, fit, presets, board, refine, notes,
+        fit_mode, per_view_options,
     )
     for cam, flipped in reversed_order.items():
         if flipped:
@@ -476,7 +503,8 @@ def calibrate_capture(
     )
     previous = _previous(previous_dir, notes)
     report = build_report(fit, observations, board, base.sensor_roi(), summary, cross_checks, previous,
-                          presets=presets, cameras=verdicts)
+                          presets=presets, cameras=verdicts,
+                          fix_principal_point="fix_principal_point" in per_view_options)
     report.notes.extend(notes)
 
     capture = {
@@ -496,6 +524,7 @@ def calibrate_capture(
         # install copies again and every backup keeps (two 1440x1080 videos a month).
         "capture_folder": str(capture_dir.resolve()),
     }
+    capture.update(fit_settings(fit_mode, per_view_options))
     with tempfile.TemporaryDirectory(prefix="calibration_coverage_") as tmp:
         # Every camera's, from extraction: a 2D-only camera's shows what it did see. The
         # hulls do not depend on the corner order.
@@ -521,6 +550,18 @@ def calibrate_capture(
     return index, report
 
 
+# The board a capture was made with, in its waypoints.yaml capture_settings (make_3d_calib
+# writes it); a capture without one was made with the checkerboard.
+CAPTURE_BOARD_KEY = "board"
+
+
+def capture_board(log: WaypointLog) -> BoardSpec:
+    """The board `log` records under capture_settings, or BoardSpec(), the checkerboard, when it
+    records none (every capture before the ChArUco board)."""
+    plain = log.capture_settings.get(CAPTURE_BOARD_KEY)
+    return BoardSpec() if plain is None else BoardSpec(**dict(plain))
+
+
 def calibrated_preset_sets(live: Mapping[str, PresetGeometry], calibrated: Sequence[str]) -> List[PresetSet]:
     """presets_for_cameras over the `calibrated` cameras' live geometries only.
 
@@ -534,6 +575,41 @@ def calibrated_preset_sets(live: Mapping[str, PresetGeometry], calibrated: Seque
     return presets_for_cameras({cam: live[cam] for cam in calibrated})
 
 
+def fit_options(fit_mode: str, fix_principal_point: bool, placement: str) -> Dict[str, object]:
+    """The keyword options calibrate_capture passes to the per-view fit: only those that differ
+    from its defaults, and none for the motor-frame fit."""
+    options: Dict[str, object] = {}
+    if fit_mode != FIT_MOTOR_FRAME:
+        if fix_principal_point:
+            options["fix_principal_point"] = True
+        if placement != "similarity":
+            options["placement"] = placement
+    return options
+
+
+def fit_settings(fit_mode: str, options: Mapping[str, object]) -> Dict[str, str]:
+    """What calibration.yaml records under `capture` about the fit: `fit` for a per-view fit,
+    `fit_principal_point: centre` when it held the principal point, and `placement` when it
+    was not the similarity. Nothing for the motor-frame fit, so those calibrations read as before."""
+    if fit_mode == FIT_MOTOR_FRAME:
+        return {}
+    out = {"fit": fit_mode}
+    if options.get("fix_principal_point"):
+        out["fit_principal_point"] = "centre"
+    if "placement" in options:
+        out["placement"] = str(options["placement"])
+    return out
+
+
+def _fit(mode: str, *args, **kwargs) -> MotorFrameFit:
+    """fit_motor_frame or fit_per_view, by `mode`, through this module's names (tests patch them)."""
+    if mode == FIT_MOTOR_FRAME:
+        return fit_motor_frame(*args, **kwargs)
+    if mode == FIT_PER_VIEW:
+        return fit_per_view(*args, **kwargs)
+    raise ValueError(f"fit mode must be one of {FIT_MODES}, got {mode!r}")
+
+
 def _cross_checks(
     videos: Mapping[str, Path],
     segments: Mapping[str, List[Tuple[int, int]]],
@@ -543,6 +619,8 @@ def _cross_checks(
     board: BoardSpec,
     refine: str,
     notes: List[str],
+    fit_mode: str = FIT_MOTOR_FRAME,
+    per_view_options: Optional[Mapping] = None,
 ) -> List[PresetCrossCheck]:
     """A PresetCrossCheck per binned preset, in the order of `presets`; a failed fit adds a note.
 
@@ -575,8 +653,12 @@ def _cross_checks(
             for g in binned:
                 corners = detect_board(_preset_frame(gray, g), board, refine=refine)
                 if corners is not None:
-                    reference = sensor_to_preset_points(observations[i].corners[cam], g)
-                    ordered = normalize_corner_order(corners, board, reference=reference)
+                    if board.kind == CHARUCO:
+                        # The corner ids fix the order; a partial board is kept as found.
+                        ordered = corners
+                    else:
+                        reference = sensor_to_preset_points(observations[i].corners[cam], g)
+                        ordered = normalize_corner_order(corners, board, reference=reference)
                     found[g.name][i].setdefault(cam, []).append(ordered)
 
     checks = []
@@ -585,19 +667,37 @@ def _cross_checks(
             WaypointObservation(
                 index=o.index,
                 motor_mm=np.array(o.motor_mm, dtype=float),
-                corners={cam: np.median(np.stack(c), axis=0) for cam, c in found[g.name][i].items()},
+                corners={cam: median_corners(np.stack(c), board) for cam, c in found[g.name][i].items()},
             )
             for i, o in enumerate(observations)
         ]
         offset = _corner_offset(preset_observations, observations, g)
         try:
-            # Started from the sensor fit mapped to the preset, not from the planar start,
+            reference, extra = fit, {}
+            if fit_mode != FIT_MOTOR_FRAME:
+                # Like with like. The per-view fit's focal length rests on the stage model, so
+                # a subset of the corners moves it: on christielab10's session004 the sensor
+                # fit on only the corners inside the 256 preset's window moved fx 0.9 %. The
+                # reference is therefore the sensor fit on exactly the views and corners the
+                # preset found, and the direct fit weighs its residuals in sensor px
+                # (pixel_scale), so the two solve the same problem and differ only by the
+                # detection in binned frames and the K mapping, which this check is for. With
+                # fix_principal_point both hold cx, cy at the mapped value, so the delta covers
+                # fx and fy only; the principal-point mapping has an exact, fit-free test
+                # (multires_geometry_test).
+                reference = _fit(
+                    fit_mode, _same_corners(observations, preset_observations, board), board, fit.image_size,
+                    tuple(videos), initial=fit, **(per_view_options or {}),
+                )
+                extra = {"pixel_scale": float(g.binning)}
+            # Started from the reference mapped to the preset, not from the planar start,
             # which is degenerate in focal length: from it, the 512 preset's fit on the
             # synthetic capture ran out of evaluations. The start does not move the optimum:
             # from the mapped K, from one 1 % and 2 px off, and from the edge-convention
             # mapping, the fit reached the same K to 1e-4 px.
-            direct = fit_motor_frame(
-                preset_observations, board, (g.width, g.height), tuple(videos), initial=_mapped_fit(fit, g)
+            direct = _fit(
+                fit_mode, preset_observations, board, (g.width, g.height), tuple(videos),
+                initial=_mapped_fit(reference, g), **(per_view_options or {}), **extra,
             )
         except (RuntimeError, ValueError) as error:
             logger.warning("cross-check %s: the direct fit failed: %s", g.name, error)
@@ -605,7 +705,7 @@ def _cross_checks(
             checks.append(PresetCrossCheck(geometry=g, max_intrinsic_delta_px=math.inf, corner_offset_px=offset))
             continue
         delta = max(
-            _intrinsic_delta(direct.cameras[cam].K, map_intrinsics(fit.cameras[cam].K, g)) for cam in videos
+            _intrinsic_delta(direct.cameras[cam].K, map_intrinsics(reference.cameras[cam].K, g)) for cam in videos
         )
         checks.append(PresetCrossCheck(geometry=g, max_intrinsic_delta_px=delta, corner_offset_px=offset))
     return checks
@@ -653,7 +753,30 @@ def _corner_offset(
     ]
     if not differences:
         return math.nan
-    return float(np.linalg.norm(np.concatenate(differences).mean(axis=0)))
+    # A ChArUco corner found in only one of the two is NaN and left out.
+    stacked = np.concatenate(differences)
+    stacked = stacked[np.all(np.isfinite(stacked), axis=1)]
+    if not len(stacked):
+        return math.nan
+    return float(np.linalg.norm(stacked.mean(axis=0)))
+
+
+def _same_corners(
+    observations: Sequence[WaypointObservation], preset_observations: Sequence[WaypointObservation], board: BoardSpec
+) -> List[WaypointObservation]:
+    """The sensor `observations` cut to what the preset found: per waypoint and camera, only the
+    sensor corners whose ids the preset detection holds, and only where that is still a view."""
+    out = []
+    for o, p in zip(observations, preset_observations):
+        corners = {}
+        for cam, c in o.corners.items():
+            if cam not in p.corners:
+                continue
+            kept = np.where(valid_corners(p.corners[cam])[:, None], np.asarray(c, float), np.nan)
+            if usable_view(kept, board):
+                corners[cam] = kept
+        out.append(WaypointObservation(index=o.index, motor_mm=o.motor_mm, corners=corners))
+    return out
 
 
 def _mapped_fit(fit: MotorFrameFit, g: PresetGeometry) -> MotorFrameFit:

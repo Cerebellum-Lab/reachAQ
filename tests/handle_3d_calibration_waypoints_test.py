@@ -30,7 +30,7 @@ from reachaq.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from reachaq.device import MotorConfigurationFile
 from reachaq.inference.multires_calibration import store
 from reachaq.inference.multires_calibration.extract import distinct_waypoints
-from reachaq.inference.multires_calibration.fit import BoardSpec, CaptureCamera
+from reachaq.inference.multires_calibration.fit import RIG_CHARUCO_BOARD, BoardSpec, CaptureCamera
 from reachaq.inference.multires_calibration.geometry import PresetGeometry, PresetSet, presets_for_cameras
 from reachaq.inference.multires_calibration.pipeline import (
     WAYPOINT_LOG,
@@ -868,6 +868,105 @@ def test_the_capture_triggers_recording_like_a_session(tmp_path, monkeypatch):
         assert start < on < recording < off
 
 
+def test_the_library_board_setting_reaches_the_calibration(tmp_path, monkeypatch):
+    from reachaq.inference.multires_calibration import library
+
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.calibration_library_root = tmp_path / "calibrations"
+    library.update_settings(app_model.calibration_library_root, board={
+        "kind": "charuco", "square_mm": 4.0, "rows": 6, "cols": 8, "marker_mm": 3.0, "dictionary": "DICT_4X4_50"})
+    boards = []
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: SimpleNamespace(verified=[True]))
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture",
+                        lambda *a, **k: boards.append(k["board"]) or (None, SimpleNamespace(id="cal"),
+                                                                      SimpleNamespace(verdict="pass")))
+    for name in ("left", "right"):
+        (tmp_path / "session" / f"{name}_recording.mp4").write_bytes(b"")
+        (tmp_path / "session" / f"{name}_recording_timestamps.txt").write_text("")
+
+    make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert boards == [BoardSpec(kind="charuco", marker_mm=3.0, dictionary="DICT_4X4_50")]
+
+
+@pytest.mark.parametrize("library", [False, True], ids=["no_library", "no_board_key"])
+def test_without_a_board_setting_the_calibration_uses_the_rig_charuco_board(tmp_path, monkeypatch, library):
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    if library:
+        app_model.calibration_library_root = tmp_path / "calibrations"
+    boards = []
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: SimpleNamespace(verified=[True]))
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture",
+                        lambda *a, **k: boards.append(k["board"]) or (None, SimpleNamespace(id="cal"),
+                                                                      SimpleNamespace(verdict="pass")))
+    for name in ("left", "right"):
+        (tmp_path / "session" / f"{name}_recording.mp4").write_bytes(b"")
+        (tmp_path / "session" / f"{name}_recording_timestamps.txt").write_text("")
+
+    make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert boards == [BoardSpec(kind="charuco", marker_mm=3.0, dictionary="DICT_4X4_50")]
+
+
+@pytest.mark.parametrize("settings, expected", [
+    ({}, "per_view"),
+    ({"fit": "motor_frame"}, "motor_frame"),
+    ({"board": {"kind": "checkerboard"}}, "motor_frame"),
+])
+def test_the_fit_setting_reaches_the_calibration(tmp_path, monkeypatch, settings, expected):
+    from reachaq.inference.multires_calibration import library
+
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.calibration_library_root = tmp_path / "calibrations"
+    if settings:
+        library.update_settings(app_model.calibration_library_root, **settings)
+    modes = []
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: SimpleNamespace(verified=[True]))
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture",
+                        lambda *a, **k: modes.append(k["fit_mode"]) or (None, SimpleNamespace(id="cal"),
+                                                                        SimpleNamespace(verdict="pass")))
+    for name in ("left", "right"):
+        (tmp_path / "session" / f"{name}_recording.mp4").write_bytes(b"")
+        (tmp_path / "session" / f"{name}_recording_timestamps.txt").write_text("")
+
+    make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert modes == [expected]
+
+
+@pytest.mark.parametrize("settings, key", [
+    ({"fit": "bundle"}, "fit"),
+    ({"fit_principal_point": "middle"}, "fit_principal_point"),
+])
+def test_a_bad_fit_setting_stops_the_calibration_before_any_motion(tmp_path, monkeypatch, settings, key):
+    from reachaq.inference.multires_calibration import library
+
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.calibration_library_root = tmp_path / "calibrations"
+    library.update_settings(app_model.calibration_library_root, **settings)
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: calls.append(("run_waypoints",)))
+
+    with pytest.raises(ValueError, match=key):
+        make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert not [call for call in calls if call[0] == "motor"] and ("run_waypoints",) not in calls
+
+
+def test_a_bad_board_setting_stops_the_calibration_before_any_motion(tmp_path, monkeypatch):
+    from reachaq.inference.multires_calibration import library
+
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.calibration_library_root = tmp_path / "calibrations"
+    library.update_settings(app_model.calibration_library_root, board={"kind": "charuco", "marker_mm": 5.0,
+                                                                        "dictionary": "DICT_4X4_50"})
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: calls.append(("run_waypoints",)))
+
+    with pytest.raises(ValueError, match=r"board\.marker_mm"):
+        make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+    assert not [call for call in calls if call[0] == "motor"] and ("run_waypoints",) not in calls
+
+
 def test_cameras_that_do_not_stop_fail_a_capture_that_ran(tmp_path, monkeypatch):
     calls = []
     app_model = _capture_app_model(tmp_path, calls, stops=False)
@@ -1379,7 +1478,7 @@ def test_a_saved_list_outside_todays_box_is_scouted_again(tmp_path, monkeypatch)
     # 14 points, one-axis moves, the last outside today's box (motor x 0.6-20).
     points = [(1.0 + i, 20.0, 60.0) for i in range(13)] + [(500.0, 20.0, 60.0)]
     save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
-                   datetime(2026, 11, 20))
+                   datetime(2026, 11, 20), RIG_CHARUCO_BOARD)
     run()
     assert seen["scouts"] == 1
 
@@ -1392,7 +1491,7 @@ def test_the_saved_list_is_checked_against_the_configured_travel(tmp_path, monke
     app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(14, z=30.0)])
     points = [(1.0 + i, 20.0, 30.0) for i in range(14)]
     save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
-                   datetime(2026, 11, 20))
+                   datetime(2026, 11, 20), RIG_CHARUCO_BOARD)
     run()
     assert seen["scouts"] == 0
     assert [motor for *_, motor in seen["plans"][-1]] == points
@@ -1400,10 +1499,24 @@ def test_the_saved_list_is_checked_against_the_configured_travel(tmp_path, monke
     # Outside the travel (z 36): scouted again, with the travel.
     points = [(1.0 + i, 20.0, 36.0) for i in range(14)]
     save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
-                   datetime(2026, 11, 20))
+                   datetime(2026, 11, 20), RIG_CHARUCO_BOARD)
     run()
     assert seen["scouts"] == 1
     assert seen["travel"] == ((None, None), (None, None), (0.0, 35.0))
+
+
+@pytest.mark.parametrize("saved_board", [None, BoardSpec()], ids=["no_board", "checkerboard"])
+def test_a_list_scouted_with_another_board_is_scouted_again(tmp_path, monkeypatch, saved_board):
+    # A list from before the ChArUco board names none, so it was scouted with the checkerboard,
+    # whose views are whole-board ones; the ChArUco board, the default now, is usable in more.
+    app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(14)])
+    points = [(1.0 + i, 20.0, 60.0) for i in range(14)]
+    save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml", points, ["left", "right"],
+                   datetime(2026, 11, 20), saved_board)
+    run()
+    assert seen["scouts"] == 1
+    saved = yaml.safe_load((tmp_path / "calibrations" / "scout_move_list.yaml").read_text())
+    assert saved["board"]["kind"] == "charuco"
 
 
 def test_a_fault_before_waypoint_0_sends_no_waypoint_command():
@@ -1504,7 +1617,8 @@ def test_a_camera_the_chosen_list_leaves_short_gets_advice(tmp_path, monkeypatch
 def test_a_saved_list_with_fewer_than_12_points_is_not_used(tmp_path, monkeypatch):
     app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(14)])
     save_move_list(tmp_path / "calibrations" / "scout_move_list.yaml",
-                   [(1.0 + i, 20.0, 60.0) for i in range(11)], ["left", "right"], datetime(2026, 11, 20))
+                   [(1.0 + i, 20.0, 60.0) for i in range(11)], ["left", "right"], datetime(2026, 11, 20),
+                   RIG_CHARUCO_BOARD)
     run()
     assert seen["scouts"] == 1
 

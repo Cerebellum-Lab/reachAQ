@@ -825,3 +825,16 @@ def test_a_camera_name_that_is_not_a_file_name_is_refused(tmp_path, name):
     with pytest.raises(ValueError, match="is not a valid file name") as raised:
         load_waypoint_log(path)
     assert repr(name) in str(raised.value)
+
+
+@pytest.mark.parametrize("fix_pp, placement, expected", [
+    (False, "similarity", {"fit": "per_view"}),
+    (True, "similarity", {"fit": "per_view", "fit_principal_point": "centre"}),
+    # The affine placement alone does not hold the principal point.
+    (False, "affine", {"fit": "per_view", "placement": "affine"}),
+    (True, "affine", {"fit": "per_view", "fit_principal_point": "centre", "placement": "affine"}),
+])
+def test_the_recorded_fit_settings_name_only_what_was_set(fix_pp, placement, expected):
+    assert pipeline.fit_settings("per_view", pipeline.fit_options("per_view", fix_pp, placement)) == expected
+    assert pipeline.fit_settings("motor_frame", pipeline.fit_options("motor_frame", fix_pp, placement)) == {}
+    assert pipeline.fit_options("motor_frame", fix_pp, placement) == {}
