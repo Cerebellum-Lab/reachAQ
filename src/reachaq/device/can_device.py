@@ -380,6 +380,9 @@ class CanDevice(Device):
         # uuid -> (perf, motors) of STEPPER_FAULT NEEDS_HOME frames, read when that uuid's
         # -EBUSY arrives: the board refused a FIXED_XYZ whole, and these axes need a home.
         self._needs_home_faults: Dict[int, Tuple[float, Tuple[Motor, ...]]] = {}
+        # The reader (a fault) and the command loop (an error ACK) both check-and-remember a
+        # uuid before stopping: one stop per event.
+        self._stopped_uuids_lock = threading.Lock()
 
         self._init_default_move_configs()
         self._compound_movement: Optional[List[Dict[str, Any]]] = None
@@ -970,6 +973,9 @@ class CanDevice(Device):
             self._stopped_since_motion = True
             self._forget_commanded_positions()  # where a stop left the axes is not known
             (logger.info if quiet else logger.error)("Pellet STOP (all axes) sent: %s", reason)
+        elif quiet:
+            # The teardown stop: nothing was moving, and an ESTOP would latch, so none follows.
+            logger.warning("Pellet STOP NOT SENT (bus write failed): %s", reason)
         else:
             logger.error("Pellet STOP NOT SENT (bus write failed), trying ESTOP: %s", reason)
         return sent
@@ -1274,9 +1280,11 @@ class CanDevice(Device):
                 if refusal is not None:
                     if self._hold_busy_set(found_board_with_uuid_ack, refusal, refused_entry):
                         continue
-                    if refusal.blocking_fault:
+                    if refusal.blocking_fault and not self._claim_stop(msg_uuid):
+                        # Its fault frame already stopped the stage.
+                        self._stop_refused_command(found_board_with_uuid_ack, refusal)
+                    elif refusal.blocking_fault:
                         # Pellet 2.4.0 stopped the move itself; stop every axis (H1, H4).
-                        self._remember_stopped_uuid(msg_uuid)
                         self._estop_in_loop(
                             f"the board stopped {refusal.step} with {refusal.error_name}",
                             cur_commands,
@@ -1584,6 +1592,9 @@ class CanDevice(Device):
                     prev_command[2] = ctx  # ensure it keeps the context/token as well
                     prev_command[3] = perf_c  # and the perf_c as well.
                 target_board.uuid = after_uuid
+                with self._stopped_uuids_lock:  # the 8-bit uuid was reissued: forget its last use
+                    self._stopped_uuids.pop(after_uuid, None)
+                self._needs_home_faults.pop(after_uuid, None)
                 command_timeout_delay = self._prev_command_timeout or self.default_command_ack_timeout_duration
                 target_board.ack_perf_timeout = t_perf_last_command_with_uuid + command_timeout_delay
                 target_board.ack_timeout_used = command_timeout_delay
@@ -1688,11 +1699,24 @@ class CanDevice(Device):
     # -- pellet 2.4.0 STOP acks and STEPPER_FAULT (capability bit 9) -------------------
 
     def _remember_stopped_uuid(self, uuid) -> None:
-        now = get_perf_now()
-        self._stopped_uuids = {
-            u: t for u, t in self._stopped_uuids.items() if now - t < _UUID_MEMORY_S
-        }
-        self._stopped_uuids[int(uuid)] = now
+        with self._stopped_uuids_lock:
+            now = get_perf_now()
+            self._stopped_uuids = {
+                u: t for u, t in self._stopped_uuids.items() if now - t < _UUID_MEMORY_S
+            }
+            self._stopped_uuids[int(uuid)] = now
+
+    def _claim_stop(self, uuid) -> bool:
+        """True, and the uuid remembered, unless a stop for it was already made."""
+        with self._stopped_uuids_lock:
+            if self._was_stopped(uuid):
+                return False
+            now = get_perf_now()
+            self._stopped_uuids = {
+                u: t for u, t in self._stopped_uuids.items() if now - t < _UUID_MEMORY_S
+            }
+            self._stopped_uuids[int(uuid)] = now
+            return True
 
     def _was_stopped(self, uuid) -> bool:
         stamp = self._stopped_uuids.get(int(uuid))
@@ -1729,10 +1753,9 @@ class CanDevice(Device):
             self._needs_home_faults[uuid] = (now, tuple(dict.fromkeys((*motors, fault.motor))))
         else:
             logger.error("Pellet board fault: %s (uuid=%s)", description, uuid)
-            if self._was_stopped(uuid):
+            if not self._claim_stop(uuid):
                 logger.info("Stage already stopped for uuid=%s; not stopping it again", uuid)
             else:
-                self._remember_stopped_uuid(uuid)
                 try:
                     self.estop(f"the pellet board reported a fault: {description}")
                 except Exception:

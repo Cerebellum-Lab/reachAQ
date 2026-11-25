@@ -1016,3 +1016,48 @@ def test_what_the_2_4_0_codes_leave_needing_a_home(error, command_class, expecte
                              command_class=command_class, motors=(Motor.PELLET_Z_MOTOR,), motion_safety=True)
 
     assert refusal.needs_home == expected
+
+
+# -- review I1, m1, m4 -------------------------------------------------------------------
+
+def test_a_2_4_0_board_rebooted_into_2_3_1_is_stopped_with_estop(safety_board):
+    # The interface forgets bit 9 on the reboot (socketcan_backend_test); the next stop is
+    # ESTOP, both while the board has not answered and once it says 0x04.
+    board = safety_board
+    board.interface.board_capabilities = None  # the reboot was seen
+    board.device.estop("MOVE_Z was not acknowledged within 0.9 s")
+    board.interface.board_capabilities = 0x04  # it answered: 2.3.1
+    _lost_move(board)
+    assert _wait(lambda: len(board.interface.estop_frames) == 2)
+
+    assert board.interface.stop_frames == []
+    assert board.interface.estop_frames == [True, True]
+    assert board.device.last_stop_frame == "ESTOP"
+
+
+def test_a_failed_teardown_stop_says_no_estop_follows(safety_board, caplog):
+    safety_board.interface.stepper_stop = lambda motor_mask=0: False
+
+    with caplog.at_level(logging.WARNING, logger="reachaq.device.can_device"):
+        safety_board.device.disconnect()
+
+    assert safety_board.interface.estop_frames == []
+    assert "STOP NOT SENT" in caplog.text and "trying ESTOP" not in caplog.text
+
+
+def test_a_reissued_uuid_forgets_its_last_stop(safety_board):
+    # m4: the 8-bit uuid wraps; a new command on an old uuid is not "already stopped".
+    board = safety_board
+    calls = board.answer("move_motor_z", _LOST)
+    board.device.default_command_ack_timeout_duration = 30.0
+    board.device._motor_configs[Motor.PELLET_Z_MOTOR].uuid_ack_timeout = 30.0
+    uuid = board.interface.uuid() % 255 + 1  # the uuid the move will get
+    board.device._remember_stopped_uuid(uuid)
+    board.device._needs_home_faults[uuid] = (0.0, (Motor.PELLET_X_MOTOR,))
+
+    board.send(SystemCommandKind.MOVE_Z, 15.5, token="moving")
+    assert _wait(lambda: calls)
+    assert _wait(lambda: board.device._boards_pending_ctx[Target.PELLET_DEVICE].uuid == uuid)
+
+    assert not board.device._was_stopped(uuid)
+    assert uuid not in board.device._needs_home_faults

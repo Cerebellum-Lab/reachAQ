@@ -4140,7 +4140,8 @@ class AppModel(ObservableObject):
         axes = self._pellet_axes_needing_home()
         if pellet_source_required and axes:
             blockers.append(
-                f"Pellet axis {', '.join(axes)} needs homing after a refused command: "
+                f"Pellet axis {', '.join(axes)} needs homing (after a refusal, a stop or a board fault, "
+                "or not homed since the board booted): "
                 "home the pellet axes"
             )
         faults = self._pellet_axes_with_driver_fault()
