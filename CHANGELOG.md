@@ -58,6 +58,22 @@ installer, which migrates the settings; see "Upgrading from v3" in
   uninstalls every `auto-trainer*` distribution, restores the pose plugins v3
   registered, and replaces installed SoftMouse user units that still name a v3
   module.
+- Pellet firmware 2.4.0 (capability bit 9, `stepper_motion_safety`): every host
+  stop is an all-axes `STEPPER_STOP` on such a board, ESTOP on 2.3.1; a STOP also
+  goes out at every teardown. `STEPPER_FAULT` frames and the `-ETIME`, `-EFAULT`
+  and `-EIO` ACKs stop every axis and raise the blocking stopped-stage alert; each
+  fault is written to `streams/device.csv` and `recording.stepperFaults`. A
+  FIXED_XYZ refused for `NEEDS_HOME` prompts a home and a resend, without a stop.
+  Status bits `NEEDS_HOME` and `HOMED_SINCE_BOOT` gate automatic motion and
+  Record. `BOOT_CHAIN` bootloader responses decode, and an unknown bootloader
+  subcommand no longer ends the CAN reader. The 2.4.0 allowlist entry requires
+  `stepper_motion_safety`.
+
+### Changed
+
+- Every stepper target is clamped to its axis's `max_pos` from
+  `motor_config.yaml` (at most 15 turns, as before), matching pellet 2.4.0's
+  per-axis travel caps.
 
 ## [3.2.2] - 2026-11-24
 

@@ -11,7 +11,7 @@ required; camera-only operation is unaffected when CAN/pellet is disabled.
 
 | Firmware | Requires | Status |
 |---|---|---|
-| `2.4.0` | `finite_stim3_pulse`, `timing_trailer`, `time_sync`; `sync_listener` and `stepper_driver_fault` are optional | Rollout pending; needs reachAQ v3.0.1 or later; signed with the new `pellet-k2` key, so each board needs one SWD visit (MCUboot and application together) before it can run it |
+| `2.4.0` | `finite_stim3_pulse`, `timing_trailer`, `time_sync`, `stepper_motion_safety` (bit 9: STEPPER_STOP and STEPPER_FAULT, so only a reachAQ that stops with STOP accepts it); `sync_listener` and `stepper_driver_fault` are optional | Rollout pending; needs reachAQ v3.0.1 or later; signed with the new `pellet-k2` key, so each board needs one SWD visit (MCUboot and application together) before it can run it |
 | `2.3.1` | `finite_stim3_pulse`; `stepper_driver_fault` (bit 6) is optional, and only a pellet v1.3 board reports it | Rollout pending; 19 of 19 qualification checks on a pellet v1.2 board; no v1.3 board has run it; recorded-session validation pending; required on a pellet v1.3 board |
 | `2.3.0` | `finite_stim3_pulse` (the first release to report its capabilities) | Rig-verified; recorded-session validation pending |
 | `2.2.0` | nothing (it reports no capabilities) | Rollout pending |

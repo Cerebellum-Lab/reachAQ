@@ -393,6 +393,62 @@ operator Home or a reconnect.
 The maintenance tools (`src/reachaq/pellet_delivery`, `scripts/can_console.py`,
 `src/reachaq/hardware/validate_can_hardware.py`) do not send ESTOP.
 
+### Pellet firmware 2.4.0: STOP and board faults
+
+A board that advertises capability bit 9 (`stepper_motion_safety`, pellet
+firmware 2.4.0) is stopped with an all-axes `STEPPER_STOP` (`0x2C`, motor mask
+0) instead of ESTOP, at every trigger above. STOP needs no release, does not
+latch, and is acknowledged (with uuid 0, which no command uses; the
+acknowledgement is only logged). An axis it stopped mid-move needs a home on the
+board; reachAQ still treats every axis as needing a home after any stop, as it
+does after an ESTOP. If the STOP frame cannot be written, ESTOP is sent instead.
+A 2.3.1 board, or any board without bit 9, gets ESTOP as before. The log line
+reads `Pellet STOP (all axes) sent: ...`, and `recording.estops` entries carry
+`frame` (`STOP` or `ESTOP`). The release before a home is still sent: it is
+harmless on a board that is not latched.
+
+On a bit 9 board reachAQ also sends a STOP when it disconnects with nothing
+moving (a routine teardown): it leaves idle axes homed, so it is not reported as
+a stop.
+
+The board's own faults:
+
+- A `STEPPER_FAULT` frame (`0x2D`) with reason `WATCHDOG`, `LIMIT`,
+  `SWITCH_AT_START`, `DMA` or `DRIVER_NOT_IDLE` stops every axis at once (a
+  FIXED_XYZ otherwise finishes its other axes) and raises the blocking "Pellet
+  stage stopped" alert, whose reason names the axis, the fault and the board's
+  raw pulse counts (pulses issued, pulses planned, where the board believed the
+  axis was). The counts are raw: they are not shown as lost steps until the
+  bench check of the pulse count has passed. So does an ACK of `-ETIME`,
+  `-EFAULT` or `-EIO` to a stepper command, whichever of the two arrives first;
+  the second is only logged.
+- Reason `NEEDS_HOME` means the board refused a FIXED_XYZ whole, moving
+  nothing, because that axis needs a home. Its `-EBUSY` is then not a stop: the
+  refusal says to home the named axes and send it again. A bare `-EBUSY`
+  (no `NEEDS_HOME` frame) still stops the stage.
+- `-ERANGE` (a target past the axis's travel) is refused without a stop.
+- `-ECANCELED` is the acknowledgement of a move a STOP ended; it arrives after
+  the move was already ended as `stopped`, and is logged.
+
+Every fault is written to the session's `streams/device.csv` (the decoded frame,
+and a `stepper_fault` state row) and to its metadata as
+`recording.stepperFaults` (`axis`, `reason`, `reasonName`, `homing`,
+`towardSwitch`, `pulsesIssued`, `pulsesPlanned`, `believedPositionTurns`,
+`believedPositionMm`, `pulsesPerTurn`, `canUuid`, `description`, `blocking`,
+`wallTime`, `perfTime`). The faulted axis needs a home, which holds automatic
+motion and Record.
+
+Status bits: on a bit 9 board an axis whose `STEPPER_STATUS` has `NEEDS_HOME`
+(bit 2) set, or `HOMED_SINCE_BOOT` (bit 3) clear, is listed as needing a home
+for as long as the status says so, and its reported position is shown as
+unknown while `NEEDS_HOME` is set (the board's plan after a fault is not proof
+of position). Bits 2 and 3 are ignored on older firmware.
+
+Travel: every stepper target is clamped to that axis's `max_pos` in
+`motor_config.yaml` (still at most 15 turns), absolute, relative and saved
+(SET) targets alike. Pellet 2.4.0 refuses a target past its own per-axis travel
+(x 35, y 35, z 30 mm by default) with `-ERANGE`.
+
 ## Software-only camera launch
 
 `--random-cameras` changes configured camera sources only in memory for that
