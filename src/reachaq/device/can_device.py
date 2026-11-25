@@ -346,6 +346,12 @@ class CanDevice(Device):
         self._failure_callback = failure_callback
         self._operation_callback = operation_callback
         self._estop_callback = estop_callback
+        # Tokens of motion commands (_MOTION_COMMANDS) accepted and not yet acknowledged
+        # or refused: queued, between a sequence's frames, or awaiting an ack.
+        self._motion_tokens = set()
+        # Set by a written ESTOP, cleared by the next motion command or stepper frame:
+        # nothing is in flight that the stop did not already stop.
+        self._stopped_since_motion = False
 
         self._init_default_move_configs()
         self._compound_movement: Optional[List[Dict[str, Any]]] = None
@@ -698,16 +704,35 @@ class CanDevice(Device):
 
     @property
     def motion_possibly_in_flight(self) -> bool:
-        """A frame that may have set a stepper moving is awaiting its ack.
+        """A motion command is not finished, or a stepper frame awaits its ack, since the last ESTOP.
 
-        Set when the frame is sent, cleared when its ack (or refusal) arrives,
-        when an ESTOP ends it, and on disconnect. Between two steps of a sequence
-        it is False: the board acknowledges a move when it is done.
+        True from the moment a motion command is accepted (before any frame of it is
+        written), while it is queued, between a sequence's frames and while a stepper
+        frame awaits its ack, until the command is acknowledged or refused. A teardown
+        that finds it False cannot be raced by a frame of a command already accepted.
+        A written ESTOP makes it False until the next motion command.
         """
+        if self._stopped_since_motion:
+            return False
+        return bool(self._motion_tokens) or self.stepper_frame_in_flight
+
+    @property
+    def stepper_frame_in_flight(self) -> bool:
+        """A stepper frame was sent and its ack has not arrived (the narrower check)."""
+        if self._stopped_since_motion:
+            return False
         return any(
             board.uuid is not None and board.stepper_motion
             for board in tuple(self._boards_pending_ctx.values())
         )
+
+    def _acknowledge_command(self, token: object, *, perf_c: float = math.nan):
+        self._motion_tokens.discard(token)
+        super()._acknowledge_command(token, perf_c=perf_c)
+
+    def _refuse_command(self, refusal) -> None:
+        self._motion_tokens.discard(refusal.token)
+        super()._refuse_command(refusal)
 
     def estop(self, reason: str) -> bool:
         """Stop every pellet stepper now: one ESTOP frame, written from the calling thread.
@@ -720,14 +745,15 @@ class CanDevice(Device):
         waiters and tokens end. Returns whether the frame reached the bus.
         """
         sent = self._write_estop(True, reason)
-        # The listener first: a waiter that sees its command stopped finds the stage stopped.
-        self._notify_estop(reason, sent)
         try:
             # Not _put_to_cmd_queue: no shutdown check and no liveness raise.
-            # A disconnect clears what is pending anyway.
+            # A disconnect clears what is pending anyway. Queued before the listeners
+            # run, so the stopped move ends "stopped", not refused by the latched
+            # board's -EPERM ack on its next status tick.
             self._commands_queue.put((_estop_abort, str(reason), None))
         except Exception:
             logger.exception("Could not queue the ESTOP's clean-up")
+        self._notify_estop(reason, sent)
         return sent
 
     def release_estop(self) -> None:
@@ -742,13 +768,20 @@ class CanDevice(Device):
     def _write_estop(self, asserted: bool, reason: str) -> bool:
         estop = getattr(self._interface, "estop", None)
         sent = False
-        try:
-            if estop is None:
-                raise RuntimeError(f"{type(self._interface).__name__} cannot send an ESTOP")
-            sent = bool(estop(asserted))
-        except Exception as err:
-            logger.error("Could not write the pellet ESTOP %s frame: %s",
-                         "assert" if asserted else "release", err)
+        # One immediate retry of a failed write: the frame latches and is idempotent.
+        # This is not a re-send of a frame that went out.
+        for attempt in (1, 2):
+            try:
+                if estop is None:
+                    raise RuntimeError(f"{type(self._interface).__name__} cannot send an ESTOP")
+                sent = bool(estop(asserted))
+            except Exception as err:
+                logger.error("Could not write the pellet ESTOP %s frame (attempt %s/2): %s",
+                             "assert" if asserted else "release", attempt, err)
+            if sent or estop is None:
+                break
+        if asserted and sent:
+            self._stopped_since_motion = True
         if asserted:
             logger.error("Pellet ESTOP %s: %s", "sent" if sent else "NOT SENT (bus write failed)", reason)
         elif sent:
@@ -766,10 +799,16 @@ class CanDevice(Device):
         except Exception:
             logger.exception("ESTOP listener failed")
 
-    def _estop_in_loop(self, reason: str, cur_commands: list) -> None:
-        """An ESTOP the command loop itself decided on: write it, then end what it stopped."""
+    def _estop_in_loop(self, reason: str, cur_commands: list, *, before_clean_up=None) -> None:
+        """An ESTOP the command loop itself decided on: write it first, then end what it stopped.
+
+        before_clean_up runs after the frame and the listeners: a refusal that
+        decided the stop reaches its waiters only once the stage is stopped.
+        """
         sent = self._write_estop(True, reason)
-        self._notify_estop(reason, sent)  # first, as in estop()
+        self._notify_estop(reason, sent)
+        if before_clean_up is not None:
+            before_clean_up()
         self._end_stopped_commands(reason, cur_commands)
 
     def _end_stopped_commands(self, reason: str, cur_commands: list) -> None:
@@ -871,6 +910,13 @@ class CanDevice(Device):
             self.__command_handler()
         except BaseException as err:
             logger.exception("command handler crashed: %s", err)
+            # Nothing else stops the stage: a crash is not recovered and starts no teardown,
+            # and with the loop gone no ack timeout can fire for the frame in flight.
+            try:
+                if self.motion_possibly_in_flight:
+                    self.estop(f"the CAN command loop failed during a move ({err.__class__.__name__})")
+            except Exception:
+                logger.exception("Pellet ESTOP after the command handler crash failed")
             failure = getattr(err, "can_failure", None)
             if failure is None:
                 failure = CanFailure(
@@ -975,6 +1021,7 @@ class CanDevice(Device):
                             cur_commands.insert(0, (_uuid_ack, data, ctx, -math.inf))
                             board_ctx.busy_set_retries = 0
                         board_ctx.uuid = None
+                        board_ctx.stepper_motion = False
                         board_ctx.repeated_command_count = 0
                         board_ctx.prev_command = None
                         board_ctx.last_stim_output = None
@@ -999,13 +1046,16 @@ class CanDevice(Device):
                 if refusal is not None:
                     if self._hold_busy_set(found_board_with_uuid_ack, refusal, refused_entry):
                         continue
-                    self._stop_refused_command(found_board_with_uuid_ack, refusal)
                     if refusal.motion_may_continue:
                         self._estop_in_loop(
                             f"the board answered {refusal.error_name} to {refusal.step}"
                             " (an axis may still be moving)",
                             cur_commands,
+                            before_clean_up=partial(
+                                self._stop_refused_command, found_board_with_uuid_ack, refusal),
                         )
+                    else:
+                        self._stop_refused_command(found_board_with_uuid_ack, refusal)
                     continue
             else:
                 if kind is not None:
@@ -1295,6 +1345,8 @@ class CanDevice(Device):
                     _is_stepper_motion(target_board.prev_command, target_board.kind)
                     and not target_board.prev_command_skips_retry
                 )
+                if target_board.stepper_motion:
+                    self._stopped_since_motion = False
             else:
                 # no uuid generated
                 compound_steps = target_board.compound_steps
@@ -1523,8 +1575,17 @@ class CanDevice(Device):
             board.busy_set_entry = None
             board.busy_set_due = math.inf
             board.busy_set_retries = 0
+        self._motion_tokens.clear()
 
     def disconnect(self):
+        # The device-level choke point: HardwareModel's teardown, the transport worker's
+        # finally (a reader crash) and connect() all pass here. Stop a stage that may be
+        # moving before what is pending is dropped and the loop is told to exit.
+        try:
+            if self.motion_possibly_in_flight and getattr(self._interface, "is_open", False):
+                self.estop("the CAN device disconnected during a move")
+        except Exception:
+            logger.exception("Pellet ESTOP before the device disconnect failed")
         with self._disconnect_lock:
             self._want_exit.set()
             with self._command_execution_lock:
@@ -1788,6 +1849,10 @@ class CanDevice(Device):
         if context is not None:
             self._latency("enqueue", token=str(context),
                           kind=getattr(kind, "name", str(kind)), perf=time.perf_counter())
+        if kind in _MOTION_COMMANDS:
+            if context is not None:
+                self._motion_tokens.add(context)
+            self._stopped_since_motion = False
         self._put_to_cmd_queue((kind, data, context))
         return
 

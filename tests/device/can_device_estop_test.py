@@ -22,7 +22,7 @@ import pytest
 
 from reachaq.core import Motor
 from reachaq.core.message import SystemCommandKind, SystemStatusMessageKind
-from reachaq.device import CommandRefusal, RefusedCommandClass, Target
+from reachaq.device import CanDevice, CommandRefusal, RefusedCommandClass, Target
 from reachaq.device.device_interface import Acknowledge
 
 from can_device_refusal_test import _Board, _LOST
@@ -264,11 +264,15 @@ def test_estop_is_written_at_once_and_never_queued_behind_the_pending_move(board
         time.sleep(0.005)
     assert board.device.motion_possibly_in_flight
 
+    threads = []
+    real = board.interface.estop
+    board.interface.estop = lambda asserted=True: (threads.append(threading.current_thread()), real(asserted))[1]
     sent = board.device.estop("test stop")
 
     # Written by the call itself, on this thread, while the move still awaits its ack.
     assert sent is True
     assert board.interface.estop_frames == [True]
+    assert threads == [threading.current_thread()], "written on the calling thread, not by the loop"
     refusal = board.refusal_of(token)
     assert refusal.estop_reason == "test stop"
     time.sleep(0.3)
@@ -487,3 +491,178 @@ def test_every_device_trigger_sends_the_all_axes_estop(board, trigger):
 
     assert calls == [((True,), {})], "one ESTOP, asserted, naming no axis"
     assert [axes for _reason, axes, _sent in board.reported] == [_XYZ]
+
+
+# -- review b2d30887: crashes, teardown races, ordering ----------------------------
+
+def _wait(predicate, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    return predicate()
+
+
+def _pending_move(board):
+    board.device.default_command_ack_timeout_duration = 30.0
+    moves = board.answer("move_motor_z", _LOST)
+    board.send(SystemCommandKind.MOVE_Z, 15.5, token="moving")
+    assert _wait(lambda: moves)
+    return moves
+
+
+def test_a_device_disconnect_during_a_move_sends_an_estop_first(board):
+    # I-1: CanDevice.disconnect is the device-level choke point: the reader's finally,
+    # HardwareModel's teardown and connect()'s own disconnect all pass through it.
+    _pending_move(board)
+
+    board.device.disconnect()
+
+    assert board.interface.estop_frames == [True]
+    assert "disconnected during a move" in board.reported[0][0]
+
+
+def test_a_reader_crash_during_a_move_sends_an_estop():
+    # I-1: the transport worker's finally disconnects the device; nothing else would stop it.
+    from queue import Queue
+    from reachaq.device import DeviceApi, DeviceConnection
+
+    device = CanDevice(api=DeviceApi(), force_emulation=True, required_targets=(Target.PELLET_DEVICE,))
+    interface = device.device_interface
+    connection = DeviceConnection(device, message_queue=Queue())
+    connection.request_connect()
+    try:
+        assert _wait(lambda: device.connected)
+        device.default_command_ack_timeout_duration = 30.0
+        def lost_move(*args, **kwargs):
+            interface.next_uuid()
+            return True
+
+        interface.move_motor_z = lost_move
+        device._init_handlers()
+        device.notify_message(SystemCommandKind.MOVE_Z, 15.5, context="moving")
+        assert _wait(lambda: device.motion_possibly_in_flight)
+
+        def crash(*args, **kwargs):
+            raise RuntimeError("reader decode failure")
+
+        interface.read = crash
+
+        assert _wait(lambda: interface.estop_frames == [True]), interface.estop_frames
+    finally:
+        connection.request_disconnect()
+        connection.join()
+
+
+def test_a_command_loop_crash_during_a_move_sends_an_estop(board):
+    # I-2: a crash ends as CanFailureKind.COMMAND, which starts no teardown.
+    _pending_move(board)
+
+    board.device.notify_message("not a command kind", None, context="crash")
+
+    assert _wait(lambda: board.interface.estop_frames == [True])
+    assert "command loop failed" in board.reported[0][0]
+
+
+def test_a_disconnect_between_the_frames_of_a_send_sends_an_estop(board):
+    # I-3: during the pre-reveal delay no stepper frame awaits its ack, but the send is not done.
+    board.device.default_command_ack_timeout_duration = 30.0
+    delays = board.answer("delay", _LOST)
+    board.send(SystemCommandKind.SEND_PELLET, {"pre_reveal_stimulus": (200, 1000, 2)}, token="send")
+    assert _wait(lambda: delays)
+    ctx = board.device._boards_pending_ctx[Target.PELLET_DEVICE]
+    assert not ctx.stepper_motion
+
+    assert board.device.motion_possibly_in_flight, "a motion command is still pending"
+    board.device.disconnect()
+
+    assert board.interface.estop_frames == [True]
+
+
+def test_a_queued_motion_command_is_motion_possibly_in_flight(board):
+    # I-3: queued behind a pending SET, the move has not been sent yet.
+    board.device.default_command_ack_timeout_duration = 30.0
+    sets = board.answer("set_motor_x", _LOST)
+    board.send(SystemCommandKind.SET_X, 1.0, token="set")
+    assert _wait(lambda: sets)
+    assert not board.device.motion_possibly_in_flight
+
+    board.send(SystemCommandKind.MOVE_Y, 2.0, token="queued")
+
+    assert board.device.motion_possibly_in_flight
+
+
+def test_an_idle_device_disconnect_sends_no_estop(board):
+    token = board.send(SystemCommandKind.MOVE_Y, 2.0)
+    assert board.wait_for(SystemStatusMessageKind.ACKNOWLEDGE, token) is not None
+    assert _wait(lambda: not board.device.motion_possibly_in_flight)
+
+    board.device.disconnect()
+
+    assert board.interface.estop_frames == []
+
+
+def test_the_ebusy_estop_is_written_before_the_refusal_reaches_its_waiters(board):
+    # M-1: the frame first, then the listeners.
+    seen = []
+    real = board.device.api.message_callback
+
+    def callback(kind, data):
+        if kind == SystemStatusMessageKind.COMMAND_REFUSED:
+            seen.append(list(board.interface.estop_frames))
+        real(kind, data)
+
+    board.device.api.message_callback = callback
+    board.answer("move_motor_z", -16)
+
+    board.refusal_of(board.send(SystemCommandKind.MOVE_Z, 15.5))
+
+    assert seen == [[True]]
+
+
+def test_estop_queues_its_clean_up_before_it_notifies_listeners():
+    # M-2: so the stopped move ends "stopped", not refused by the board's -EPERM ack.
+    from reachaq.device import DeviceApi
+    from reachaq.device.can_device import _estop_abort
+
+    device = CanDevice(api=DeviceApi(), force_emulation=True, required_targets=(Target.PELLET_DEVICE,))
+    seen = []
+    device._estop_callback = lambda reason, axes, sent: seen.append(
+        [item[0] for item in list(device._commands_queue.queue)])
+
+    device.estop("test stop")
+
+    assert seen == [[_estop_abort]]
+
+
+def test_motion_is_in_flight_before_the_move_frame_is_written(board):
+    # M-4: a concurrent teardown must see the move from the moment it is on its way.
+    seen = []
+    real = board.interface.move_motor_x
+
+    def move(*args, **kwargs):
+        seen.append(board.device.motion_possibly_in_flight)
+        return real(*args, **kwargs)
+
+    board._replace("move_motor_x", move)
+    token = board.send(SystemCommandKind.MOVE_X, 1.0)
+
+    assert board.wait_for(SystemStatusMessageKind.ACKNOWLEDGE, token) is not None
+    assert seen == [True]
+
+
+def test_a_failed_estop_write_is_tried_once_more(board):
+    # M-8: ESTOP latches and is idempotent; one immediate retry of a write error.
+    calls = []
+    real = board.interface.estop
+
+    def flaky(asserted=True):
+        calls.append(asserted)
+        if len(calls) == 1:
+            raise OSError(105, "No buffer space available")
+        return real(asserted)
+
+    board.interface.estop = flaky
+
+    assert board.device.estop("test stop") is True
+    assert calls == [True, True]
+    assert board.reported == [("test stop", _XYZ, True)]

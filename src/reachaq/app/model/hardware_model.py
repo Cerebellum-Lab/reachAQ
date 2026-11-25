@@ -265,7 +265,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 self._refresh_cmd_in_progress(after_commands)
                 if expired_motion:
                     self.estop_if_moving(
-                        f"{expired_motion[0].name} was not acknowledged within 30 s")
+                        f"{expired_motion[0].name} was not acknowledged within 30 s", frame_only=True)
 
     @property
     def pending_tokens(self) -> List[str]:
@@ -300,8 +300,27 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
     @property
     def motion_possibly_in_flight(self) -> bool:
-        """A stepper frame was sent and its ack has not arrived (CanDevice.motion_possibly_in_flight)."""
-        return getattr(self._can_device, "motion_possibly_in_flight", False) is True
+        """A motion command is not finished, here or on the device, since the last stop.
+
+        CanDevice.motion_possibly_in_flight (accepted motion commands and stepper frames
+        awaiting their ack), or a motion token of this model still pending that was sent
+        after the last ESTOP: between a sequence's frames nothing awaits an ack, but the
+        next frame can go out before a teardown stops the device.
+        """
+        if getattr(self._can_device, "motion_possibly_in_flight", False) is True:
+            return True
+        record = self._estop_record
+        stopped_at = -math.inf if record is None else record["perfTime"]
+        with self._lock:
+            return any(
+                command in _REFUSED_WHILE_STOPPED and started > stopped_at
+                for command, started in self._pending_tokens.values()
+            )
+
+    @property
+    def stepper_frame_in_flight(self) -> bool:
+        """A stepper frame was sent and its ack has not arrived (CanDevice.stepper_frame_in_flight)."""
+        return getattr(self._can_device, "stepper_frame_in_flight", False) is True
 
     def estop(self, reason: str) -> bool:
         """Stop every pellet stepper now (CanDevice.estop); False when it could not be sent.
@@ -320,9 +339,14 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             logger.exception("Pellet ESTOP failed: %s", reason)
             return False
 
-    def estop_if_moving(self, reason: str) -> bool:
-        """estop(reason) only while a stepper frame awaits its ack; an idle stage is left alone."""
-        if not self.motion_possibly_in_flight:
+    def estop_if_moving(self, reason: str, *, frame_only: bool = False) -> bool:
+        """estop(reason) only while motion is possibly in flight; an idle stage is left alone.
+
+        frame_only narrows it to a stepper frame awaiting its ack: a waiter that gives
+        up must not stop a sequence that is only waiting out a long delay frame.
+        """
+        moving = self.stepper_frame_in_flight if frame_only else self.motion_possibly_in_flight
+        if not moving:
             return False
         return self.estop(reason)
 
@@ -2062,7 +2086,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         if pending is not None:
             self._refresh_cmd_in_progress(commands_in_progress)
             if pending[0] in _REFUSED_WHILE_STOPPED:
-                self.estop_if_moving(f"{pending[0].name} was not acknowledged within {timeout:g} s")
+                self.estop_if_moving(f"{pending[0].name} was not acknowledged within {timeout:g} s",
+                                     frame_only=True)
         if raise_on_timeout:
             raise RuntimeError(f"timeout waiting ack of pending token={token}")
         logger.warning("timeout waiting ack token %s, but continuing", token)
