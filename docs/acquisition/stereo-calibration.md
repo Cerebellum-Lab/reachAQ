@@ -389,8 +389,8 @@ The per-view fit adds stage-accuracy notes to the report: the similarity's scale
 and RMS, each waypoint more than 1 mm from its commanded position by name (for
 example `waypoint 13: board 3.3 mm short of commanded z`), each waypoint's board
 tilt and its axis in the motor frame, and every waypoint's residual. They are
-warnings about the stage, not the calibration. The report's stage-accuracy block
-grades them (see The quality report): it warns and never fails.
+measured numbers. The report's stage-accuracy block grades them (see The quality
+report): it warns and never fails.
 
 `fit_principal_point: centre` holds every camera's principal point at the image
 centre in the per-view fit (default `free`). The board only translates, so its
@@ -994,7 +994,7 @@ Each camera has two reprojection RMS values, and only one of them is graded:
 The stage-accuracy block reports measured numbers only. It names no cause.
 
 The text report lists the stage-accuracy metrics after the others, under
-`Stage accuracy (the stage, not the calibration; warns, never fails):`. They are
+`Stage accuracy (measured; warns, never fails):`. They are
 `motor_scale_dev`, `stage_slack_rms_mm` and `stage_repeat_mm`. The last two
 come from the per-view fit's placement, so a motor-frame fit has only
 `motor_scale_dev`.
@@ -1024,7 +1024,7 @@ for example `left-right`.
 | `loo_triangulation_px` | camera, 3 or more cameras | > 0.5 | > 1.0 | Median distance, sensor px, between this camera's corners and the points the other calibrated cameras triangulate, projected into it, over positions it and at least two others saw |
 | `motor_scale_dev` | capture | > 0.01 | none | Stage accuracy. \|motor scale - 1\|: true travel (from the board's squares) against commanded travel |
 | `stage_slack_rms_mm` | motor axis (x, y, z) | > 1.0 | none | Stage accuracy, per-view fit only. RMS over every view of where the board was minus where the stage model put it, along that motor axis |
-| `stage_repeat_mm` | waypoint pair | > 0.5 | none | Stage accuracy, per-view fit only, for a position visited twice. Distance the board moved between the two visits; the note gives it per axis |
+| `stage_repeat_mm` | waypoint pair | > 0.5 | none | Stage accuracy, per-view fit only, for a position visited twice. Distance between the board positions the fit placed at the two visits; the note gives it per axis |
 | `waypoints_unverified` | capture | > 0 | none | Positions where the motor's reported position did not come within 0.05 mm of the command in time. Verified means the motor reported the commanded position, not a traced arrival |
 | `waypoints_unreached` | capture | none | > 0 | Positions where the reported position was more than 0.1 mm from the commanded one on some axis. The fit places the board at the commanded position, so any such view is in the wrong place. A position with no finite reported position is not counted |
 | `cross_check_delta_px` | binned preset | > 1.5 | none | Largest difference in fx, fy, cx or cy between a direct fit in the preset's own pooled frames and the mapped sensor fit, preset px. With the per-view fit, the sensor fit it is compared with is refitted on exactly the views and corners the preset found, and the direct fit weighs its residuals in sensor px, so the two solve the same problem. Informational: the direct fit has a noise floor near 0.5 px |

@@ -789,7 +789,9 @@ def test_the_stage_block_reports_slack_and_repeat_visits_and_never_fails(rig, fi
 
     repeat = metric(report, "stage_repeat_mm", f"{first.index}-{again.index}")
     assert repeat.value == pytest.approx(2.0) and repeat.status == "warn"
-    assert "z +2.00" in repeat.note
+    assert "z +2.00" in repeat.note and "board position differs by" in repeat.note
+    # Measured numbers only: the heading names no cause.
+    assert "not the calibration" not in STAGE_HEADING
     slack = {axis: metric(report, "stage_slack_rms_mm", axis) for axis in "xyz"}
     assert slack["z"].value == pytest.approx(2.0 / math.sqrt(len(observations)))
     assert slack["x"].value == 0.0 and slack["y"].value == 0.0

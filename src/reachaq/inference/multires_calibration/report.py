@@ -142,7 +142,7 @@ DEFAULT_THRESHOLDS: Thresholds = {
 # warn and never fail, and the text report lists them in a block of their own after the
 # calibration's metrics.
 STAGE_METRICS = ("motor_scale_dev", "stage_slack_rms_mm", "stage_repeat_mm")
-STAGE_HEADING = "Stage accuracy (the stage, not the calibration; warns, never fails):"
+STAGE_HEADING = "Stage accuracy (measured; warns, never fails):"
 # The metrics where a smaller value is worse; see the module docstring.
 LOWER_IS_WORSE = frozenset({"views_kept", "covisible_views", "coverage_roi_fraction", "coverage_frame_fraction"})
 NO_PREVIOUS_NOTE = "no comparable previous calibration"
@@ -490,7 +490,7 @@ def build_report(
         for a, b, commanded, d in repeat_visits(observations, residual):
             add("stage_repeat_mm", f"{a}-{b}", float(np.linalg.norm(d)), "mm",
                 f"waypoints {a} and {b} at commanded {_format_xyz_mm(commanded)}:"
-                f" board moved x {d[0]:+.2f}, y {d[1]:+.2f}, z {d[2]:+.2f} mm between visits")
+                f" board position differs by x {d[0]:+.2f}, y {d[1]:+.2f}, z {d[2]:+.2f} mm between visits")
     for check in cross_checks:
         add("cross_check_delta_px", None, check.max_intrinsic_delta_px, "preset px", f"preset {check.geometry.name}")
         add("cross_check_corner_offset_px", None, check.corner_offset_px, "preset px", f"preset {check.geometry.name}")
@@ -581,8 +581,8 @@ def repeat_visits(
 ) -> List[Tuple[int, int, np.ndarray, np.ndarray]]:
     """(waypoint a, waypoint b, commanded mm, board at b minus board at a in motor mm) for every
     pair of placed views at the same commanded position, in waypoint order. The commanded
-    position is the same, so the difference of the placement residuals is how far the board
-    moved between the two visits."""
+    position is the same, so the difference of the placement residuals is how far apart the
+    fit placed the board at the two visits."""
     placed = [(o.index, np.asarray(o.motor_mm, float).reshape(3)) for o in observations if o.index in residual_mm]
     out = []
     for i, (a, m_a) in enumerate(placed):
