@@ -16,7 +16,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
-from autotrainer.core import Motor
+from autotrainer.core import Motor, SystemCommandKind
 from autotrainer.core.interfaces import RecordingEndingReason
 from tools.acquisition.model.recording_session_controller import RecordingSessionController
 from tools.acquisition.model.session_boundary import SessionBoundary
@@ -60,16 +60,70 @@ def test_an_estop_is_written_to_the_sessions_metadata(app_model, tmp_path):
     assert estop["operator"] is False and estop["sent"] is True
 
 
-def test_a_stopped_stage_is_not_homed_at_the_end_of_the_session(app_model):
-    app_model._set_subsystem_status(SubsystemId.CAN_PELLET, SubsystemState.READY)
-    app_model.hardware._on_device_estop("a test stop", _XYZ, True)
-    with mock.patch.object(app_model.hardware, "send_home_and_wait") as send_home:
-        app_model._request_session_end_home("stop")
+class _StoppedBoard:
+    """CanDevice and connection fakes: one log of releases and sends; a home is acked at once."""
 
-    send_home.assert_not_called()
-    action = app_model._recording_session.end_actions[0]
-    assert action["status"] == "skipped"
-    assert "stopped (a test stop)" in action["error"]
+    def __init__(self, hardware):
+        self.log = []
+        self._hardware = hardware
+        self.motion_possibly_in_flight = False
+
+    def estop(self, reason):
+        self.log.append(("estop", reason))
+        self._hardware._on_device_estop(reason, _XYZ, True)
+        return True
+
+    def release_estop(self):
+        self.log.append(("release",))
+
+    def send_message(self, kind, data=None, context=None):
+        self.log.append(("send", kind))
+        if kind is SystemCommandKind.SEND_HOME:
+            threading.Timer(0.05, self._hardware._ack_received, args=(context,)).start()
+
+
+def _stopped_app(app_model):
+    hardware = app_model.hardware
+    board = _StoppedBoard(hardware)
+    hardware._can_device = board
+    hardware._device_conn = board
+    hardware.estop("MOVE_Z was not acknowledged within 3 s")
+    return hardware, board
+
+
+def test_the_session_end_home_after_a_stop_releases_the_latch_homes_and_clears_it(app_model, caplog):
+    import logging
+
+    app_model._set_subsystem_status(SubsystemId.CAN_PELLET, SubsystemState.READY)
+    hardware, board = _stopped_app(app_model)
+    try:
+        with mock.patch.object(type(hardware), "connected", new_callable=mock.PropertyMock,
+                               return_value=True), caplog.at_level(logging.INFO):
+            app_model._request_session_end_home("stop")
+
+        assert board.log[1:] == [("release",), ("send", SystemCommandKind.SEND_HOME)]
+        assert not hardware.estop_active
+        assert hardware.pellet_axes_needing_home == ()
+        action = app_model._recording_session.end_actions[0]
+        assert action["status"] == "completed"
+        assert any("Session-end pellet home after a stop" in r.getMessage() for r in caplog.records)
+    finally:
+        hardware._can_device = hardware._device_conn = None
+
+
+def test_a_pellet_machine_auto_home_is_still_refused_while_stopped(app_model):
+    hardware, board = _stopped_app(app_model)
+    try:
+        pellet = app_model.behavior.system_machine.pellet
+        try:
+            pellet.move_home(force=True)
+        except Exception:
+            pass  # PelletDeviceCommandFailed: the home was not queued
+
+        assert ("send", SystemCommandKind.SEND_HOME) not in board.log
+        assert hardware.estop_active
+    finally:
+        hardware._can_device = hardware._device_conn = None
 
 
 class _Stop(Exception):

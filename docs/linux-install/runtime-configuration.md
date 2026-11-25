@@ -289,12 +289,14 @@ timer running: the axis keeps moving, and the board answers every later move
 with `-EBUSY`. The one command that stops it is ESTOP, a single broadcast
 frame with no acknowledgement. ReachAQ sends it (since v3.2.3):
 
-- when a stepper frame is not acknowledged in time: a MOVE, a home,
-  `SEND_TO_FIXED_XYZ`, or any frame of the home, load, send and retract
-  sequences. The frame is **not re-sent** any more (a re-sent move is what
-  the running axis answers with `-EBUSY`). A lost SET is still re-sent, and a
-  lost stimulus-pulse acknowledgement is still skipped;
-- when the board answers `-EBUSY` to a stepper command;
+- when a stepper-motion frame is not acknowledged in time: a MOVE, a home or
+  `SEND_TO_FIXED_XYZ`, standalone or a step of a sequence. That frame is **not
+  re-sent** any more (a re-sent move is what the running axis answers with
+  `-EBUSY`). A sequence's servo, delay and tone frames and a lost SET are still
+  re-sent, and a lost stimulus-pulse acknowledgement is still skipped;
+- when the board answers `-EBUSY` to a move, a home, a sequence or
+  `SEND_TO_FIXED_XYZ`. A busy SET (which moves nothing) is logged and sent again
+  every 0.25 s, up to 12 times, before it is refused;
 - when a command's waiter gives up on a move that is still awaiting its
   acknowledgement (3 s by default, the 30 s give-up);
 - when a calibration capture or scout fails, before its cameras stop, and at
@@ -313,14 +315,16 @@ as `stopped`, never acknowledged.
 
 After an ESTOP every axis needs a home, the LIVE position shows `—`, and every
 move, send, load, retract, cover, release and automatic home is refused; SETs
-still go out. The alert "Pellet stage stopped: <reason>. Home before
-continuing." stays until the stage is homed (a STOP the operator pressed says
-so instead). The board stays latched in E-stop and refuses every move and
+still go out. The alert "Pellet stage stopped: <reason>. Home before continuing
+(Hardware Control ▸ Home); the session-end home also clears it." stays until the
+stage is homed (a STOP the operator pressed says so instead). The board stays latched in E-stop and refuses every move and
 home with `-EPERM` until it is released. **Hardware Control ▸ Home** releases
 it and then homes; Refresh Hardware (a connect) does the same, since the latch
-outlives the app. An automatic CAN recovery does not release a stop this app
-made: its home is refused and the operator decides. The session-end home is
-skipped while the stage is stopped.
+outlives the app. The session-end home is the one automatic home that may run
+after a stop: it releases the latch, homes, and on its acknowledgement clears the
+stop (logged). The pellet machine's re-homes and an automatic CAN recovery do not
+release a stop this app made: they are refused until an operator Home or a
+reconnect.
 
 The maintenance tools (`tools/pellet_delivery`, `scripts/can_console.py`,
 `tools/hardware/validate_can_hardware.py`) do not send ESTOP.

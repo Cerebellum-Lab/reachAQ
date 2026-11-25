@@ -375,7 +375,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             prev, self._estop_record = self._estop_record, None
             self._estop_home_token = None
         if prev is not None:
-            logger.notice("Pellet stage %s: motion allowed again", why)
+            logger.warning("Pellet stage %s: the stop (%s) is cleared, motion allowed again", why, prev["reason"])
             self.property_changed(self.PELLET_ESTOP_PROPERTY, None, prev)
 
     def _check_dcs_cfg(self, *, return_none: bool=False):
@@ -773,8 +773,14 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     def send_home(self) -> Optional[UUID]:
         return self._send_with_token(self._device_conn, SystemCommandKind.SEND_HOME)
 
-    def send_home_and_wait(self, *, timeout: float = 15.0) -> UUID:
-        token = self.send_home()
+    def send_home_and_wait(self, *, timeout: float = 15.0, release_estop: bool = False) -> UUID:
+        """SEND_HOME and wait for its ack. With release_estop, while the stage is stopped,
+        it is home_after_estop's home (the latch released first; its ack clears the stop):
+        the session-end home is the one automatic home allowed to do that."""
+        if release_estop and self.estop_active:
+            token = self.home_after_estop()
+        else:
+            token = self.send_home()
         if token is None:
             raise RuntimeError("pellet home command was not queued")
         self.wait_pending_command_acked(token, timeout=timeout)

@@ -295,7 +295,8 @@ def test_a_stopped_stage_raises_a_blocking_error_until_it_is_homed(wired):
     assert alert.severity is AlertSeverity.ERROR and alert.needs_dialog and alert.is_condition
     assert alert.title == "Pellet stage stopped"
     assert alert.message == (
-        "Pellet stage stopped: MOVE_Z was not acknowledged within 3 s. Home before continuing.")
+        "Pellet stage stopped: MOVE_Z was not acknowledged within 3 s. Home before continuing "
+        "(Hardware Control ▸ Home); the session-end home also clears it.")
     assert "Hardware Control ▸ Home" in alert.remedy
     assert dialogs == [alert]
 
@@ -310,6 +311,7 @@ def test_the_operators_stop_says_stop_was_pressed_and_is_no_failure(wired):
     (alert,) = center.active_alerts()
     assert alert.title == "Pellet stage stopped by the operator"
     assert "STOP was pressed" in alert.message and "Home before continuing" in alert.message
+    assert "the session-end home also clears it" in alert.message
     assert "fail" not in (alert.title + alert.message).lower()
     assert alert.severity is AlertSeverity.WARNING and not alert.needs_dialog
     assert dialogs == []

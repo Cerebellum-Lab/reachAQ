@@ -325,6 +325,11 @@ def alert_for_pellet_axes(kind: str, axes: Tuple[str, ...]) -> Optional[Operator
     )
 
 
+_HOME_TO_CLEAR = (
+    "Home before continuing (Hardware Control ▸ Home); the session-end home also clears it."
+)
+
+
 def alert_for_pellet_estop(record: Optional[Mapping]) -> Optional[OperatorAlert]:
     """The alert for a stopped pellet stage (HardwareModel.pellet_estop), or None once homed.
 
@@ -340,7 +345,7 @@ def alert_for_pellet_estop(record: Optional[Mapping]) -> Optional[OperatorAlert]
             key="pellet:estop",
             severity=AlertSeverity.WARNING,
             title="Pellet stage stopped by the operator",
-            message="STOP was pressed in Hardware Control. Home before continuing.",
+            message=f"STOP was pressed in Hardware Control. {_HOME_TO_CLEAR}",
             remedy=remedy,
             is_condition=True,
         )
@@ -349,7 +354,7 @@ def alert_for_pellet_estop(record: Optional[Mapping]) -> Optional[OperatorAlert]
         key="pellet:estop",
         severity=AlertSeverity.ERROR,
         title="Pellet stage stopped",
-        message=f"Pellet stage stopped: {record.get('reason', 'unknown reason')}. Home before continuing.{sent}",
+        message=f"Pellet stage stopped: {record.get('reason', 'unknown reason')}. {_HOME_TO_CLEAR}{sent}",
         remedy=remedy,
         needs_dialog=True,
         is_condition=True,
