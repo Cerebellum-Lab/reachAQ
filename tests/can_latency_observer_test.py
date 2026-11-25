@@ -20,6 +20,7 @@ def _device(seen):
     device._want_exit = threading.Event()
     device._commands_handler_thread = None
     device._commands_queue = queue.Queue()
+    device._motion_tokens = set()  # set in __init__, which object.__new__ skips
     device.latency_observer = lambda stage, fields: seen.append((stage, fields))
     return device
 
