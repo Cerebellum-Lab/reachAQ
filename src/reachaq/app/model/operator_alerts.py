@@ -357,7 +357,7 @@ def alert_for_pellet_estop(record: Optional[Mapping]) -> Optional[OperatorAlert]
         if later:
             also = f" (a later failure was also recorded: {later[-1].get('reason', 'unknown reason')})"
             if not all(item.get("sent", True) for item in later):
-                also += " The ESTOP could not be written to the CAN bus."
+                also += f" The {later[-1].get('frame') or 'ESTOP'} could not be written to the CAN bus."
         return OperatorAlert(
             key="pellet:estop",
             severity=AlertSeverity.WARNING,
@@ -366,7 +366,9 @@ def alert_for_pellet_estop(record: Optional[Mapping]) -> Optional[OperatorAlert]
             remedy=remedy,
             is_condition=True,
         )
-    sent = "" if record.get("sent", True) else " The ESTOP could not be written to the CAN bus."
+    # "frame": STOP on a pellet 2.4.0 board (capability bit 9), ESTOP otherwise.
+    frame = record.get("frame") or "ESTOP"
+    sent = "" if record.get("sent", True) else f" The {frame} could not be written to the CAN bus."
     return OperatorAlert(
         key="pellet:estop",
         severity=AlertSeverity.ERROR,

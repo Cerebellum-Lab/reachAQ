@@ -39,6 +39,8 @@ class RecordingSessionController:
     end_actions: Tuple[dict, ...] = ()
     #: Pellet ESTOPs during the session (HardwareModel.pellet_estop records).
     estops: Tuple[dict, ...] = ()
+    #: Pellet 2.4.0 STEPPER_FAULTs during the session (HardwareModel.PELLET_STEPPER_FAULT_PROPERTY).
+    stepper_faults: Tuple[dict, ...] = ()
     storage_telemetry: dict = field(default_factory=dict)
     capture_telemetry: Optional[dict] = None
     _generation: int = field(default=0, init=False, repr=False)
@@ -154,6 +156,7 @@ class RecordingSessionController:
         self.enabled_sources = ()
         self.end_actions = ()
         self.estops = ()
+        self.stepper_faults = ()
         self.storage_telemetry = {}
         self.capture_telemetry = None
 
@@ -178,6 +181,10 @@ class RecordingSessionController:
     def add_estop(self, record: dict) -> None:
         with self._lock:
             self.estops = (*self.estops, dict(record))
+
+    def add_stepper_fault(self, record: dict) -> None:
+        with self._lock:
+            self.stepper_faults = (*self.stepper_faults, dict(record))
 
     def set_stream_result(self, result: dict) -> None:
         with self._lock:
@@ -262,6 +269,7 @@ class RecordingSessionController:
         self.enabled_sources = ()
         self.end_actions = ()
         self.estops = ()
+        self.stepper_faults = ()
         self.storage_telemetry = {}
         self.capture_telemetry = None
         self.analysis_finished = True

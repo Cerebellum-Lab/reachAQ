@@ -234,3 +234,50 @@ def test_each_estop_is_its_own_entry_in_the_session_metadata(app_model):
     reasons = [(e["reason"], e["operator"], e["kind"], e["sent"]) for e in app_model._recording_session.estops]
     assert reasons == [(OPERATOR_STOP_REASON, True, "operator", True),
                        ("a later failure", False, "operator", False)]
+
+
+def _limit_fault():
+    from reachaq.device import StepperFault, Target
+
+    return StepperFault(target=Target.PELLET_DEVICE, motor=Motor.PELLET_Z_MOTOR, reason=2, flags=0x02,
+                        pulses_issued=571, pulses_planned=1142, believed_position_turns=2.5,
+                        believed_position_mm=6.09, pulses_per_turn=192.0, uuid=12)
+
+
+def test_the_session_keeps_its_stepper_faults_and_record_resets_them():
+    controller = RecordingSessionController()
+    record = {"axis": "Z", "reasonName": "LIMIT"}
+
+    controller.add_stepper_fault(record)
+    assert controller.stepper_faults == (record,)
+
+    controller.prepare_record({})
+    assert controller.stepper_faults == ()
+
+
+def test_a_board_fault_is_written_to_the_sessions_metadata(app_model, tmp_path):
+    app_model.hardware._on_stepper_fault(_limit_fault())
+    project = app_model.project.to_local_value()
+    app_model._recording_session.boundary = SessionBoundary(
+        session_id=project.short_id, primary_camera="left", primary_frame_id=42,
+        start_perf_time=10.0, start_wall_time=1_800_000_000.25, camera_when=1_000_000.0,
+        end_perf_time=12.0, end_wall_time=1_800_000_002.25,
+    )
+    app_model._on_session_capture_ended(RecordingEndingReason.MANUAL_STOP)
+    output = tmp_path / "session003" / "metadata"
+    (tmp_path / "session003" / "streams").mkdir(parents=True)
+
+    app_model._save_metadata(project, project.when, str(output), project.session)
+
+    saved = json.loads(output.with_suffix(".json").read_text())
+    (fault,) = saved["recording"]["stepperFaults"]
+    assert fault["axis"] == "Z" and fault["reasonName"] == "LIMIT" and fault["blocking"] is True
+    assert (fault["pulsesIssued"], fault["pulsesPlanned"]) == (571, 1142)
+    assert isinstance(fault["wallTime"], float)
+
+
+def test_a_board_fault_holds_automatic_motion_until_the_axis_is_homed(app_model):
+    app_model.hardware._on_stepper_fault(_limit_fault())
+
+    assert app_model.hardware.pellet_axes_needing_home == ("Z",)
+    assert not app_model._pellet_motion_readiness()

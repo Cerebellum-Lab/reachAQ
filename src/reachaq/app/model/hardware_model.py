@@ -24,7 +24,8 @@ from reachaq.device import (CanTransportConfiguration, CanTransportKind, DeviceC
                                 DeviceConnection, CanDevice, CanFailure, CanFailureKind, CommandRefusedError,
                                 StepperConfig, ServoConfig, Device, ColorLed, Target, EmulationInterface,
                                 capture_can_diagnostics)
-from reachaq.device.device_interface import BOARD_STIM_LINE_OUTPUTS, stepper_travel_refusal
+from reachaq.device.device_interface import (BOARD_STIM_LINE_OUTPUTS, CAPABILITY_STEPPER_MOTION_SAFETY,
+                                             stepper_travel_refusal)
 from reachaq.device.can_device import (default_cover_pellet, default_load_pellet, default_move_retract,
                                            default_release_pellet, default_send_pellet, sequence_stepper_targets)
 from reachaq.device.compound_movement_file import CompoundMovements
@@ -90,6 +91,9 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     #: The last ESTOP (a dict: wallTime, perfTime, reason, axes, operator, sent) while the
     #: stage is stopped; None once a home cleared it.
     PELLET_ESTOP_PROPERTY = "pellet_estop"
+    #: The last STEPPER_FAULT the board sent (pellet 2.4.0), as a dict (StepperFault.to_record
+    #: plus wallTime, perfTime and blocking); session metadata records each (recording.stepperFaults).
+    PELLET_STEPPER_FAULT_PROPERTY = "pellet_stepper_fault"
 
     # Per axis x, y, z: the token of the latest SET queued, so a refusal of an older SET does
     # not roll back a newer one (_forget_refused_set).
@@ -108,6 +112,9 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     # Class defaults as well as __init__'s, for models a test builds without __init__.
     _estop_record: Optional[dict] = None
     _estop_home_token: Optional[UUID] = None
+    _axes_needing_home: Tuple[str, ...] = ()
+    _board_axes_needing_home: Tuple[str, ...] = ()
+    _board_capabilities = 0
 
     DEVICE_ACK_TIMEOUT_ENGAGED = "device_ack_timeout_engaged"
     DEVICE_PELLET_STATUS_TIMEOUT_ENGAGED = "device_pellet_status_timeout_engaged"
@@ -169,6 +176,10 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         # Stepper axes the board will refuse to move until each is homed, as
         # its refusals said; cleared by an acknowledged home.
         self._axes_needing_home: Tuple[str, ...] = ()
+        # Pellet 2.4.0 (bit 9): the axes whose latest STEPPER_STATUS has NEEDS_HOME (bit 2) set
+        # or HOMED_SINCE_BOOT (bit 3) clear. Follows the status, so a stale frame is corrected
+        # by the next one; pellet_axes_needing_home is the union with the refusal set above.
+        self._board_axes_needing_home: Tuple[str, ...] = ()
         # Stepper axes whose driver reports a latched fault (status bit 0), as
         # the board last said; the board clears it when a home re-proves them.
         self._axes_with_driver_fault: Tuple[str, ...] = ()
@@ -273,8 +284,15 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
     @property
     def pellet_axes_needing_home(self) -> Tuple[str, ...]:
-        """Pellet stepper axes ("X", "Y", "Z") a refusal said need a home."""
-        return self._axes_needing_home
+        """Pellet stepper axes ("X", "Y", "Z") that need a home: a refusal or a stop said so,
+        or (pellet 2.4.0) the board's status says it refuses motion (NEEDS_HOME) or has not
+        homed the axis since it booted (HOMED_SINCE_BOOT clear)."""
+        return tuple(sorted(set(self._axes_needing_home) | set(self._board_axes_needing_home)))
+
+    @property
+    def pellet_motion_safety(self) -> bool:
+        """The pellet board advertises capability bit 9 (pellet 2.4.0 motion safety)."""
+        return bool(int(self._board_capabilities or 0) & CAPABILITY_STEPPER_MOTION_SAFETY)
 
     @property
     def pellet_axes_with_driver_fault(self) -> Tuple[str, ...]:
@@ -383,6 +401,8 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             "perfTime": get_perf_now(),
             "reason": str(reason),
             "axes": list(axes),
+            # STOP on a pellet 2.4.0 board (bit 9), ESTOP otherwise (CanDevice._write_estop).
+            "frame": str(getattr(self._can_device, "last_stop_frame", None) or "ESTOP"),
             "operator": operator,
             # Which homes may release it: after a failure the session-end home may too;
             # after the operator's STOP only an operator Home or a reconnect.
@@ -407,7 +427,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             prev_position, self._last_motor_coordinates = self._last_motor_coordinates, _nans_offset3dTuple
         # The reported position is the board's plan, not a measurement: unknown until homed.
         self._on_property_changed(self.POS_XYZ, _nans_offset3dTuple, prev_position)
-        self._set_axes_needing_home(tuple(sorted(set(axes) | set(self._axes_needing_home))))
+        self._add_axes_needing_home(axes)
         self.property_changed(self.PELLET_ESTOP_PROPERTY, record, prev)
         self._emit_device_event("state", "estop", data=dict(event))
 
@@ -1003,6 +1023,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self._firmware_version_received.clear()
         self._board_wire_schema_version = None
         self._board_capabilities = 0
+        self._set_board_axes_needing_home(())  # read again from this connection's status frames
         self._can_is_emulation = transport.kind is CanTransportKind.EMULATION
         self._update_firmware_compatibility("")
         log_hardware_initialization(
@@ -1399,8 +1420,14 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
 
     def _reported_position(self, status) -> float:
         """A stepper's reported position, or NaN while the stage is stopped: the board
-        reports where it planned the axis to be, which an ESTOP made unknown until a home."""
-        return math.nan if self._estop_record is not None else status.position
+        reports where it planned the axis to be, which an ESTOP made unknown until a home.
+        Also NaN on a pellet 2.4.0 axis that needs a home (status NEEDS_HOME): the board's
+        plan after a fault is not proof of where the axis is (design H5)."""
+        if self._estop_record is not None:
+            return math.nan
+        if self.pellet_motion_safety and getattr(status, "needs_home", False):
+            return math.nan
+        return status.position
 
     def _message_handler_property_changed(self, name: str, value, old_value):
         props = MessageHandler
@@ -1410,6 +1437,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             self._last_motor_coordinates = new
             self.send_x = value.send_position
             self._note_driver_fault("X", value)
+            self._note_board_home_state("X", value)
             self._on_property_changed(self.POS_XYZ, new, prev)
 
         elif name == props.STEPPER_Y_PROPERTY:
@@ -1418,6 +1446,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             self._last_motor_coordinates = new
             self.send_y = value.send_position
             self._note_driver_fault("Y", value)
+            self._note_board_home_state("Y", value)
             self._on_property_changed(self.POS_XYZ, new, prev)
 
         elif name == props.STEPPER_Z_PROPERTY:
@@ -1426,6 +1455,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
             self._last_motor_coordinates = new
             self.send_z = value.send_position
             self._note_driver_fault("Z", value)
+            self._note_board_home_state("Z", value)
             self._on_property_changed(self.POS_XYZ, new, prev)
 
         elif name == props.COVER_ARM_ANGLE_PROPERTY:
@@ -1477,6 +1507,9 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 "treating it as a firmware that cannot")
 
     def _decoded_device_message(self, kind, data, perf_time, wall_time) -> None:
+        if kind == SystemStatusMessageKind.PELLET_STEPPER_FAULT:
+            self._on_stepper_fault(data)
+            return
         if kind != SystemStatusMessageKind.BOARD_CAPABILITIES:
             return
         self._board_wire_schema_version = int(data.wire_schema_version)
@@ -2039,9 +2072,60 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self._last_requested_set_coordinates = self._last_requested_set_coordinates.replace(**{coord: reported})
 
     def _set_axes_needing_home(self, axes: Tuple[str, ...]) -> None:
-        prev, self._axes_needing_home = self._axes_needing_home, tuple(axes)
-        if prev != self._axes_needing_home:
-            self.property_changed(self.PELLET_NEEDS_HOME_PROPERTY, self._axes_needing_home, prev)
+        prev = self.pellet_axes_needing_home
+        self._axes_needing_home = tuple(axes)
+        self._publish_axes_needing_home(prev)
+
+    def _add_axes_needing_home(self, axes) -> None:
+        self._set_axes_needing_home(tuple(sorted(set(axes) | set(self._axes_needing_home))))
+
+    def _set_board_axes_needing_home(self, axes: Tuple[str, ...]) -> None:
+        prev = self.pellet_axes_needing_home
+        self._board_axes_needing_home = tuple(sorted(axes))
+        self._publish_axes_needing_home(prev)
+
+    def _publish_axes_needing_home(self, prev: Tuple[str, ...]) -> None:
+        current = self.pellet_axes_needing_home
+        if prev != current:
+            self.property_changed(self.PELLET_NEEDS_HOME_PROPERTY, current, prev)
+
+    def _note_board_home_state(self, axis: str, status) -> None:
+        """Pellet 2.4.0 (bit 9 only): keep the axis in the board's needs-home set while its
+        status says NEEDS_HOME (bit 2: it refuses motion) or not HOMED_SINCE_BOOT (bit 3).
+        Older firmware sends both bits 0, which means nothing, so they are ignored there.
+        Like the driver fault, it follows the latest status: no stale frame can pin it."""
+        if not self.pellet_motion_safety:
+            return
+        needs = bool(getattr(status, "needs_home", False)) or not bool(getattr(status, "homed_since_boot", False))
+        axes = set(self._board_axes_needing_home)
+        if needs and axis not in axes:
+            logger.warning("Pellet board reports axis %s %s", axis,
+                           "needs a home" if getattr(status, "needs_home", False) else "not homed since boot")
+        axes.add(axis) if needs else axes.discard(axis)
+        if tuple(sorted(axes)) != self._board_axes_needing_home:
+            self._set_board_axes_needing_home(tuple(axes))
+
+    def _on_stepper_fault(self, fault) -> None:
+        """A pellet 2.4.0 STEPPER_FAULT (CanDevice already stopped the stage for every reason
+        but NEEDS_HOME, and that stop raised the blocking alert).
+
+        The axis needs a home either way, which holds automatic motion and Record. The
+        fault is published (PELLET_STEPPER_FAULT_PROPERTY: session metadata) and recorded
+        as a state row in the session data, with its pulse counts as raw counts.
+        """
+        describe = getattr(fault, "describe", None)
+        record = dict(fault.to_record()) if hasattr(fault, "to_record") else {"description": str(fault)}
+        record.update({
+            "wallTime": time.time(),
+            "perfTime": get_perf_now(),
+            "blocking": not bool(getattr(fault, "needs_home_only", False)),
+        })
+        axis = record.get("axis")
+        if axis in _AXIS_NAMES.values():
+            self._add_axes_needing_home((axis,))
+        logger.warning("Pellet board fault recorded: %s", describe() if describe else record["description"])
+        self.property_changed(self.PELLET_STEPPER_FAULT_PROPERTY, dict(record), None)
+        self._emit_device_event("state", "stepper_fault", data=dict(record))
 
     def _note_driver_fault(self, axis: str, status) -> None:
         """Keep the axis in, or out of, the faulted set as its status byte says.
