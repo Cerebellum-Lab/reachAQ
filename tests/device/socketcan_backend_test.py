@@ -723,3 +723,67 @@ def test_a_backend_without_stepper_stop_reports_no_motion_safety():
 
     assert not interface.has_stepper_motion_safety
     assert interface.stepper_stop(0) is False
+
+
+# -- per-axis travel clamp (design H8) -----------------------------------------------
+
+def _clamp_interface(max_pos):
+    from reachaq.device import StepperConfig
+
+    interface = _socketcan_interface()
+    interface._pellet_addr = 0
+    moves = []
+
+    def stepper_move(addr, motor_id, position, velocity, acceleration, abs_or_rel, save, uuid):
+        moves.append((motor_id, position, int(abs_or_rel), save))
+        return 0
+
+    interface._jc = types.SimpleNamespace(StepperMove=stepper_move)
+    config = StepperConfig.from_dict({} if max_pos is None else {"min_pos": 0, "max_pos": max_pos})
+    interface.z_config = config
+    interface.x_config = StepperConfig.from_dict({"min_pos": 0, "max_pos": 35.0})
+    return interface, moves
+
+
+def test_an_absolute_target_past_max_pos_is_clamped_to_it():
+    from reachaq.device.stepper_motor import mm_to_turns
+
+    interface, moves = _clamp_interface(30.0)
+
+    assert interface.move_motor_z(33.0)
+    assert interface.move_motor_x(36.0)
+    assert interface.move_motor_z(12.0)
+
+    assert moves[0][1] == pytest.approx(mm_to_turns(30.0))  # z: 30 mm, as the 2.4.0 cap
+    assert moves[1][1] == pytest.approx(mm_to_turns(35.0))  # x: its own 35 mm
+    assert moves[2][1] == pytest.approx(mm_to_turns(12.0))  # inside the travel: unchanged
+
+
+def test_a_saved_send_position_past_max_pos_is_clamped_too():
+    from reachaq.device.stepper_motor import mm_to_turns
+
+    interface, moves = _clamp_interface(30.0)
+
+    assert interface.set_motor_z(31.0)
+
+    assert moves == [(2, pytest.approx(mm_to_turns(30.0)), 0, True)]
+
+
+def test_a_relative_move_is_held_to_max_pos():
+    from reachaq.core import Offset3DTuple
+    from reachaq.device.stepper_motor import mm_to_turns
+
+    interface, moves = _clamp_interface(30.0)
+    interface._last_positions = Offset3DTuple(0.0, 0.0, 25.0)
+
+    assert interface.move_motor_z(10.0, relative=True)
+
+    assert moves[0][1] == pytest.approx(mm_to_turns(5.0))  # 25 + 10 held to 30
+
+
+def test_without_max_pos_the_absolute_15_turn_cap_stays():
+    interface, moves = _clamp_interface(None)
+
+    assert interface.move_motor_z(100.0)
+
+    assert moves[0][1] == pytest.approx(15.0)

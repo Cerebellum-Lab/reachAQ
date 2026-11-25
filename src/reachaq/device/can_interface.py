@@ -121,6 +121,17 @@ _STEPPER_MAX_POS = turns_to_mm(_STEPPER_MAX_TURNS)
 STEPPER_STOP_UUID = 0
 
 
+def stepper_travel_cap_mm(config) -> float:
+    """The highest target (mm) a stepper is sent to: its max_pos (motor_config.yaml), held to
+    the absolute 15 turns. Pellet 2.4.0 refuses a target past its own per-axis travel with
+    -ERANGE (x 35, y 35, z 30 mm by default, christielab10's max_pos values); clamping here
+    keeps the host's targets inside it (design H8)."""
+    maximum = getattr(config, "maximum_position", None)
+    if maximum is None or not math.isfinite(maximum):
+        return _STEPPER_MAX_POS
+    return min(_STEPPER_MAX_POS, max(0.0, float(maximum)))
+
+
 def _is_pellet_by_addr(addr: int) -> bool:
     """
     Pellet device CAN address board type is 0 (bits 2 and 3)
@@ -1237,6 +1248,9 @@ class CanInterface(DeviceInterface):
 
         turns_position = mm_to_turns(corrected_position)
         turns_velocity = mm_to_turns(velocity)
+        # Per axis: max_pos from motor_config.yaml, at most 15 turns (H8).
+        cap_mm = stepper_travel_cap_mm(config)
+        cap_turns = mm_to_turns(cap_mm)
         turns_acceleration = mm_to_turns(config.maximum_acceleration)
 
         if relative:
@@ -1253,18 +1267,20 @@ class CanInterface(DeviceInterface):
                     position -= tentative
                     turns_position = mm_to_turns(position)
                     logger.verbose("Limiting relative move to %s", position)
-                elif tentative > _STEPPER_MAX_POS:
-                    position = _STEPPER_MAX_POS - last_pos
+                elif tentative > cap_mm:
+                    position = cap_mm - last_pos
                     turns_position = mm_to_turns(position)
-                    logger.verbose("Limiting relative move to %s", position)
+                    logger.warning("%s: limiting relative move to %.3f mm: %.3f mm is past the axis's "
+                                   "travel cap %.3f mm", motor, position, tentative, cap_mm)
         else:
             # absolute move
             if turns_position < 0:
                 logger.debug("limited turns_position to 0 ; was %.1f", turns_position)
                 turns_position = 0
-            elif turns_position > _STEPPER_MAX_TURNS:
-                logger.debug("limited turns_position to max ; was %.1f", turns_position)
-                turns_position = _STEPPER_MAX_TURNS
+            elif turns_position > cap_turns:
+                logger.warning("%s: limiting target to %.3f mm: %.3f mm is past the axis's travel cap",
+                               motor, cap_mm, turns_to_mm(turns_position))
+                turns_position = cap_turns
 
         uuid = CanInterface.next_uuid()
         res = self._jc.StepperMove(
