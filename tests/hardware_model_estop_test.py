@@ -705,3 +705,24 @@ def test_a_board_fault_reaches_the_model_through_the_device_and_stops_the_stage(
         hardware_model._can_device = None
         device.disconnect()
         interface.close()
+
+
+
+def test_a_board_that_lost_bit_9_keeps_its_unhomed_axes_needing_a_home(hardware_model):
+    # Review I1: a reboot into 2.3.1. Its status bits 2/3 read 0 (unhomed) until its
+    # capabilities answer says 0x04; those axes then stay needing a home until a home.
+    from reachaq.device import BoardCapabilities
+
+    hardware_model._board_capabilities = 0x217
+    _status(hardware_model, "X", 0)
+    _status(hardware_model, "Y", 0)
+    assert hardware_model.pellet_axes_needing_home == ("X", "Y")
+
+    hardware_model._decoded_device_message(SystemStatusMessageKind.BOARD_CAPABILITIES, BoardCapabilities(
+        target=Target.PELLET_DEVICE, wire_schema_version=1, capabilities=0x04, boot_id=2), 1.0, 2.0)
+
+    assert not hardware_model.pellet_motion_safety
+    assert hardware_model.pellet_axes_needing_home == ("X", "Y")
+    _status(hardware_model, "X", 0)  # 2.3.1's zeros mean nothing now
+    hardware_model._set_axes_needing_home(())  # an acknowledged home
+    assert hardware_model.pellet_axes_needing_home == ()

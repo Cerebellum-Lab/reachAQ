@@ -1515,6 +1515,12 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         self._board_wire_schema_version = int(data.wire_schema_version)
         self._board_capabilities = int(data.capabilities)
         self._board_capabilities_received.set()
+        if not self.pellet_motion_safety and self._board_axes_needing_home:
+            # The board now runs firmware without the home bits (a reboot into 2.3.1): the axes
+            # it last said were not homed stay needing a home, until an acknowledged home.
+            axes = self._board_axes_needing_home
+            self._set_board_axes_needing_home(())
+            self._add_axes_needing_home(axes)
         self._update_firmware_compatibility(self._pellet_version)
 
     def _update_firmware_compatibility(self, version: str) -> None:
@@ -2038,7 +2044,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
                 "error": refusal.error,
                 "error_name": refusal.error_name,
                 "resent": refusal.resent,
-                "needs_home": list(self._axes_needing_home),
+                "needs_home": list(self.pellet_axes_needing_home),
                 "message": refusal.message,
             },
             context=None if token is None else str(token),

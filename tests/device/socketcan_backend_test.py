@@ -787,3 +787,113 @@ def test_without_max_pos_the_absolute_15_turn_cap_stays():
     assert interface.move_motor_z(100.0)
 
     assert moves[0][1] == pytest.approx(15.0)
+
+
+# -- review I1: a mid-session reboot or firmware change forgets bit 9 ------------------
+
+def _status_frame(*, boot_id=None, sequence=1):
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.STEPPER_STATUS, 0)
+    payload = struct.pack("<BBBBff", 2, 0x08, 0, 0, 1.0, 1.0) + b"\x00"
+    if boot_id is not None:
+        payload += struct.pack("<BBBBIIQ", 0xA7, 1, 0, 0, boot_id, sequence, 1000 * sequence)
+    return socketcan_jerrycan.decode_frame(can_id, payload)
+
+
+def _bit_9_interface():
+    interface = _socketcan_interface()
+    interface._pellet_addr = 0
+    asked = []
+    interface._jc = types.SimpleNamespace(
+        StepperStop=lambda *args: 0,
+        RequestCapabilities=lambda dst: asked.append("capabilities") or 0,
+        BootloaderCommand=lambda dst, subcmd: asked.append("version") or 0,
+    )
+    interface._board_capabilities = 0x217
+    return interface, asked
+
+
+def test_a_pellet_reboot_forgets_bit_9_and_asks_again(caplog):
+    interface, asked = _bit_9_interface()
+    interface._translate(_status_frame(boot_id=0x1111, sequence=1))
+    interface._translate(_status_frame(boot_id=0x1111, sequence=2))
+    assert interface.has_stepper_motion_safety and asked == []
+
+    with caplog.at_level(logging.WARNING, logger="reachaq.device.can_interface"):
+        interface._translate(_status_frame(boot_id=0x2222, sequence=0))
+
+    assert interface.board_capabilities is None
+    assert not interface.has_stepper_motion_safety, "stops are ESTOP until the board answers"
+    assert asked == ["capabilities", "version"]
+    assert "rebooted" in caplog.text
+
+
+def test_a_board_reverted_to_2_3_1_is_seen_by_its_missing_timing_trailer():
+    # 2.3.1 sends no timing trailer, so its boot id is never seen: the missing trailer is.
+    interface, asked = _bit_9_interface()
+    interface._translate(_status_frame(boot_id=0x1111))
+
+    interface._translate(_status_frame(boot_id=None))
+
+    assert interface.board_capabilities is None and not interface.has_stepper_motion_safety
+    assert asked == ["capabilities", "version"]
+    # The board's answer decides again: 2.3.1 reports 0x04, so it stays on ESTOP.
+    can_id = socketcan_jerrycan.encode_can_id(JerryCANCmdType.CAPABILITIES_RESPONSE, 0)
+    interface._translate(socketcan_jerrycan.decode_frame(can_id, struct.pack("<BII", 1, 0x04, 9) + b"\x00"))
+    assert interface.board_capabilities == 0x04 and not interface.has_stepper_motion_safety
+
+
+def test_a_board_without_timing_trailers_is_not_mistaken_for_a_reboot():
+    interface, asked = _bit_9_interface()
+    interface._board_capabilities = 0x204  # bit 9 without the trailer bit
+
+    interface._translate(_status_frame(boot_id=None))
+
+    assert interface.board_capabilities == 0x204 and asked == []
+
+
+# -- review m8: a backend that cannot send STOP refuses a bit 9 board -----------------
+
+def test_a_backend_without_stop_refuses_to_open_a_bit_9_board(monkeypatch):
+    from reachaq.device import BoardCapabilities
+    from reachaq.device.can_interface import PelletBackendUnsupportedError
+
+    class NoStopBus:  # pyjerrycan's JerryCAN has no StepperStop
+        close_called = False
+
+        def Open(self):
+            return 0
+
+        def Close(self):
+            self.close_called = True
+            return 0
+
+        def ReceiveMessages(self, max_count, collect_ms):
+            return [_status_frame(boot_id=None)]
+
+        def RequestCapabilities(self, dst):
+            return 0
+
+    interface = _socketcan_interface()
+    interface._channel_ownership = mock.Mock()
+    interface._jc = NoStopBus()
+    monkeypatch.setattr(interface, "_query_configuration", lambda: None)
+    monkeypatch.setattr(interface, "_translate", lambda message: None)
+    monkeypatch.setattr(interface, "_assign_address", lambda message: setattr(interface, "_pellet_addr", 0))
+    monkeypatch.setattr(interface, "get_response", lambda *args, **kwargs: BoardCapabilities(
+        target=Target.PELLET_DEVICE, wire_schema_version=1, capabilities=0x217, boot_id=1))
+
+    with pytest.raises(PelletBackendUnsupportedError, match="cannot send STEPPER_STOP"):
+        interface.open()
+
+    assert interface._jc.close_called and not interface.is_open
+
+
+def test_a_backend_without_stop_still_opens_a_2_3_1_board(monkeypatch):
+    from reachaq.device import BoardCapabilities
+
+    interface = _socketcan_interface()
+    interface._jc = types.SimpleNamespace()
+
+    interface._refuse_backend_without_stop(0x04)  # no raise
+    interface._jc = types.SimpleNamespace(StepperStop=lambda *a: 0)
+    interface._refuse_backend_without_stop(0x217)  # SocketCAN: no raise

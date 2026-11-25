@@ -113,8 +113,15 @@ class MissingDeviceAddressError(RuntimeError):
     """Dedicated for when device address could not be read"""
 
 
+class PelletBackendUnsupportedError(RuntimeError):
+    """The pellet board's firmware needs a CAN backend feature this one lacks (STEPPER_STOP)."""
+
+
 _STEPPER_MAX_TURNS = 15  # absolute max nbr of turns for each stepper, hardcoded for now.
 _STEPPER_MAX_POS = turns_to_mm(_STEPPER_MAX_TURNS)
+
+#: CAPABILITIES_RESPONSE bit 0: every frame that has room carries a timing trailer.
+_CAPABILITY_TIMING_TRAILER = 1 << 0
 
 #: STEPPER_STOP's uuid. The host never gives a command uuid 0 (next_uuid skips it), so the
 #: board's ACK of a STOP can never be matched to the command it stopped.
@@ -856,6 +863,8 @@ class CanInterface(DeviceInterface):
                         motor=None,
                         timeout=0.25,
                     )
+                    if capabilities is not None:
+                        self._refuse_backend_without_stop(int(capabilities.capabilities))
                     if capabilities is not None and capabilities.capabilities & 0x2:
                         for _ in range(4):
                             if self.request_clock_sync():
@@ -1760,6 +1769,8 @@ class CanInterface(DeviceInterface):
             Populated class type (see device_interface.py) or None
         """
         sequence_status = self._observe_board_sequence(message)
+        if _is_pellet_by_addr(message.dst_id):
+            self._check_pellet_identity(message, sequence_status)
         if not _is_pellet_by_addr(message.dst_id) and message.type not in self._any_board_types:
             self._ignore_foreign_board(message.dst_id)
             return None
@@ -1775,6 +1786,47 @@ class CanInterface(DeviceInterface):
             res.index = self._get_index(message)
             self._apply_board_timing(res, message, sequence_status)
         return res
+
+    def _refuse_backend_without_stop(self, capabilities: int) -> None:
+        """Raise when the board has bit 9 (pellet 2.4.0) and this backend cannot send
+        STEPPER_STOP (pyjerrycan): a host that cannot stop the board's way must not drive
+        it, and it would not decode STEPPER_FAULT either (design H7)."""
+        if capabilities & CAPABILITY_STEPPER_MOTION_SAFETY and not hasattr(self._jc, "StepperStop"):
+            raise PelletBackendUnsupportedError(
+                f"The pellet board reports stepper motion safety (capabilities {capabilities:#x}, pellet "
+                f"firmware 2.4.0 or later), but the {type(self._jc).__name__} CAN backend cannot send "
+                "STEPPER_STOP. Use the SocketCAN backend (REACHAQ_CAN_TRANSPORT=socketcan) with this firmware.")
+
+    def _check_pellet_identity(self, message, sequence_status: dict) -> None:
+        """Forget the pellet's capabilities when the board may now run other firmware.
+
+        A reboot mid-session (a new boot_id in the timing trailer), or a STEPPER_STATUS
+        without a trailer from a board whose capabilities said it sends one (2.4.0
+        reverted by MCUboot to 2.3.1, which has no trailer), can mean the board no longer
+        has bit 9. 2.3.1 drops STEPPER_STOP silently and the write still succeeds, so the
+        host must not trust the old bits: until the board answers again every stop is
+        ESTOP, which every firmware honours. The capabilities and the version are asked
+        for again; the answers restore the bits and the compatibility check.
+        """
+        caps = self._board_capabilities
+        if caps is None:
+            return
+        if sequence_status.get("reboot"):
+            why = "the pellet board rebooted (new boot id)"
+        elif (caps & _CAPABILITY_TIMING_TRAILER
+              and message.type == self._jerrycan_cmd_type.STEPPER_STATUS
+              and not bool(getattr(message, "board_timing_valid", False))):
+            why = "the pellet board stopped sending timing trailers (other firmware?)"
+        else:
+            return
+        self._board_capabilities = None
+        logger.warning("%s: its capabilities are forgotten until it answers again; stops are ESTOP meanwhile",
+                       why)
+        for request in (self.request_capabilities, self.request_version):
+            try:
+                request()
+            except Exception as error:
+                logger.warning("Could not ask the pellet board again (%s): %s", request.__name__, error)
 
     def _ignore_foreign_board(self, address: int) -> None:
         """Skip traffic from a board this host has no driver for.
