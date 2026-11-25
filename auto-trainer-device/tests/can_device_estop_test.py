@@ -353,3 +353,83 @@ def test_only_ebusy_on_a_stepper_command_may_leave_an_axis_moving(command_class,
     refusal = CommandRefusal(token="t", error=error, command=None, step="s", command_class=command_class)
 
     assert refusal.motion_may_continue is expected
+
+
+# -- every trigger stops all axes ------------------------------------------------
+# Pellet firmware 2.4.0's STOP can name axes; a stop naming only some leaves the others
+# finishing their moves. Every host failure path sends the board-wide form: the ESTOP
+# command with no axis selection.
+
+def test_the_estop_frame_has_no_axis_selection():
+    from autotrainer.device import socketcan_jerrycan as jc
+
+    sent = []
+    bus = jc.SocketCanJerryCAN.__new__(jc.SocketCanJerryCAN)
+    bus.SendMessage = lambda msg, dst_id: sent.append(jc.encode_frame(msg, dst_id)) or 0
+
+    assert bus.EStop(True) == 0
+    assert bus.EStop(False) == 0
+
+    (assert_id, assert_payload), (release_id, release_payload) = sent
+    assert assert_id == jc.encode_can_id(jc.JerryCANCmdType.ESTOP, 0x1F), "broadcast, to every board"
+    # The ESTOP payload is one byte, assert or release, with no axis field; then uuid 0 (none).
+    assert assert_payload == b"\x01\x00" and release_payload == b"\x00\x00"
+    assert release_id == assert_id
+
+
+def _lost_move(board):
+    board.device.default_command_ack_timeout_duration = 0.2
+    board.answer("move_motor_z", _LOST)
+    return board.send(SystemCommandKind.MOVE_Z, 15.5)
+
+
+def _lost_fixed_xyz(board):
+    board.device.default_command_ack_timeout_duration = 0.2
+    board.answer("fixed_position", _LOST)
+    return board.send(SystemCommandKind.SEND_FIXED_XYZ)
+
+
+def _lost_sequence_frame(board):
+    board.device.default_command_ack_timeout_duration = 0.2
+    board.answer("stepper_home", _LOST)
+    return board.send(SystemCommandKind.SEND_HOME)
+
+
+def _ebusy(board):
+    board.answer("move_motor_z", -16)
+    return board.send(SystemCommandKind.MOVE_Z, 15.5)
+
+
+def _resent_ebusy(board):
+    board.device.default_command_ack_timeout_duration = 0.2
+    board.answer("set_motor_x", _LOST, -16)
+    return board.send(SystemCommandKind.SET_X, 1.0)
+
+
+def _public(board):
+    board.device.estop("operator STOP")
+    return None
+
+
+@pytest.mark.parametrize("trigger", [
+    _lost_move, _lost_fixed_xyz, _lost_sequence_frame, _ebusy, _resent_ebusy, _public,
+], ids=["move-ack-timeout", "fixed-xyz-ack-timeout", "sequence-ack-timeout", "ebusy",
+        "outcome-unknown-ebusy", "estop-call"])
+def test_every_device_trigger_sends_the_all_axes_estop(board, trigger):
+    calls = []
+    real = board.interface.estop
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real(*args, **kwargs)
+
+    board.interface.estop = spy
+    token = trigger(board)
+    if token is not None:
+        board.refusal_of(token)
+    deadline = time.monotonic() + 2.0
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert calls == [((True,), {})], "one ESTOP, asserted, naming no axis"
+    assert [axes for _reason, axes, _sent in board.reported] == [_XYZ]
