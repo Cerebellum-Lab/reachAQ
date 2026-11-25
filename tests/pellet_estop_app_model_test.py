@@ -222,3 +222,15 @@ def test_the_session_end_home_after_an_operator_stop_and_a_failure_stop_does_not
         assert app_model._recording_session.end_actions[0]["status"] == "skipped"
     finally:
         hardware._can_device = hardware._device_conn = None
+
+
+def test_each_estop_is_its_own_entry_in_the_session_metadata(app_model):
+    from reachaq.app.model.hardware_model import OPERATOR_STOP_REASON
+
+    hardware = app_model.hardware
+    hardware._on_device_estop(OPERATOR_STOP_REASON, _XYZ, True)
+    hardware._on_device_estop("a later failure", _XYZ, False)
+
+    reasons = [(e["reason"], e["operator"], e["kind"], e["sent"]) for e in app_model._recording_session.estops]
+    assert reasons == [(OPERATOR_STOP_REASON, True, "operator", True),
+                       ("a later failure", False, "operator", False)]

@@ -12249,7 +12249,7 @@ class AppModel(ObservableObject):
         elif name == hard.PELLET_ESTOP_PROPERTY:
             if value is not None:
                 # Kept with the session the stop happened in; Record resets them.
-                self._recording_session.add_estop(value)
+                self._recording_session.add_estop(value.get("event", value))
         elif name in {
             hard.FIRMWARE_COMPATIBILITY_PROPERTY,
             hard.PELLET_NEEDS_HOME_PROPERTY,

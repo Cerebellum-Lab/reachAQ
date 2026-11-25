@@ -352,11 +352,17 @@ def alert_for_pellet_estop(record: Optional[Mapping]) -> Optional[OperatorAlert]
         return None
     remedy = _ESTOP_REMEDY
     if record.get("kind", "operator" if record.get("operator") else "failure") == "operator":
+        later = list(record.get("later_failures") or ())
+        also = ""
+        if later:
+            also = f" (a later failure was also recorded: {later[-1].get('reason', 'unknown reason')})"
+            if not all(item.get("sent", True) for item in later):
+                also += " The ESTOP could not be written to the CAN bus."
         return OperatorAlert(
             key="pellet:estop",
             severity=AlertSeverity.WARNING,
             title="Pellet stage stopped by the operator",
-            message=f"STOP was pressed in Hardware Control. {_HOME_TO_CLEAR_OPERATOR}",
+            message=f"STOP was pressed in Hardware Control. {_HOME_TO_CLEAR_OPERATOR}{also}",
             remedy=remedy,
             is_condition=True,
         )

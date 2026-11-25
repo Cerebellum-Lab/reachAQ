@@ -341,3 +341,16 @@ def test_the_bridge_raises_the_stop_from_a_real_hardware_model(app_model):
         assert "Pellet stage stopped" not in {alert.title for alert in center.active_alerts()}
     finally:
         bridge.disconnect()
+
+
+def test_the_operator_alert_shows_a_later_failure_too(wired):
+    # Recheck M-3.
+    model, center, _ = wired
+    record = dict(_estop("operator STOP", operator=True), kind="operator",
+                  later_failures=[{"reason": "MOVE_Z was not acknowledged within 0.88 s", "sent": False}])
+    model.hardware.property_changed("pellet_estop", record, None)
+
+    (alert,) = center.active_alerts()
+    assert alert.title == "Pellet stage stopped by the operator"
+    assert "(a later failure was also recorded: MOVE_Z was not acknowledged within 0.88 s)" in alert.message
+    assert "could not be written to the CAN bus" in alert.message

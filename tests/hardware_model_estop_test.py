@@ -515,3 +515,21 @@ def test_without_the_switch_the_device_keeps_profile_deadlines(hardware_model, f
     hardware_model.connect(Queue())
 
     assert getattr(hardware_model._can_device, "profile_ack_deadlines", True) is True
+
+
+def test_a_later_failure_under_an_operator_stop_is_kept_and_logged(hardware_model, caplog):
+    # Recheck M-3: the stop stays the operator's, and the later failure is not hidden.
+    import logging
+
+    _stopped(hardware_model, OPERATOR_STOP_REASON)
+    with caplog.at_level(logging.WARNING):
+        hardware_model.estop("calibration waypoint 3 was not reached within 0.88 s")
+
+    record = hardware_model.pellet_estop
+    assert record["kind"] == "operator" and record["operator"] is True
+    assert record["reason"] == OPERATOR_STOP_REASON
+    (later,) = record["later_failures"]
+    assert later["reason"] == "calibration waypoint 3 was not reached within 0.88 s"
+    assert record["event"]["reason"] == later["reason"]
+    assert any("calibration waypoint 3" in r.getMessage() and "operator" in r.getMessage()
+               for r in caplog.records)

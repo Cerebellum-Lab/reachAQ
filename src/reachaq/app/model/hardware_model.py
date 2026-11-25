@@ -310,7 +310,7 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
         if getattr(self._can_device, "motion_possibly_in_flight", False) is True:
             return True
         record = self._estop_record
-        stopped_at = -math.inf if record is None else record["perfTime"]
+        stopped_at = -math.inf if record is None else record.get("event", record)["perfTime"]
         with self._lock:
             return any(
                 command in _REFUSED_WHILE_STOPPED and started > stopped_at
@@ -376,30 +376,40 @@ class HardwareModel(ObservableObject, PelletDeviceProtocol):
     def _on_device_estop(self, reason: str, motors, sent: bool) -> None:
         """CanDevice sent (or tried to send) an ESTOP: the stage is stopped until homed."""
         axes = tuple(sorted(_AXIS_NAMES[m] for m in motors if m in _AXIS_NAMES))
-        record = {
+        operator = str(reason) == OPERATOR_STOP_REASON
+        # This ESTOP, as session metadata records it (recording.estops).
+        event = {
             "wallTime": time.time(),
             "perfTime": get_perf_now(),
             "reason": str(reason),
             "axes": list(axes),
-            "operator": str(reason) == OPERATOR_STOP_REASON,
+            "operator": operator,
             # Which homes may release it: after a failure the session-end home may too;
             # after the operator's STOP only an operator Home or a reconnect.
-            "kind": "operator" if str(reason) == OPERATOR_STOP_REASON else "failure",
+            "kind": "operator" if operator else "failure",
             "sent": bool(sent),
         }
         with self._lock:
-            if self._estop_record is not None and self._estop_record.get("kind") == "operator":
+            prev = self._estop_record
+            if prev is not None and prev.get("kind") == "operator" and not operator:
                 # Sticky until the stop clears: a later failure stop must not let the
-                # session-end home release a latch the operator set (review I-C).
-                record["kind"] = "operator"
-            prev, self._estop_record = self._estop_record, record
+                # session-end home release a latch the operator set (review I-C). The stop
+                # stays the operator's; the failure is kept, not hidden (recheck M-3).
+                event["kind"] = "operator"
+                record = {**prev, "later_failures": [*prev.get("later_failures", ()), dict(event)],
+                          "event": event}
+                logger.warning("Pellet stage already stopped by the operator; later failure recorded: %s",
+                               reason)
+            else:
+                record = {**event, "later_failures": [], "event": event}
+            self._estop_record = record
             self._estop_home_token = None
             prev_position, self._last_motor_coordinates = self._last_motor_coordinates, _nans_offset3dTuple
         # The reported position is the board's plan, not a measurement: unknown until homed.
         self._on_property_changed(self.POS_XYZ, _nans_offset3dTuple, prev_position)
         self._set_axes_needing_home(tuple(sorted(set(axes) | set(self._axes_needing_home))))
         self.property_changed(self.PELLET_ESTOP_PROPERTY, record, prev)
-        self._emit_device_event("state", "estop", data=dict(record))
+        self._emit_device_event("state", "estop", data=dict(event))
 
     def _clear_estop(self, why: str) -> None:
         with self._lock:

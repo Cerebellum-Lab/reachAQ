@@ -228,7 +228,7 @@ def test_the_1555_runaway_is_stopped_at_its_deadline_once_the_reader_is_heard(bo
     time.sleep(0.3)
     assert board.interface.estop_frames == [], "no frame read since the deadline: not yet"
 
-    device.notify_data([])  # the reader delivers a status frame: it is alive
+    device.notify_data([], read_started=now[0])  # a read begun after the deadline completed
     refusal = board.refusal_of(token)
 
     assert board.interface.estop_frames == [True]
@@ -360,3 +360,48 @@ def test_an_unhandled_command_does_not_leave_motion_in_flight(board):
         time.sleep(0.01)
 
     assert not device.motion_possibly_in_flight
+
+
+def test_a_stale_frame_read_before_the_deadline_is_no_proof_of_life(board, monkeypatch):
+    # Recheck R-1: after a whole-process stall the reader's first batch holds one frame it
+    # received before the deadline; the ack is next in the buffer, in the following batch.
+    now = _fake_clock(monkeypatch)
+    device, interface = board.device, board.interface
+    device._commanded_pos[Motor.PELLET_Z_MOTOR] = 1.0
+    moves = board.answer("move_motor_z", _LOST)
+    token = board.send(SystemCommandKind.MOVE_Z, 15.5)
+    _sent(board, moves)
+    uuid = interface.uuid()
+    ctx = device._boards_pending_ctx[Target.PELLET_DEVICE]
+    read_before = ctx.ack_perf_timeout - 0.01
+
+    now[0] = ctx.ack_perf_timeout + 0.3  # the stall ends 0.3 s past the deadline
+    device.notify_data([], read_started=read_before)  # the stale batch, processed now
+    time.sleep(0.3)
+    assert interface.estop_frames == [], "a read begun before the deadline proves nothing"
+
+    device._handle_ack(Acknowledge(uuid=uuid))  # the next batch: the ack
+    device.notify_data([], read_started=now[0])
+
+    assert board.wait_for(SystemStatusMessageKind.ACKNOWLEDGE, token) is not None
+    assert interface.estop_frames == []
+
+
+def test_the_acked_line_measures_to_the_acks_receive_time(board, monkeypatch, caplog):
+    # Recheck M-2: the reader's stamp, not when the loop got round to the ack.
+    now = _fake_clock(monkeypatch)
+    device, interface = board.device, board.interface
+    device._commanded_pos[Motor.PELLET_Z_MOTOR] = 15.5
+    moves = board.answer("move_motor_z", _LOST)
+    with caplog.at_level(logging.INFO, logger="reachaq.device.can_device"):
+        token = board.send(SystemCommandKind.MOVE_Z, 30.0)
+        _sent(board, moves)
+        sent = device._boards_pending_ctx[Target.PELLET_DEVICE].sent_perf
+        ack = Acknowledge(uuid=interface.uuid())
+        ack.index = int((sent + 0.438) * 1e9)  # received 0.438 s after the send
+        now[0] = sent + 0.6  # handled later
+        device._handle_ack(ack)
+        assert board.wait_for(SystemStatusMessageKind.ACKNOWLEDGE, token) is not None
+    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("pellet-ack-timing outcome=acked")]
+    fields = dict(item.split("=") for item in line.split()[1:])
+    assert float(fields["elapsed_s"]) == pytest.approx(0.438, abs=0.002)
