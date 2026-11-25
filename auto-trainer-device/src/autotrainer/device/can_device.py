@@ -31,7 +31,8 @@ from .can_interface import CanInterface, Target, target_of_motor, _STEPPER_MAX_P
 from .can_transport import CanTransportConfiguration, CanTransportKind
 from .can_failure import CanFailure, CanFailureKind
 from .board_refusal import EBUSY, EPERM, CommandRefusal, RefusedCommandClass, is_refusal
-from .motion_deadline import ack_deadline, profile_time
+from .motion_deadline import (READER_SILENT_BACKSTOP_S, ack_deadline, fixed_xyz_deadline, home_deadline,
+                              home_time, profile_time)
 from .device_interface import (
     Acknowledge,
     AnalogOutput,
@@ -262,6 +263,9 @@ class _BoardPendingContext:
     compound_steps: Optional[List[Dict[str, Any]]] = None
     # The frame awaiting its ack (uuid) may have set a stepper moving (_is_stepper_motion).
     stepper_motion: bool = False
+    # The stepper frame's expected timing, for the pellet-ack-timing log line (CanDevice).
+    motion_info: Optional[Dict[str, Any]] = None
+    sent_perf: float = math.nan
     # A SET the board answered -EBUSY to, held until busy_set_due (time.perf_counter) and then
     # sent again; ctx stays set meanwhile, so what is queued for the board waits behind it.
     busy_set_entry: Optional[Tuple[Any, ...]] = None
@@ -288,6 +292,11 @@ class CanDevice(Device):
     # times (about 3 s), before it is refused. No ESTOP (Ben, 2026-11-24).
     busy_set_retry_count: int = 12
     busy_set_retry_delay_s: float = 0.25
+
+    # Per-move ack deadlines (motion_deadline). False: every stepper frame waits the fixed
+    # default_command_ack_timeout_duration instead; a timeout still sends the ESTOP.
+    # Set from motor_config.yaml's pellet.profile_ack_deadlines (HardwareModel.connect).
+    profile_ack_deadlines: bool = True
 
     same_data_refresh_delay: float = _similar_data_refresh_delay
     """When > 0: if new data value is equal to previous value,
@@ -366,6 +375,12 @@ class CanDevice(Device):
         self._last_send_pos = Offset3DTuple(math.nan, math.nan, math.nan)
         # Where each stepper was last commanded to (NaN: unknown), for per-move ack deadlines.
         self._forget_commanded_positions()
+        # The expected timing of the stepper frame being sent (pellet-ack-timing), and when the
+        # CAN reader last delivered anything: a deadline fires only once a frame read after it
+        # was processed, so a stall of the whole process cannot fire it (or, if the reader stays
+        # silent, READER_SILENT_BACKSTOP_S past it).
+        self._pending_motion_info: Optional[Dict[str, Any]] = None
+        self._last_rx_perf = -math.inf
 
         if isinstance(self._interface, EmulationInterface):
             logger.warning(
@@ -802,14 +817,36 @@ class CanDevice(Device):
             velocity = float(rate) / 100.0 * velocity
         return profile_time(distance, velocity, config.maximum_acceleration)
 
+    def _timed(self, deadline: Optional[float], axes: str, distances, profile: Optional[float]) -> Optional[float]:
+        """Record the frame's expected timing for its log line; the deadline, or None when
+        profile deadlines are off (the fixed default timeout applies)."""
+        if not self.profile_ack_deadlines:
+            deadline = None
+        self._pending_motion_info = {
+            "axes": axes,
+            "distance_mm": ",".join(f"{d:.3f}" for d in distances),
+            "profile_s": profile,
+            "deadline_s": deadline,
+        }
+        return deadline
+
     def _move_deadline(self, motor: Motor, target, *, relative: bool = False,
                        home: bool = False) -> Tuple[Optional[float], float]:
         """(ack deadline in s or None, where the axis ends) of a move of `motor` to `target`.
 
         The move starts where the axis was last commanded; from an unknown start
-        it is given the full travel (_STEPPER_MAX_POS). A home ends at 0 and runs
-        at the homing speed. `target` may be a (position, rate %) pair.
+        it is given the full travel (_STEPPER_MAX_POS). A home is always given the
+        full travel, at the homing speed with no ramp: it runs until the switch
+        closes, from wherever the carriage really is (lost steps). It ends at 0.
+        `target` may be a (position, rate %) pair.
         """
+        axis = "XYZ"[_XYZ.index(motor)] if motor in _XYZ else str(motor)
+        if home:
+            config = self._motor_configs.get(motor)
+            velocity = None if config is None else config.homing_velocity
+            deadline = None if velocity is None else home_deadline(velocity, _STEPPER_MAX_POS)
+            profile = None if velocity is None else home_time(velocity, _STEPPER_MAX_POS)
+            return self._timed(deadline, axis, (_STEPPER_MAX_POS,), profile), 0.0
         rate = None
         if isinstance(target, tuple) and len(target) == 2:
             target, rate = target
@@ -818,28 +855,35 @@ class CanDevice(Device):
             target = float(target)
         except (TypeError, ValueError):
             target = math.nan
-        end = 0.0 if home else (start + target if relative else target)
+        end = start + target if relative else target
         distance = abs(end - start) if math.isfinite(start) and math.isfinite(end) else _STEPPER_MAX_POS
-        return ack_deadline(self._profile(motor, distance, home=home, rate=rate)), end
+        profile = self._profile(motor, distance, rate=rate)
+        return self._timed(ack_deadline(profile), axis, (distance,), profile), end
 
     def _fixed_xyz_deadline(self) -> Tuple[Optional[float], Dict[Motor, float]]:
-        """SEND_TO_FIXED_XYZ moves the axes one after another: the sum of their profiles."""
-        total, ends = 0.0, {}
+        """SEND_TO_FIXED_XYZ moves the axes one after another, one state per status tick:
+        the sum of their profiles plus the ticks (fixed_xyz_deadline)."""
+        profiles, distances, ends = [], [], {}
         for motor, end in zip(_XYZ, self._last_send_pos):
             start = self._commanded_pos.get(motor, math.nan)
             known = math.isfinite(start) and math.isfinite(end)
-            profile = self._profile(motor, abs(end - start) if known else _STEPPER_MAX_POS)
-            if profile is None:
-                return None, {}
-            total += profile
+            distance = abs(end - start) if known else _STEPPER_MAX_POS
+            profiles.append(self._profile(motor, distance))
+            distances.append(distance)
             ends[motor] = end if math.isfinite(end) else math.nan
-        return ack_deadline(total), ends
+        deadline = fixed_xyz_deadline(profiles)
+        total = None if deadline is None else sum(profiles)
+        return self._timed(deadline, "XYZ", distances, total), ends
 
     def _compound_step_deadline(self, step: Dict[str, Any]) -> Tuple[Optional[float], Dict[Motor, float]]:
         """The ack deadline of a sequence's stepper step, and where its axes end; (None, {}) otherwise."""
+        self._pending_motion_info = None
         for key, motor in (('x', Motor.PELLET_X_MOTOR), ('y', Motor.PELLET_Y_MOTOR), ('z', Motor.PELLET_Z_MOTOR)):
             if key in step:
                 deadline, end = self._move_deadline(motor, _to_tuple(step[key]))
+                if step.get("save_as_fixed", False):
+                    # Only the send position is stored (firmware 2.3.1, stepper.c:87-90).
+                    return deadline, {}
                 return deadline, {motor: end}
             if f'{key}_rel' in step:
                 deadline, end = self._move_deadline(motor, step[f'{key}_rel'], relative=True)
@@ -858,6 +902,26 @@ class CanDevice(Device):
             deadline, end = self._move_deadline(Motor.PELLET_Y_MOTOR, 0.0, home=True)
             return deadline, {Motor.PELLET_Y_MOTOR: end}
         return None, {}
+
+    def _log_ack_timing(self, outcome: str, board_ctx: _BoardPendingContext, p_now: float, level: int) -> None:
+        """One parseable line per stepper frame, acked or past its deadline (documented in
+        docs/linux-install/runtime-configuration.md):
+
+            pellet-ack-timing outcome=acked command=MOVE_Z axes=Z distance_mm=14.500
+                profile_s=0.440 deadline_s=0.884 elapsed_s=0.452
+        """
+        info = board_ctx.motion_info or {}
+
+        def number(value):
+            return "nan" if value is None or not math.isfinite(value) else f"{value:.3f}"
+
+        logger.log(
+            level,
+            "pellet-ack-timing outcome=%s command=%s axes=%s distance_mm=%s profile_s=%s deadline_s=%s elapsed_s=%s",
+            outcome, getattr(board_ctx.kind, "name", board_ctx.kind), info.get("axes", "?"),
+            info.get("distance_mm", "nan"), number(info.get("profile_s")),
+            number(board_ctx.ack_timeout_used), number(p_now - board_ctx.sent_perf),
+        )
 
     def _write_estop(self, asserted: bool, reason: str) -> bool:
         estop = getattr(self._interface, "estop", None)
@@ -1115,8 +1179,11 @@ class CanDevice(Device):
                         else:
                             cur_commands.insert(0, (_uuid_ack, data, ctx, -math.inf))
                             board_ctx.busy_set_retries = 0
+                            if board_ctx.stepper_motion:
+                                self._log_ack_timing("acked", board_ctx, get_perf_now(), logging.INFO)
                         board_ctx.uuid = None
                         board_ctx.stepper_motion = False
+                        board_ctx.motion_info = None
                         board_ctx.repeated_command_count = 0
                         board_ctx.prev_command = None
                         board_ctx.last_stim_output = None
@@ -1181,6 +1248,13 @@ class CanDevice(Device):
             for target, board_ctx in sorted(search_retry_boards.items(), key=lambda t: t[1].ack_perf_timeout):
                 if board_ctx.uuid is None or p_now < board_ctx.ack_perf_timeout:
                     continue
+                if (board_ctx.stepper_motion
+                        and p_now < board_ctx.ack_perf_timeout + READER_SILENT_BACKSTOP_S
+                        and (self._last_rx_perf < board_ctx.ack_perf_timeout or not input_q.empty())):
+                    # Not until the reader has processed a frame read after the deadline, and
+                    # what it queued has been read: a stall of the whole process delays the
+                    # reader too, and must not stop a move whose ack is already on its way.
+                    continue
                 logger.warning(
                     "timeout waiting ack previous command: %s ; context=%s ; pending_uuid=%s",
                     board_ctx.kind,
@@ -1213,6 +1287,7 @@ class CanDevice(Device):
                     # moving, and the resend is answered -EBUSY while it runs on.
                     # Pellet firmware 2.3.1 has no motion timeout of its own.
                     kind_name = getattr(board_ctx.kind, "name", str(board_ctx.kind))
+                    self._log_ack_timing("deadline_expired", board_ctx, p_now, logging.ERROR)
                     self._estop_in_loop(
                         f"{kind_name} was not acknowledged within {board_ctx.ack_timeout_used:.2f} s",
                         cur_commands,
@@ -1295,6 +1370,7 @@ class CanDevice(Device):
             cur_commands.pop(0)  # (kind, data, ctx, perf_c) will be pushed back if command need to eventually retry
             if self._want_exit.is_set():
                 logger.verbose("Discarding CAN command because shutdown was requested")
+                self._motion_tokens.discard(ctx)
                 break
             #
             # execute command
@@ -1314,6 +1390,7 @@ class CanDevice(Device):
             #
             # preset the possible default command (uuid) timeout:
             self._prev_command_timeout = self.default_command_ack_timeout_duration
+            self._pending_motion_info = None
             #
             if kind is _next_compound:
                 kind, steps = data
@@ -1352,6 +1429,7 @@ class CanDevice(Device):
                 if handler is None:  # actually not anymore necessary,
                     # since we check target_board
                     logger.warning("unhandled command queue message: %s", kind)
+                    self._motion_tokens.discard(ctx)
                     continue
                 success = False
                 send_entry = time.perf_counter()
@@ -1442,6 +1520,9 @@ class CanDevice(Device):
                 )
                 if target_board.stepper_motion:
                     self._stopped_since_motion = False
+                target_board.motion_info = self._pending_motion_info if target_board.stepper_motion else None
+                target_board.sent_perf = t_perf_last_command_with_uuid
+                self._pending_motion_info = None
             else:
                 # no uuid generated
                 compound_steps = target_board.compound_steps
@@ -1583,6 +1664,7 @@ class CanDevice(Device):
         )
         # The board's error goes with the uuid: a refusal must not look like a success.
         self._put_to_cmd_queue((_uuid_ack, (msg.uuid, perf_c, int(getattr(msg, "error", 0))), None))
+        self._last_rx_perf = get_perf_now()  # after the put: a waiting deadline sees the ack first
 
     @property
     def api(self):
@@ -1944,7 +2026,7 @@ class CanDevice(Device):
         if context is not None:
             self._latency("enqueue", token=str(context),
                           kind=getattr(kind, "name", str(kind)), perf=time.perf_counter())
-        if kind in _MOTION_COMMANDS:
+        if kind in _MOTION_COMMANDS and not self._want_exit.is_set():
             if context is not None:
                 self._motion_tokens.add(context)
             self._stopped_since_motion = False
@@ -1969,6 +2051,9 @@ class CanDevice(Device):
                 handler(message)
             else:
                 logger.warning("Unhandled data type: %s", type(message))
+        # Stamped once the batch is handled, so an ack in it is queued before a deadline
+        # waiting on this proof of life can fire.
+        self._last_rx_perf = get_perf_now()
 
     def _report_stepper_status(self, message: StepperStatus):
         """

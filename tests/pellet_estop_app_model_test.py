@@ -201,3 +201,24 @@ def test_the_session_end_home_after_an_operator_stop_does_not_release_it(app_mod
         assert "operator STOP" in action["error"]
     finally:
         hardware._can_device = hardware._device_conn = None
+
+
+def test_the_session_end_home_after_an_operator_stop_and_a_failure_stop_does_not_release(app_model):
+    # Review I-C, end to end: STOP pressed, then a failure stop; the session end is skipped.
+    from tools.acquisition.model.hardware_model import OPERATOR_STOP_REASON
+
+    app_model._set_subsystem_status(SubsystemId.CAN_PELLET, SubsystemState.READY)
+    hardware = app_model.hardware
+    board = _StoppedBoard(hardware)
+    hardware._can_device = hardware._device_conn = board
+    hardware.estop(OPERATOR_STOP_REASON)
+    hardware.estop("calibration waypoint 3 was not reached within 0.88 s")
+    try:
+        with mock.patch.object(type(hardware), "connected", new_callable=mock.PropertyMock,
+                               return_value=True):
+            app_model._request_session_end_home("stop")
+
+        assert ("release",) not in board.log
+        assert app_model._recording_session.end_actions[0]["status"] == "skipped"
+    finally:
+        hardware._can_device = hardware._device_conn = None

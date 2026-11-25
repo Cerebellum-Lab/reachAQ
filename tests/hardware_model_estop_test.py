@@ -490,3 +490,28 @@ def test_the_stop_records_its_kind(hardware_model, reason, kind):
     _stopped(hardware_model, reason)
 
     assert hardware_model.pellet_estop["kind"] == kind
+
+
+def test_a_later_failure_stop_keeps_an_operator_stop_operator(hardware_model):
+    # Review I-C: a scout's arrival failure after the operator pressed STOP.
+    _stopped(hardware_model, OPERATOR_STOP_REASON)
+    hardware_model.estop("calibration waypoint 3 was not reached within 0.88 s")
+
+    assert hardware_model.pellet_estop["kind"] == "operator"
+    with pytest.raises(RuntimeError, match="operator"):
+        hardware_model.send_home_and_wait(timeout=0.1, release_estop=True)
+
+
+def test_the_connect_passes_the_profile_deadline_switch_to_the_device(hardware_model, fake_connect, monkeypatch):
+    monkeypatch.setattr(_ConnectConnection, "load_default_motor_config",
+                        lambda self: SimpleNamespace(profile_ack_deadlines=False))
+
+    hardware_model.connect(Queue())
+
+    assert hardware_model._can_device.profile_ack_deadlines is False
+
+
+def test_without_the_switch_the_device_keeps_profile_deadlines(hardware_model, fake_connect):
+    hardware_model.connect(Queue())
+
+    assert getattr(hardware_model._can_device, "profile_ack_deadlines", True) is True

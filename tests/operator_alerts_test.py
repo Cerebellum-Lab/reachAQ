@@ -296,7 +296,8 @@ def test_a_stopped_stage_raises_a_blocking_error_until_it_is_homed(wired):
     assert alert.title == "Pellet stage stopped"
     assert alert.message == (
         "Pellet stage stopped: MOVE_Z was not acknowledged within 3 s. Home before continuing "
-        "(Hardware Control ▸ Home); the session-end home also clears it.")
+        "(Hardware Control ▸ Home); the session-end home also clears it when the pellet board "
+        "is Ready at session end.")
     assert "Hardware Control ▸ Home" in alert.remedy
     # Review M-6: Home is enabled only with the board connected and acquisition started.
     assert "acquisition is started" in alert.remedy and "Refresh Hardware" in alert.remedy
@@ -314,7 +315,8 @@ def test_the_operators_stop_says_stop_was_pressed_and_is_no_failure(wired):
     assert alert.title == "Pellet stage stopped by the operator"
     assert alert.message == (
         "STOP was pressed in Hardware Control. Home before continuing (Hardware Control ▸ Home) "
-        "or reconnect (Refresh Hardware); the session-end home does not clear it.")
+        "or reconnect (Refresh Hardware, or a calibration capture's connect); the session-end "
+        "home does not clear it.")
     assert "fail" not in (alert.title + alert.message).lower()
     assert alert.severity is AlertSeverity.WARNING and not alert.needs_dialog
     assert dialogs == []
