@@ -42,6 +42,7 @@ class _Device:
         self._model = model
         self.log = log
         self.motion_possibly_in_flight = moving
+        self.stepper_frame_in_flight = moving
         self.property_changed = _Subscribers()
 
     def estop(self, reason):
@@ -464,3 +465,18 @@ def test_every_model_trigger_stops_all_axes_through_the_one_estop(hardware_model
         "the CAN connection was closed during a move",
     ]
     assert hardware_model.pellet_estop["axes"] == ["X", "Y", "Z"]
+
+
+def test_a_teardown_while_a_motion_command_is_pending_between_frames_stops_the_stage(hardware_model):
+    # Review I-3: between a sequence's frames no stepper frame awaits its ack, but the
+    # SEND_PELLET token is not finished: the next frame can go out before the device stops.
+    log = _wired(hardware_model, moving=False)
+    hardware_model._device_conn = SimpleNamespace(
+        send_message=lambda kind, data=None, context=None: log.append(("send", kind, context)),
+        request_disconnect=lambda: log.append(("request_disconnect",)), join=lambda: True,
+    )
+    hardware_model.send_pellet()
+
+    hardware_model._disconnect_transport_locked(command_outcome="cancelled")
+
+    assert [entry[0] for entry in log] == ["send", "estop", "request_disconnect"]
