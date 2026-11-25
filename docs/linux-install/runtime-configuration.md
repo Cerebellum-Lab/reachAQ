@@ -279,6 +279,120 @@ For the current JerryCAN board, expect `can0`, `mtu 72`, CAN FD,
 [PEAK/SocketCAN guide](peak-socketcan.md) for installation, termination,
 permissions, reset behavior, and safe validation.
 
+## Pellet stage stop (ESTOP)
+
+Pellet firmware 2.3.1 on a v1.2 board has no motion timeout and no travel
+clamp of its own, and nothing on the board stops a stepper when the host goes
+away. A limit-switch stop in the middle of a move can leave the axis's step
+timer running: the axis keeps moving, and the board answers every later move
+with `-EBUSY`. The one command that stops it is ESTOP, a single broadcast
+frame with no acknowledgement. ReachAQ sends it (since v3.2.3):
+
+- when a stepper-motion frame is not acknowledged in time: a MOVE, a home or
+  `SEND_TO_FIXED_XYZ`, standalone or a step of a sequence. "In time" is the
+  move's own deadline (below), not the fixed 3 s. That frame is **not re-sent**
+  any more (a re-sent move is what the running axis answers with `-EBUSY`). A
+  sequence's servo, delay and tone frames and a lost SET are still re-sent with
+  the fixed timeout, and a lost stimulus-pulse acknowledgement is still skipped;
+- when the board answers `-EBUSY` to a move, a home, a sequence or
+  `SEND_TO_FIXED_XYZ`. A busy SET (which moves nothing) is logged and sent again
+  every 0.25 s, up to 12 times, before it is refused;
+- when a command's waiter gives up on a move that is still awaiting its
+  acknowledgement (3 s by default, the 30 s give-up);
+- when a calibration capture or scout fails, before its cameras stop, and at
+  its teardown if a move is still in flight; when a scout waypoint is not
+  reached;
+- when the CAN connection is closed while motion is possibly in flight: a
+  disconnect, a CAN safety shutdown or recovery, a failed connect, closing the
+  app, a crash of the CAN reader or of the command loop. Motion is possibly in
+  flight from the moment a move, home or sequence is accepted until it is
+  acknowledged or refused, also while it is queued or between its frames. An
+  idle stage is never stopped by a disconnect;
+- when the operator presses **STOP** in Hardware Control. STOP is enabled
+  whenever the board is connected, also while a command runs.
+
+Each ESTOP is logged at ERROR with its reason (`Pellet ESTOP sent: ...`) and
+written to the session's metadata as `recording.estops` (`wallTime`,
+`perfTime`, `reason`, `axes`, `operator`, `kind` (`failure` or `operator`),
+`sent`). A failed write is tried once more at once. The command it stopped
+ends as `stopped`, never acknowledged.
+
+**Per-move deadline.** The board acknowledges a move on its 100 ms status tick
+once the move is done, so each stepper frame's acknowledgement is due a known
+time after it is sent:
+
+- a move: `max(0.6 s, 1.1 × t + 0.4 s)`, where `t` is the firmware's
+  raised-cosine profile at the axis's `max_vel` and `max_acc`
+  (`t = d/v + 2v/a` when `d ≥ 2v²/a`, else `2·√(2d/a)`), over the distance from
+  the axis's last commanded position (the full travel, 36.55 mm, when that is
+  unknown, as after a connect or a stop);
+- a home: the full travel at `home_vel` with no ramp, `1.1 × 36.55 mm / home_vel
+  + 0.4 s` (1.74 s at 30 mm/s), wherever the host thinks the axis is: after lost
+  steps the carriage can be far from its logical position;
+- `SEND_TO_FIXED_XYZ`: `1.1 × Σt + 0.6 s + 0.4 s` over the three axes, which the
+  board moves one after another, one state per status tick (2.61 s for the trial
+  send (25, 0, 10) → (0, 20, 0) at 120/600);
+- a sequence's stepper steps each get their own; its servo, delay and tone
+  frames keep the fixed timeout.
+
+A deadline fires only once the CAN reader has completed a read that began after
+it (the board sends status every 100 ms), so frames received before a stall of
+the whole app are not taken as proof that the acknowledgement is missing; if
+the reader stays silent the move is stopped 1 s past its deadline anyway. The
+stall budget is the 0.3 s in the margin plus this check; a stall that outlasts
+both can still stop a move that had finished. A `uuid_ack_timeout` set in
+`motor_config.yaml` replaces the deadline for that motor: it is a hard ceiling,
+and a value below the real acknowledgement time stops every move. The constants
+(provisional) come from christielab10's acknowledgements: 683 moves and 60 homes
+on 2026-11-24, acknowledged at most 0.09 s after the firmware profile and the
+longest home 1.24 s; and every `SEND_TO_FIXED_XYZ` in the trial logs of
+2026-09-24, 2026-10-02 and 2026-11-24, the trial send acknowledged after
+1.80-1.86 s. They are to be re-measured on a GUI trial session. The 15:55 z
+runaway (1.0 → 15.5 mm) is stopped 0.88 s after it was sent. A
+3D-calibration waypoint's arrival wait uses the same move deadline.
+
+If the profile deadlines false-trip, set `pellet.profile_ack_deadlines: false`
+in `~/reachAQ/motor_config.yaml` and Refresh Hardware; the stop protection
+stays: every stepper frame then waits the fixed acknowledgement timeout (3 s, or the
+hardware configuration's `min_ack_timeout` when larger) and a missed acknowledgement still sends the ESTOP. A
+missing key means true.
+
+Every stepper frame's timing is logged in one line, to check the deadlines in
+normal sessions: at INFO when it is acknowledged, at ERROR when its deadline
+expires.
+
+```
+pellet-ack-timing outcome=acked command=MOVE_Z axes=Z distance_mm=14.500 profile_s=0.440 deadline_s=0.884 elapsed_s=0.452
+pellet-ack-timing outcome=deadline_expired command=SEND_PELLET axes=XYZ distance_mm=25.000,20.000,10.000 profile_s=1.459 deadline_s=2.605 elapsed_s=2.611
+```
+
+`distance_mm` is per axis for `SEND_TO_FIXED_XYZ`, `profile_s` the firmware
+profile (the sum for `SEND_TO_FIXED_XYZ`, the full-travel time for a home),
+`deadline_s` the timeout armed for the frame and `elapsed_s` the time from the
+send to the acknowledgement, or to the expiry.
+
+After an ESTOP every axis needs a home, the LIVE position shows `—`, and every
+move, send, load, retract, cover, release and automatic home is refused; SETs
+still go out. The alert "Pellet stage stopped: <reason>. Home before continuing
+(Hardware Control ▸ Home); the session-end home also clears it when the pellet
+board is Ready at session end." stays until the stage is homed. After the
+operator's STOP it reads "STOP was pressed in Hardware Control. Home before
+continuing (Hardware Control ▸ Home) or reconnect (Refresh Hardware, or a
+calibration capture's connect); the session-end home does not clear it." A
+later failure stop keeps an operator stop an operator stop. The board stays
+latched in E-stop and refuses every move and home with `-EPERM` until it is
+released. **Hardware Control ▸ Home** releases it and then homes; it is enabled
+only while the pellet board is connected and acquisition is started. Refresh
+Hardware (a connect) releases and homes as well, since the latch outlives the
+app. After a failure stop the session-end home may run too: it releases the
+latch, homes, and on its acknowledgement clears the stop (logged). After the
+operator's STOP it is skipped. The pellet machine's re-homes and an automatic
+CAN recovery never release a stop this app made: they are refused until an
+operator Home or a reconnect.
+
+The maintenance tools (`src/reachaq/pellet_delivery`, `scripts/can_console.py`,
+`src/reachaq/hardware/validate_can_hardware.py`) do not send ESTOP.
+
 ## Software-only camera launch
 
 `--random-cameras` changes configured camera sources only in memory for that

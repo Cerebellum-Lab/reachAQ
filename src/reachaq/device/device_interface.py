@@ -782,6 +782,15 @@ class DeviceInterface:
     def servo_attach(self, motor: Motor):
         raise NotImplementedError
 
+    def estop(self, asserted: bool = True) -> bool:
+        """Assert (True) or release (False) the boards' E-stop: one unacknowledged frame.
+
+        Asserted, the pellet board stops every stepper at once (queue purged,
+        step timer off) and refuses motion with -EPERM until it is released;
+        a release leaves every axis needing a home (firmware 2.3.1).
+        """
+        raise NotImplementedError
+
     def servo_detach(self, motor: Motor):
         raise NotImplementedError
 

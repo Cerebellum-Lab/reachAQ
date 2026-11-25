@@ -19,6 +19,7 @@ from reachaq.core.capture import CaptureProcessStatus
 from reachaq.core.configuration import DEFAULT_3D_CALIB_DIR_NAME
 from reachaq.core.diamond_triangle_config import DiamondTriangleOffsetConfig
 from reachaq.device import MotorConfigurationFile, stepper_travel_refusal
+from reachaq.device.motion_deadline import ack_deadline, profile_time
 from reachaq.inference.multires_calibration.fit import BoardSpec, CaptureCamera
 from reachaq.inference.multires_calibration.geometry import PresetGeometry, presets_from_base
 from reachaq.inference.multires_calibration.library import add_entry, entry_path, read_settings
@@ -363,6 +364,55 @@ def _move_settle(
     )
 
 
+def _stop_stage(hard, reason: str, *, only_if_moving: bool = False) -> None:
+    """ESTOP the stage (HardwareModel.estop), or only while a move is in flight; best effort.
+
+    Pellet firmware 2.3.1 has no motion timeout: a capture that gives up on a move must
+    stop it, or the axis can run on after the stage is disconnected. A stage object
+    without an ESTOP (a test's motor) is left alone.
+    """
+    stop = getattr(hard, "estop_if_moving" if only_if_moving else "estop", None)
+    if stop is None:
+        return
+    try:
+        stop(reason)
+    except Exception:
+        logger.exception("Could not stop the pellet stage: %s", reason)
+
+
+def _why(err: BaseException) -> str:
+    """The first line of an error, short enough for an operator alert."""
+    text = str(err).strip()
+    return text.splitlines()[0][:160] if text else type(err).__name__
+
+
+ARRIVAL_FALLBACK_S = 2.0
+
+
+def _arrival_timeout(
+    limits: Mapping[str, Optional[Tuple[float, float]]],
+    axes: Sequence[str],
+    target: Sequence[float],
+    origin: Optional[Sequence[float]],
+) -> float:
+    """How long a waypoint's arrival is waited for: the per-move ack deadline of its slowest
+    axis (motion_deadline, as CanDevice bounds the move's ack), or ARRIVAL_FALLBACK_S when
+    the start or the axis's speed is not known."""
+    if origin is None:
+        return ARRIVAL_FALLBACK_S
+    deadlines = []
+    for axis in axes:
+        k = AXES.index(axis)
+        axis_limits_ = limits.get(axis)
+        if axis_limits_ is None:
+            return ARRIVAL_FALLBACK_S
+        deadline = ack_deadline(profile_time(target[k] - origin[k], *axis_limits_))
+        if deadline is None:
+            return ARRIVAL_FALLBACK_S
+        deadlines.append(deadline)
+    return max(deadlines) if deadlines else ARRIVAL_FALLBACK_S
+
+
 def _command(hard, axis: str, motor_value: float) -> None:
     move = {"x": hard.move_x, "y": hard.move_y, "z": hard.move_z}[axis]
     token = move(motor_value)
@@ -381,7 +431,7 @@ def run_waypoints(
     now=time.time,
     clock=time.monotonic,
     tolerance: float = 0.05,
-    arrival_timeout: float = 2.0,
+    arrival_timeout: Optional[float] = None,
     capture_settings: Optional[Mapping[str, Any]] = None,
     cameras: Optional[Sequence[CaptureCamera]] = None,
     strict: bool = False,
@@ -437,12 +487,14 @@ def run_waypoints(
         wait = _move_settle(limits, moved, motor, origin) if settle is None else settle
         logger.debug("waypoint %d: %s to %s, settle %.3f s", i, "".join(moved), motor, wait)
         sleep(wait)
+        timeout = _arrival_timeout(limits, moved, motor, origin) if arrival_timeout is None else arrival_timeout
         origin = motor  # the next move starts where this one was commanded to
         arrived, reported = wait_until_arrived(
-            hard, motor, tolerance=tolerance, timeout=arrival_timeout, sleep=sleep, now=clock)
+            hard, motor, tolerance=tolerance, timeout=timeout, sleep=sleep, now=clock)
         arrive = now()
         if strict:
             if not arrived:
+                _stop_stage(hard, f"calibration waypoint {i} was not reached within {timeout:.2f} s")
                 raise ScoutAborted(f"waypoint {i}: the motor reported {reported}, not the commanded {motor}")
             _abort_on_fault(hard, f"waypoint {i}")
         if not arrived:
@@ -680,7 +732,10 @@ def _stop_recording(cameras, record_mode) -> None:
 def _teardown_capture(cameras, hard, cams_before_cfg, failed: Optional[BaseException]) -> Optional[BaseException]:
     """Stop the cameras, disconnect the stage (none to disconnect when `hard` is None) and
     restore the cameras' configurations, on every path; returns `failed`, or the cameras'
-    failure to stop when nothing failed before."""
+    failure to stop when nothing failed before. A stage still moving is stopped first,
+    before the cameras and the disconnect."""
+    if hard is not None:
+        _stop_stage(hard, "the calibration capture ended during a move", only_if_moving=True)
     for camera in reversed(cameras):
         logger.info("%s: notify end cam", camera.name)
         camera.on_capture_notify_end()
@@ -749,6 +804,8 @@ def _record_plan(
     except Exception as err:
         logger.exception("Could not prepare and run %s: %s", label, err)
         failed = err
+        if not getattr(hard, "estop_active", False):  # not when the failure was the stop
+            _stop_stage(hard, f"the {label} failed: {_why(err)}")
     finally:
         failed = _teardown_capture(cameras, hard, cams_before_cfg, failed)
 

@@ -48,6 +48,7 @@ class FakeModel:
             property_changed=_Event(),
             PELLET_NEEDS_HOME_PROPERTY="pellet_needs_home",
             PELLET_DRIVER_FAULT_PROPERTY="pellet_driver_fault",
+            PELLET_ESTOP_PROPERTY="pellet_estop",
         )
         self.subsystem_statuses = {}
         self.session_recording_status = SessionRecordingStatus.READY
@@ -278,3 +279,78 @@ def test_the_bridge_reads_a_real_app_model(app_model):
         assert "Pellet board (CAN) failed" not in {alert.title for alert in center.active_alerts()}
     finally:
         bridge.disconnect()
+
+
+def _estop(reason="MOVE_Z was not acknowledged within 3 s", *, operator=False, sent=True):
+    return {"wallTime": 1.0, "perfTime": 2.0, "reason": reason, "axes": ["X", "Y", "Z"],
+            "operator": operator, "sent": sent}
+
+
+def test_a_stopped_stage_raises_a_blocking_error_until_it_is_homed(wired):
+    model, center, dialogs = wired
+    record = _estop()
+    model.hardware.property_changed("pellet_estop", record, None)
+
+    (alert,) = center.active_alerts()
+    assert alert.severity is AlertSeverity.ERROR and alert.needs_dialog and alert.is_condition
+    assert alert.title == "Pellet stage stopped"
+    assert alert.message == (
+        "Pellet stage stopped: MOVE_Z was not acknowledged within 3 s. Home before continuing "
+        "(Hardware Control ▸ Home); the session-end home also clears it when the pellet board "
+        "is Ready at session end.")
+    assert "Hardware Control ▸ Home" in alert.remedy
+    # Review M-6: Home is enabled only with the board connected and acquisition started.
+    assert "acquisition is started" in alert.remedy and "Refresh Hardware" in alert.remedy
+    assert dialogs == [alert]
+
+    model.hardware.property_changed("pellet_estop", None, record)
+    assert center.active_alerts() == ()
+
+
+def test_the_operators_stop_says_stop_was_pressed_and_is_no_failure(wired):
+    model, center, dialogs = wired
+    model.hardware.property_changed("pellet_estop", _estop("operator STOP", operator=True), None)
+
+    (alert,) = center.active_alerts()
+    assert alert.title == "Pellet stage stopped by the operator"
+    assert alert.message == (
+        "STOP was pressed in Hardware Control. Home before continuing (Hardware Control ▸ Home) "
+        "or reconnect (Refresh Hardware, or a calibration capture's connect); the session-end "
+        "home does not clear it.")
+    assert "fail" not in (alert.title + alert.message).lower()
+    assert alert.severity is AlertSeverity.WARNING and not alert.needs_dialog
+    assert dialogs == []
+
+
+def test_a_stop_the_bus_did_not_carry_says_so(wired):
+    model, center, _ = wired
+    model.hardware.property_changed("pellet_estop", _estop(sent=False), None)
+
+    (alert,) = center.active_alerts()
+    assert "could not be written to the CAN bus" in alert.message
+
+
+def test_the_bridge_raises_the_stop_from_a_real_hardware_model(app_model):
+    center = OperatorAlertCenter()
+    bridge = OperatorAlertBridge(app_model, center)
+    bridge.connect()
+    try:
+        app_model.hardware._on_device_estop("a test stop", (), True)
+        assert "Pellet stage stopped" in {alert.title for alert in center.active_alerts()}
+        app_model.hardware._clear_estop("homed")
+        assert "Pellet stage stopped" not in {alert.title for alert in center.active_alerts()}
+    finally:
+        bridge.disconnect()
+
+
+def test_the_operator_alert_shows_a_later_failure_too(wired):
+    # Recheck M-3.
+    model, center, _ = wired
+    record = dict(_estop("operator STOP", operator=True), kind="operator",
+                  later_failures=[{"reason": "MOVE_Z was not acknowledged within 0.88 s", "sent": False}])
+    model.hardware.property_changed("pellet_estop", record, None)
+
+    (alert,) = center.active_alerts()
+    assert alert.title == "Pellet stage stopped by the operator"
+    assert "(a later failure was also recorded: MOVE_Z was not acknowledged within 0.88 s)" in alert.message
+    assert "could not be written to the CAN bus" in alert.message

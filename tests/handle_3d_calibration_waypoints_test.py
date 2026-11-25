@@ -1533,3 +1533,134 @@ def test_a_hand_written_list_inside_the_travel_is_captured(tmp_path, monkeypatch
     app_model, seen, run = _scout_capture(tmp_path, monkeypatch, [_scout_result(11)])
     run()
     assert seen["plans"] == [plan_waypoints(start, moves, _dcs())]
+
+
+# -- ESTOP: a capture that gives up on the stage stops it ----------------------------
+
+class _StoppableMotor:
+    """Mixed into a fake motor: records ESTOPs (HardwareModel.estop / estop_if_moving)."""
+
+    moving = False
+
+    def _stops(self):
+        if not hasattr(self, "stops"):
+            self.stops = []
+        return self.stops
+
+    def estop(self, reason):
+        self._stops().append(reason)
+        self.estop_active = True
+        return True
+
+    def estop_if_moving(self, reason):
+        if not self.moving:
+            return False
+        return self.estop(reason)
+
+
+class _StoppableScoutMotor(_StoppableMotor, _Motor):
+    pass
+
+
+def test_an_unreached_scout_waypoint_stops_the_stage_before_the_scout_aborts(monkeypatch):
+    clock = _Clock()
+    motor = _StoppableScoutMotor(clock, travel=0.0)
+    motor.motor_configurations = _motor_configurations(**SPEEDS)
+    monkeypatch.setattr(h3d, "wait_until_arrived", lambda hard, target, **kwargs: (False, (0.0, 0.0, 0.0)))
+
+    with pytest.raises(ScoutAborted, match="waypoint 0"):
+        run_waypoints(motor, _scout_grid_plan(), strict=True, arrival_timeout=2.0,
+                      sleep=clock.sleep, now=clock.now, clock=clock.now)
+
+    assert motor.stops == ["calibration waypoint 0 was not reached within 2.00 s"]
+
+
+class _StoppableCaptureMotor(_StoppableMotor, _CaptureMotor):
+    def estop(self, reason):
+        self._calls.append(("motor", "estop", reason))
+        return super().estop(reason)
+
+
+def test_a_failed_capture_stops_the_stage_before_the_cameras_and_the_disconnect(tmp_path, monkeypatch):
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.hardware = _StoppableCaptureMotor(calls)
+
+    def failing_run_waypoints(*args, **kwargs):
+        raise RuntimeError("the move of z to 15.500 was not queued")
+
+    monkeypatch.setattr(h3d, "run_waypoints", failing_run_waypoints)
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture", lambda *a, **k: None)
+
+    with pytest.raises(RuntimeError, match="not queued"):
+        make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+
+    stop = calls.index(("motor", "estop", "the 3d calib failed: the move of z to 15.500 was not queued"))
+    first_camera_stop = min(i for i, call in enumerate(calls) if call[1:] == ("on_capture_stop",))
+    assert stop < first_camera_stop < calls.index(("motor", "disconnect"))
+    assert app_model.hardware.stops == ["the 3d calib failed: the move of z to 15.500 was not queued"]
+
+
+def test_a_capture_failure_that_was_the_stop_is_not_stopped_twice(tmp_path, monkeypatch):
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.hardware = _StoppableCaptureMotor(calls)
+    app_model.hardware.estop_active = True  # the board's ack timeout already stopped it
+
+    def failing_run_waypoints(*args, **kwargs):
+        raise RuntimeError("command token ended as stopped")
+
+    monkeypatch.setattr(h3d, "run_waypoints", failing_run_waypoints)
+
+    with pytest.raises(RuntimeError, match="ended as stopped"):
+        make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+
+    assert getattr(app_model.hardware, "stops", []) == []
+
+
+@pytest.mark.parametrize("moving", [True, False], ids=["moving", "idle"])
+def test_the_capture_teardown_stops_a_stage_still_moving_before_the_cameras(tmp_path, monkeypatch, moving):
+    calls = []
+    app_model = _capture_app_model(tmp_path, calls, stops=True)
+    app_model.hardware = _StoppableCaptureMotor(calls)
+    app_model.hardware.moving = moving
+    monkeypatch.setattr(h3d, "run_waypoints", lambda *a, **k: SimpleNamespace(verified=[True]))
+    monkeypatch.setattr(h3d, "calibrate_waypoint_capture",
+                        lambda *a, **k: (None, SimpleNamespace(id="cal"), SimpleNamespace(verdict="pass")))
+    for name in ("left", "right"):
+        (tmp_path / "session" / f"{name}_recording.mp4").write_bytes(b"")
+        (tmp_path / "session" / f"{name}_recording_timestamps.txt").write_text("")
+
+    make_3d_calib(app_model, [app_model.left_camera, app_model.right_camera])
+
+    stops = [i for i, call in enumerate(calls) if call[:2] == ("motor", "estop")]
+    if moving:
+        assert calls[stops[0]][2] == "the calibration capture ended during a move"
+        assert stops[0] < min(i for i, call in enumerate(calls) if call[1:] == ("on_capture_stop",))
+    else:
+        assert stops == []
+
+
+def test_each_arrival_wait_is_bounded_by_its_own_moves_profile(monkeypatch):
+    # Review I-5: the arrival wait gets the per-move ack deadline, not a fixed 2 s.
+    from reachaq.device.motion_deadline import ack_deadline, profile_time
+
+    clock = _Clock()
+    motor = _scout_motor(clock)
+    timeouts = []
+    real_wait = h3d.wait_until_arrived
+
+    def wait(hard, target, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        return real_wait(hard, target, **kwargs)
+
+    monkeypatch.setattr(h3d, "wait_until_arrived", wait)
+    plan = _scout_grid_plan()
+    run_waypoints(motor, plan, strict=True, sleep=clock.sleep, now=clock.now, clock=clock.now)
+
+    for k in range(1, len(plan)):
+        axis = plan[k][0]
+        i = "xyz".index(axis)
+        v, a = SPEEDS[axis]
+        distance = abs(plan[k][2][i] - plan[k - 1][2][i])
+        assert timeouts[k] == pytest.approx(ack_deadline(profile_time(distance, v, a)))

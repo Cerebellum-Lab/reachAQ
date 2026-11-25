@@ -213,3 +213,80 @@ def test_pending_command_and_connection_share_one_availability_rule(
         hardware._pellet_version = ""
         content.deleteLater()
         qapp.processEvents()
+
+
+def _connected(content, hardware):
+    content._capture_active = True
+    hardware._pellet_version = "test"
+    hardware._firmware_compatibility = hardware._firmware_policy.evaluate("2.0.0")
+
+
+def _released(content, hardware, qapp):
+    hardware._pending_tokens.clear()
+    hardware._pellet_version = ""
+    hardware._estop_record = None
+    content.deleteLater()
+    qapp.processEvents()
+
+
+def test_stop_stays_enabled_while_a_command_is_running(qapp, app_model):
+    hardware = app_model.hardware
+    content = HardwareControlContent(app_model)
+    try:
+        _connected(content, hardware)
+        hardware._pending_tokens["operation"] = ("moving", 0.0)
+        content._refresh_enabled_state()
+
+        assert not content._x_set_button.isEnabled()
+        assert content._stop_button.isEnabled()
+        assert content._stop_button not in content._commands_widgets
+
+        content._capture_active = False  # outside a capture as well
+        content._refresh_enabled_state()
+        assert content._stop_button.isEnabled()
+    finally:
+        _released(content, hardware, qapp)
+
+
+def test_stop_calls_the_hardware_models_estop_directly(qapp, app_model, monkeypatch):
+    hardware = app_model.hardware
+    content = HardwareControlContent(app_model)
+    calls = []
+    monkeypatch.setattr(hardware, "estop", lambda reason: calls.append(reason) or True)
+    pellet_machine = app_model.behavior.system_machine.pellet
+    monkeypatch.setattr(pellet_machine, "move_home", lambda **kwargs: calls.append(("move_home", kwargs)))
+    try:
+        _connected(content, hardware)
+        hardware._pending_tokens["operation"] = ("moving", 0.0)
+        content._refresh_enabled_state()
+
+        QTest.mouseClick(content._stop_button, Qt.MouseButton.LeftButton)
+
+        assert calls == ["operator STOP"]
+    finally:
+        _released(content, hardware, qapp)
+
+
+def _home_button(content):
+    from PySide6.QtWidgets import QPushButton
+
+    return next(b for b in content.findChildren(QPushButton) if b.text() == "Home")
+
+
+def test_home_after_a_stop_releases_the_latch_through_the_hardware_model(qapp, app_model, monkeypatch):
+    hardware = app_model.hardware
+    content = HardwareControlContent(app_model)
+    calls = []
+    monkeypatch.setattr(hardware, "home_after_estop", lambda: calls.append("home_after_estop"))
+    pellet_machine = app_model.behavior.system_machine.pellet
+    monkeypatch.setattr(pellet_machine, "move_home", lambda **kwargs: calls.append("move_home"))
+    try:
+        _connected(content, hardware)
+        content._refresh_enabled_state()
+        QTest.mouseClick(_home_button(content), Qt.MouseButton.LeftButton)
+        hardware._estop_record = {"reason": "operator STOP"}
+        QTest.mouseClick(_home_button(content), Qt.MouseButton.LeftButton)
+
+        assert calls == ["move_home", "home_after_estop"]
+    finally:
+        _released(content, hardware, qapp)
