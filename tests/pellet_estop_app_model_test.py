@@ -177,3 +177,27 @@ def test_closing_the_window_stops_a_moving_stage_before_the_capture_stop(monkeyp
     MainWindow.close(window)
 
     assert order == [("estop", "reachAQ is closing"), ("capture_stop",), ("on_close",)]
+
+
+def test_the_session_end_home_after_an_operator_stop_does_not_release_it(app_model):
+    # Ben, 2026-11-24: after an operator STOP only an operator Home or a reconnect releases.
+    from tools.acquisition.model.hardware_model import OPERATOR_STOP_REASON
+
+    app_model._set_subsystem_status(SubsystemId.CAN_PELLET, SubsystemState.READY)
+    hardware = app_model.hardware
+    board = _StoppedBoard(hardware)
+    hardware._can_device = hardware._device_conn = board
+    hardware.estop(OPERATOR_STOP_REASON)
+    try:
+        with mock.patch.object(type(hardware), "connected", new_callable=mock.PropertyMock,
+                               return_value=True):
+            app_model._request_session_end_home("stop")
+
+        assert ("release",) not in board.log
+        assert ("send", SystemCommandKind.SEND_HOME) not in board.log
+        assert hardware.estop_active
+        action = app_model._recording_session.end_actions[0]
+        assert action["status"] == "skipped"
+        assert "operator STOP" in action["error"]
+    finally:
+        hardware._can_device = hardware._device_conn = None
